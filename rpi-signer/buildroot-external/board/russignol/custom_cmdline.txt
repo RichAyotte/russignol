@@ -1,0 +1,1 @@
+root=/dev/mmcblk0p2 rootfstype=f2fs rootflags=fsync_mode=strict,compress_algorithm=zstd,compress_chksum,atgc,gc_merge,alloc_mode=reuse,background_gc=off,errors=remount-ro rootwait quiet loglevel=0 panic=0

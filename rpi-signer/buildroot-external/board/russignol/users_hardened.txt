@@ -1,0 +1,4 @@
+spi 102 spi 102 * /dev/null /bin/false - spi dummy user
+gpio 103 gpio 103 * /dev/null /bin/false - gpio dummy user
+i2c 104 i2c 104 * /dev/null /bin/false - i2c dummy user
+russignol 1000 russignol 1000 * /home/russignol /bin/false spi,gpio,i2c "Russignol user"

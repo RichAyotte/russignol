@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target
+/target-x86_64
+/target-aarch64
+**/target/
+**/*.rs.bk
+
+# Rootfs overlay binaries (generated during build)
+/rpi-signer/buildroot-external/rootfs-overlay-common/bin/russignol-signer
+
+# Buildroot state tracking (xtask-generated)
+/rpi-signer/buildroot-external/.last_build_config
+
+# AI assistants (user-specific)
+.claude/
+
+# Editor and system backup files
+**/*~
+**/*.bak
+**/*.backup
+**/*.orig
+**/*.swp
+**/*.swo

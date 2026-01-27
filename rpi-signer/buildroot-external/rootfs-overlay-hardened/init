@@ -1,0 +1,427 @@
+#!/bin/sh
+#
+# Hardened Monolithic /init (PID 1)
+# Platform: Raspberry Pi Zero 2W
+# Function: Network Gadget, Hardware Init, Partition Setup, Process Supervision
+#
+# Partition Layout:
+# - p3 (keys): Created at first boot, 64MB for encrypted keys (becomes RO after key gen)
+# - p4 (data): Created at first boot, 64MB for watermarks and logs
+#
+# IMPORTANT: This file is for the HARDENED build only.
+# The DEV build uses SysV init scripts instead:
+#   - rootfs-overlay-dev/etc/init.d/S20russignol
+#   - rootfs-overlay-dev/etc/fstab
+# If you change partition layout, paths, or startup logic here,
+# you MUST also update the dev init scripts to match.
+#
+
+# ==============================================================================
+# DEBUG LOGGING
+# ==============================================================================
+DEBUG_LOG="/var/log/init.log"
+log_debug() {
+    # echo "$1" >> "$DEBUG_LOG"
+    :
+}
+
+# ==============================================================================
+# 0. SIGNAL HANDLING
+# ==============================================================================
+init_signals() {
+    SHUTDOWN=0
+    trap 'SHUTDOWN=1' TERM INT
+    trap ':' CHLD
+}
+
+# ==============================================================================
+# 1. ESSENTIAL MOUNTS
+# ==============================================================================
+init_mounts() {
+    export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+    mount -t proc proc /proc
+    mount -t sysfs sysfs /sys
+    mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs mdev /dev
+    mkdir -p /dev/pts
+    mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=0666
+    mount -t tmpfs tmpfs /tmp -o mode=1777,nosuid,nodev
+    mount -t tmpfs tmpfs /run -o mode=0755,nosuid,nodev
+    mkdir -p /dev/shm
+    mount -t tmpfs tmpfs /dev/shm -o mode=1777,nosuid,nodev
+}
+
+# ==============================================================================
+# 2. DEVICE MANAGER
+# ==============================================================================
+init_mdev() {
+    echo "/sbin/mdev" > /proc/sys/kernel/hotplug
+    mdev -s
+}
+
+# ==============================================================================
+# 3. SEED RNG
+# ==============================================================================
+init_rng() {
+    if [ -r "/etc/default/seedrng" ]; then
+        . "/etc/default/seedrng"
+    fi
+    seedrng ${SEEDRNG_ARGS:-} || true
+}
+
+# ==============================================================================
+# 4. PARTITION SETUP
+# ==============================================================================
+# Keys partition (p3) - created at first boot by signer, holds encrypted keys
+KEYS_PART="/dev/mmcblk0p3"
+KEYS_MOUNT="/keys"
+
+# Data partition (p4) - created at first boot by signer, holds watermarks/logs
+DATA_PART="/dev/mmcblk0p4"
+DATA_MOUNT="/data"
+
+# Setup marker lives on keys partition (survives data partition corruption)
+SETUP_MARKER="${KEYS_MOUNT}/.setup_complete"
+
+R_USER="russignol"
+# inline_data/inline_dentry: store small files in inode (reduces write amplification)
+F2FS_OPTS="rw,inline_data,inline_dentry,fsync_mode=strict,compress_algorithm=zstd,compress_chksum,atgc,gc_merge,alloc_mode=reuse,background_gc=off,errors=remount-ro"
+
+# Check if partition exists in kernel (created at first boot)
+partition_exists() {
+    [ -e "/sys/block/mmcblk0/mmcblk0p$1" ]
+}
+
+init_keys_partition() {
+    log_debug "Setting up keys partition..."
+
+    # Check if p3 exists - if not, first boot hasn't created it yet
+    if ! partition_exists 3; then
+        log_debug "Keys partition (p3) not found - will be created by signer"
+        return 0
+    fi
+
+    # Create mount point
+    mkdir -p "${KEYS_MOUNT}"
+
+    # Mount read-write first to check for setup marker
+    if mount -t f2fs -o rw "${KEYS_PART}" "${KEYS_MOUNT}" 2>/dev/null; then
+        if [ -f "${SETUP_MARKER}" ]; then
+            # After setup: remount read-only for security
+            mount -o remount,ro "${KEYS_MOUNT}"
+            log_debug "Setup complete, keys partition remounted read-only"
+        else
+            # First boot: keep read-write for key generation
+            log_debug "First boot, keys partition kept read-write"
+        fi
+    else
+        log_debug "ERROR: Failed to mount keys partition"
+    fi
+}
+
+init_data_partition() {
+    log_debug "Setting up data partition..."
+
+    # Check if p4 exists - if not, first boot hasn't created it yet
+    if ! partition_exists 4; then
+        log_debug "Data partition (p4) not found - will be created by signer"
+        return 0
+    fi
+
+    # Create mount point
+    mkdir -p "${DATA_MOUNT}"
+
+    # Mount data partition
+    mount -t f2fs -o "${F2FS_OPTS}" "${DATA_PART}" "${DATA_MOUNT}" 2>/dev/null || true
+
+    log_debug "Data partition setup complete"
+}
+
+# ==============================================================================
+# 5. USB MODULE LOADING
+# ==============================================================================
+USB_CONFIGFS="/sys/kernel/config"
+
+load_usb_modules() {
+    # uname not available in hardened busybox, find module dir directly
+    MODULE_DIR=$(ls -d /lib/modules/*/ 2>/dev/null | head -1)
+    MODULE_DIR=${MODULE_DIR%/}  # remove trailing slash
+    GADGET_DIR="$MODULE_DIR/kernel/drivers/usb/gadget"
+    USB_DIR="$MODULE_DIR/kernel/drivers/usb"
+
+    log_debug "  MODULE_DIR=$MODULE_DIR"
+    log_debug "  dir exists: $([ -d $MODULE_DIR ] && echo YES || echo NO)"
+
+    # Skip if gadget framework already available (built-in case)
+    if [ -d "$USB_CONFIGFS/usb_gadget" ] 2>/dev/null; then
+        log_debug "  usb_gadget already exists (built-in)"
+        return 0
+    fi
+
+    # Load configfs module first
+    CONFIGFS_KO="$MODULE_DIR/kernel/fs/configfs/configfs.ko"
+    log_debug "  configfs.ko exists: $([ -f $CONFIGFS_KO ] && echo YES || echo NO)"
+    if [ -f "$CONFIGFS_KO" ]; then
+        insmod "$CONFIGFS_KO" 2>&1 | while read line; do log_debug "  insmod configfs: $line"; done
+    fi
+
+    # Mount configfs BEFORE loading libcomposite
+    log_debug "  configfs in mounts: $(grep -q configfs /proc/mounts && echo YES || echo NO)"
+    if ! grep -q configfs /proc/mounts; then
+        mount -t configfs none "$USB_CONFIGFS" 2>&1
+        log_debug "  mount configfs ret=$?"
+    fi
+    log_debug "  configfs now mounted: $(grep -q configfs /proc/mounts && echo YES || echo NO)"
+
+    # Load remaining modules
+    for mod in \
+        "$USB_DIR/common/usb-common.ko" \
+        "$GADGET_DIR/udc/udc-core.ko" \
+        "$USB_DIR/roles/roles.ko" \
+        "$USB_DIR/phy/phy-generic.ko" \
+        "$USB_DIR/dwc2/dwc2.ko" \
+        "$GADGET_DIR/libcomposite.ko" \
+        "$GADGET_DIR/function/u_ether.ko" \
+        "$GADGET_DIR/function/usb_f_ecm.ko"
+    do
+        if [ -f "$mod" ]; then
+            insmod "$mod" 2>&1
+            log_debug "  insmod $(basename $mod) ret=$?"
+        else
+            log_debug "  MISSING: $mod"
+        fi
+    done
+
+    # Wait for UDC
+    log_debug "  Waiting for UDC..."
+    for i in $(seq 1 30); do
+        [ -n "$(ls /sys/class/udc 2>/dev/null)" ] && break
+        sleep 0.1
+    done
+    log_debug "  UDC contents: $(ls /sys/class/udc 2>/dev/null || echo EMPTY)"
+
+    # Wait for usb_gadget
+    log_debug "  Waiting for usb_gadget..."
+    for i in $(seq 1 20); do
+        [ -d "$USB_CONFIGFS/usb_gadget" ] && { log_debug "  usb_gadget appeared"; return 0; }
+        sleep 0.1
+    done
+
+    log_debug "  usb_gadget NOT found"
+    return 1
+}
+
+# ==============================================================================
+# 6. USB GADGET SETUP
+# ==============================================================================
+USB_GADGET="$USB_CONFIGFS/usb_gadget/g1"
+USB_IFACE="usb0"
+USB_PERSIST="/data/usb-gadget-persist"
+
+get_random_hex() {
+    local count=$1
+    hexdump -n "$count" -e "$count/1 \"%02x\"" /dev/urandom 2>/dev/null || \
+        cat /dev/urandom | tr -dc 'a-f0-9' | head -c "$((count * 2))"
+}
+
+setup_gadget() {
+    # Ensure ConfigFS is mounted
+    if ! grep -q configfs /proc/mounts; then
+        mount -t configfs none "$USB_CONFIGFS" 2>/dev/null
+    fi
+
+    # Cleanup previous
+    if [ -d "$USB_GADGET" ]; then
+        echo "" > "$USB_GADGET/UDC" 2>/dev/null || true
+        rm -rf "$USB_GADGET"
+    fi
+
+    mkdir -p "$USB_GADGET"
+    cd "$USB_GADGET" || return 1
+
+    echo 0x1d6b > idVendor
+    echo 0x0104 > idProduct
+    echo 0x0100 > bcdDevice
+    echo 0x0200 > bcdUSB
+
+    # Identity
+    if [ -f "$USB_PERSIST" ]; then
+        sed -i 's/\r$//' "$USB_PERSIST" 2>/dev/null
+        . "$USB_PERSIST"
+    else
+        USB_SERIAL=$(get_random_hex 16)
+        HOST_MAC="02:$(get_random_hex 5 | sed 's/../&:/g' | sed 's/:$//')"
+        DEV_MAC="02:$(get_random_hex 5 | sed 's/../&:/g' | sed 's/:$//')"
+    fi
+
+    mkdir -p strings/0x409
+    echo "${USB_SERIAL:-0123456789}" > strings/0x409/serialnumber
+    echo "Russignol" > strings/0x409/manufacturer
+    echo "Russignol Ethernet" > strings/0x409/product
+
+    mkdir -p configs/c.1/strings/0x409
+    echo "ECM Network" > configs/c.1/strings/0x409/configuration
+    echo 500 > configs/c.1/MaxPower
+
+    mkdir -p functions/ecm.usb0
+    echo "${HOST_MAC:-02:00:00:00:00:01}" > functions/ecm.usb0/host_addr
+    echo "${DEV_MAC:-02:00:00:00:00:02}" > functions/ecm.usb0/dev_addr
+
+    ln -s functions/ecm.usb0 configs/c.1/
+
+    # Bind to UDC
+    for i in $(seq 1 10); do
+        UDC=$(ls /sys/class/udc 2>/dev/null | head -n1)
+        [ -n "$UDC" ] && break
+        sleep 0.5
+    done
+
+    if [ -n "$UDC" ]; then
+        echo "$UDC" > UDC
+    else
+        return 1
+    fi
+}
+
+# ==============================================================================
+# 7. NETWORK WATCHDOG
+# ==============================================================================
+HOST_IP="169.254.1.2"
+# 6 failures * 5 seconds = 30 second timeout before USB reset
+MAX_FAILURES=6
+RESET_COUNT_FILE="/tmp/usb_reset_count"
+
+start_watchdog() {
+    (
+        sleep 5
+        FAIL_COUNT=0
+        while true; do
+            if ip link show dev "$USB_IFACE" >/dev/null 2>&1; then
+                ip link show dev "$USB_IFACE" | grep -q "UP" || ip link set "$USB_IFACE" up 2>/dev/null
+                if ! ip addr show dev "$USB_IFACE" | grep -q "169.254.1.1"; then
+                    ip addr flush dev "$USB_IFACE" 2>/dev/null
+                    ip neigh flush dev "$USB_IFACE" 2>/dev/null
+                    ip addr add 169.254.1.1/30 dev "$USB_IFACE" 2>/dev/null
+                fi
+                if ping -c 1 -W 1 "$HOST_IP" >/dev/null 2>&1; then
+                    FAIL_COUNT=0
+                else
+                    FAIL_COUNT=$((FAIL_COUNT + 1))
+                fi
+                if [ "$FAIL_COUNT" -ge "$MAX_FAILURES" ]; then
+                    # Track reset count for diagnostics
+                    RESET_COUNT=$(cat "$RESET_COUNT_FILE" 2>/dev/null || echo 0)
+                    RESET_COUNT=$((RESET_COUNT + 1))
+                    echo "$RESET_COUNT" > "$RESET_COUNT_FILE"
+                    logger -t usb-watchdog "USB gadget reset #$RESET_COUNT (after $MAX_FAILURES ping failures)"
+
+                    echo "" > "$USB_GADGET/UDC" 2>/dev/null
+                    sleep 1
+                    UDC=$(ls /sys/class/udc 2>/dev/null | head -n1)
+                    [ -n "$UDC" ] && echo "$UDC" > "$USB_GADGET/UDC"
+                    sleep 2
+                    FAIL_COUNT=0
+                fi
+            else
+                FAIL_COUNT=0
+            fi
+            sleep 5
+        done
+    ) &
+}
+
+# ==============================================================================
+# 8. APP SUPERVISOR
+# ==============================================================================
+#
+# NOTE: The signer handles its own first-boot detection and setup.
+# This script just mounts partitions, ensures logging, and starts the signer
+# as the russignol user.
+#
+R_CMD="/bin/russignol-signer"
+LOG_FILE="/data/logs/watchdog.log"
+LOG_MAX_LINES=10000
+
+run_supervisor() {
+    cd /home/russignol
+
+    # Main loop - run signer
+    # First boot (no partitions): run as root for storage setup (sfdisk needs root)
+    #   - Signer will drop privileges to russignol after storage completes
+    #   - No log redirection (partitions don't exist yet, errors show on display)
+    # After setup: run as unprivileged russignol user via su with logging
+    while true; do
+        # Determine if we need root privileges (first boot - no partitions yet)
+        if ! partition_exists 3 || ! partition_exists 4; then
+            # First boot: run as root, no log redirection (would fail anyway)
+            $R_CMD
+        else
+            # Normal boot: ensure log directory exists
+            mkdir -p "${DATA_MOUNT}/logs"
+
+            # Log rotation - keep only last LOG_MAX_LINES
+            if [ -f "$LOG_FILE" ]; then
+                LOG_SIZE=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+                if [ "$LOG_SIZE" -gt "$LOG_MAX_LINES" ]; then
+                    tail -n "$LOG_MAX_LINES" "$LOG_FILE" > "$LOG_FILE.tmp"
+                    mv "$LOG_FILE.tmp" "$LOG_FILE"
+                fi
+            fi
+
+            su -s /bin/sh -c "$R_CMD" "$R_USER" >> "$LOG_FILE" 2>&1
+        fi
+
+        # Don't restart - error should remain visible on display
+        # System halts on panic (panic=0 in cmdline), power cycle to recover
+        exit 0
+    done
+}
+
+# ==============================================================================
+# MAIN - Enable functions one by one for debugging
+# ==============================================================================
+
+log_debug "=== INIT START ==="
+
+log_debug "Before init_signals"
+init_signals
+log_debug "After init_signals"
+
+log_debug "Before init_mounts"
+init_mounts
+log_debug "After init_mounts"
+
+log_debug "Before init_mdev"
+init_mdev
+log_debug "After init_mdev"
+
+log_debug "Before init_rng"
+init_rng
+log_debug "After init_rng"
+
+log_debug "Before init_keys_partition"
+init_keys_partition
+log_debug "After init_keys_partition"
+
+log_debug "Before init_data_partition"
+init_data_partition
+log_debug "After init_data_partition"
+
+# USB gadget setup in background (don't block app startup)
+(
+    log_debug "Before load_usb_modules"
+    load_usb_modules
+    log_debug "After load_usb_modules ret=$?"
+
+    log_debug "Before setup_gadget"
+    setup_gadget
+    log_debug "After setup_gadget ret=$?"
+) &
+
+# Watchdog configures usb0 (ip link up + assigns 169.254.1.1/30) and handles reconnect recovery
+log_debug "Before start_watchdog"
+start_watchdog
+log_debug "After start_watchdog"
+
+log_debug "Before run_supervisor"
+run_supervisor
+log_debug "After run_supervisor"

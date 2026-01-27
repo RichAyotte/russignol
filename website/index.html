@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Russignol - Tezos Hardware Signer</title>
+    <meta name="description" content="Secure Tezos hardware signer for Raspberry Pi Zero 2 with e-paper display.">
+
+    <!-- Open Graph Meta Tags -->
+    <meta property="og:title" content="Russignol - Tezos Hardware Signer">
+    <meta property="og:description" content="Turn your Raspberry Pi Zero 2 into a dedicated, physically separate signing device with a e-paper display.">
+    <meta property="og:image" content="https://russignol.com/assets/2.13inch-touch-e-paper-hat-with-case.webp">
+    <meta property="og:url" content="https://russignol.com">
+    <meta property="og:type" content="website">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:image" content="https://russignol.com/assets/2.13inch-touch-e-paper-hat-with-case.webp">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" href="assets/russignol-logo.svg" type="image/svg+xml">
+</head>
+<body>
+
+    <header class="main-header">
+        <div class="container">
+            <div class="logo-container">
+                <img src="assets/russignol-logo.svg" alt="Russignol Logo" class="logo" width="40" height="40">
+                <div class="brand-name">Russignol</div>
+            </div>
+            <nav class="main-nav">
+                <ul>
+                    <li><a href="#features">Features</a></li>
+                    <li><a href="#why-russignol">Why Russignol?</a></li>
+                    <li><a href="#setup">Get Started</a></li>
+                </ul>
+            </nav>
+        </div>
+    </header>
+
+    <main>
+        <section class="hero">
+            <div class="container">
+                <div class="hero-content">
+                    <div class="hero-text">
+                        <div class="hero-title-wrapper">
+                            <h1>Secure Tezos Hardware Signer</h1>
+                            <p class="hero-subtitle">Originally engineered for <a href="https://baktz.com/" class="hero-link">Baktz</a>, Russignol is the fastest Raspberry Pi Zero 2 hardware signer — built for uncompromising security and reliability.</p>
+                        </div>
+                        <div class="cta-group">
+                            <a href="#setup" class="btn btn-primary">Get Started</a>
+                        </div>
+                    </div>
+                    <div class="hero-image">
+                        <img src="assets/2.13inch-touch-e-paper-hat-with-case.webp" alt="Russignol Device - Raspberry Pi Zero 2 with E-Paper Hat" width="500" height="300">
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="features" class="features">
+            <div class="container">
+                <h2>Features</h2>
+                <div class="feature-grid">
+                    <div class="feature-card">
+                        <div class="icon">
+                            <!-- Key Icon -->
+                            <div class="feature-icon icon-key"></div>
+                        </div>
+                        <h3>Secure Storage</h3>
+                        <p>Private keys are encrypted and stored securely on the device with PIN protection.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="icon">
+                            <!-- Rocket Icon -->
+                            <div class="feature-icon icon-rocket"></div>
+                        </div>
+                        <h3>Fast BLS Signatures</h3>
+                        <p>Optimized for performance: the Pi Zero 2 generates BLS signatures in under 6ms, ready for future Tezos protocols.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="icon">
+                            <!-- Touchscreen Icon -->
+                            <div class="feature-icon icon-screen"></div>
+                        </div>
+                        <h3>E-Paper Touch Display</h3>
+                        <p>Intuitive touch controls for PIN entry. View signing activity at a glance.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="icon">
+                            <!-- Gears Icon -->
+                            <div class="feature-icon icon-gears"></div>
+                        </div>
+                        <h3>Automated Setup</h3>
+                        <p>The companion CLI utility makes configuring your baker host effortless and verifiable.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="why-russignol" class="features">
+            <div class="container">
+                <h2>Why Russignol?</h2>
+                <div class="tech-specs" style="margin-top: 0;">
+                    <ul>
+                        <li>
+                            <strong>Physical Separation:</strong>
+                            <span>Your private keys <span class="highlight">never leave the device</span>. Key generation and PIN setup happen exclusively on the touchscreen — even a compromised host <span class="highlight">cannot access or extract</span> your keys.</span>
+                        </li>
+                        <li>
+                            <strong>Hardened by Default:</strong>
+                            <span>Sleep soundly with a purpose-built Linux distribution. <span class="highlight">No WiFi, no Bluetooth, no SSH, no logins</span> — attack vectors are eliminated, not just disabled.</span>
+                        </li>
+                        <li>
+                            <strong>Memory-Safe Implementation:</strong>
+                            <span>Built in Rust for <span class="highlight">guaranteed memory safety</span>. Cryptographic operations use the audited and formally verified <a href="https://github.com/supranational/blst" target="_blank" rel="noopener noreferrer">blst</a> library — <span class="highlight">no buffer overflows, no exploits</span>.</span>
+                        </li>
+                        <li>
+                            <strong>Never Miss a Block:</strong>
+                            <span>Sign blocks in <span class="highlight">under 6ms</span> with no garbage collection pauses — <span class="highlight">at least 2x faster</span> than comparable signers.</span>
+                        </li>
+                        <li>
+                            <strong>Tiny Attack Surface:</strong>
+                            <span>Just <span class="highlight">7.4MB</span> compressed — fewer binaries means fewer vulnerabilities. Audit the entire system, not thousands of unknown packages.</span>
+                        </li>
+                        <li>
+                            <strong>Instant Recovery:</strong>
+                            <span>Back online in <span class="highlight">3.8 seconds</span> after a power cycle. Minimize missed blocks during restarts or unexpected reboots.</span>
+                        </li>
+                        <li>
+                            <strong>Built to Last:</strong>
+                            <span>No more prematurely worn-out SD cards — no risky key migrations, no downtime, no unhappy delegators. F2FS expands to use your <span class="highlight">entire card</span> for maximum wear leveling. Your storage will <span class="highlight">outlive the hardware</span>.</span>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <section id="setup" class="setup">
+            <div class="container">
+                <h2>Get Started</h2>
+
+                <!-- <div class="os-tabs">
+                    <button class="os-tab active" data-os="linux">Linux</button>
+                    <button class="os-tab" data-os="macos">macOS</button>
+                </div> -->
+
+                <div class="os-content active" id="os-linux">
+                    <div class="step-list">
+                        <div class="step">
+                            <div class="step-number">1</div>
+                            <div class="step-content">
+                                <h3>Download Host Utility</h3>
+                                <p>Download the setup utility for your host architecture from <a href="https://github.com/RichAyotte/russignol/releases/latest" target="_blank" rel="noopener noreferrer">GitHub Releases</a>.</p>
+
+                                <h4>AMD64</h4>
+                                <div class="code-block-container">
+                                    <div class="terminal-header">
+                                        <button class="copy-btn" onclick="copyToClipboard('curl-amd64', this)">Copy</button>
+                                    </div>
+                                    <pre><code id="curl-amd64">curl -L -o russignol https://github.com/RichAyotte/russignol/releases/latest/download/russignol-amd64 && chmod +x russignol</code></pre>
+                                </div>
+
+                                <h4>AArch64</h4>
+                                <div class="code-block-container">
+                                    <div class="terminal-header">
+                                        <button class="copy-btn" onclick="copyToClipboard('curl-aarch64', this)">Copy</button>
+                                    </div>
+                                    <pre><code id="curl-aarch64">curl -L -o russignol https://github.com/RichAyotte/russignol/releases/latest/download/russignol-aarch64 && chmod +x russignol</code></pre>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="step">
+                            <div class="step-number">2</div>
+                            <div class="step-content">
+                                <h3>Flash the Image</h3>
+                                <p>Download and flash the Russignol image to your SD card. This can run on any Linux machine with an SD card reader — it doesn't need to be your baker.</p>
+                                <div class="code-block-container">
+                                    <div class="terminal-header">
+                                        <button class="copy-btn" onclick="copyToClipboard('flash-linux', this)">Copy</button>
+                                    </div>
+                                    <pre><code id="flash-linux">./russignol image download-and-flash</code></pre>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="step">
+                            <div class="step-number">3</div>
+                            <div class="step-content">
+                                <h3>Initialize Device</h3>
+                                <p>Insert the SD card into your Pi Zero 2 and connect it via USB. On the touchscreen, create your PIN and generate your signing keys.</p>
+                            </div>
+                        </div>
+                        <div class="step">
+                            <div class="step-number">4</div>
+                            <div class="step-content">
+                                <h3>Configure Baker</h3>
+                                <p>On your baker host, run the setup wizard to configure it to use the keys on your Russignol device.</p>
+                                <div class="code-block-container">
+                                    <div class="terminal-header">
+                                        <button class="copy-btn" onclick="copyToClipboard('run-setup', this)">Copy</button>
+                                    </div>
+                                    <pre><code id="run-setup">./russignol setup</code></pre>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- macOS instructions temporarily disabled
+                <div class="os-content" id="os-macos">
+                    <div class="step-list">
+                        <div class="step">
+                            <div class="step-number">1</div>
+                            <div class="step-content">
+                                <h3>Download Image</h3>
+                                <p>Download the Raspberry Pi image.</p>
+                                <div class="code-block-container">
+                                    <div class="terminal-header">
+                                        <button class="copy-btn" onclick="copyToClipboard('curl-img-macos', this)">Copy</button>
+                                    </div>
+                                    <pre><code id="curl-img-macos">curl -L -O https://github.com/RichAyotte/russignol/releases/latest/download/russignol-pi-zero.img.xz</code></pre>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="step">
+                            <div class="step-number">2</div>
+                            <div class="step-content">
+                                <h3>Flash the Image</h3>
+                                <p>Find your SD card, unmount it, and flash the image.</p>
+                                <div class="warning-text">
+                                    <strong>⚠️ CRITICAL:</strong> Replace <code>N</code> with your actual SD card disk number (e.g., <code>2</code>). Run <code>diskutil list</code> to identify it. Writing to the wrong device will <strong>erase all data</strong> on that drive.
+                                </div>
+                                <div class="code-block-container">
+                                    <div class="terminal-header">
+                                        <button class="copy-btn" onclick="copyToClipboard('flash-macos', this)">Copy</button>
+                                    </div>
+                                    <pre><code id="flash-macos">diskutil unmountDisk /dev/diskN && xzcat russignol-pi-zero.img.xz | sudo dd of=/dev/rdiskN bs=4m && diskutil eject /dev/diskN</code></pre>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="step">
+                            <div class="step-number">3</div>
+                            <div class="step-content">
+                                <h3>Initialize Device</h3>
+                                <p>Insert the SD card into your Pi Zero 2 and power it via any USB port. On the touchscreen, create your PIN and generate your signing keys.</p>
+                            </div>
+                        </div>
+                        <div class="step">
+                            <div class="step-number">4</div>
+                            <div class="step-content">
+                                <h3>Configure Baker</h3>
+                                <p>On your Linux baker host, download the setup utility and connect the Russignol device via USB.</p>
+
+                                <h4>AMD64</h4>
+                                <div class="code-block-container">
+                                    <div class="terminal-header">
+                                        <button class="copy-btn" onclick="copyToClipboard('curl-amd64-macos', this)">Copy</button>
+                                    </div>
+                                    <pre><code id="curl-amd64-macos">curl -L -o russignol https://github.com/RichAyotte/russignol/releases/latest/download/russignol-amd64 && chmod +x russignol</code></pre>
+                                </div>
+
+                                <h4>AArch64</h4>
+                                <div class="code-block-container">
+                                    <div class="terminal-header">
+                                        <button class="copy-btn" onclick="copyToClipboard('curl-aarch64-macos', this)">Copy</button>
+                                    </div>
+                                    <pre><code id="curl-aarch64-macos">curl -L -o russignol https://github.com/RichAyotte/russignol/releases/latest/download/russignol-aarch64 && chmod +x russignol</code></pre>
+                                </div>
+
+                                <p style="margin-top: 1.5rem;">Then run the setup wizard:</p>
+                                <div class="code-block-container">
+                                    <div class="terminal-header">
+                                        <button class="copy-btn" onclick="copyToClipboard('run-setup-macos', this)">Copy</button>
+                                    </div>
+                                    <pre><code id="run-setup-macos">./russignol setup</code></pre>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                -->
+            </div>
+        </section>
+
+    </main>
+
+    <footer>
+        <div class="container footer-content">
+            <div class="footer-section brand">
+                <p>&copy; 2025 Russignol</p>
+                <p class="creator">Created by <a href="https://x.com/RichAyotte" target="_blank" rel="noopener noreferrer">Richard Ayotte</a></p>
+            </div>
+
+            <div class="footer-section credits">
+                <h4>Credits & Attribution</h4>
+                <ul>
+                    <li>Inspired by <a href="https://gitlab.com/nomadic-labs/tezos-rpi-bls-signer" target="_blank" rel="noopener noreferrer">tezos-rpi-bls-signer</a></li>
+                    <li>Powered by <a href="https://github.com/supranational/blst" target="_blank" rel="noopener noreferrer">blst</a></li>
+                    <li>Logic ported from <a href="https://gitlab.com/tezos/tezos/" target="_blank" rel="noopener noreferrer">Tezos octez-signer</a></li>
+                    <li>Icons by <a href="https://mobiriseicons.com/" target="_blank" rel="noopener noreferrer">Mobirise Icons</a></li>
+                </ul>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        function copyToClipboard(elementId, btn) {
+            const codeElement = document.getElementById(elementId);
+            const textToCopy = codeElement.innerText;
+
+            navigator.clipboard
+                .writeText(textToCopy)
+                .then(() => {
+                    // If a timeout is already pending for this button, clear it
+                    if (btn.dataset.timeoutId) {
+                        clearTimeout(parseInt(btn.dataset.timeoutId));
+                    }
+
+                    btn.innerText = "COPIED!";
+                    btn.classList.add("copied");
+
+                    const timeoutId = setTimeout(() => {
+                        btn.innerText = "Copy";
+                        btn.classList.remove("copied");
+                        delete btn.dataset.timeoutId;
+                    }, 2000);
+
+                    // Store the timeout ID on the button
+                    btn.dataset.timeoutId = timeoutId;
+                })
+                .catch((err) => {
+                    console.error("Failed to copy text: ", err);
+                });
+        }
+
+        // OS tab switching
+        document.querySelectorAll('.os-tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                const os = tab.dataset.os;
+
+                // Update active tab
+                document.querySelectorAll('.os-tab').forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+
+                // Update active content
+                document.querySelectorAll('.os-content').forEach(c => c.classList.remove('active'));
+                document.getElementById('os-' + os).classList.add('active');
+            });
+        });
+    </script>
+</body>
+</html>

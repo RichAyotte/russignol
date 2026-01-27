@@ -1,0 +1,18 @@
+<svg viewBox="0 0 550 550" xmlns="http://www.w3.org/2000/svg">
+<style>@keyframes blink {
+      0% { opacity: 0; }
+      5% { opacity: 0.08; }
+      100% { opacity: 0; }
+    }
+    .sq {
+      fill: #F97316;
+      opacity: 0;
+      animation: blink 8s infinite ease-in-out;
+    }
+    .s5 { animation-duration: 10s; animation-delay: 2s; }
+    .s6 { animation-duration: 14s; animation-delay: 6s; }
+    .s7 { animation-duration: 8s; animation-delay: 1s; }</style>
+<rect class="sq s5" x="32" y="415" width="20" height="20"/>
+<rect class="sq s6" x="218" y="218" width="20" height="20"/>
+<rect class="sq s7" x="385" y="85" width="20" height="20"/>
+</svg>

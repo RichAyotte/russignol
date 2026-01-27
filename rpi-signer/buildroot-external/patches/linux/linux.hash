@@ -1,0 +1,7 @@
+# SHA256 hash for Linux kernel 6.18
+# From: https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc
+sha256  9106a4605da9e31ff17659d958782b815f9591ab308d03b0ee21aad6c7dced4b  linux-6.18.tar.xz
+
+# Raspberry Pi kernel (rpi-6.18.y branch, commit 575595f5142ad78c1f92c891f6affb46743370ed)
+# Downloaded from: https://github.com/raspberrypi/linux/archive/575595f5142ad78c1f92c891f6affb46743370ed.tar.gz
+sha256  79b0eac9535e4ac7856afbd49e3b7c5bd2e45d578ca297b03f1324ebe36ce4c0  575595f5142ad78c1f92c891f6affb46743370ed.tar.gz

@@ -1,0 +1,17 @@
+[package]
+name = "russignol-crypto"
+version = "0.1.2"
+edition.workspace = true
+authors.workspace = true
+description = "Shared encryption utilities for Russignol (scrypt + AES-256-GCM)"
+
+[lints]
+workspace = true
+
+[dependencies]
+scrypt = "0.11"
+aes-gcm = "0.10"
+log = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }

@@ -1,0 +1,24 @@
+<svg viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<pattern id="a" width="20" height="20" patternUnits="userSpaceOnUse">
+<path d="m20 0h-20v20" fill="none" stroke="#fff" stroke-opacity=".03"/>
+</pattern>
+<style>@keyframes blink {
+        0%, 100% { opacity: 0; }
+        50% { opacity: 0.1; } /* Even dimmer (10%) */
+      }
+      .sq {
+        fill: #F97316;
+        opacity: 0;
+        animation: blink 8s infinite ease-in-out;
+      }
+      /* Randomize durations and long delays for "rare" feel */
+      .sq1 { animation-duration: 6s; animation-delay: 1s; }
+      .sq2 { animation-duration: 9s; animation-delay: 4s; }
+      .sq3 { animation-duration: 11s; animation-delay: 0s; }</style>
+</defs>
+<rect width="100%" height="100%" fill="url(#a)"/>
+<rect class="sq sq1" x="40" y="60" width="20" height="20"/>
+<rect class="sq sq2" x="280" y="180" width="20" height="20"/>
+<rect class="sq sq3" x="140" y="320" width="20" height="20"/>
+</svg>

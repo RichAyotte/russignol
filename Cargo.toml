@@ -1,0 +1,62 @@
+[workspace]
+members = [
+    "libs/crypto",
+    "libs/signer",
+    "libs/epd-2in13-v4",
+    "libs/ui",
+    "rpi-signer",
+    "host-utility",
+    "xtask",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+authors = ["Richard Ayotte"]
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Selectively disable overly strict pedantic lints
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+# Shared dependencies across workspace
+[workspace.dependencies]
+log = { version = "0.4", features = ["max_level_info", "release_max_level_info"] }
+env_logger = "0.11"
+
+# Dev profile - enable optimizations for usable debug builds
+[profile.dev]
+opt-level = 1             # Basic optimizations, better debuggability
+
+# Optimize heavy dependencies even in dev builds
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.aes-gcm]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.epd-2in13-v4]
+opt-level = 3
+[profile.dev.package.embedded-graphics]
+opt-level = 3
+
+# Workspace-wide release profile optimizations
+# Applied to all member crates for consistent, aggressive optimization
+[profile.release]
+opt-level = 3             # Maximum speed optimization (default, but explicit)
+lto = "fat"               # Full link-time optimization across all crates
+codegen-units = 1         # Single codegen unit for maximum optimization
+strip = true              # Strip debug symbols for smaller binaries
+panic = "abort"           # Abort on panic (no unwinding = smaller binaries)
+
+# Profiling build - release speed with debug symbols
+[profile.profiling]
+inherits = "release"
+debug = true            # Keep full symbols
+strip = false           # NEVER strip during profiling
+lto = false             # Keep functions distinct across crate boundaries
+codegen-units = 256     # Higher units = less aggressive cross-function inlining
+split-debuginfo = "off" # Ensures symbols are in the binary, not external files

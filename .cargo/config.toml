@@ -1,0 +1,43 @@
+# Cross-compilation configuration for Raspberry Pi Zero 2W (ARM Cortex-A53)
+# Used by: rpi-signer, libs/signer, libs/epd-2in13-v4
+
+[build]
+# Default to x86_64 for host tools
+target = "x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu]
+linker = "x86_64-linux-gnu-gcc"
+# Generic x86_64 for maximum compatibility (no -march=native)
+rustflags = [
+    "-C", "target-cpu=x86-64",          # Generic x86_64, not native CPU
+]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+# Generic ARM64 for maximum compatibility across all ARMv8 processors
+# Note: rpi-signer build.sh overrides this with cortex-a53 via RUSTFLAGS
+rustflags = [
+    "-C", "target-cpu=generic",         # Generic ARMv8, compatible with all ARM64 CPUs
+]
+
+# macOS targets not configured - build natively on macOS instead:
+#   cargo build --release --package russignol-setup --target x86_64-apple-darwin
+#   cargo build --release --package russignol-setup --target aarch64-apple-darwin
+
+[env]
+# Override CFLAGS for cross-compilation (clear host's CFLAGS)
+CFLAGS = { value = "", force = true }
+# Optimized CFLAGS for Raspberry Pi Zero 2W (ARM Cortex-A53)
+CFLAGS_aarch64_unknown_linux_gnu = { value = "-mcpu=cortex-a53 -O3 -fomit-frame-pointer", force = true }
+
+[alias]
+# Build automation using xtask
+xtask = "run --package xtask --"
+# Build RPi signer for ARM64
+build-rpi = "build --target aarch64-unknown-linux-gnu -p russignol-signer"
+# Build e-paper display example
+build-epd-example = "build --release --example main -p epd-2in13-v4 --target aarch64-unknown-linux-gnu"
+
+[profile.release]
+# Workspace-wide release optimizations
+debug = false                           # No debug info in release builds

@@ -1,0 +1,121 @@
+#!/bin/sh
+#
+# Russignol signer init script for DEV build (SysV init)
+#
+# IMPORTANT: This file is for the DEV build only.
+# The HARDENED build uses a monolithic /init script instead:
+#   - rootfs-overlay-hardened/init
+# If you change partition layout, paths, or startup logic here,
+# you MUST also update the hardened init script to match.
+#
+# NOTE: The signer handles its own first-boot detection and setup.
+# This script just mounts partitions and starts the signer as russignol user.
+#
+
+PID_FILE="/var/run/russignol.pid"
+USER="russignol"
+COMMAND="/bin/russignol-signer"
+
+# Partition layout (created at first boot by signer):
+# - p3 (keys): Holds encrypted keys, becomes RO after setup
+# - p4 (data): Holds watermarks and logs
+KEYS_PART="/dev/mmcblk0p3"
+KEYS_MOUNT="/keys"
+DATA_PART="/dev/mmcblk0p4"
+DATA_MOUNT="/data"
+SETUP_MARKER="/keys/.setup_complete"
+# inline_data/inline_dentry: store small files in inode (reduces write amplification)
+F2FS_OPTS="rw,inline_data,inline_dentry,fsync_mode=strict,compress_algorithm=zstd,compress_chksum,atgc,gc_merge,alloc_mode=reuse,background_gc=off,errors=remount-ro"
+
+# Check if partition exists in kernel (created at first boot)
+partition_exists() {
+    [ -e "/sys/block/mmcblk0/mmcblk0p$1" ]
+}
+
+# Check if a partition is mounted
+is_mounted() {
+    grep -q "^$1 " /proc/mounts
+}
+
+mount_keys_partition() {
+    # Check if p3 exists - if not, first boot hasn't created it yet
+    if ! partition_exists 3; then
+        echo "Keys partition (p3) not found - will be created by signer"
+        return 0
+    fi
+
+    mkdir -p "${KEYS_MOUNT}"
+    if ! is_mounted "${KEYS_PART}"; then
+        # Mount read-write first to check for setup marker
+        if mount -t f2fs -o rw "${KEYS_PART}" "${KEYS_MOUNT}" 2>/dev/null; then
+            if [ -f "${SETUP_MARKER}" ]; then
+                # After setup: remount read-only for security
+                mount -o remount,ro "${KEYS_MOUNT}"
+            fi
+            # First boot: leave mounted read-write for key generation
+        fi
+    fi
+}
+
+mount_data_partition() {
+    # Check if p4 exists - if not, first boot hasn't created it yet
+    if ! partition_exists 4; then
+        echo "Data partition (p4) not found - will be created by signer"
+        return 0
+    fi
+
+    mkdir -p "${DATA_MOUNT}"
+    if ! is_mounted "${DATA_PART}"; then
+        mount -t f2fs -o "${F2FS_OPTS}" "${DATA_PART}" "${DATA_MOUNT}" 2>/dev/null || true
+    fi
+}
+
+case "$1" in
+    start)
+        echo "Starting Russignol"
+
+        # Mount partitions (if they exist)
+        mount_keys_partition
+        mount_data_partition
+
+        # First boot (no partitions): run as root for storage setup
+        #   - Signer will drop privileges to russignol after storage completes
+        # After setup: run as unprivileged russignol user
+        if ! partition_exists 3 || ! partition_exists 4; then
+            echo "First boot detected - running as root for storage setup"
+            echo "Signer will drop privileges after partition creation"
+            start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
+                --chdir /home/russignol \
+                --background --startas /bin/sh -- -c "$COMMAND"
+        else
+            echo "Normal boot - running as $USER"
+            start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
+                --chuid "$USER" \
+                --chdir /home/russignol \
+                --background --startas /bin/sh -- -c "$COMMAND"
+        fi
+        if [ $? -ne 0 ]; then
+            echo "Failed to start Russignol" >&2
+            exit 1
+        fi
+        ;;
+    stop)
+        echo "Stopping Russignol the Tezos Signer"
+        start-stop-daemon --stop --oknodo --pidfile "$PID_FILE" --retry 5
+        if [ $? -ne 0 ]; then
+            echo "Failed to stop Russignol" >&2
+            exit 1
+        fi
+        ;;
+    restart)
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0

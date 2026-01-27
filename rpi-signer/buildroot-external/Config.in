@@ -1,0 +1,5 @@
+# Russignol configuration options
+# This file can be used to add custom configuration options
+
+# Example:
+# source "$BR2_EXTERNAL_RUSSIGNOL_PATH/package/mypackage/Config.in"

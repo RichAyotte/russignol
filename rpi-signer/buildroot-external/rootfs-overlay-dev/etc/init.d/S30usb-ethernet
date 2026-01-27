@@ -1,0 +1,273 @@
+#!/bin/sh
+#
+# /etc/init.d/S30usb-gadget
+# Russignol USB Ethernet Gadget
+# Components: Identity + Janitor + Ping Watchdog
+#
+
+NAME="usb-gadget"
+CONFIGFS_MOUNT="/sys/kernel/config"
+GADGET="$CONFIGFS_MOUNT/usb_gadget/g1"
+UDC_DIR="/sys/class/udc"
+INTERFACE="usb0"
+PERSIST_FILE="/etc/usb-gadget-persist"
+
+# Config: Target to ping (The Host)
+HOST_IP="169.254.1.2"
+# Config: 6 failures * 5 seconds = 30 second timeout before USB reset
+# Increased from 3 to reduce USB cycling stress over extended operation
+MAX_FAILURES=6
+PIDFILE="/var/run/usb-gadget.pid"
+RESET_COUNT_FILE="/tmp/usb_reset_count"
+
+# -------------------------------------------------------------------------
+# 0. Load USB Gadget Modules (for deferred loading)
+# -------------------------------------------------------------------------
+load_modules() {
+    MODULE_DIR="/lib/modules/$(uname -r)"
+    GADGET_DIR="$MODULE_DIR/kernel/drivers/usb/gadget"
+    USB_DIR="$MODULE_DIR/kernel/drivers/usb"
+
+    # Check if gadget framework is already available (built-in case)
+    if [ -d "$CONFIGFS_MOUNT/usb_gadget" ] 2>/dev/null; then
+        return 0
+    fi
+
+    # Load modules in dependency order:
+    # 1. configfs (filesystem for gadget configuration)
+    # 2. usb-common (common USB utilities)
+    # 3. udc-core (USB Device Controller framework)
+    # 4. roles (USB role support)
+    # 5. phy-generic (USB PHY transceiver)
+    # 6. dwc2 (USB controller - creates /sys/class/udc/)
+    # 7. libcomposite (ConfigFS gadget framework)
+    # 8. u_ether (USB ethernet utilities)
+    # 9. usb_f_ecm (ECM function driver)
+    for mod in \
+        "$MODULE_DIR/kernel/fs/configfs/configfs.ko" \
+        "$USB_DIR/common/usb-common.ko" \
+        "$GADGET_DIR/udc/udc-core.ko" \
+        "$USB_DIR/roles/roles.ko" \
+        "$USB_DIR/phy/phy-generic.ko" \
+        "$USB_DIR/dwc2/dwc2.ko" \
+        "$GADGET_DIR/libcomposite.ko" \
+        "$GADGET_DIR/function/u_ether.ko" \
+        "$GADGET_DIR/function/usb_f_ecm.ko"
+    do
+        [ -f "$mod" ] && insmod "$mod" 2>/dev/null || true
+    done
+
+    # Wait for UDC to appear (dwc2 creates this)
+    for i in $(seq 1 30); do
+        [ -n "$(ls $UDC_DIR 2>/dev/null)" ] && break
+        sleep 0.1
+    done
+
+    # Wait for configfs usb_gadget directory to appear
+    for i in $(seq 1 20); do
+        [ -d "$CONFIGFS_MOUNT/usb_gadget" ] && return 0
+        sleep 0.1
+    done
+
+    echo "Warning: USB gadget configfs not available after module load"
+    return 1
+}
+
+# -------------------------------------------------------------------------
+# 1. Random Hex Generator
+# -------------------------------------------------------------------------
+get_random_hex() {
+    local count=$1
+    if command -v hexdump >/dev/null 2>&1; then
+        hexdump -n "$count" -e "$count/1 \"%02x\"" /dev/urandom
+    else
+        cat /dev/urandom | tr -dc 'a-f0-9' | head -c "$((count * 2))"
+    fi
+}
+
+# -------------------------------------------------------------------------
+# 2. Create Gadget
+# -------------------------------------------------------------------------
+create_gadget() {
+    if [ -d "$GADGET" ]; then
+        echo "" > "$GADGET/UDC" 2>/dev/null || true
+        rm -rf "$GADGET"
+    fi
+
+    mkdir -p "$GADGET"
+    cd "$GADGET" || return 1
+
+    echo 0x1d6b > idVendor
+    echo 0x0104 > idProduct
+    echo 0x0100 > bcdDevice
+    echo 0x0200 > bcdUSB
+
+    # --- Identity ---
+    if [ -f "$PERSIST_FILE" ]; then
+        sed -i 's/\r$//' "$PERSIST_FILE" 2>/dev/null
+        . "$PERSIST_FILE"
+    else
+        USB_SERIAL=$(get_random_hex 16)
+        gen_mac() {
+            local h=$(get_random_hex 5)
+            echo "02:${h:0:2}:${h:2:2}:${h:4:2}:${h:6:2}:${h:8:2}"
+        }
+        HOST_MAC=$(gen_mac)
+        DEV_MAC=$(gen_mac)
+
+        if touch "$PERSIST_FILE" 2>/dev/null; then
+            echo "USB_SERIAL=$USB_SERIAL" > "$PERSIST_FILE"
+            echo "HOST_MAC=$HOST_MAC" >> "$PERSIST_FILE"
+            echo "DEV_MAC=$DEV_MAC" >> "$PERSIST_FILE"
+        fi
+    fi
+
+    mkdir -p strings/0x409
+    echo "$USB_SERIAL"          > strings/0x409/serialnumber
+    echo "Russignol"            > strings/0x409/manufacturer
+    echo "Russignol Ethernet"   > strings/0x409/product
+
+    mkdir -p configs/c.1/strings/0x409
+    echo "ECM Network" > configs/c.1/strings/0x409/configuration
+    echo 500           > configs/c.1/MaxPower
+
+    mkdir -p functions/ecm.usb0
+    echo "$HOST_MAC" > functions/ecm.usb0/host_addr
+    echo "$DEV_MAC"  > functions/ecm.usb0/dev_addr
+
+    ln -s functions/ecm.usb0 configs/c.1/
+
+    # Bind
+    for i in $(seq 1 10); do
+        UDC=$(ls "$UDC_DIR" | head -n1)
+        [ -n "$UDC" ] && break
+        sleep 0.5
+    done
+
+    if [ -n "$UDC" ]; then
+        echo "$UDC" > UDC || return 1
+    else
+        echo "Error: No UDC controller found available for binding."
+        return 1
+    fi
+}
+
+# -------------------------------------------------------------------------
+# 3. Network Janitor (Single Pass)
+# -------------------------------------------------------------------------
+check_janitor() {
+    if ip link show dev "$INTERFACE" >/dev/null 2>&1; then
+
+        # Ensure UP
+        if ! ip link show dev "$INTERFACE" | grep -q "UP"; then
+            ip link set "$INTERFACE" up 2>/dev/null
+        fi
+
+        # Ensure IP
+        if ! ip addr show dev "$INTERFACE" | grep -q "169.254.1.1"; then
+            ip addr flush dev "$INTERFACE" 2>/dev/null
+            ip neigh flush dev "$INTERFACE" 2>/dev/null
+            ip addr add 169.254.1.1/30 dev "$INTERFACE" 2>/dev/null
+        fi
+    fi
+}
+
+# -------------------------------------------------------------------------
+# 4. Ping Watchdog (Single Pass)
+# -------------------------------------------------------------------------
+# Global state for watchdog
+FAIL_COUNT=0
+
+check_watchdog() {
+    if ip link show dev "$INTERFACE" >/dev/null 2>&1; then
+        # Ping Host (1 sec timeout)
+        if ping -c 1 -W 1 "$HOST_IP" >/dev/null 2>&1; then
+            FAIL_COUNT=0
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
+
+        # Reset if too many failures
+        if [ "$FAIL_COUNT" -ge "$MAX_FAILURES" ]; then
+            # Track reset count for diagnostics
+            RESET_COUNT=$(cat "$RESET_COUNT_FILE" 2>/dev/null || echo 0)
+            RESET_COUNT=$((RESET_COUNT + 1))
+            echo "$RESET_COUNT" > "$RESET_COUNT_FILE"
+            logger -t usb-watchdog "USB gadget reset #$RESET_COUNT (after $MAX_FAILURES ping failures)"
+
+            echo "" > "$GADGET/UDC" 2>/dev/null
+            sleep 1
+            UDC=$(ls "$UDC_DIR" | head -n1)
+            [ -n "$UDC" ] && echo "$UDC" > "$GADGET/UDC"
+            FAIL_COUNT=0
+        fi
+    else
+         # Interface missing? Reset count so we don't panic loop.
+         FAIL_COUNT=0
+    fi
+}
+
+# -------------------------------------------------------------------------
+# 5. Daemon Loop
+# -------------------------------------------------------------------------
+daemon_loop() {
+    while true; do
+        check_janitor
+        check_watchdog
+        sleep 5
+    done
+}
+
+# -------------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------------
+case "$1" in
+    start)
+        echo "Starting Russignol Gadget (background)... OK"
+
+        # Fork entire setup to background for deferred loading
+        # This allows init to continue immediately (faster boot)
+        (
+            # Load USB gadget modules first
+            load_modules
+
+            # Mount configfs if needed
+            if ! grep -q configfs /proc/mounts; then
+                mount -t configfs none "$CONFIGFS_MOUNT" 2>/dev/null
+            fi
+
+            # Create gadget (this triggers USB enumeration)
+            if create_gadget; then
+                # Start the daemon loop inline (already in background)
+                daemon_loop
+            else
+                echo "USB gadget creation failed" >&2
+            fi
+        ) &
+
+        echo $! > "$PIDFILE"
+        ;;
+    stop)
+        echo -n "Stopping Russignol Gadget... "
+        start-stop-daemon -K -p "$PIDFILE"
+        RET=$?
+        [ $RET -eq 0 ] && echo "OK" || echo "ERROR"
+
+        # Cleanup hardware
+        ip link set "$INTERFACE" down 2>/dev/null
+        echo "" > "$GADGET/UDC" 2>/dev/null
+        rm -rf "$GADGET"
+        ;;
+    restart|reload)
+        $0 stop
+        sleep 1
+        $0 start
+        ;;
+    daemon)
+        # Internal use only
+        daemon_loop
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+esac

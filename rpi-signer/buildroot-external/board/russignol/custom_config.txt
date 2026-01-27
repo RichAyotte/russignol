@@ -1,0 +1,28 @@
+# Russignol Signer - Raspberry Pi Configuration
+# See https://www.raspberrypi.com/documentation/computers/config_txt.html
+
+# Boot configuration
+start_file=start.elf
+fixup_file=fixup.dat
+# Uncompressed kernel: with SD overclock, read speed beats CPU decompression time.
+# Also compresses better in final .img.gz distribution image.
+kernel=Image
+arm_64bit=1
+
+# Peripherals for e-Paper display and USB gadget
+dtparam=spi=on
+dtparam=i2c_arm=on
+dtoverlay=dwc2,dr_mode=peripheral
+
+# Fast boot optimizations
+disable_splash=1
+boot_delay=0
+initial_turbo=30
+dtparam=sd_overclock=100
+enable_uart=0
+
+# Resource reduction (headless signer)
+gpu_mem=16
+dtoverlay=disable-wifi
+dtoverlay=disable-bt
+dtoverlay=cma,cma-size=8388608
