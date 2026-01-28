@@ -75,6 +75,12 @@ diskutil eject /dev/diskN
 
 > **Note:** Users in the `disk` group (Linux) can omit `sudo` for `dd` and `eject`.
 
+> **Note:** For USB device access without root, ensure your user is in the `plugdev` group:
+> ```bash
+> sudo usermod -aG plugdev $USER
+> ```
+> Log out and back in for the change to take effect.
+
 ## Step 2: Boot and Initialize Device
 
 1. Insert the flashed SD card into your Raspberry Pi Zero 2W
@@ -97,6 +103,7 @@ SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="010
 EOF
 
 sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=net
 ```
 
 ### Configure Link-Local Address
@@ -121,6 +128,24 @@ EOF
 
 sudo systemctl restart systemd-networkd
 ```
+
+### Exclude from NetworkManager
+
+If NetworkManager is running, prevent it from managing the russignol interface:
+
+```bash
+sudo mkdir -p /etc/NetworkManager/conf.d
+sudo tee /etc/NetworkManager/conf.d/unmanaged-russignol.conf << 'EOF'
+[keyfile]
+unmanaged-devices=interface-name:russignol
+EOF
+
+sudo systemctl restart NetworkManager
+```
+
+Skip this step if NetworkManager is not installed or not running (`systemctl is-active NetworkManager`).
+
+### Manual Configuration (Alternative)
 
 Alternatively, configure manually each boot:
 
