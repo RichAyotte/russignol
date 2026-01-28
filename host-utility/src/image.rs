@@ -22,6 +22,14 @@ use crate::utils::{
 use crate::version;
 use crate::watermark;
 
+/// Download metadata resolved from URL or release info
+struct DownloadInfo {
+    url: String,
+    checksum: Option<String>,
+    compressed_size: Option<u64>,
+    uncompressed_size: Option<u64>,
+}
+
 /// Image subcommands
 #[derive(Subcommand, Debug)]
 pub enum ImageCommands {
@@ -290,11 +298,18 @@ fn cmd_download(url: Option<String>, output: Option<PathBuf>, skip_verify: bool)
         PathBuf::from(filename)
     });
 
-    // Download with caching (skip checksum if user requested)
+    // Download with caching
     let checksum = if skip_verify {
         None
     } else {
-        expected_checksum.as_deref()
+        let cs = expected_checksum.as_deref().filter(|s| !s.is_empty());
+        if cs.is_none() {
+            bail!(
+                "Checksum not available for this release.\n\
+                 Use --skip-verify to download without verification (not recommended)."
+            );
+        }
+        cs
     };
     let cached_path = download_with_cache(&download_url, checksum, compressed_size)?;
 
@@ -412,6 +427,42 @@ fn cmd_flash(image: &Path, device: Option<PathBuf>, yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// Resolve download URL and metadata from custom URL or latest release
+fn resolve_download_info(url: Option<String>) -> Result<DownloadInfo> {
+    if let Some(custom_url) = url {
+        utils::info(&format!("Using custom URL: {custom_url}"));
+        Ok(DownloadInfo {
+            url: custom_url,
+            checksum: None,
+            compressed_size: None,
+            uncompressed_size: None,
+        })
+    } else {
+        utils::info("Fetching latest version info...");
+        let version_info = version::fetch_latest_version()
+            .context("Failed to fetch version info from russignol.com")?;
+
+        let image_info = version_info
+            .images
+            .get("pi-zero")
+            .context("No pi-zero image found. Use --url to specify a direct download URL.")?;
+
+        let url = version::get_image_download_url(&version_info, "pi-zero")?;
+        utils::success(&format!(
+            "Found image: {} ({})",
+            image_info.filename,
+            format_bytes(image_info.compressed_size_bytes)
+        ));
+
+        Ok(DownloadInfo {
+            url,
+            checksum: Some(image_info.sha256.clone()),
+            compressed_size: Some(image_info.compressed_size_bytes),
+            uncompressed_size: Some(image_info.size_bytes),
+        })
+    }
+}
+
 fn cmd_download_and_flash(url: Option<String>, device: Option<PathBuf>, yes: bool) -> Result<()> {
     // Check for required tools first
     check_flash_tools()?;
@@ -451,36 +502,8 @@ fn cmd_download_and_flash(url: Option<String>, device: Option<PathBuf>, yes: boo
     check_device_not_mounted(&target_device.path)?;
     check_device_has_media(&target_device.path)?;
 
-    // Get download info
-    // uncompressed_size is used for progress bar during flash
-    let (download_url, expected_checksum, compressed_size, uncompressed_size) =
-        if let Some(custom_url) = url {
-            utils::info(&format!("Using custom URL: {custom_url}"));
-            (custom_url, None, None, None)
-        } else {
-            utils::info("Fetching latest version info...");
-            let version_info = version::fetch_latest_version()
-                .context("Failed to fetch version info from russignol.com")?;
-
-            let image_info = version_info
-                .images
-                .get("pi-zero")
-                .context("No pi-zero image found. Use --url to specify a direct download URL.")?;
-
-            let url = version::get_image_download_url(&version_info, "pi-zero")?;
-            utils::success(&format!(
-                "Found image: {} ({})",
-                image_info.filename,
-                format_bytes(image_info.compressed_size_bytes)
-            ));
-
-            (
-                url,
-                Some(image_info.sha256.clone()),
-                Some(image_info.compressed_size_bytes),
-                Some(image_info.size_bytes),
-            )
-        };
+    // Get download info (uncompressed_size is used for progress bar during flash)
+    let dl = resolve_download_info(url)?;
 
     // Safety confirmation BEFORE downloading
     if !confirm_flash_operation(&target_device, yes)? {
@@ -489,12 +512,14 @@ fn cmd_download_and_flash(url: Option<String>, device: Option<PathBuf>, yes: boo
         return Ok(());
     }
 
-    // Download with caching and resume support
-    let image_path =
-        download_with_cache(&download_url, expected_checksum.as_deref(), compressed_size)?;
+    // Download with caching and resume support (checksum required for flash)
+    let checksum = dl.checksum.as_deref().filter(|s| !s.is_empty()).context(
+        "Checksum not available for this release. Cannot safely flash without verification.",
+    )?;
+    let image_path = download_with_cache(&dl.url, Some(checksum), dl.compressed_size)?;
 
     // Flash the downloaded image
-    flash_image_to_device(&image_path, &target_device.path, uncompressed_size)?;
+    flash_image_to_device(&image_path, &target_device.path, dl.uncompressed_size)?;
 
     // Re-read partition table so kernel sees new partitions
     reread_partition_table(&target_device.path);

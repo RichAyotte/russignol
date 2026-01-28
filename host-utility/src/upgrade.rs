@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
@@ -51,6 +51,11 @@ pub fn run_upgrade(check_only: bool, _yes: bool) -> Result<()> {
         .context("Architecture not found in version info")?
         .sha256;
 
+    if expected_checksum.is_empty() {
+        bail!(
+            "Checksum not available for this release. Cannot safely upgrade without verification."
+        );
+    }
     verify_checksum(temp_file.path(), expected_checksum)?;
 
     // Replace binary

@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
+use sha2::{Digest, Sha256};
 use std::env;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -431,7 +434,17 @@ fn build_for_target_with_dir(target: &str, dev: bool, target_dir: &str) -> Resul
     Ok(())
 }
 
-/// Move release assets to target/ with canonical names
+/// Compute SHA256 hash of a file
+fn compute_sha256(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut file =
+        File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    std::io::copy(&mut file, &mut hasher)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Move release assets to target/ with canonical names and generate checksums
 fn copy_release_assets() -> Result<Vec<String>> {
     let mut assets: Vec<String> = Vec::new();
 
@@ -473,6 +486,29 @@ fn copy_release_assets() -> Result<Vec<String>> {
         );
     }
 
+    // Generate checksums.txt for all assets
+    if !assets.is_empty() {
+        println!("  Computing checksums...");
+        let checksums_path = "target/checksums.txt";
+        let file = File::create(checksums_path).context("Failed to create checksums.txt")?;
+        let mut writer = BufWriter::new(file);
+
+        for asset_path in &assets {
+            let path = Path::new(asset_path);
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .context("Invalid asset filename")?;
+            let hash = compute_sha256(path)?;
+            // sha256sum format: two spaces between hash and filename
+            writeln!(writer, "{hash}  {filename}").context("Failed to write checksum")?;
+        }
+
+        writer.flush().context("Failed to flush checksums.txt")?;
+        assets.push(checksums_path.to_string());
+        println!("    {} checksums.txt", "✓".green());
+    }
+
     Ok(assets)
 }
 
@@ -494,6 +530,7 @@ fn cmd_github_release() -> Result<()> {
         "russignol-amd64",
         "russignol-aarch64",
         "russignol-pi-zero.img.xz",
+        "checksums.txt",
     ] {
         let path = format!("target/{name}");
         if Path::new(&path).exists() {

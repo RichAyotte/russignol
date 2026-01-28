@@ -63,6 +63,7 @@ struct GitHubRelease {
 struct GitHubAsset {
     name: String,
     size: u64,
+    browser_download_url: String,
 }
 
 /// Get current version
@@ -89,6 +90,62 @@ pub fn is_newer(current: &str, latest: &str) -> Result<bool> {
     Ok(latest_ver > current_ver)
 }
 
+/// Parse checksums.txt content into a `HashMap`
+///
+/// Expects sha256sum format: "<hash>  <filename>" (two spaces between hash and filename).
+/// Returns a `HashMap` mapping filename -> sha256 hash.
+fn parse_checksums(content: &str) -> HashMap<String, String> {
+    let mut checksums = HashMap::new();
+    for line in content.lines() {
+        // Skip empty lines
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Split on double-space (sha256sum format)
+        if let Some((hash, filename)) = line.split_once("  ") {
+            checksums.insert(filename.to_string(), hash.to_string());
+        }
+    }
+    checksums
+}
+
+/// Fetch and parse checksums.txt from release assets
+///
+/// Returns a `HashMap` mapping filename -> sha256 hash.
+/// Returns empty `HashMap` if checksums.txt is not found (backwards compatible with old releases).
+fn fetch_checksums(agent: &ureq::Agent, assets: &[GitHubAsset]) -> HashMap<String, String> {
+    // Find checksums.txt asset
+    let checksums_asset = assets.iter().find(|a| a.name == "checksums.txt");
+
+    let Some(asset) = checksums_asset else {
+        log::debug!("checksums.txt not found in release assets");
+        return HashMap::new();
+    };
+
+    // Fetch the checksums file
+    let response = match agent.get(&asset.browser_download_url).call() {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::warn!("Failed to fetch checksums.txt: {e}");
+            return HashMap::new();
+        }
+    };
+
+    let content = match response.into_body().read_to_string() {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Failed to read checksums.txt: {e}");
+            return HashMap::new();
+        }
+    };
+
+    let checksums = parse_checksums(&content);
+    log::debug!("Loaded {} checksums from checksums.txt", checksums.len());
+    checksums
+}
+
 /// Fetch latest version info from GitHub releases API
 pub fn fetch_latest_version() -> Result<VersionInfo> {
     let agent = create_http_agent(30);
@@ -109,6 +166,9 @@ pub fn fetch_latest_version() -> Result<VersionInfo> {
         .unwrap_or(&release.published_at)
         .to_string();
 
+    // Fetch checksums from checksums.txt (if available)
+    let checksums = fetch_checksums(&agent, &release.assets);
+
     // Build binaries map from assets
     let mut binaries = HashMap::new();
     let mut images = HashMap::new();
@@ -119,7 +179,7 @@ pub fn fetch_latest_version() -> Result<VersionInfo> {
                 "amd64".to_string(),
                 BinaryInfo {
                     filename: asset.name.clone(),
-                    sha256: String::new(), // SHA256 not available from GitHub API
+                    sha256: checksums.get(&asset.name).cloned().unwrap_or_default(),
                     size_bytes: asset.size,
                 },
             );
@@ -128,7 +188,7 @@ pub fn fetch_latest_version() -> Result<VersionInfo> {
                 "aarch64".to_string(),
                 BinaryInfo {
                     filename: asset.name.clone(),
-                    sha256: String::new(),
+                    sha256: checksums.get(&asset.name).cloned().unwrap_or_default(),
                     size_bytes: asset.size,
                 },
             );
@@ -137,7 +197,7 @@ pub fn fetch_latest_version() -> Result<VersionInfo> {
                 "pi-zero".to_string(),
                 ImageInfo {
                     filename: asset.name.clone(),
-                    sha256: String::new(),
+                    sha256: checksums.get(&asset.name).cloned().unwrap_or_default(),
                     size_bytes: 0, // Uncompressed size not available
                     compressed_size_bytes: asset.size,
                     min_sd_size_gb: 8,
@@ -229,5 +289,81 @@ mod tests {
         assert_eq!(version_info.version, "0.2.0");
         assert_eq!(version_info.binaries.len(), 2);
         assert_eq!(version_info.binaries["amd64"].filename, "russignol-amd64");
+    }
+
+    #[test]
+    fn test_parse_checksums_valid() {
+        let content = "\
+abc123def456789012345678901234567890123456789012345678901234  russignol-amd64
+def456abc789012345678901234567890123456789012345678901234567  russignol-aarch64
+f9dbc58069cf55bfdd0497e16cfba842d5fbe4c3230ebc8a515bef6edd37904f  russignol-pi-zero.img.xz
+";
+        let checksums = parse_checksums(content);
+
+        assert_eq!(checksums.len(), 3);
+        assert_eq!(
+            checksums.get("russignol-amd64"),
+            Some(&"abc123def456789012345678901234567890123456789012345678901234".to_string())
+        );
+        assert_eq!(
+            checksums.get("russignol-aarch64"),
+            Some(&"def456abc789012345678901234567890123456789012345678901234567".to_string())
+        );
+        assert_eq!(
+            checksums.get("russignol-pi-zero.img.xz"),
+            Some(&"f9dbc58069cf55bfdd0497e16cfba842d5fbe4c3230ebc8a515bef6edd37904f".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_checksums_empty() {
+        let checksums = parse_checksums("");
+        assert!(checksums.is_empty());
+    }
+
+    #[test]
+    fn test_parse_checksums_with_empty_lines() {
+        let content = "\
+abc123  file1
+
+def456  file2
+
+";
+        let checksums = parse_checksums(content);
+        assert_eq!(checksums.len(), 2);
+        assert_eq!(checksums.get("file1"), Some(&"abc123".to_string()));
+        assert_eq!(checksums.get("file2"), Some(&"def456".to_string()));
+    }
+
+    #[test]
+    fn test_parse_checksums_malformed_lines_ignored() {
+        let content = "\
+abc123  file1
+invalid-no-double-space
+def456  file2
+";
+        let checksums = parse_checksums(content);
+        assert_eq!(checksums.len(), 2);
+        assert_eq!(checksums.get("file1"), Some(&"abc123".to_string()));
+        assert_eq!(checksums.get("file2"), Some(&"def456".to_string()));
+    }
+
+    #[test]
+    fn test_missing_checksum_returns_empty_string() {
+        // When a file is not in checksums.txt, unwrap_or_default returns empty string
+        let checksums = parse_checksums("abc123  other-file\n");
+
+        // File not in checksums - should return empty string (not None)
+        // This empty string signals "checksum not available" to download functions
+        let missing = checksums
+            .get("russignol-amd64")
+            .cloned()
+            .unwrap_or_default();
+        assert!(missing.is_empty());
+
+        // Verify empty string is filtered out (the pattern used in download code)
+        let as_option: Option<String> = Some(missing);
+        let checksum = as_option.as_deref().filter(|s| !s.is_empty());
+        assert!(checksum.is_none(), "Empty checksum should filter to None");
     }
 }

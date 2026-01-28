@@ -18,3 +18,4 @@ clap = { version = "4.5", features = ["derive", "color"] }
 colored = "3.1"
 which = "8.0"
 walkdir = "2.5"
+sha2 = "0.10"
