@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 mod build;
+mod changelog;
 mod clean;
 mod config;
 mod image;
@@ -580,6 +581,10 @@ fn cmd_github_release() -> Result<()> {
         bail!("No release assets found. Build first with: cargo xtask release");
     }
 
+    // Generate changelog from conventional commits
+    println!("  Generating changelog...");
+    let changelog_path = changelog::create_changelog_file(&version)?;
+
     // Create GitHub release with assets
     println!("  Creating release on GitHub...");
     let tag = format!("v{version}");
@@ -591,7 +596,8 @@ fn cmd_github_release() -> Result<()> {
         &tag,
         "--title",
         &title,
-        "--generate-notes",
+        "--notes-file",
+        &changelog_path,
     ];
 
     for asset in &assets {

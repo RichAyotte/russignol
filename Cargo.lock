@@ -2801,6 +2801,7 @@ dependencies = [
  "anyhow",
  "clap",
  "colored",
+ "regex",
  "sha2",
  "walkdir",
  "which",
