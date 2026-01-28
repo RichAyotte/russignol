@@ -31,6 +31,20 @@ brew install xz
 
 ## Step 1: Download and Flash SD Card
 
+> **Warning: Manual flashing skips critical security provisioning.**
+>
+> The [host utility](INSTALL_HOST_UTILITY.md) performs essential setup that manual flashing cannot replicate:
+>
+> - **No watermark initialization** — The host utility queries your live Tezos node and writes blockchain state to the boot partition. Without this, an attacker who obtains the image could modify watermark values to enable replay attacks or double-signing.
+> - **No SD card wear leveling** — The host utility configures over-provisioning and TRIMs unpartitioned space for optimal flash wear leveling. Manual flashing skips this optimization, reducing SD card longevity.
+> - **No image integrity verification** — Manual `dd` doesn't verify the SHA256 checksum; corrupted downloads go undetected.
+> - **No device safety checks** — Risk of accidentally overwriting the wrong drive. The host utility validates removable devices and requires explicit confirmation.
+> - **No node validation** — Manual process doesn't verify your node is running and synced before flashing.
+>
+> **Recommended:** Use the [host utility](INSTALL_HOST_UTILITY.md) instead.
+>
+> Proceeding with manual installation means accepting responsibility for these missing security features.
+
 Download the latest SD card image:
 
 ```bash
