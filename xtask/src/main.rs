@@ -90,6 +90,10 @@ enum Commands {
         /// Create GitHub release with binaries (requires gh CLI)
         #[arg(long)]
         github: bool,
+
+        /// Publish website to Cloudflare Pages (requires wrangler CLI)
+        #[arg(long)]
+        website: bool,
     },
 
     /// Run test suites across workspace
@@ -112,6 +116,9 @@ enum Commands {
 
     /// Validate build environment
     Validate,
+
+    /// Publish website to Cloudflare Pages (requires wrangler CLI)
+    Website,
 
     /// Run watermark protection E2E tests on a physical device
     WatermarkTest {
@@ -247,10 +254,15 @@ fn try_main() -> Result<()> {
                 KernelAction::Update => config::config_kernel_update(dev),
             },
         },
-        Commands::Release { clean, github } => cmd_release(clean, github),
+        Commands::Release {
+            clean,
+            github,
+            website,
+        } => cmd_release(clean, github, website),
         Commands::Test { no_fuzz } => cmd_test(!no_fuzz),
         Commands::Clean { buildroot, deep } => do_clean(buildroot, deep),
         Commands::Validate => cmd_validate(),
+        Commands::Website => cmd_website(),
         Commands::WatermarkTest {
             device,
             port,
@@ -512,6 +524,32 @@ fn copy_release_assets() -> Result<Vec<String>> {
     Ok(assets)
 }
 
+fn cmd_website() -> Result<()> {
+    check_command("wrangler", "Install with: bun add -g wrangler")?;
+    cmd_website_publish()
+}
+
+fn cmd_website_publish() -> Result<()> {
+    println!(
+        "{}",
+        "Publishing website to Cloudflare Pages...".cyan().bold()
+    );
+
+    run_cmd(
+        "wrangler",
+        &["pages", "deploy", "website", "--project-name=russignol"],
+        "Failed to publish website to Cloudflare Pages",
+    )?;
+
+    println!(
+        "\n{}",
+        "✓ Website published to Cloudflare Pages!".green().bold()
+    );
+    println!("  View at: https://russignol.com");
+
+    Ok(())
+}
+
 fn cmd_github_release() -> Result<()> {
     let version = get_cargo_version()?;
 
@@ -573,7 +611,7 @@ fn cmd_github_release() -> Result<()> {
     Ok(())
 }
 
-fn cmd_release(clean: bool, github: bool) -> Result<()> {
+fn cmd_release(clean: bool, github: bool, website: bool) -> Result<()> {
     let version = get_cargo_version()?;
 
     println!(
@@ -582,6 +620,11 @@ fn cmd_release(clean: bool, github: bool) -> Result<()> {
             .cyan()
             .bold()
     );
+
+    // Validate wrangler early if --website is used
+    if website {
+        check_command("wrangler", "Install with: bun add -g wrangler")?;
+    }
 
     let mut step = 1;
 
@@ -638,6 +681,16 @@ fn cmd_release(clean: bool, github: bool) -> Result<()> {
         cmd_github_release()?;
     }
 
+    // 8. Publish website (optional)
+    if website {
+        step += 1;
+        println!(
+            "\n{}",
+            format!("Step {step}: Publish Website").cyan().bold()
+        );
+        cmd_website_publish()?;
+    }
+
     println!(
         "\n{} {}",
         "✓ Release".green().bold(),
@@ -647,6 +700,9 @@ fn cmd_release(clean: bool, github: bool) -> Result<()> {
     println!("  - SD image: target/russignol-pi-zero.img.xz");
     if github {
         println!("  - GitHub: https://github.com/RichAyotte/russignol/releases");
+    }
+    if website {
+        println!("  - Website: https://russignol.com");
     }
 
     Ok(())
