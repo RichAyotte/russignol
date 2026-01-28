@@ -1,30 +1,20 @@
-# Security Audit Report: Russignol Tezos Signer (Hardened Build)
+# Security Self-Assessment: Russignol Tezos Signer (Hardened Build)
 
-**Date:** December 14, 2025
-**Auditor:** Claude Code Security Analysis
-**Version:** 1.0
+**Date:** January 28, 2026
+**Reviewer:** Self-assessment (not an independent third-party audit)
+**Version:** 2.0
 **Build Variant:** Hardened
+
+> **Disclaimer:** This document is a self-assessment performed using automated code analysis tools. It is not a substitute for a formal third-party security audit. The findings and ratings reflect the reviewer's analysis of the codebase and configuration files.
 
 ## Executive Summary
 
-This comprehensive security audit analyzes the Russignol project (hardened build), a hardware signer for the Tezos blockchain designed to run on a Raspberry Pi Zero 2W with an e-ink touchscreen display. The audit covers security design, attack surfaces, custom distribution security, kernel configuration, and potential vulnerabilities.
-
-### Overall Security Rating: **10/10**
-
-| Category | Rating | Notes |
-|----------|--------|-------|
-| Cryptography | ★★★★★ | Excellent - BLS12-381 via BLST, AES-256-GCM |
-| Network Isolation | ★★★★★ | Excellent - USB Gadget Ethernet only |
-| Key Management | ★★★★☆ | Good - Encrypted storage, PIN-protected |
-| Authentication | ★★☆☆☆ | By design - Disabled, relies on isolation |
-| Persistence | ★★★★☆ | Good - Watermark persisted via write-behind cache |
-| OS Hardening | ★★★★★ | Excellent - No SSH, locked accounts, minimal utilities |
-| Hardware Stability | ★★★★★ | Excellent - 24/7 operation, well within thermal limits |
+This security assessment analyzes the Russignol project (hardened build), a hardware signer for the Tezos blockchain designed to run on a Raspberry Pi Zero 2W with an e-ink touchscreen display. The assessment covers security design, attack surfaces, custom distribution security, kernel configuration, and potential vulnerabilities.
 
 ### Operational Validation
 
 - **Uptime:** 24/7 continuous operation for weeks
-- **Thermal:** Well within safe operating margins
+- **Thermal:** ~35°C typical operating temperature
 - **Reliability:** Zero failures in extended testing
 
 ## Table of Contents
@@ -35,11 +25,13 @@ This comprehensive security audit analyzes the Russignol project (hardened build
 4. [Cryptographic Operations](#4-cryptographic-operations)
 5. [Network Attack Surface](#5-network-attack-surface)
 6. [Admin Command Attack Surface](#6-admin-command-attack-surface)
-7. [Physical Attack Surface](#7-physical-attack-surface)
-8. [Key Extraction Attacks](#8-key-extraction-attacks)
-9. [Supply Chain Security](#9-supply-chain-security)
-10. [Vulnerability Summary](#10-vulnerability-summary)
-11. [Recommendations](#11-recommendations)
+7. [Runtime Security Features](#7-runtime-security-features)
+8. [Physical Attack Surface](#8-physical-attack-surface)
+9. [Key Extraction Attacks](#9-key-extraction-attacks)
+10. [Supply Chain Security](#10-supply-chain-security)
+11. [Code Quality](#11-code-quality)
+12. [Vulnerability Summary](#12-vulnerability-summary)
+13. [Recommendations](#13-recommendations)
 
 ## 1. Project Architecture
 
@@ -113,7 +105,6 @@ The project uses Buildroot to create a minimal, purpose-built Linux distribution
 - ✅ `russignol` user locked (password hash set to `*`)
 - ✅ Non-root user runs signer application
 - ✅ Hardware groups have no login shell
-- ✅ No privilege escalation paths
 - ✅ No SSH daemon running
 
 ### 2.3 BusyBox Hardening
@@ -125,12 +116,12 @@ The project uses Buildroot to create a minimal, purpose-built Linux distribution
 | Network | telnet, ftp, wget, netcat, traceroute, nslookup, arping |
 | Editors | vi, ed |
 | User Management | adduser, deluser, passwd |
-| Admin | su, sulogin, vlock |
 | Debug | pstree, lsof, nmeter |
 
 **Retained Utilities:**
+- su (required for privilege drop at boot)
 - ping, ip (minimal networking)
-- grep, sed, awk (text processing)
+- grep, sed (text processing)
 - logger (system logging)
 
 ## 3. Custom Kernel Analysis
@@ -151,7 +142,7 @@ The project uses Buildroot to create a minimal, purpose-built Linux distribution
 **Assessment:**
 - ✅ F2FS with strict fsync (data durability)
 - ✅ Compression with checksums
-- ✅ Auto-reboot on panic (10 seconds)
+- ✅ System halts on kernel panic (`panic=0`) - prevents exploitation of unstable state
 - ✅ Read-only remount on errors
 - ✅ Explicit init specification
 
@@ -160,10 +151,10 @@ The project uses Buildroot to create a minimal, purpose-built Linux distribution
 The device runs at stock clock speeds for maximum reliability.
 
 **Operational Data:**
-- Thermal: Well within safe operating margins (below 80°C throttle threshold)
+- Thermal: ~35°C typical operating temperature
 - Reliability: **24/7 operation for weeks** without failures
 
-**Assessment:** ✅ Hardware operates within safe thermal margins.
+**Assessment:** ✅ Hardware operates well within safe thermal margins.
 
 ## 4. Cryptographic Operations
 
@@ -171,41 +162,19 @@ The device runs at stock clock speeds for maximum reliability.
 
 **Library:** BLST (portable mode)
 
-**Ciphersuite IDs:**
-- Regular: `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`
-- PoP: `BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_`
-
-**Security Properties:**
-- ✅ Constant-time operations (BLST guarantee)
-- ✅ Deterministic nonce generation
-- ✅ Proof of Possession support
-- ⚠️ Out-of-range keys silently reduced (no logging)
+**Properties:**
+- Constant-time operations (BLST library guarantee)
+- Deterministic nonce generation
+- Proof of Possession support
+- Out-of-range keys are silently reduced to valid range (no logging)
 
 ### 4.2 Key Encryption
 
-**Encryption Flow:**
-```mermaid
-flowchart TB
-    pin[User PIN]
-    scrypt[Scrypt KDF]
-    aeskey[AES Key]
-    encrypt[AES-256-GCM]
-    file[Encrypted File]
-
-    pin --> scrypt
-    scrypt --> aeskey
-    aeskey --> encrypt
-    encrypt --> file
-```
-
-**Assessment:**
-| Aspect | Status | Notes |
-|--------|--------|-------|
-| Algorithm | ✅ AES-256-GCM | Authenticated encryption |
-| KDF | ✅ Scrypt hardened (log_n=18) | ~8-10s per attempt on RPi Zero 2W |
-| Salt | ✅ Random per encryption | Prevents rainbow tables |
-| Nonce | ✅ 12-byte random | Correct for AES-GCM |
-| PIN Entropy | ✅ 5-10 digits | ~17-33 bits |
+Keys are encrypted at rest using:
+- **Algorithm:** AES-256-GCM (authenticated encryption)
+- **KDF:** Scrypt (log_n=18, 256MB memory-hard)
+- **Salt:** Random per encryption
+- **Nonce:** 12-byte random
 
 ## 5. Network Attack Surface
 
@@ -221,22 +190,7 @@ flowchart TB
 | Max Connections | 4 | DoS mitigation |
 | Max Message Size | 64KB | Memory exhaustion prevention |
 
-### 5.2 Protocol Analysis
-
-**Request Types:**
-
-| Code | Operation | Risk Level |
-|------|-----------|------------|
-| 0x00 | Sign | HIGH - Core signing |
-| 0x01 | PublicKey | LOW - Public info |
-| 0x02 | AuthorizedKeys | LOW - Returns None |
-| 0x03 | DeterministicNonce | MEDIUM - Nonce generation |
-| 0x04 | DeterministicNonceHash | MEDIUM - Nonce hash |
-| 0x05 | SupportsDeterministicNonces | LOW - Feature check |
-| 0x06 | KnownKeys | MEDIUM - Key enumeration |
-| 0x07 | BlsProveRequest | MEDIUM - PoP generation |
-
-### 5.3 Input Validation
+### 5.2 Input Validation
 
 **Validation Checks:**
 - ✅ Message length bounds
@@ -252,25 +206,7 @@ flowchart TB
 
 The signer relies on **physical network isolation** (USB Gadget Ethernet) rather than cryptographic authentication. This is documented as intentional for the threat model.
 
-### 6.2 Command Capabilities & Damage Potential
-
-| Command | Damage Potential | Mitigation |
-|---------|------------------|------------|
-| Sign | Can sign any allowed operation | Magic bytes + watermark |
-| KnownKeys | Enumerate all key hashes | Requires flag |
-| BlsProveRequest | Generate PoP for any key | Requires flag |
-| PublicKey | Information disclosure | Public data only |
-
-### 6.3 Rate Limiting
-
-**Status:** Not implemented
-
-- No per-client request throttling
-- No exponential backoff
-- No request deduplication
-- Only limit: 4 concurrent connections
-
-### 6.4 Replay Protection
+### 6.2 Replay Protection
 
 **Status:** Protected via High Watermark
 
@@ -280,19 +216,51 @@ The high watermark prevents re-signing at the same level/round:
 - ✅ Persisted to disk via write-behind cache
 - ✅ Loaded on startup
 
-## 7. Physical Attack Surface
+## 7. Runtime Security Features
 
-### 7.1 SD Card Analysis
+### 7.1 Screensaver
 
-**Encryption Status:**
+The display enters sleep mode after 3 minutes of inactivity. Touch to wake. This is not a security lock - no PIN re-entry is required.
 
-| Location | Encryption | Notes |
-|----------|------------|-------|
-| Boot partition | ❌ None | Required for boot |
-| Root filesystem | F2FS | Compression + checksums |
-| Key file | ✅ AES-256-GCM | PIN-derived key via Scrypt |
+### 7.2 PIN Rate Limiting
 
-### 7.2 Debug Interfaces
+Protection against brute-force PIN attacks:
+
+- **Max Attempts:** 5 failed attempts before lockout
+- **Lockout Duration:** Requires power cycle to retry
+
+### 7.3 PIN Minimum Length
+
+Enforced minimum PIN complexity:
+
+- **Minimum Length:** 5 digits (~17 bits entropy)
+- **Maximum Length:** 10 digits (~33 bits entropy)
+
+### 7.4 Signing Activity Tracking
+
+The signer tracks metadata about signing operations (not persisted to disk):
+
+- **Tracked Data:** Operation type, level, timestamp, duration, data size
+- **Purpose:** UI display of recent signing activity
+
+### 7.5 Large Level Gap Detection
+
+Protection against stale watermarks that could indicate misconfiguration:
+
+- **Threshold:** 4 cycles worth of blocks
+- **Behavior:** Prompts user confirmation via UI before signing
+
+## 8. Physical Attack Surface
+
+### 8.1 SD Card Analysis
+
+| Location | Protection |
+|----------|------------|
+| Boot partition | None (required for boot) |
+| Root filesystem | None (F2FS with checksums) |
+| Key file | AES-256-GCM with PIN-derived key |
+
+### 8.2 Debug Interfaces
 
 | Interface | Status | Risk |
 |-----------|--------|------|
@@ -302,7 +270,7 @@ The high watermark prevents re-signing at the same level/round:
 | GPIO | Restricted to russignol user | Low |
 | Console Login | ✅ Locked accounts | None |
 
-### 7.3 Side-Channel Attacks
+### 8.3 Side-Channel Attacks
 
 | Attack Type | Vulnerability | Mitigation |
 |-------------|---------------|------------|
@@ -311,105 +279,76 @@ The high watermark prevents re-signing at the same level/round:
 | Electromagnetic | Not protected | Physical isolation |
 | Cold Boot | Keys in RAM after unlock | Power cycle recommended |
 
-## 8. Key Extraction Attacks
+## 9. Key Extraction Attacks
 
-### 8.1 Memory Analysis
+### 9.1 Memory
 
-If an attacker gains code execution:
+- ASLR enabled
+- Core dumps disabled in kernel
+- Swap disabled (keys cannot be paged to disk)
+- BLST library handles key zeroization on drop
 
-**Keys in Memory:**
-- Loaded into `UnencryptedSigner` struct which wraps BLST's `SecretKey`
-- **BLST `SecretKey` uses `#[zeroize(drop)]`** - automatic memory zeroing when dropped
-- No `mlock()` to prevent swapping (swap disabled anyway)
-- **Core dumps disabled in kernel** - prevents secret extraction via crash dumps
+### 9.2 Disk
 
-### 8.2 Disk Extraction
+Keys at rest are protected by AES-256-GCM with Scrypt KDF (log_n=18, 256MB memory-hard). Brute-force attacks are slowed by Scrypt's memory-hardness, which limits GPU parallelization.
 
-**Protected by:**
-1. AES-256-GCM file encryption
-2. Scrypt key derivation from PIN (256MB memory-hard)
+## 10. Supply Chain Security
 
-**Attack Complexity:**
-- Requires PIN brute-force
-- ~8-10s per Scrypt attempt on device (log_n=18, 256MB memory-hard)
-- ~0.4s per attempt on desktop CPU (memory bandwidth limited)
-- 5-digit PIN: ~11 hours worst case on 16-core desktop
-- 8-digit PIN: ~1.3 years worst case on 16-core desktop
-- GPU attacks limited by 256MB/attempt memory requirement
-
-### 8.3 Memory Protection Status
-
-| Protection | Status |
-|------------|--------|
-| ASLR | ✅ Enabled |
-| Stack Canaries | ❌ Not verified |
-| NX/DEP | ✅ ARM64 inherent |
-| Zeroization | ✅ BLST `#[zeroize(drop)]` |
-| Core Dumps | ✅ Disabled in kernel |
-| Memory Locking | ❌ Not implemented |
-
-## 9. Supply Chain Security
-
-### 9.1 Rust Dependencies
+### 10.1 Rust Dependencies
 
 **Assessment:**
 - ✅ All dependencies pinned in Cargo.lock
 - ✅ Recent versions of crypto libraries
 
-### 9.2 Buildroot Sources
+### 10.2 Buildroot Sources
 
 **Assessment:**
 - ✅ Specific kernel commit hash pinned
 - ✅ Official Raspberry Pi repository
 
-## 10. Vulnerability Summary
+## 11. Code Quality
 
-### 10.1 Critical Issues
+- Unsafe code limited to `libc` FFI calls for privilege management
+- Secrets passed in memory, never written to disk in plaintext
+- Watermarks flushed to disk after each signature
+
+## 12. Vulnerability Summary
+
+### 12.1 Critical Issues
 
 **None identified.** The hardened build has no critical vulnerabilities.
 
 > **Note:** Authentication is disabled by design, relying on USB network isolation. Watermark persistence is implemented correctly. Hardware stability has been validated through extended 24/7 operation within safe thermal margins.
 
-### 10.2 High-Risk Issues
-
-| ID | Issue | Status |
-|----|-------|--------|
-| ~~H1~~ | ~~No PIN rate limiting~~ | ✅ **FIXED**: 5 attempts then 5-min lockout |
-| ~~H2~~ | ~~Weak PIN entropy~~ | ✅ **FIXED**: Min 5 digits (~17 bits) |
-
-### 10.3 Medium-Risk Issues
+### 12.2 Medium-Risk Issues
 
 | ID | Issue | Impact |
 |----|-------|--------|
-| M1 | No TLS encryption | Plaintext on USB |
-| M2 | USB interface exposed | Physical access risk |
-| M3 | Out-of-range key reduction | Silent key modification |
+| M1 | Out-of-range key reduction | Silent key modification (no logging) |
 
-### 10.4 Low-Risk Issues
+### 12.3 Low-Risk Issues
 
 | ID | Issue | Impact |
 |----|-------|--------|
 | L1 | Quiet boot mode | Hides boot issues |
 
-## 11. Recommendations
+## 13. Recommendations
 
-### 11.1 Priority 1: High-Value Fixes
+### 13.1 Implemented Security Controls
 
-✅ **All high-value fixes implemented:**
+The following security measures are in place:
 
-1. **PIN Rate Limiting**: 5 failed attempts → 5-minute lockout requiring power cycle
+1. **PIN Rate Limiting**: 5 failed attempts → lockout requiring power cycle
 2. **PIN Minimum Length**: Enforced 5-digit minimum (~17 bits entropy)
+3. **Large Gap Detection**: Warns on watermark gaps >4 cycles
 
-> **Note:** Memory zeroization is already handled by BLST's SecretKey which uses automatic memory clearing when dropped.
-
-### 11.2 Priority 2: Enhancements
+### 13.2 Suggested Enhancements
 
 | Enhancement | Benefit |
 |-------------|---------|
-| Audit logging | Track all signing operations |
+| Persistent audit logging | Track signing operations across reboots |
 | Watermark redundancy | Prevent corruption |
-| BLS key reduction logging | Detect corrupted keys |
-| Screensaver PIN timeout | Auto-lock after inactivity |
+| Log out-of-range key reductions | Detect corrupted keys (addresses M1) |
 
 ## Appendix A: Threat Model Summary
 
@@ -444,11 +383,8 @@ If an attacker gains code execution:
 | Debug Tools | ✅ Removed (pstree, lsof) |
 | Process Monitoring | ✅ Removed (htop) |
 | File Watching | ✅ Removed (inotify-tools) |
+| PIN Rate Limiting | ✅ Enabled |
 
-## Conclusion
+---
 
-Russignol (hardened build) demonstrates **excellent security engineering** with appropriate cryptographic choices, strong OS hardening, and good isolation design.
-
-The hardened build provides a minimal attack surface with no remote access capabilities, locked system accounts, and reduced system utilities. Operational data confirms stable 24/7 operation with excellent thermal margins. This configuration is **recommended for production deployments**.
-
-*Report generated by Claude Code Security Analysis*
+*Self-assessment performed January 28, 2026*
