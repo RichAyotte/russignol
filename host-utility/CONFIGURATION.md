@@ -30,6 +30,7 @@ The Russignol host utility uses a persistent configuration system to manage cust
 - `rpc_endpoint` (string): RPC endpoint URL for octez-client (required)
   - Format: `http://HOST:PORT` or `https://HOST:PORT`
   - Example: `http://localhost:8732`, `http://127.0.0.1:8733`
+  - Can be overridden per-command with `--endpoint <URL>`
 
 ## Auto-Detection
 

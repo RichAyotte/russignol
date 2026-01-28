@@ -121,6 +121,14 @@ russignol setup --verbose
 russignol setup --yes
 ```
 
+**Remote node** (use a different RPC endpoint):
+
+```bash
+russignol setup --endpoint http://192.168.1.100:8732
+```
+
+The `--endpoint` flag overrides the configured RPC endpoint for a single command. This is useful when your node runs on a different machine or port.
+
 ## Step 7: Verify Baker Connection
 
 Confirm your baker can reach the signer.

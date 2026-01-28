@@ -860,6 +860,7 @@ fn check_sd_card_readiness(auto_confirm: bool) -> Result<bool> {
                 match image::run_image_command(image::ImageCommands::DownloadAndFlash {
                     url: None,
                     device: None,
+                    endpoint: None,
                     yes: false,
                 }) {
                     Ok(()) => {

@@ -26,6 +26,7 @@ cargo xtask host-utility
 russignol setup                     Run full setup wizard
 russignol setup --dry-run           Simulate without changes
 russignol setup --verbose           Detailed output
+russignol setup --endpoint <URL>    Use remote node RPC endpoint
 
 russignol image download-and-flash  Download and flash SD card
 russignol image download            Download image only
@@ -40,8 +41,11 @@ russignol rotate-keys               Start key rotation workflow
 russignol rotate-keys --monitor     Check pending rotation status
 
 russignol status                    Check device connectivity
+russignol status --endpoint <URL>   Check status using remote node
 russignol completions <shell>       Install shell completions (bash/zsh/fish)
 ```
+
+All node-dependent commands (`setup`, `status`, `rotate-keys`, `image flash`, `image download-and-flash`, `watermark init`) support `--endpoint` to override the configured RPC endpoint.
 
 ## Documentation
 

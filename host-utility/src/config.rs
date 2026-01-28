@@ -106,6 +106,23 @@ impl RussignolConfig {
         Ok(config)
     }
 
+    /// Create a minimal configuration with just an RPC endpoint
+    ///
+    /// Used when no config file exists but user provides --endpoint flag.
+    /// Uses default octez-client directory (~/.tezos-client).
+    pub fn minimal_with_endpoint(endpoint: &str) -> Self {
+        Self {
+            version: CONFIG_VERSION,
+            octez_client_dir: dirs::home_dir().map_or_else(
+                || PathBuf::from(".tezos-client"),
+                |h| h.join(".tezos-client"),
+            ),
+            octez_node_dir: None,
+            rpc_endpoint: endpoint.to_string(),
+            dal_node_endpoint: None,
+        }
+    }
+
     /// Load configuration from a specific file path
     fn load_from_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)

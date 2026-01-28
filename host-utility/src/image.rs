@@ -57,6 +57,10 @@ pub enum ImageCommands {
         #[arg(long, short)]
         device: Option<PathBuf>,
 
+        /// Tezos node RPC endpoint (default: <http://localhost:8732>)
+        #[arg(long)]
+        endpoint: Option<String>,
+
         /// Skip all confirmation prompts (dangerous!)
         #[arg(long, short = 'y')]
         yes: bool,
@@ -71,6 +75,10 @@ pub enum ImageCommands {
         /// Target device (e.g., /dev/sdc). Auto-detects if not specified.
         #[arg(long, short)]
         device: Option<PathBuf>,
+
+        /// Tezos node RPC endpoint (default: <http://localhost:8732>)
+        #[arg(long)]
+        endpoint: Option<String>,
 
         /// Skip all confirmation prompts (dangerous!)
         #[arg(long, short = 'y')]
@@ -112,10 +120,18 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
             output,
             skip_verify,
         } => cmd_download(url, output, skip_verify),
-        ImageCommands::Flash { image, device, yes } => cmd_flash(&image, device, yes),
-        ImageCommands::DownloadAndFlash { url, device, yes } => {
-            cmd_download_and_flash(url, device, yes)
-        }
+        ImageCommands::Flash {
+            image,
+            device,
+            endpoint,
+            yes,
+        } => cmd_flash(&image, device, endpoint.as_deref(), yes),
+        ImageCommands::DownloadAndFlash {
+            url,
+            device,
+            endpoint,
+            yes,
+        } => cmd_download_and_flash(url, device, endpoint.as_deref(), yes),
         ImageCommands::List => cmd_list(),
     }
 }
@@ -241,11 +257,40 @@ fn check_flash_tools() -> Result<()> {
 /// Check node connectivity and fetch chain info for watermark configuration
 ///
 /// Returns `Ok(Some(chain_info))` if node is available,
-/// Ok(None) if no config exists (with warning),
+/// Ok(None) if no config exists and no endpoint provided (with warning),
 /// or Err if node check fails.
-fn check_node_for_watermarks() -> Result<Option<watermark::ChainInfo>> {
-    let config = config::RussignolConfig::load().ok();
-    if let Some(ref cfg) = config {
+///
+/// If `endpoint_override` is provided, it will be used instead of the configured endpoint.
+/// If no config exists but endpoint is provided, creates a minimal config using the endpoint.
+fn check_node_for_watermarks(
+    endpoint_override: Option<&str>,
+) -> Result<Option<watermark::ChainInfo>> {
+    let loaded_config = config::RussignolConfig::load().ok();
+
+    // Determine effective config: use loaded config with endpoint override,
+    // or create minimal config if endpoint provided without existing config
+    let effective_config = match (&loaded_config, endpoint_override) {
+        (Some(cfg), Some(endpoint)) => {
+            // Have config, override endpoint
+            let mut cfg_clone = cfg.clone();
+            cfg_clone.rpc_endpoint = endpoint.to_string();
+            Some(cfg_clone)
+        }
+        (Some(cfg), None) => {
+            // Have config, use as-is
+            Some(cfg.clone())
+        }
+        (None, Some(endpoint)) => {
+            // No config but endpoint provided - create minimal config
+            Some(config::RussignolConfig::minimal_with_endpoint(endpoint))
+        }
+        (None, None) => {
+            // No config and no endpoint
+            None
+        }
+    };
+
+    if let Some(ref cfg) = effective_config {
         match watermark::prefetch_chain_info(cfg) {
             Ok(info) => Ok(Some(info)),
             Err(e) => {
@@ -326,7 +371,12 @@ fn cmd_download(url: Option<String>, output: Option<PathBuf>, skip_verify: bool)
     Ok(())
 }
 
-fn cmd_flash(image: &Path, device: Option<PathBuf>, yes: bool) -> Result<()> {
+fn cmd_flash(
+    image: &Path,
+    device: Option<PathBuf>,
+    endpoint: Option<&str>,
+    yes: bool,
+) -> Result<()> {
     // Check for required tools first
     check_flash_tools()?;
 
@@ -344,7 +394,7 @@ fn cmd_flash(image: &Path, device: Option<PathBuf>, yes: bool) -> Result<()> {
     print_title_bar("💾 Flash SD Card");
 
     // Check node FIRST - fail fast if node is unavailable
-    let chain_info = check_node_for_watermarks()?;
+    let chain_info = check_node_for_watermarks(endpoint)?;
 
     // Detect or use provided device
     let target_device = if let Some(dev) = device {
@@ -463,7 +513,12 @@ fn resolve_download_info(url: Option<String>) -> Result<DownloadInfo> {
     }
 }
 
-fn cmd_download_and_flash(url: Option<String>, device: Option<PathBuf>, yes: bool) -> Result<()> {
+fn cmd_download_and_flash(
+    url: Option<String>,
+    device: Option<PathBuf>,
+    endpoint: Option<&str>,
+    yes: bool,
+) -> Result<()> {
     // Check for required tools first
     check_flash_tools()?;
 
@@ -478,7 +533,7 @@ fn cmd_download_and_flash(url: Option<String>, device: Option<PathBuf>, yes: boo
     print_title_bar("📥💾 Download and Flash SD Card");
 
     // Check node FIRST - fail fast if node is unavailable
-    let chain_info = check_node_for_watermarks()?;
+    let chain_info = check_node_for_watermarks(endpoint)?;
 
     // Detect/select device
     let target_device = if let Some(dev) = device {

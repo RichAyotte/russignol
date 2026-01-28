@@ -6,8 +6,7 @@
 
 use crate::constants::REQUIRED_COMMANDS;
 use crate::utils::{
-    JsonValueExt, command_exists, dir_exists, file_exists, info, run_command,
-    run_octez_client_command, success, warning,
+    JsonValueExt, command_exists, dir_exists, file_exists, info, run_command, success, warning,
 };
 use anyhow::{Context, Result};
 
@@ -33,63 +32,16 @@ pub fn verify_dependencies() -> Result<()> {
     Ok(())
 }
 
-/// Verify that octez-node is running, accessible, and synced
+/// Verify that octez-node is accessible and synced
 ///
-/// Checks via systemd service, process table, RPC responsiveness, and sync status
+/// Checks RPC responsiveness and sync status via timestamp comparison.
 pub fn verify_octez_node(config: &crate::config::RussignolConfig) -> Result<()> {
-    // Primary: Check systemd service
-    let is_active_via_systemd = if command_exists("systemctl") {
-        let output = run_command("systemctl", &["is-active", "octez-node.service"]);
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.trim() == "active"
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    // Secondary: Check process table
-    let is_running = if is_active_via_systemd {
-        true
-    } else {
-        let output = run_command("pgrep", &["-f", "octez-node"]);
-        if let Ok(output) = output {
-            output.status.success() && !output.stdout.is_empty()
-        } else {
-            // Fallback to ps + grep
-            let output = run_command("ps", &["aux"])?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout
-                .lines()
-                .any(|line| line.contains("octez-node") && !line.contains("grep"))
-        }
-    };
-
-    if !is_running {
-        anyhow::bail!("Cannot find a running octez-node process. Please ensure it is started.");
-    }
-
-    // Tertiary: Check RPC responsiveness
+    // Check RPC responsiveness
     crate::utils::rpc_get_json("/version", config).context("octez-node RPC is not responsive")?;
 
     // Check sync status
-    let head_output = run_octez_client_command(
-        &["rpc", "get", "/chains/main/blocks/head/header/shell"],
-        config,
-    )
-    .context("Failed to get blockchain head")?;
-
-    if !head_output.status.success() {
-        anyhow::bail!(
-            "Failed to query blockchain head: {}",
-            String::from_utf8_lossy(&head_output.stderr)
-        );
-    }
-
-    let head_json: serde_json::Value = serde_json::from_slice(&head_output.stdout)
-        .context("Failed to parse blockchain head JSON")?;
+    let head_json = crate::utils::rpc_get_json("/chains/main/blocks/head/header/shell", config)
+        .context("Failed to get blockchain head")?;
 
     if let Some(timestamp_str) = head_json.get_str("timestamp") {
         let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp_str)
