@@ -150,8 +150,8 @@ Skip this step if NetworkManager is not installed or not running (`systemctl is-
 Alternatively, configure manually each boot:
 
 ```bash
-ip addr add 169.254.1.2/30 dev russignol
-ip link set russignol up
+sudo ip addr add 169.254.1.2/30 dev russignol
+sudo ip link set russignol up
 ```
 
 ### Verify Connectivity
@@ -246,7 +246,14 @@ You can also check the signer status via the e-ink display, which shows recent s
 Check USB connection:
 
 ```bash
-lsusb | grep "Linux-USB Ethernet"
+lsusb -d 1d6b:0104 -v 2>/dev/null | grep -i russignol
+```
+
+Expected output:
+
+```
+  iManufacturer           1 Russignol
+  iProduct                2 Russignol Ethernet
 ```
 
 Check kernel messages:
@@ -255,10 +262,18 @@ Check kernel messages:
 sudo dmesg -T | tail -20
 ```
 
-Verify cdc_ether module is loaded:
+Look for lines mentioning `cdc_ether` and `usb0` indicating the device was recognized.
+
+Verify cdc_ether driver is available:
 
 ```bash
-lsmod | grep cdc_ether
+ls /sys/module/cdc_ether
+```
+
+Expected output:
+
+```
+coresize  drivers  holders  initsize  initstate  refcnt  taint  uevent
 ```
 
 ### Network Unreachable
@@ -269,18 +284,31 @@ Check interface exists:
 ip link show russignol
 ```
 
+Expected output (state should be `UP`):
+
+```
+4: russignol: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000
+    link/ether ...
+```
+
 Check address assigned:
 
 ```bash
 ip addr show russignol | grep 169.254
 ```
 
+Expected output:
+
+```
+    inet 169.254.1.2/30 brd 169.254.1.3 scope link russignol
+```
+
 Try manual configuration:
 
 ```bash
-ip addr flush dev russignol
-ip addr add 169.254.1.2/30 dev russignol
-ip link set russignol up
+sudo ip addr flush dev russignol
+sudo ip addr add 169.254.1.2/30 dev russignol
+sudo ip link set russignol up
 ```
 
 ### Key Import Fails
@@ -291,7 +319,15 @@ Verify signer is accessible:
 octez-client list known remote keys tcp://169.254.1.1:7732
 ```
 
-Check the device is unlocked by entering your PIN on the touchscreen.
+Expected output (two tz4 addresses):
+
+```
+Tezos remote known keys:
+  tz4xxxxxxxxx...
+  tz4yyyyyyyyy...
+```
+
+If no output or connection refused, check the device is unlocked by entering your PIN on the touchscreen.
 
 ## Next Steps
 
