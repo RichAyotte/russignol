@@ -8,9 +8,9 @@ Russignol is a dedicated hardware signing device. Your validator keys stay on is
 
 ## Why?
 
-[tz4 addresses](https://octez.tezos.com/docs/active/accounts.html#tz4-bls) (BLS signatures) let all bakers attest in every block without bloat, enabling predictable rewards and shorter block times. But BLS signing is slow: Ledger takes ~10 seconds, making it unusable with 6-second blocks.
+[tz4 addresses](https://octez.tezos.com/docs/active/accounts.html#tz4-bls) (BLS signatures) enable [aggregated attestations](https://research-development.nomadic-labs.com/tallinn-announcement.html)—combining hundreds of signatures into one per block. This reduces consensus data by 63x (from ~900 MB/day to ~14 MB/day), allowing all bakers to attest every block instead of ~200 out of ~300. The result: stronger security through full participation, predictable rewards proportional to stake, and reduced overhead that supports further [block time improvements](https://research-development.nomadic-labs.com/tallinn-announcement.html).
 
-Your private keys are also a high-value target. Traditional setups store keys on internet-connected machines, exposing them to remote exploits, compromised infrastructure, and memory-scraping attacks.
+Ledger Nano can't perform BLS signatures fast enough for 6-second blocks, and software signers store keys on internet-connected machines—exposing them to remote exploits and memory-scraping attacks.
 
 ## Features
 
@@ -47,6 +47,13 @@ Your private keys are also a high-value target. Traditional setups store keys on
 
 - [Build System](xtask/README.md)
 - [Contributing](CONTRIBUTING.md)
+
+## Credits & Attribution
+
+- Inspired by [tezos-rpi-bls-signer](https://gitlab.com/nomadic-labs/tezos-rpi-bls-signer)
+- Powered by [blst](https://github.com/supranational/blst)
+- Logic ported from [Tezos octez-signer](https://gitlab.com/tezos/tezos/)
+- Icons by [Mobirise Icons](https://mobiriseicons.com/)
 
 ## License
 
