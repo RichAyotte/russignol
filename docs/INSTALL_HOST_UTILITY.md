@@ -27,15 +27,13 @@ Download the latest release for your architecture:
 **x86_64:**
 
 ```bash
-curl -LO https://github.com/RichAyotte/russignol/releases/latest/download/russignol-amd64
-chmod +x russignol-amd64
+curl -Lo russignol https://github.com/RichAyotte/russignol/releases/latest/download/russignol-amd64 && chmod +x russignol
 ```
 
 **ARM64:**
 
 ```bash
-curl -LO https://github.com/RichAyotte/russignol/releases/latest/download/russignol-aarch64
-chmod +x russignol-aarch64
+curl -Lo russignol https://github.com/RichAyotte/russignol/releases/latest/download/russignol-aarch64 && chmod +x russignol
 ```
 
 ## Step 2: Install
@@ -43,7 +41,7 @@ chmod +x russignol-aarch64
 Install the utility to `~/.local/bin/russignol`:
 
 ```bash
-./russignol-amd64 install
+./russignol install
 ```
 
 Ensure `~/.local/bin` is in your PATH.
@@ -184,7 +182,7 @@ lsusb | grep "Linux-USB Ethernet"
 Check kernel messages:
 
 ```bash
-sudo dmesg | tail -20
+sudo dmesg -T | tail -20
 ```
 
 ### Network Unreachable

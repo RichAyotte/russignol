@@ -42,8 +42,7 @@ Flash to SD card:
 **Linux** (replace `/dev/sdX` with your SD card device):
 
 ```bash
-xzcat russignol-pi-zero.img.xz | sudo dd of=/dev/sdX bs=4M iflag=fullblock oflag=direct status=progress
-sync
+xzcat russignol-pi-zero.img.xz | sudo dd of=/dev/sdX bs=4M iflag=fullblock oflag=direct conv=fsync status=progress
 sudo eject /dev/sdX
 ```
 
@@ -54,8 +53,7 @@ sudo eject /dev/sdX
 ```bash
 diskutil list
 diskutil unmountDisk /dev/diskN
-xzcat russignol-pi-zero.img.xz | sudo dd of=/dev/rdiskN bs=4m
-sync
+xzcat russignol-pi-zero.img.xz | sudo dd of=/dev/rdiskN bs=4m conv=fsync
 diskutil eject /dev/diskN
 ```
 
@@ -215,7 +213,7 @@ lsusb | grep "Linux-USB Ethernet"
 Check kernel messages:
 
 ```bash
-sudo dmesg | tail -20
+sudo dmesg -T | tail -20
 ```
 
 Verify cdc_ether module is loaded:
