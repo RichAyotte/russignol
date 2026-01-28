@@ -22,6 +22,10 @@ cargo clippy --fix --allow-dirty --allow-staged
 cargo fmt
 ```
 
+# Commits
+
+Use [Conventional Commits](https://www.conventionalcommits.org/) format for all commit messages.
+
 # Code Quality
 
 - Fix warnings and clippy lints at the source; avoid `#[allow(...)]` suppression
