@@ -287,17 +287,7 @@ fn main() -> Result<()> {
             image::run_image_command(command)?;
         }
         Some(Commands::Watermark { command }) => {
-            let mut config = config::RussignolConfig::load()?;
-            match command {
-                WatermarkCommands::Init {
-                    device,
-                    endpoint,
-                    yes,
-                } => {
-                    config.with_overrides(endpoint.as_deref(), None);
-                    watermark::cmd_watermark_init(device, yes, &config)?;
-                }
-            }
+            handle_watermark_command(command)?;
         }
         Some(Commands::RotateKeys {
             monitor,
@@ -390,6 +380,21 @@ fn install_completions(shell: Shell) -> Result<()> {
         file_path.display()
     );
 
+    Ok(())
+}
+
+fn handle_watermark_command(command: WatermarkCommands) -> Result<()> {
+    let mut config = config::RussignolConfig::load()?;
+    match command {
+        WatermarkCommands::Init {
+            device,
+            endpoint,
+            yes,
+        } => {
+            config.with_overrides(endpoint.as_deref(), None);
+            watermark::cmd_watermark_init(device, yes, &config)?;
+        }
+    }
     Ok(())
 }
 

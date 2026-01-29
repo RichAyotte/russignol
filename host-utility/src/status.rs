@@ -17,7 +17,7 @@ pub fn run_status(verbose: bool, config: &RussignolConfig) {
     println!();
 
     // Create progress tracking using shared progress module
-    let total_checks = 17; // Total number of individual checks
+    let total_checks = 18; // Total number of individual checks
     let (progress_tx, progress_handle) = progress::create_concurrent_progress(total_checks);
 
     // Fetch all data concurrently with progress tracking
@@ -82,6 +82,7 @@ struct HardwareData {
     device_detected: Result<()>,
     serial: Option<String>,
     mac: Option<String>,
+    power_info: Option<hardware::UsbPowerInfo>,
 }
 
 struct SystemData {
@@ -120,8 +121,9 @@ fn fetch_hardware_data(progress: &mpsc::Sender<CheckEvent>) -> HardwareData {
     let tx1 = progress.clone();
     let tx2 = progress.clone();
     let tx3 = progress.clone();
+    let tx4 = progress.clone();
 
-    let (device_detected, serial, mac) = std::thread::scope(|s| {
+    let (device_detected, serial, mac, power_info) = std::thread::scope(|s| {
         let h1 = s.spawn(move || {
             let _ = tx1.send(CheckEvent::Started("Detecting USB"));
             let result = hardware::detect_hardware_device();
@@ -143,13 +145,26 @@ fn fetch_hardware_data(progress: &mpsc::Sender<CheckEvent>) -> HardwareData {
             result
         });
 
-        (h1.join().unwrap(), h2.join().unwrap(), h3.join().unwrap())
+        let h4 = s.spawn(move || {
+            let _ = tx4.send(CheckEvent::Started("Checking USB power"));
+            let result = hardware::get_usb_power_info();
+            let _ = tx4.send(CheckEvent::Completed("Checking USB power"));
+            result
+        });
+
+        (
+            h1.join().unwrap(),
+            h2.join().unwrap(),
+            h3.join().unwrap(),
+            h4.join().unwrap(),
+        )
     });
 
     HardwareData {
         device_detected,
         serial: serial.ok().flatten(),
         mac: mac.ok().flatten(),
+        power_info: power_info.ok().flatten(),
     }
 }
 
@@ -426,8 +441,56 @@ fn display_hardware_status(verbose: bool, data: HardwareData) {
                 println!("      MAC address: {mac}");
             }
 
+            // Display USB connection info
+            if let Some(ref power_info) = data.power_info {
+                if power_info.behind_hub {
+                    if let Some(ref hub_info) = power_info.hub_info {
+                        println!("      USB connection: Through hub ({})", hub_info.hub_path);
+                    } else {
+                        println!("      USB connection: Through hub");
+                    }
+                } else {
+                    println!("      USB connection: Direct");
+                }
+            }
+
             if verbose {
                 println!("      VID:PID: {USB_VID_PID}");
+                if let Some(ref power_info) = data.power_info {
+                    println!("      Device power: {}mA", power_info.device_power_ma);
+                    if let Some(ref hub_info) = power_info.hub_info {
+                        println!("      Hub power: {}mA", hub_info.hub_power_ma);
+                    }
+                }
+            }
+
+            // Check for power budget warning
+            if let Some(ref power_info) = data.power_info
+                && let Some(ref hub_info) = power_info.hub_info
+                && hub_info.is_bus_powered
+                && hub_info.total_power_draw_ma > hub_info.power_budget_ma
+            {
+                println!(
+                    "  {} Bus-powered hub - power budget exceeded ({}mA / {}mA)",
+                    "⚠".yellow(),
+                    hub_info.total_power_draw_ma,
+                    hub_info.power_budget_ma
+                );
+                println!("      Devices on hub:");
+                for device in &hub_info.devices {
+                    let suffix = if device.path == power_info.device_path {
+                        " (this device)"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "        {:<24} {:>3}mA{}",
+                        device.product, device.power_ma, suffix
+                    );
+                }
+                println!(
+                    "      Remove other devices, use a self-powered hub, or connect directly."
+                );
             }
         }
         Err(e) => {

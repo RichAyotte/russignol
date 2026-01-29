@@ -21,6 +21,10 @@ pub const USB_VID_PID: &str = "1d6b:0104";
 /// Manufacturer name for Russignol device
 pub const MANUFACTURER_NAME: &str = "Russignol";
 
+/// USB bus-powered hub power budget in milliamps
+/// USB 2.0 specification limits bus-powered hubs to 500mA total across all ports
+pub const USB_BUS_POWERED_BUDGET_MA: u32 = 500;
+
 // ============================================================================
 // Network Configuration
 // ============================================================================
