@@ -15,7 +15,7 @@ use crate::blockchain;
 use crate::config::RussignolConfig;
 use crate::constants::{
     COMPANION_KEY_ALIAS, COMPANION_KEY_OLD_ALIAS, COMPANION_KEY_PENDING_ALIAS, CONSENSUS_KEY_ALIAS,
-    CONSENSUS_KEY_OLD_ALIAS, CONSENSUS_KEY_PENDING_ALIAS, SIGNER_IP,
+    CONSENSUS_KEY_OLD_ALIAS, CONSENSUS_KEY_PENDING_ALIAS,
 };
 use crate::image;
 use crate::keys;
@@ -979,9 +979,11 @@ fn guide_device_swap(hw_config: HardwareConfig, expectation: &DeviceExpectation)
 fn wait_for_device(expectation: &DeviceExpectation, config: &RussignolConfig) -> Result<()> {
     let spinner = create_spinner("Verifying device connectivity...");
 
+    let signer_ip = config.signer_ip();
+
     // Try pinging the signer IP
     for attempt in 1..=10 {
-        let ping_result = run_command("ping", &["-c", "1", "-W", "2", SIGNER_IP]);
+        let ping_result = run_command("ping", &["-c", "1", "-W", "2", signer_ip]);
         if let Ok(output) = ping_result
             && output.status.success()
         {
@@ -1031,7 +1033,7 @@ fn wait_for_device(expectation: &DeviceExpectation, config: &RussignolConfig) ->
     }
 
     spinner.finish_and_clear();
-    anyhow::bail!("Could not connect to device at {SIGNER_IP}. Please check USB connection.");
+    anyhow::bail!("Could not connect to device at {signer_ip}. Please check USB connection.");
 }
 
 /// Check if the connected signer has the key for the existing consensus alias
@@ -2081,7 +2083,7 @@ fn resume_from_keys_activated_need_swap(
     println!();
     info("Verifying signer connectivity...");
 
-    let spinner = create_spinner("Checking signer at 169.254.1.1...");
+    let spinner = create_spinner(&format!("Checking signer at {}...", config.signer_ip()));
     let signer_ok = keys::check_remote_signer(config);
     spinner.finish_and_clear();
 
@@ -2089,7 +2091,10 @@ fn resume_from_keys_activated_need_swap(
         warning("Remote signer not accessible or doesn't have enough keys");
         println!();
         info("Please ensure the NEW Russignol device is connected and the signer is running.");
-        info("The signer should respond at tcp://169.254.1.1:7732");
+        info(&format!(
+            "The signer should respond at {}",
+            config.signer_uri()
+        ));
 
         if auto_confirm {
             anyhow::bail!(
@@ -2259,7 +2264,10 @@ fn resume_from_partial_swap(
             rollback_aliases(config)?;
             warning("Rolled back to old keys. Please investigate the issue.");
             info("Check baker logs: journalctl -u octez-baker");
-            info("Verify signer connectivity: ping 169.254.1.1");
+            info(&format!(
+                "Verify signer connectivity: ping {}",
+                config.signer_ip()
+            ));
         } else {
             warning("Backup aliases preserved for potential rollback");
             info("Check baker logs and retry manually if needed");

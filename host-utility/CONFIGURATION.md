@@ -15,7 +15,8 @@ The Russignol host utility uses a persistent configuration system to manage cust
   "octez_client_dir": "/home/user/.octez-client-shadownet",
   "octez_node_dir": null,
   "rpc_endpoint": "http://127.0.0.1:8733",
-  "dal_node_endpoint": null
+  "dal_node_endpoint": null,
+  "signer_endpoint": null
 }
 ```
 
@@ -31,6 +32,12 @@ The Russignol host utility uses a persistent configuration system to manage cust
   - Format: `http://HOST:PORT` or `https://HOST:PORT`
   - Example: `http://localhost:8732`, `http://127.0.0.1:8733`
   - Can be overridden per-command with `--endpoint <URL>`
+- `signer_endpoint` (string|null): Remote signer endpoint (optional)
+  - Format: `tcp://HOST:PORT`
+  - Example: `tcp://192.168.1.50:7732`
+  - When set, connects to a signer at this address instead of the default USB device
+  - Skips local USB/network configuration when specified
+  - Can be overridden per-command with `--signer-endpoint <URL>`
 
 ## Auto-Detection
 
@@ -81,6 +88,8 @@ Current configuration:
   Octez Client Directory: /home/user/.octez-client-shadownet
   Octez Node Directory:   (not set)
   RPC Endpoint:           http://127.0.0.1:8733
+  DAL Node Endpoint:      (not set)
+  Signer Endpoint:        (local USB signer)
 
 Config file: /home/user/.config/russignol/config.json
 ```
@@ -96,6 +105,7 @@ russignol config set <key> <value>
 - `octez-node-dir`: Set node directory path (optional)
 - `rpc-endpoint`: Set RPC endpoint URL
 - `dal-node-endpoint`: Set DAL node endpoint URL (optional, for bakers participating in DAL)
+- `signer-endpoint`: Set remote signer endpoint (optional, for signers not connected via USB)
 
 **Examples**:
 ```bash
@@ -107,6 +117,9 @@ russignol config set rpc-endpoint http://127.0.0.1:8733
 
 # Set node directory
 russignol config set octez-node-dir ~/.octez-node-shadownet
+
+# Set remote signer endpoint (for signers not connected via USB)
+russignol config set signer-endpoint tcp://192.168.1.50:7732
 ```
 
 ### Reset Configuration

@@ -5,7 +5,7 @@ use std::sync::mpsc;
 // Import shared modules
 use crate::blockchain;
 use crate::config::RussignolConfig;
-use crate::constants::{COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, SIGNER_URI, USB_VID_PID};
+use crate::constants::{COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, USB_VID_PID};
 use crate::hardware;
 use crate::keys;
 use crate::progress::{self, CheckEvent};
@@ -72,7 +72,7 @@ pub fn run_status(verbose: bool, config: &RussignolConfig) {
     // Display all results sequentially (no interleaved output)
     display_hardware_status(verbose, hardware_data);
     display_system_status(verbose, system_data);
-    display_connectivity_status(verbose, &connectivity_data);
+    display_connectivity_status(verbose, &connectivity_data, config.signer_uri());
     display_keys_and_blockchain_status(verbose, &delegate_result, &keys_data, &blockchain_data);
     display_baking_rights(verbose, &delegate_result, rights_data);
 }
@@ -514,10 +514,10 @@ fn display_system_status(verbose: bool, data: SystemData) {
     println!();
 }
 
-fn display_connectivity_status(verbose: bool, data: &ConnectivityData) {
+fn display_connectivity_status(verbose: bool, data: &ConnectivityData, signer_uri: &str) {
     println!("{}", "Connectivity:".bold());
 
-    // Check network interface and IP assignment (combined)
+    // Check network interface and IP assignment
     if data.interface_ok && data.ip_assigned {
         println!(
             "  {} Network interface 'russignol' configured (169.254.1.2/30)",
@@ -536,14 +536,14 @@ fn display_connectivity_status(verbose: bool, data: &ConnectivityData) {
         println!("  {} Network interface not configured", "✗".red());
     }
 
-    // Check remote signer connectivity
+    // Check signer connectivity
     if data.remote_signer {
-        println!("  {} Remote signer connectivity verified", "✓".green());
+        println!("  {} Signer connectivity verified", "✓".green());
         if verbose {
-            println!("      Signer address: {SIGNER_URI}");
+            println!("      Signer address: {signer_uri}");
         }
     } else {
-        println!("  {} Remote signer not accessible", "✗".red());
+        println!("  {} Signer not accessible at {signer_uri}", "✗".red());
     }
 
     println!();

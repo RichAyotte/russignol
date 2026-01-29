@@ -1,7 +1,7 @@
 use crate::backup;
 use crate::blockchain;
 use crate::config::RussignolConfig;
-use crate::constants::{COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, ORANGE_RGB, SIGNER_IP};
+use crate::constants::{COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, ORANGE_RGB};
 use crate::keys;
 use crate::utils::{JsonValueExt, read_file, run_octez_client_command};
 use anyhow::{Context, Result};
@@ -519,9 +519,13 @@ fn discover_and_import_keys(
     }
 
     // Check if keys are already correctly imported
-    if let Ok((consensus_ok, companion_ok)) =
-        check_keys_correctly_imported(&secret_keys_file, &remote_keys[0], &remote_keys[1])
-        && consensus_ok
+    let signer_ip = config.signer_ip();
+    if let Ok((consensus_ok, companion_ok)) = check_keys_correctly_imported(
+        &secret_keys_file,
+        &remote_keys[0],
+        &remote_keys[1],
+        signer_ip,
+    ) && consensus_ok
         && companion_ok
     {
         // Validation: Primary - CLI check (silent - progress shown in main)
@@ -539,7 +543,7 @@ fn discover_and_import_keys(
         }
 
         // Validation: Secondary - File system check (silent - progress shown in main)
-        validate_keys_in_filesystem(client_dir, verbose)?;
+        validate_keys_in_filesystem(client_dir, signer_ip)?;
 
         return Ok(());
     }
@@ -580,7 +584,7 @@ fn discover_and_import_keys(
     }
 
     // Validation: Secondary - File system check (silent - progress shown in main)
-    validate_keys_in_filesystem(client_dir, verbose)?;
+    validate_keys_in_filesystem(client_dir, config.signer_ip())?;
 
     Ok(())
 }
@@ -589,6 +593,7 @@ fn check_keys_correctly_imported(
     secret_keys_file: &Path,
     expected_consensus_hash: &str,
     expected_companion_hash: &str,
+    signer_ip: &str,
 ) -> Result<(bool, bool)> {
     if !secret_keys_file.exists() {
         return Ok((false, false));
@@ -609,7 +614,7 @@ fn check_keys_correctly_imported(
                 // Check consensus key
                 if name == CONSENSUS_KEY_ALIAS
                     && value.contains(expected_consensus_hash)
-                    && value.contains(SIGNER_IP)
+                    && value.contains(signer_ip)
                 {
                     consensus_correct = true;
                 }
@@ -617,7 +622,7 @@ fn check_keys_correctly_imported(
                 // Check companion key
                 if name == COMPANION_KEY_ALIAS
                     && value.contains(expected_companion_hash)
-                    && value.contains(SIGNER_IP)
+                    && value.contains(signer_ip)
                 {
                     companion_correct = true;
                 }
@@ -628,7 +633,7 @@ fn check_keys_correctly_imported(
     Ok((consensus_correct, companion_correct))
 }
 
-fn validate_keys_in_filesystem(client_dir: &Path, _verbose: bool) -> Result<()> {
+fn validate_keys_in_filesystem(client_dir: &Path, signer_ip: &str) -> Result<()> {
     let secret_keys_file = client_dir.join("secret_keys");
 
     // Check secret_keys
@@ -644,10 +649,10 @@ fn validate_keys_in_filesystem(client_dir: &Path, _verbose: bool) -> Result<()> 
             if let Some(name) = key.get_str("name")
                 && let Some(value) = key.get_str("value")
             {
-                if name == CONSENSUS_KEY_ALIAS && value.contains(SIGNER_IP) {
+                if name == CONSENSUS_KEY_ALIAS && value.contains(signer_ip) {
                     found_consensus = true;
                 }
-                if name == COMPANION_KEY_ALIAS && value.contains(SIGNER_IP) {
+                if name == COMPANION_KEY_ALIAS && value.contains(signer_ip) {
                     found_companion = true;
                 }
             }

@@ -43,9 +43,49 @@ pub struct RussignolConfig {
     /// DAL node RPC endpoint URL (optional, for bakers participating in DAL)
     #[serde(default)]
     pub dal_node_endpoint: Option<String>,
+
+    /// Remote signer endpoint (e.g., <tcp://192.168.1.100:7732>)
+    /// When set, skips local USB/network configuration and uses this endpoint
+    #[serde(default)]
+    pub signer_endpoint: Option<String>,
 }
 
 impl RussignolConfig {
+    /// Get the signer URI to use
+    ///
+    /// Returns the configured signer endpoint if set, otherwise falls back to
+    /// the default local signer URI (<tcp://169.254.1.1:7732>).
+    pub fn signer_uri(&self) -> &str {
+        self.signer_endpoint
+            .as_deref()
+            .unwrap_or(crate::constants::SIGNER_URI)
+    }
+
+    /// Extract the IP address from the signer URI
+    ///
+    /// Parses the signer URI (e.g., "<tcp://192.168.1.100:7732>") and extracts
+    /// just the IP address portion.
+    pub fn signer_ip(&self) -> &str {
+        let uri = self.signer_uri();
+        // Strip "tcp://" prefix and ":port" suffix
+        uri.strip_prefix("tcp://")
+            .and_then(|s| s.split(':').next())
+            .unwrap_or(crate::constants::SIGNER_IP)
+    }
+
+    /// Apply command-line endpoint overrides to the configuration
+    ///
+    /// This is used by commands that accept `--endpoint` and `--signer-endpoint`
+    /// flags to override the configured values for a single invocation.
+    pub fn with_overrides(&mut self, endpoint: Option<&str>, signer_endpoint: Option<&str>) {
+        if let Some(ep) = endpoint {
+            self.rpc_endpoint = ep.to_string();
+        }
+        if let Some(se) = signer_endpoint {
+            self.signer_endpoint = Some(se.to_string());
+        }
+    }
+
     /// Load configuration from file, or create with auto-detection if missing
     ///
     /// This is the main entry point for configuration loading. It will:
@@ -120,6 +160,7 @@ impl RussignolConfig {
             octez_node_dir: None,
             rpc_endpoint: endpoint.to_string(),
             dal_node_endpoint: None,
+            signer_endpoint: None,
         }
     }
 
@@ -181,6 +222,43 @@ impl RussignolConfig {
                 "Invalid RPC endpoint '{}': must start with http:// or https://",
                 self.rpc_endpoint
             );
+        }
+
+        // Validate signer endpoint format if specified
+        if let Some(ref endpoint) = self.signer_endpoint {
+            Self::validate_signer_endpoint(endpoint)?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate a signer endpoint format
+    ///
+    /// Must be in the format tcp://host:port
+    fn validate_signer_endpoint(endpoint: &str) -> Result<()> {
+        if !endpoint.starts_with("tcp://") {
+            anyhow::bail!("Invalid signer endpoint '{endpoint}': must start with tcp://");
+        }
+
+        // Strip tcp:// prefix and validate host:port format
+        let host_port = endpoint.strip_prefix("tcp://").unwrap();
+        let parts: Vec<&str> = host_port.split(':').collect();
+        if parts.len() != 2 {
+            anyhow::bail!(
+                "Invalid signer endpoint '{endpoint}': must be in format tcp://host:port"
+            );
+        }
+
+        // Validate port is a number
+        let port = parts[1];
+        if port.parse::<u16>().is_err() {
+            anyhow::bail!("Invalid signer endpoint '{endpoint}': port must be a number (1-65535)");
+        }
+
+        // Basic host validation (non-empty)
+        let host = parts[0];
+        if host.is_empty() {
+            anyhow::bail!("Invalid signer endpoint '{endpoint}': host cannot be empty");
         }
 
         Ok(())
@@ -299,6 +377,7 @@ impl RussignolConfig {
             octez_node_dir: node_dir,
             rpc_endpoint,
             dal_node_endpoint,
+            signer_endpoint: None,
         })
     }
 
@@ -598,6 +677,14 @@ fn cmd_config_show() -> Result<()> {
     } else {
         println!("  DAL Node Endpoint:      {}", "(not set)".dimmed());
     }
+    if let Some(ref signer_endpoint) = config.signer_endpoint {
+        println!("  Signer Endpoint:        {signer_endpoint}");
+    } else {
+        println!(
+            "  Signer Endpoint:        {}",
+            "(local USB signer)".dimmed()
+        );
+    }
     println!();
     println!(
         "Config file: {}",
@@ -637,9 +724,13 @@ fn cmd_config_set(key: &str, value: &str) -> Result<()> {
             }
             config.dal_node_endpoint = Some(value.to_string());
         }
+        "signer-endpoint" => {
+            RussignolConfig::validate_signer_endpoint(value)?;
+            config.signer_endpoint = Some(value.to_string());
+        }
         _ => {
             anyhow::bail!(
-                "Unknown configuration key: {key}\nValid keys: octez-client-dir, octez-node-dir, rpc-endpoint, dal-node-endpoint"
+                "Unknown configuration key: {key}\nValid keys: octez-client-dir, octez-node-dir, rpc-endpoint, dal-node-endpoint, signer-endpoint"
             );
         }
     }

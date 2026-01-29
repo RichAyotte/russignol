@@ -64,6 +64,11 @@ enum Commands {
         #[arg(long)]
         endpoint: Option<String>,
 
+        /// Remote signer endpoint (e.g., <tcp://192.168.1.100:7732>)
+        /// When specified, skips local USB/network configuration
+        #[arg(long)]
+        signer_endpoint: Option<String>,
+
         /// Baker key or alias to use (required when using --yes)
         #[arg(long)]
         baker_key: Option<String>,
@@ -77,6 +82,10 @@ enum Commands {
         /// Tezos node RPC endpoint (default: <http://localhost:8732>)
         #[arg(long)]
         endpoint: Option<String>,
+
+        /// Remote signer endpoint (e.g., <tcp://192.168.1.100:7732>)
+        #[arg(long)]
+        signer_endpoint: Option<String>,
     },
     /// Remove all system configuration
     Cleanup {
@@ -153,6 +162,10 @@ enum Commands {
         /// Tezos node RPC endpoint (default: <http://localhost:8732>)
         #[arg(long)]
         endpoint: Option<String>,
+
+        /// Remote signer endpoint (e.g., <tcp://192.168.1.100:7732>)
+        #[arg(long)]
+        signer_endpoint: Option<String>,
 
         /// Hardware setup mode
         #[arg(long, value_enum)]
@@ -231,6 +244,7 @@ fn main() -> Result<()> {
             skip_hardware_check,
             yes,
             endpoint,
+            signer_endpoint,
             baker_key,
         }) => {
             run_setup(&SetupConfig {
@@ -242,10 +256,15 @@ fn main() -> Result<()> {
                 skip_hardware_check,
                 baker_key: baker_key.as_deref(),
                 endpoint: endpoint.as_deref(),
+                signer_endpoint: signer_endpoint.as_deref(),
             })?;
         }
-        Some(Commands::Status { verbose, endpoint }) => {
-            handle_status_command(verbose, endpoint)?;
+        Some(Commands::Status {
+            verbose,
+            endpoint,
+            signer_endpoint,
+        }) => {
+            handle_status_command(verbose, endpoint.as_deref(), signer_endpoint.as_deref())?;
         }
         Some(Commands::Cleanup { dry_run }) => {
             // Load configuration
@@ -275,9 +294,7 @@ fn main() -> Result<()> {
                     endpoint,
                     yes,
                 } => {
-                    if let Some(ep) = endpoint {
-                        config.rpc_endpoint = ep;
-                    }
+                    config.with_overrides(endpoint.as_deref(), None);
                     watermark::cmd_watermark_init(device, yes, &config)?;
                 }
             }
@@ -289,6 +306,7 @@ fn main() -> Result<()> {
             yes,
             verbose,
             endpoint,
+            signer_endpoint,
             config: hardware_config,
             restart_method,
             baker_service,
@@ -308,7 +326,13 @@ fn main() -> Result<()> {
                 stop_command,
                 start_command,
             };
-            handle_rotate_keys_command(&opts, hardware_config, &restart_config, endpoint)?;
+            handle_rotate_keys_command(
+                &opts,
+                hardware_config,
+                &restart_config,
+                endpoint.as_deref(),
+                signer_endpoint.as_deref(),
+            )?;
         }
     }
 
@@ -369,7 +393,11 @@ fn install_completions(shell: Shell) -> Result<()> {
     Ok(())
 }
 
-fn handle_status_command(verbose: bool, endpoint: Option<String>) -> Result<()> {
+fn handle_status_command(
+    verbose: bool,
+    endpoint: Option<&str>,
+    signer_endpoint: Option<&str>,
+) -> Result<()> {
     let log_level = if verbose {
         log::LevelFilter::Debug
     } else {
@@ -380,9 +408,7 @@ fn handle_status_command(verbose: bool, endpoint: Option<String>) -> Result<()> 
         .init();
 
     let mut config = config::RussignolConfig::load()?;
-    if let Some(ep) = endpoint {
-        config.rpc_endpoint = ep;
-    }
+    config.with_overrides(endpoint, signer_endpoint);
     status::run_status(verbose, &config);
     Ok(())
 }
@@ -405,7 +431,8 @@ fn handle_rotate_keys_command(
     opts: &rotate_keys::RotateKeysOptions,
     hardware_config: Option<rotate_keys::HardwareConfig>,
     restart_config: &rotate_keys::RestartConfig,
-    endpoint: Option<String>,
+    endpoint: Option<&str>,
+    signer_endpoint: Option<&str>,
 ) -> Result<()> {
     let log_level = if opts.verbose {
         log::LevelFilter::Debug
@@ -417,9 +444,7 @@ fn handle_rotate_keys_command(
         .init();
 
     let mut config = config::RussignolConfig::load()?;
-    if let Some(ep) = endpoint {
-        config.rpc_endpoint = ep;
-    }
+    config.with_overrides(endpoint, signer_endpoint);
     rotate_keys::run(opts, hardware_config, restart_config, &config)
 }
 
@@ -429,6 +454,7 @@ struct SetupConfig<'a> {
     skip_hardware_check: bool,
     baker_key: Option<&'a str>,
     endpoint: Option<&'a str>,
+    signer_endpoint: Option<&'a str>,
 }
 
 fn run_setup(setup_config: &SetupConfig<'_>) -> Result<()> {
@@ -437,13 +463,12 @@ fn run_setup(setup_config: &SetupConfig<'_>) -> Result<()> {
         skip_hardware_check,
         baker_key,
         endpoint,
+        signer_endpoint,
     } = setup_config;
 
     let confirmation_config = initialize_setup_environment(confirmation, *baker_key)?;
     let mut config = config::RussignolConfig::load()?;
-    if let Some(ep) = endpoint {
-        config.rpc_endpoint = (*ep).to_string();
-    }
+    config.with_overrides(*endpoint, *signer_endpoint);
     let backup_dir = backup::create_backup_dir()?;
 
     run_setup_phases(

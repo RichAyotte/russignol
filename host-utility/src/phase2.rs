@@ -41,8 +41,17 @@ fn file_needs_update(path: &str, expected_content: &str) -> bool {
 pub fn run(
     backup_dir: &Path,
     config: &crate::confirmation::ConfirmationConfig,
-    _russignol_config: &crate::config::RussignolConfig,
+    russignol_config: &crate::config::RussignolConfig,
 ) -> Result<()> {
+    // Skip network setup when using a remote signer
+    if russignol_config.signer_endpoint.is_some() {
+        log::info!(
+            "Skipping network setup (using remote signer at {})",
+            russignol_config.signer_uri()
+        );
+        return Ok(());
+    }
+
     // Check which files actually need to be changed
     let udev_needs_update = file_needs_update(UDEV_RULE_PATH, UDEV_RULE_CONTENT);
     let network_needs_update = file_needs_update(NETWORK_CONFIG_PATH, NETWORK_CONFIG_CONTENT);

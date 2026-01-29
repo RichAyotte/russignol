@@ -4,7 +4,6 @@
 // setup and status commands, including key existence checks, hash retrieval,
 // and remote signer connectivity verification.
 
-use crate::constants::SIGNER_URI;
 use crate::utils::run_octez_client_command;
 use anyhow::Result;
 
@@ -39,8 +38,9 @@ pub fn get_key_hash(alias: &str, config: &crate::config::RussignolConfig) -> Res
 ///
 /// Returns a list of tz4 key hashes available on the signer
 pub fn discover_remote_keys(config: &crate::config::RussignolConfig) -> Result<Vec<String>> {
+    let signer_uri = config.signer_uri();
     let output =
-        run_octez_client_command(&["list", "known", "remote", "keys", SIGNER_URI], config)?;
+        run_octez_client_command(&["list", "known", "remote", "keys", signer_uri], config)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -85,7 +85,8 @@ pub fn wait_for_signer(auto_confirm: bool, config: &crate::config::RussignolConf
     }
 
     // Not accessible, show spinner and check
-    let spinner = create_spinner("Checking signer at 169.254.1.1...");
+    let signer_uri = config.signer_uri();
+    let spinner = create_spinner(&format!("Checking signer at {}...", config.signer_ip()));
 
     // Wait a moment and check again (network might just be slow)
     std::thread::sleep(Duration::from_secs(2));
@@ -100,7 +101,7 @@ pub fn wait_for_signer(auto_confirm: bool, config: &crate::config::RussignolConf
     warning("Remote signer not accessible");
     println!();
     info("Please ensure the Russignol device is connected and the signer is running.");
-    info("The signer should respond at tcp://169.254.1.1:7732");
+    info(&format!("The signer should respond at {signer_uri}"));
 
     if auto_confirm {
         anyhow::bail!("Signer not accessible and --yes specified. Cannot proceed automatically.");
@@ -141,7 +142,8 @@ pub fn import_key_from_signer(
     force: bool,
     config: &crate::config::RussignolConfig,
 ) -> Result<()> {
-    let uri = format!("{SIGNER_URI}/{key_hash}");
+    let signer_uri = config.signer_uri();
+    let uri = format!("{signer_uri}/{key_hash}");
 
     let args: Vec<&str> = if force {
         vec!["import", "secret", "key", alias, &uri, "--force"]

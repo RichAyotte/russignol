@@ -129,6 +129,17 @@ russignol setup --endpoint http://192.168.1.100:8732
 
 The `--endpoint` flag overrides the configured RPC endpoint for a single command. This is useful when your node runs on a different machine or port.
 
+**Remote signer** (connect to a signer at a different address):
+
+```bash
+russignol setup --signer-endpoint tcp://192.168.1.50:7732
+```
+
+The `--signer-endpoint` flag connects to a signer at a custom network address instead of the default USB-connected device at `tcp://169.254.1.1:7732`. When specified, the utility skips local USB/network configuration. This is useful when:
+- The signer runs on a different machine on your network
+- You have multiple signers and want to specify which one to use
+- Testing with a remote signer setup
+
 ## Step 7: Verify Baker Connection
 
 Confirm your baker can reach the signer.
