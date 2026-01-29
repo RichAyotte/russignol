@@ -140,6 +140,24 @@ pub fn get_previous_tag() -> Result<Option<String>> {
     }
 }
 
+/// Fetch tags from remote to ensure we have all tags for changelog generation
+pub fn fetch_remote_tags() -> Result<()> {
+    eprintln!("Fetching tags from remote...");
+    let output = Command::new("git")
+        .args(["fetch", "--tags"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("Failed to run git fetch --tags")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git fetch --tags failed: {stderr}");
+    }
+
+    Ok(())
+}
+
 /// Get commits since a tag (or all commits if no tag)
 pub fn get_commits_since(tag: Option<&str>) -> Result<Vec<String>> {
     let range = match tag {
@@ -221,6 +239,7 @@ fn format_commit(commit: &ParsedCommit) -> String {
 
 /// Create changelog file for a release
 pub fn create_changelog_file(version: &str) -> Result<String> {
+    fetch_remote_tags()?;
     let tag = get_previous_tag()?;
     let commit_lines = get_commits_since(tag.as_deref())?;
 
