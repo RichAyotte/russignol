@@ -94,6 +94,11 @@ impl CommitType {
             Self::Other => 10,
         }
     }
+
+    /// Whether this commit type should appear in user-facing changelogs
+    fn is_user_facing(self) -> bool {
+        matches!(self, Self::Feat | Self::Fix | Self::Perf)
+    }
 }
 
 /// A parsed conventional commit
@@ -460,9 +465,11 @@ pub fn create_changelog_file_for_component(
 
     let commit_lines = get_commits_since(tag.as_deref(), scope_filter)?;
 
+    // Only include user-facing commits (feat, fix, perf) and breaking changes
     let commits: Vec<ParsedCommit> = commit_lines
         .iter()
         .filter_map(|line| parse_commit(line))
+        .filter(|c| c.breaking || c.commit_type.is_user_facing())
         .collect();
 
     let changelog = generate_changelog(version, &commits);
