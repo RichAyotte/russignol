@@ -1,12 +1,33 @@
 //! Changelog generation from Conventional Commits
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::process::{Command, Stdio};
+
+/// Semantic version bump type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BumpType {
+    /// Breaking change - increment major version
+    Major,
+    /// New feature - increment minor version
+    Minor,
+    /// Bug fix or other change - increment patch version
+    Patch,
+}
+
+impl std::fmt::Display for BumpType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Major => write!(f, "major"),
+            Self::Minor => write!(f, "minor"),
+            Self::Patch => write!(f, "patch"),
+        }
+    }
+}
 
 /// Type of commit according to Conventional Commits spec
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -140,6 +161,30 @@ pub fn get_previous_tag() -> Result<Option<String>> {
     }
 }
 
+/// Get the previous tag for a specific component (e.g., "signer-v0.13.3")
+pub fn get_previous_component_tag(component_prefix: &str) -> Result<Option<String>> {
+    // Use git tag -l with pattern to find matching tags, sorted by version
+    let pattern = format!("{component_prefix}-v*");
+    let output = Command::new("git")
+        .args(["tag", "-l", &pattern, "--sort=-v:refname"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .context("Failed to run git tag")?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Get the first (most recent) tag
+        if let Some(tag) = stdout.lines().next() {
+            let tag = tag.trim();
+            if !tag.is_empty() {
+                return Ok(Some(tag.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Fetch tags from remote to ensure we have all tags for changelog generation
 pub fn fetch_remote_tags() -> Result<()> {
     eprintln!("Fetching tags from remote...");
@@ -158,8 +203,8 @@ pub fn fetch_remote_tags() -> Result<()> {
     Ok(())
 }
 
-/// Get commits since a tag (or all commits if no tag)
-pub fn get_commits_since(tag: Option<&str>) -> Result<Vec<String>> {
+/// Get commits since a tag (or all commits if no tag), optionally filtered by scope
+pub fn get_commits_since(tag: Option<&str>, scope_filter: Option<&str>) -> Result<Vec<String>> {
     let range = match tag {
         Some(t) => format!("{t}..HEAD"),
         None => "HEAD".to_string(),
@@ -176,11 +221,109 @@ pub fn get_commits_since(tag: Option<&str>) -> Result<Vec<String>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
+    let commits: Vec<String> = stdout
         .lines()
         .filter(|line| !line.is_empty())
         .map(String::from)
+        .collect();
+
+    // If no scope filter, return all commits
+    let Some(scope) = scope_filter else {
+        return Ok(commits);
+    };
+
+    // Filter commits by scope
+    Ok(commits
+        .into_iter()
+        .filter(|line| {
+            // Parse commit to check scope
+            if let Some(commit) = parse_commit(line) {
+                commit.scope.as_ref().is_some_and(|s| s.as_str() == scope)
+            } else {
+                false
+            }
+        })
         .collect())
+}
+
+/// Determine the version bump type from commits
+///
+/// Rules based on Conventional Commits:
+/// - Any breaking change (!) → Major
+/// - Any `feat` commit → Minor
+/// - Otherwise → Patch
+pub fn determine_bump_type(commits: &[ParsedCommit]) -> BumpType {
+    let has_breaking = commits.iter().any(|c| c.breaking);
+    if has_breaking {
+        return BumpType::Major;
+    }
+
+    let has_feat = commits.iter().any(|c| c.commit_type == CommitType::Feat);
+    if has_feat {
+        return BumpType::Minor;
+    }
+
+    BumpType::Patch
+}
+
+/// Determine bump type from commits since the last tag for a component
+pub fn get_bump_type_for_component(
+    component_prefix: Option<&str>,
+    scope_filter: Option<&str>,
+) -> Result<BumpType> {
+    fetch_remote_tags()?;
+
+    let tag = if let Some(prefix) = component_prefix {
+        get_previous_component_tag(prefix)?
+    } else {
+        get_previous_tag()?
+    };
+
+    let commit_lines = get_commits_since(tag.as_deref(), scope_filter)?;
+
+    if commit_lines.is_empty() {
+        bail!("No commits found since last release. Nothing to bump.");
+    }
+
+    let commits: Vec<ParsedCommit> = commit_lines
+        .iter()
+        .filter_map(|line| parse_commit(line))
+        .collect();
+
+    Ok(determine_bump_type(&commits))
+}
+
+/// Parse a semantic version string into (major, minor, patch)
+pub fn parse_version(version: &str) -> Result<(u32, u32, u32)> {
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() != 3 {
+        bail!("Invalid version format: {version}. Expected MAJOR.MINOR.PATCH");
+    }
+
+    let major = parts[0]
+        .parse()
+        .with_context(|| format!("Invalid major version: {}", parts[0]))?;
+    let minor = parts[1]
+        .parse()
+        .with_context(|| format!("Invalid minor version: {}", parts[1]))?;
+    let patch = parts[2]
+        .parse()
+        .with_context(|| format!("Invalid patch version: {}", parts[2]))?;
+
+    Ok((major, minor, patch))
+}
+
+/// Bump a version according to the bump type
+pub fn bump_version(version: &str, bump_type: BumpType) -> Result<String> {
+    let (major, minor, patch) = parse_version(version)?;
+
+    let (new_major, new_minor, new_patch) = match bump_type {
+        BumpType::Major => (major + 1, 0, 0),
+        BumpType::Minor => (major, minor + 1, 0),
+        BumpType::Patch => (major, minor, patch + 1),
+    };
+
+    Ok(format!("{new_major}.{new_minor}.{new_patch}"))
 }
 
 /// Generate changelog markdown from parsed commits
@@ -237,11 +380,30 @@ fn format_commit(commit: &ParsedCommit) -> String {
     }
 }
 
-/// Create changelog file for a release
+/// Create changelog file for a release (full release, all commits)
 pub fn create_changelog_file(version: &str) -> Result<String> {
+    create_changelog_file_for_component(version, None, None)
+}
+
+/// Create changelog file for a component release
+///
+/// - `component_prefix`: The tag prefix (e.g., "signer") for finding previous tag
+/// - `scope_filter`: The commit scope to filter by (e.g., "signer")
+pub fn create_changelog_file_for_component(
+    version: &str,
+    component_prefix: Option<&str>,
+    scope_filter: Option<&str>,
+) -> Result<String> {
     fetch_remote_tags()?;
-    let tag = get_previous_tag()?;
-    let commit_lines = get_commits_since(tag.as_deref())?;
+
+    // Get the appropriate previous tag
+    let tag = if let Some(prefix) = component_prefix {
+        get_previous_component_tag(prefix)?
+    } else {
+        get_previous_tag()?
+    };
+
+    let commit_lines = get_commits_since(tag.as_deref(), scope_filter)?;
 
     let commits: Vec<ParsedCommit> = commit_lines
         .iter()
@@ -250,7 +412,13 @@ pub fn create_changelog_file(version: &str) -> Result<String> {
 
     let changelog = generate_changelog(version, &commits);
 
-    let path = format!("target/CHANGELOG-{version}.md");
+    // Include component prefix in filename if present
+    let path = if let Some(prefix) = component_prefix {
+        format!("target/CHANGELOG-{prefix}-{version}.md")
+    } else {
+        format!("target/CHANGELOG-{version}.md")
+    };
+
     let file = File::create(&path).with_context(|| format!("Failed to create {path}"))?;
     let mut writer = BufWriter::new(file);
     writer
@@ -413,5 +581,105 @@ mod tests {
         };
         let formatted = format_commit(&commit);
         assert_eq!(formatted, "- fix bug (def5678)\n");
+    }
+
+    #[test]
+    fn test_parse_version_valid() {
+        let (major, minor, patch) = parse_version("1.2.3").unwrap();
+        assert_eq!((major, minor, patch), (1, 2, 3));
+    }
+
+    #[test]
+    fn test_parse_version_zero() {
+        let (major, minor, patch) = parse_version("0.0.0").unwrap();
+        assert_eq!((major, minor, patch), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_parse_version_invalid() {
+        assert!(parse_version("1.2").is_err());
+        assert!(parse_version("1.2.3.4").is_err());
+        assert!(parse_version("a.b.c").is_err());
+    }
+
+    #[test]
+    fn test_bump_version_patch() {
+        assert_eq!(bump_version("1.2.3", BumpType::Patch).unwrap(), "1.2.4");
+        assert_eq!(bump_version("0.0.0", BumpType::Patch).unwrap(), "0.0.1");
+    }
+
+    #[test]
+    fn test_bump_version_minor() {
+        assert_eq!(bump_version("1.2.3", BumpType::Minor).unwrap(), "1.3.0");
+        assert_eq!(bump_version("0.0.5", BumpType::Minor).unwrap(), "0.1.0");
+    }
+
+    #[test]
+    fn test_bump_version_major() {
+        assert_eq!(bump_version("1.2.3", BumpType::Major).unwrap(), "2.0.0");
+        assert_eq!(bump_version("0.5.3", BumpType::Major).unwrap(), "1.0.0");
+    }
+
+    #[test]
+    fn test_determine_bump_type_breaking() {
+        let commits = vec![
+            ParsedCommit {
+                commit_type: CommitType::Fix,
+                scope: None,
+                description: "normal fix".to_string(),
+                hash: "aaa".to_string(),
+                breaking: false,
+            },
+            ParsedCommit {
+                commit_type: CommitType::Feat,
+                scope: None,
+                description: "breaking feature".to_string(),
+                hash: "bbb".to_string(),
+                breaking: true,
+            },
+        ];
+        assert_eq!(determine_bump_type(&commits), BumpType::Major);
+    }
+
+    #[test]
+    fn test_determine_bump_type_feat() {
+        let commits = vec![
+            ParsedCommit {
+                commit_type: CommitType::Fix,
+                scope: None,
+                description: "a fix".to_string(),
+                hash: "aaa".to_string(),
+                breaking: false,
+            },
+            ParsedCommit {
+                commit_type: CommitType::Feat,
+                scope: None,
+                description: "new feature".to_string(),
+                hash: "bbb".to_string(),
+                breaking: false,
+            },
+        ];
+        assert_eq!(determine_bump_type(&commits), BumpType::Minor);
+    }
+
+    #[test]
+    fn test_determine_bump_type_fix_only() {
+        let commits = vec![
+            ParsedCommit {
+                commit_type: CommitType::Fix,
+                scope: None,
+                description: "bug fix".to_string(),
+                hash: "aaa".to_string(),
+                breaking: false,
+            },
+            ParsedCommit {
+                commit_type: CommitType::Docs,
+                scope: None,
+                description: "update docs".to_string(),
+                hash: "bbb".to_string(),
+                breaking: false,
+            },
+        ];
+        assert_eq!(determine_bump_type(&commits), BumpType::Patch);
     }
 }

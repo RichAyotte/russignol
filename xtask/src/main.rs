@@ -41,6 +41,88 @@ enum Arch {
     All,
 }
 
+/// Component to release in monorepo-style releases
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ReleaseComponent {
+    /// `RPi` signer application (rpi-signer/Cargo.toml)
+    Signer,
+    /// Host utility application (host-utility/Cargo.toml)
+    HostUtility,
+    /// Signer library (libs/signer/Cargo.toml)
+    SignerLib,
+    /// UI library (libs/ui/Cargo.toml)
+    Ui,
+    /// Crypto library (libs/crypto/Cargo.toml)
+    Crypto,
+    /// EPD display library (libs/epd-2in13-v4/Cargo.toml)
+    EpdDisplay,
+    /// Full release - all components (current behavior)
+    All,
+}
+
+/// Options for the release command
+#[allow(clippy::struct_excessive_bools)]
+struct ReleaseOptions {
+    component: ReleaseComponent,
+    no_bump: bool,
+    clean: bool,
+    github: bool,
+    website: bool,
+}
+
+impl ReleaseComponent {
+    /// Get the Cargo.toml path for this component
+    fn cargo_toml_path(self) -> &'static str {
+        match self {
+            Self::Signer | Self::All => "rpi-signer/Cargo.toml",
+            Self::HostUtility => "host-utility/Cargo.toml",
+            Self::SignerLib => "libs/signer/Cargo.toml",
+            Self::Ui => "libs/ui/Cargo.toml",
+            Self::Crypto => "libs/crypto/Cargo.toml",
+            Self::EpdDisplay => "libs/epd-2in13-v4/Cargo.toml",
+        }
+    }
+
+    /// Get the tag prefix for this component
+    fn tag_prefix(self) -> &'static str {
+        match self {
+            Self::Signer => "signer",
+            Self::HostUtility => "host-utility",
+            Self::SignerLib => "signer-lib",
+            Self::Ui => "ui",
+            Self::Crypto => "crypto",
+            Self::EpdDisplay => "epd-display",
+            Self::All => "", // No prefix for full releases (uses "v{version}")
+        }
+    }
+
+    /// Get the display name for this component
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Signer => "Signer",
+            Self::HostUtility => "Host Utility",
+            Self::SignerLib => "Signer Library",
+            Self::Ui => "UI Library",
+            Self::Crypto => "Crypto Library",
+            Self::EpdDisplay => "EPD Display Library",
+            Self::All => "Full Release",
+        }
+    }
+
+    /// Get the commit scope used for filtering changelog
+    fn commit_scope(self) -> Option<&'static str> {
+        match self {
+            Self::Signer => Some("signer"),
+            Self::HostUtility => Some("host-utility"),
+            Self::SignerLib => Some("signer-lib"),
+            Self::Ui => Some("ui"),
+            Self::Crypto => Some("crypto"),
+            Self::EpdDisplay => Some("epd-display"),
+            Self::All => None, // Include all commits for full release
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Build `RPi` signer for ARM64
@@ -84,6 +166,14 @@ enum Commands {
 
     /// Full release: test, build (rpi-signer + host-utility + image), optionally publish to GitHub - always hardened
     Release {
+        /// Component to release (default: all for full release)
+        #[arg(short, long, default_value = "all")]
+        component: ReleaseComponent,
+
+        /// Skip auto-bump of version (by default, version is bumped based on conventional commits)
+        #[arg(long)]
+        no_bump: bool,
+
         /// Clean Cargo artifacts before building
         #[arg(long)]
         clean: bool,
@@ -256,10 +346,18 @@ fn try_main() -> Result<()> {
             },
         },
         Commands::Release {
+            component,
+            no_bump,
             clean,
             github,
             website,
-        } => cmd_release(clean, github, website),
+        } => cmd_release(&ReleaseOptions {
+            component,
+            no_bump,
+            clean,
+            github,
+            website,
+        }),
         Commands::Test { no_fuzz } => cmd_test(!no_fuzz),
         Commands::Clean { buildroot, deep } => do_clean(buildroot, deep),
         Commands::Validate => cmd_validate(),
@@ -551,44 +649,44 @@ fn cmd_website_publish() -> Result<()> {
     Ok(())
 }
 
-fn cmd_github_release() -> Result<()> {
-    let version = get_cargo_version()?;
+fn cmd_github_release(component: ReleaseComponent) -> Result<()> {
+    let version = get_component_version(component)?;
+
+    let (tag, title) = if component == ReleaseComponent::All {
+        (format!("v{version}"), format!("Russignol v{version}"))
+    } else {
+        let prefix = component.tag_prefix();
+        (
+            format!("{prefix}-v{version}"),
+            format!("Russignol {} v{version}", component.display_name()),
+        )
+    };
 
     println!(
         "{}",
-        format!("Creating GitHub release v{version}...")
-            .cyan()
-            .bold()
+        format!("Creating GitHub release {tag}...").cyan().bold()
     );
 
     check_command("gh", "Install with: https://cli.github.com/")?;
 
-    // Collect existing release assets
-    let mut assets: Vec<String> = Vec::new();
-    for name in [
-        "russignol-amd64",
-        "russignol-aarch64",
-        "russignol-pi-zero.img.xz",
-        "checksums.txt",
-    ] {
-        let path = format!("target/{name}");
-        if Path::new(&path).exists() {
-            assets.push(path);
-        }
-    }
+    // Collect release assets based on component
+    let assets = collect_release_assets(component);
 
-    if assets.is_empty() {
-        bail!("No release assets found. Build first with: cargo xtask release");
-    }
+    // Libraries don't have binary assets - that's fine
+    let has_assets = !assets.is_empty();
 
     // Generate changelog from conventional commits
     println!("  Generating changelog...");
-    let changelog_path = changelog::create_changelog_file(&version)?;
+    let changelog_path = if component == ReleaseComponent::All {
+        changelog::create_changelog_file(&version)?
+    } else {
+        let prefix = component.tag_prefix();
+        let scope = component.commit_scope();
+        changelog::create_changelog_file_for_component(&version, Some(prefix), scope)?
+    };
 
     // Create GitHub release with assets
     println!("  Creating release on GitHub...");
-    let tag = format!("v{version}");
-    let title = format!("Russignol v{version}");
 
     let mut args = vec![
         "release",
@@ -608,88 +706,112 @@ fn cmd_github_release() -> Result<()> {
 
     println!(
         "\n{}",
-        format!("✓ GitHub release v{version} created!")
-            .green()
-            .bold()
+        format!("✓ GitHub release {tag} created!").green().bold()
     );
     println!("  View at: https://github.com/RichAyotte/russignol/releases/tag/{tag}");
+
+    if !has_assets {
+        println!("  {}", "(No binary assets for this component)".yellow());
+    }
 
     Ok(())
 }
 
-fn cmd_release(clean: bool, github: bool, website: bool) -> Result<()> {
-    let version = get_cargo_version()?;
+/// Collect release assets based on the component being released
+fn collect_release_assets(component: ReleaseComponent) -> Vec<String> {
+    let asset_names: &[&str] = match component {
+        ReleaseComponent::All => &[
+            "russignol-amd64",
+            "russignol-aarch64",
+            "russignol-pi-zero.img.xz",
+            "checksums.txt",
+        ],
+        ReleaseComponent::Signer => &["russignol-pi-zero.img.xz", "checksums.txt"],
+        ReleaseComponent::HostUtility => &["russignol-amd64", "russignol-aarch64", "checksums.txt"],
+        // Libraries don't have binary assets
+        ReleaseComponent::SignerLib
+        | ReleaseComponent::Ui
+        | ReleaseComponent::Crypto
+        | ReleaseComponent::EpdDisplay => &[],
+    };
 
-    println!(
-        "{}",
-        format!("Building full release {version} (HARDENED)...")
-            .cyan()
-            .bold()
-    );
+    asset_names
+        .iter()
+        .map(|name| format!("target/{name}"))
+        .filter(|path| Path::new(path).exists())
+        .collect()
+}
 
-    // Validate wrangler early if --website is used
-    if website {
-        check_command("wrangler", "Install with: bun add -g wrangler")?;
-    }
+fn cmd_release(opts: &ReleaseOptions) -> Result<()> {
+    let ReleaseOptions {
+        component,
+        no_bump,
+        clean,
+        github,
+        website,
+    } = *opts;
 
     let mut step = 1;
 
-    // 1. Clean (optional) - includes buildroot output
+    // 1. Version bump (default) - must happen first before we read version
+    let version = if no_bump {
+        get_component_version(component)?
+    } else {
+        println!("\n{}", format!("Step {step}: Bump Version").cyan().bold());
+        let new_version = bump_component_version(component)?;
+        step += 1;
+        new_version
+    };
+
+    let release_desc = if component == ReleaseComponent::All {
+        format!("full release {version} (HARDENED)")
+    } else {
+        format!("{} release {version}", component.display_name())
+    };
+
+    println!("{}", format!("Building {release_desc}...").cyan().bold());
+
+    // Website publishing only makes sense for full releases
+    if website && component != ReleaseComponent::All {
+        println!(
+            "  {} --website is only supported for full releases, ignoring",
+            "⚠".yellow()
+        );
+    }
+
+    // Validate wrangler early if --website is used for full release
+    if website && component == ReleaseComponent::All {
+        check_command("wrangler", "Install with: bun add -g wrangler")?;
+    }
+
+    // 2. Clean (optional) - includes buildroot output for full/signer releases
     if clean {
         println!("\n{}", format!("Step {step}: Clean").cyan().bold());
-        do_clean(true, false)?;
+        let clean_buildroot = matches!(component, ReleaseComponent::All | ReleaseComponent::Signer);
+        do_clean(clean_buildroot, false)?;
         step += 1;
     }
 
-    // 2. Test (includes proptest fuzzing)
+    // 3. Test - always run tests
     println!("\n{}", format!("Step {step}: Test").cyan().bold());
     cmd_test(true)?;
     step += 1;
 
-    // 3. Build RPi signer (hardened)
-    println!(
-        "\n{}",
-        format!("Step {step}: Build RPi Signer").cyan().bold()
-    );
-    build_rpi_signer(false)?;
-    step += 1;
+    // 4. Component-specific build steps
+    step = build_component_artifacts(component, step)?;
 
-    // 4. Build host utility (all targets, sequential, release)
-    println!(
-        "\n{}",
-        format!("Step {step}: Build Host Utility").cyan().bold()
-    );
-    cmd_host_utility(Arch::All, false, false)?;
-    step += 1;
-
-    // 5. Build image (hardened)
-    println!(
-        "\n{}",
-        format!("Step {step}: Build SD Card Image").cyan().bold()
-    );
-    build_image(false, false)?;
-    step += 1;
-
-    // 6. Move release assets to target/
-    println!(
-        "\n{}",
-        format!("Step {step}: Move Release Assets").cyan().bold()
-    );
-    copy_release_assets()?;
-
-    // 7. Create GitHub release (optional)
+    // Create GitHub release (optional)
     if github {
-        step += 1;
         println!(
             "\n{}",
             format!("Step {step}: Create GitHub Release").cyan().bold()
         );
-        cmd_github_release()?;
+        cmd_github_release(component)?;
+        step += 1;
     }
 
-    // 8. Publish website (optional)
-    if website {
-        step += 1;
+    // Publish website (optional, only for full releases)
+    if website && component == ReleaseComponent::All {
         println!(
             "\n{}",
             format!("Step {step}: Publish Website").cyan().bold()
@@ -697,21 +819,330 @@ fn cmd_release(clean: bool, github: bool, website: bool) -> Result<()> {
         cmd_website_publish()?;
     }
 
+    // Print completion summary
+    print_release_summary(component, &version, github, website);
+
+    Ok(())
+}
+
+/// Bump the version for a component based on conventional commits
+fn bump_component_version(component: ReleaseComponent) -> Result<String> {
+    let prefix = if component == ReleaseComponent::All {
+        None
+    } else {
+        Some(component.tag_prefix())
+    };
+    let scope = component.commit_scope();
+
+    // Determine bump type from commits
+    let bump_type = changelog::get_bump_type_for_component(prefix, scope)?;
+    println!("  Detected {bump_type} bump from commits");
+
+    // Get current version and calculate new version
+    let current_version = get_component_version(component)?;
+    let new_version = changelog::bump_version(&current_version, bump_type)?;
+    println!("  {} → {}", current_version, new_version.green());
+
+    // Update Cargo.toml
+    let cargo_toml_path = component.cargo_toml_path();
+    update_cargo_version(cargo_toml_path, &new_version)?;
+
+    // Commit the change
+    commit_version_bump(component, &new_version)?;
+
+    Ok(new_version)
+}
+
+/// Update the version in a Cargo.toml file
+fn update_cargo_version(cargo_toml_path: &str, new_version: &str) -> Result<()> {
+    let content = std::fs::read_to_string(cargo_toml_path)
+        .with_context(|| format!("Failed to read {cargo_toml_path}"))?;
+
+    // Find and replace the version line in the [package] section
+    let mut in_package = false;
+    let mut updated = false;
+    let new_content: String = content
+        .lines()
+        .map(|line| {
+            if line.trim() == "[package]" {
+                in_package = true;
+                return line.to_string();
+            }
+            if line.trim().starts_with('[') && line.trim() != "[package]" {
+                in_package = false;
+            }
+            if in_package && line.trim().starts_with("version") && !updated {
+                updated = true;
+                return format!("version = \"{new_version}\"");
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Preserve trailing newline if original had one
+    let new_content = if content.ends_with('\n') {
+        format!("{new_content}\n")
+    } else {
+        new_content
+    };
+
+    std::fs::write(cargo_toml_path, new_content)
+        .with_context(|| format!("Failed to write {cargo_toml_path}"))?;
+
+    println!("  Updated {}", cargo_toml_path.cyan());
+
+    Ok(())
+}
+
+/// Commit the version bump with a conventional commit message
+fn commit_version_bump(component: ReleaseComponent, version: &str) -> Result<()> {
+    let cargo_toml_path = component.cargo_toml_path();
+
+    // Stage the Cargo.toml
+    let status = Command::new("git")
+        .args(["add", cargo_toml_path])
+        .status()
+        .context("Failed to run git add")?;
+
+    if !status.success() {
+        bail!("Failed to stage {cargo_toml_path}");
+    }
+
+    // Create commit message
+    let (scope, tag) = if component == ReleaseComponent::All {
+        ("release".to_string(), format!("v{version}"))
+    } else {
+        let prefix = component.tag_prefix();
+        (prefix.to_string(), format!("{prefix}-v{version}"))
+    };
+
+    let commit_msg = format!("chore({scope}): release {tag}");
+
+    // Commit
+    let status = Command::new("git")
+        .args(["commit", "-m", &commit_msg])
+        .status()
+        .context("Failed to run git commit")?;
+
+    if !status.success() {
+        bail!("Failed to commit version bump");
+    }
+
+    println!("  Committed: {}", commit_msg.cyan());
+
+    Ok(())
+}
+
+/// Build artifacts for a specific component, returning the next step number
+fn build_component_artifacts(component: ReleaseComponent, mut step: usize) -> Result<usize> {
+    match component {
+        ReleaseComponent::All => {
+            println!(
+                "\n{}",
+                format!("Step {step}: Build RPi Signer").cyan().bold()
+            );
+            build_rpi_signer(false)?;
+            step += 1;
+
+            println!(
+                "\n{}",
+                format!("Step {step}: Build Host Utility").cyan().bold()
+            );
+            cmd_host_utility(Arch::All, false, false)?;
+            step += 1;
+
+            println!(
+                "\n{}",
+                format!("Step {step}: Build SD Card Image").cyan().bold()
+            );
+            build_image(false, false)?;
+            step += 1;
+
+            println!(
+                "\n{}",
+                format!("Step {step}: Move Release Assets").cyan().bold()
+            );
+            copy_release_assets()?;
+            step += 1;
+        }
+        ReleaseComponent::Signer => {
+            println!(
+                "\n{}",
+                format!("Step {step}: Build RPi Signer").cyan().bold()
+            );
+            build_rpi_signer(false)?;
+            step += 1;
+
+            println!(
+                "\n{}",
+                format!("Step {step}: Build SD Card Image").cyan().bold()
+            );
+            build_image(false, false)?;
+            step += 1;
+
+            println!(
+                "\n{}",
+                format!("Step {step}: Move Release Assets").cyan().bold()
+            );
+            copy_signer_release_assets()?;
+            step += 1;
+        }
+        ReleaseComponent::HostUtility => {
+            println!(
+                "\n{}",
+                format!("Step {step}: Build Host Utility").cyan().bold()
+            );
+            cmd_host_utility(Arch::All, false, false)?;
+            step += 1;
+
+            println!(
+                "\n{}",
+                format!("Step {step}: Move Release Assets").cyan().bold()
+            );
+            copy_host_utility_release_assets()?;
+            step += 1;
+        }
+        ReleaseComponent::SignerLib
+        | ReleaseComponent::Ui
+        | ReleaseComponent::Crypto
+        | ReleaseComponent::EpdDisplay => {
+            println!(
+                "  {}",
+                "Library release - no binary artifacts to build".cyan()
+            );
+        }
+    }
+    Ok(step)
+}
+
+/// Copy only signer-related release assets
+fn copy_signer_release_assets() -> Result<Vec<String>> {
+    let mut assets: Vec<String> = Vec::new();
+
+    // Move SD card image
+    let image_path = Path::new("buildroot/output/images/sdcard.img.xz");
+    if image_path.exists() {
+        let release_image = "target/russignol-pi-zero.img.xz";
+        std::fs::rename(image_path, release_image).context("Failed to move SD card image")?;
+        assets.push(release_image.to_string());
+        println!("    {} russignol-pi-zero.img.xz", "✓".green());
+    } else {
+        println!(
+            "    {} Skipping SD card image (not found at {})",
+            "⚠".yellow(),
+            image_path.display()
+        );
+    }
+
+    // Generate checksums
+    if !assets.is_empty() {
+        generate_checksums(&assets)?;
+        assets.push("target/checksums.txt".to_string());
+    }
+
+    Ok(assets)
+}
+
+/// Copy only host-utility release assets
+fn copy_host_utility_release_assets() -> Result<Vec<String>> {
+    let mut assets: Vec<String> = Vec::new();
+
+    // Move host utility binaries
+    for target in HOST_TARGETS {
+        let binary = format!("target/{target}/release/russignol");
+        if Path::new(&binary).exists() {
+            let output_name = match *target {
+                "x86_64-unknown-linux-gnu" => "russignol-amd64",
+                "aarch64-unknown-linux-gnu" => "russignol-aarch64",
+                _ => continue,
+            };
+            let release_path = format!("target/{output_name}");
+            std::fs::rename(&binary, &release_path)
+                .with_context(|| format!("Failed to move binary for {target}"))?;
+            assets.push(release_path);
+            println!("    {} {}", "✓".green(), output_name);
+        } else {
+            println!(
+                "    {} Skipping {} (binary not found)",
+                "⚠".yellow(),
+                target
+            );
+        }
+    }
+
+    // Generate checksums
+    if !assets.is_empty() {
+        generate_checksums(&assets)?;
+        assets.push("target/checksums.txt".to_string());
+    }
+
+    Ok(assets)
+}
+
+/// Generate checksums.txt for the given assets
+fn generate_checksums(assets: &[String]) -> Result<()> {
+    println!("  Computing checksums...");
+    let checksums_path = "target/checksums.txt";
+    let file = File::create(checksums_path).context("Failed to create checksums.txt")?;
+    let mut writer = BufWriter::new(file);
+
+    for asset_path in assets {
+        let path = Path::new(asset_path);
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("Invalid asset filename")?;
+        let hash = compute_sha256(path)?;
+        // sha256sum format: two spaces between hash and filename
+        writeln!(writer, "{hash}  {filename}").context("Failed to write checksum")?;
+    }
+
+    writer.flush().context("Failed to flush checksums.txt")?;
+    println!("    {} checksums.txt", "✓".green());
+
+    Ok(())
+}
+
+/// Print release completion summary
+fn print_release_summary(component: ReleaseComponent, version: &str, github: bool, website: bool) {
     println!(
         "\n{} {}",
         "✓ Release".green().bold(),
         format!("{version} complete!").green().bold()
     );
-    println!("  - Binaries: target/russignol-amd64, target/russignol-aarch64");
-    println!("  - SD image: target/russignol-pi-zero.img.xz");
-    if github {
-        println!("  - GitHub: https://github.com/RichAyotte/russignol/releases");
-    }
-    if website {
-        println!("  - Website: https://russignol.com");
+
+    match component {
+        ReleaseComponent::All => {
+            println!("  - Binaries: target/russignol-amd64, target/russignol-aarch64");
+            println!("  - SD image: target/russignol-pi-zero.img.xz");
+        }
+        ReleaseComponent::Signer => {
+            println!("  - SD image: target/russignol-pi-zero.img.xz");
+        }
+        ReleaseComponent::HostUtility => {
+            println!("  - Binaries: target/russignol-amd64, target/russignol-aarch64");
+        }
+        ReleaseComponent::SignerLib
+        | ReleaseComponent::Ui
+        | ReleaseComponent::Crypto
+        | ReleaseComponent::EpdDisplay => {
+            println!("  - Library release (tag only, no binary artifacts)");
+        }
     }
 
-    Ok(())
+    if github {
+        let tag = if component == ReleaseComponent::All {
+            format!("v{version}")
+        } else {
+            format!("{}-v{version}", component.tag_prefix())
+        };
+        println!("  - GitHub: https://github.com/RichAyotte/russignol/releases/tag/{tag}");
+    }
+
+    if website && component == ReleaseComponent::All {
+        println!("  - Website: https://russignol.com");
+    }
 }
 
 fn cmd_test(fuzz: bool) -> Result<()> {
@@ -841,10 +1272,11 @@ fn is_target_installed(target: &str) -> Result<bool> {
         .any(|line| line.contains(target) && line.contains("installed")))
 }
 
-fn get_cargo_version() -> Result<String> {
-    let cargo_toml_path = Path::new("host-utility/Cargo.toml");
+/// Get the version for a specific component from its Cargo.toml
+fn get_component_version(component: ReleaseComponent) -> Result<String> {
+    let cargo_toml_path = Path::new(component.cargo_toml_path());
     let cargo_toml_content = std::fs::read_to_string(cargo_toml_path)
-        .context("Failed to read host-utility/Cargo.toml")?;
+        .with_context(|| format!("Failed to read {}", component.cargo_toml_path()))?;
 
     // Parse version from Cargo.toml
     for line in cargo_toml_content.lines() {
@@ -856,5 +1288,5 @@ fn get_cargo_version() -> Result<String> {
         }
     }
 
-    bail!("Could not find version in host-utility/Cargo.toml")
+    bail!("Could not find version in {}", component.cargo_toml_path())
 }
