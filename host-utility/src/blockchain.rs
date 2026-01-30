@@ -399,51 +399,58 @@ pub fn query_next_attesting_rights(
     delegate: &str,
     config: &RussignolConfig,
 ) -> Result<Option<(i64, String)>> {
-    let output = run_octez_client_command(
-        &[
-            "rpc",
-            "get",
-            &format!("/chains/main/blocks/head/helpers/attestation_rights?delegate={delegate}"),
-        ],
-        config,
-    )?;
+    // Get current level and cycle from metadata
+    let metadata = crate::utils::rpc_get_json("/chains/main/blocks/head/metadata", config)?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to query attesting rights: {}", stderr.trim());
-    }
+    let current_level = metadata
+        .get_nested("level_info")
+        .and_then(|li| li.get_i64("level"))
+        .context("Failed to get current level from metadata")?;
 
-    let rights: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("Failed to parse attesting rights")?;
-
-    // Get current level
-    let head = crate::utils::rpc_get_json("/chains/main/blocks/head/header", config)?;
-
-    let current_level = head
-        .get_i64("level")
-        .context("Failed to get current level")?;
+    let current_cycle = metadata
+        .get_nested("level_info")
+        .and_then(|li| li.get_i64("cycle"))
+        .context("Failed to get current cycle from metadata")?;
 
     // Get block delay for time estimation
     let minimal_block_delay = get_minimal_block_delay(config);
 
-    // Find the first attesting right
-    // Note: attestation_rights returns [{level: N, delegates: [{delegate: "tz...", ...}]}]
-    if let Some(rights_array) = rights.as_array() {
-        for right in rights_array {
-            if let Some(level) = right.get_i64("level")
-                && level >= current_level
-                && let Some(delegates_array) =
-                    right.get_nested("delegates").and_then(|v| v.as_array())
-            {
-                // Check if our delegate is in the delegates array for this level
-                let has_rights = delegates_array
-                    .iter()
-                    .any(|d| d.get_str("delegate") == Some(delegate));
+    // Query up to 3 cycles (current, current+1, current+2)
+    // The RPC without cycle/level params returns 0 results, so we must query by cycle
+    for cycle_offset in 0..=2 {
+        let cycle = current_cycle + cycle_offset;
+        let path = format!("/chains/main/blocks/head/helpers/attestation_rights?cycle={cycle}");
 
-                if has_rights {
-                    let blocks_away = level - current_level;
-                    let estimated_time = format_time_estimate(blocks_away, minimal_block_delay);
-                    return Ok(Some((level, estimated_time)));
+        let rights = match crate::utils::rpc_get_json(&path, config) {
+            Ok(r) => r,
+            Err(e) => {
+                // "seed has not been computed yet" means we've gone too far into the future
+                if e.to_string().contains("seed") {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        // Find the first level >= current_level where our delegate has rights
+        // Note: attestation_rights returns [{level: N, delegates: [{delegate: "tz...", ...}]}]
+        if let Some(rights_array) = rights.as_array() {
+            for right in rights_array {
+                if let Some(level) = right.get_i64("level")
+                    && level >= current_level
+                    && let Some(delegates_array) =
+                        right.get_nested("delegates").and_then(|v| v.as_array())
+                {
+                    // Check if our delegate is in the delegates array for this level
+                    let has_rights = delegates_array
+                        .iter()
+                        .any(|d| d.get_str("delegate") == Some(delegate));
+
+                    if has_rights {
+                        let blocks_away = level - current_level;
+                        let estimated_time = format_time_estimate(blocks_away, minimal_block_delay);
+                        return Ok(Some((level, estimated_time)));
+                    }
                 }
             }
         }
