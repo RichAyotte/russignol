@@ -33,7 +33,7 @@ pub struct UsbPowerInfo {
 pub struct HubPowerInfo {
     /// The sysfs hub path (e.g., "3-7")
     pub hub_path: String,
-    /// Power requested by the hub itself in mA (0 = self-powered)
+    /// Power requested by the hub itself in mA (hub's own bus draw)
     pub hub_power_ma: u32,
     /// Whether this is a bus-powered hub (vs self-powered)
     pub is_bus_powered: bool,
@@ -384,6 +384,28 @@ fn collect_hub_devices(hub_path: &str) -> Result<Vec<HubDevice>> {
     Ok(devices)
 }
 
+/// Parse bmAttributes hex string and check if bit 6 (self-powered) is set
+///
+/// Per USB spec, bit 6 (0x40) of bmAttributes indicates self-powered status.
+/// Input is a hex string like "e0" or "e0\n".
+fn parse_bm_attributes_self_powered(content: &str) -> Option<bool> {
+    let value = u8::from_str_radix(content.trim(), 16).ok()?;
+    // Bit 6 (0x40) indicates self-powered
+    Some((value & 0x40) != 0)
+}
+
+/// Check if a USB hub is self-powered by reading bmAttributes from sysfs
+///
+/// Per USB spec, bit 6 (0x40) of bmAttributes indicates self-powered status.
+/// Returns true if self-powered, false if bus-powered or on error.
+fn is_hub_self_powered(hub_sysfs: &Path) -> bool {
+    let bm_attrs_path = hub_sysfs.join("bmAttributes");
+    std::fs::read_to_string(bm_attrs_path)
+        .ok()
+        .and_then(|content| parse_bm_attributes_self_powered(&content))
+        .unwrap_or(false)
+}
+
 /// Get USB power information for the Russignol device
 ///
 /// Returns `Ok(Some(info))` with power details if device found,
@@ -411,7 +433,7 @@ pub fn get_usb_power_info() -> Result<Option<UsbPowerInfo>> {
         if let Some(hub_path) = get_parent_hub_path(&device_path) {
             let hub_sysfs = devices_base.join(&hub_path);
 
-            // Read hub's own power draw (0 = self-powered, >0 = bus-powered)
+            // Read hub's own power draw (for display purposes)
             let hub_power_ma = hub_sysfs
                 .join("bMaxPower")
                 .exists()
@@ -420,7 +442,8 @@ pub fn get_usb_power_info() -> Result<Option<UsbPowerInfo>> {
                 .and_then(|s| parse_power_ma(&s))
                 .unwrap_or(0);
 
-            let is_bus_powered = hub_power_ma > 0;
+            // Check bmAttributes bit 6 for self-powered status (per USB spec)
+            let is_bus_powered = !is_hub_self_powered(&hub_sysfs);
 
             // Collect all devices on the hub
             let devices = collect_hub_devices(&hub_path)?;
@@ -533,6 +556,33 @@ mod tests {
         assert_eq!(parse_power_ma(""), None);
         assert_eq!(parse_power_ma("abc"), None);
         assert_eq!(parse_power_ma("500ma"), None); // Case sensitive
+    }
+
+    #[test]
+    fn test_parse_bm_attributes_self_powered() {
+        // 0xe0 = 1110_0000 - bit 6 is set → self-powered
+        assert_eq!(parse_bm_attributes_self_powered("e0"), Some(true));
+        assert_eq!(parse_bm_attributes_self_powered("e0\n"), Some(true));
+        assert_eq!(parse_bm_attributes_self_powered("  e0  "), Some(true));
+
+        // 0xa0 = 1010_0000 - bit 6 is NOT set → bus-powered
+        assert_eq!(parse_bm_attributes_self_powered("a0"), Some(false));
+
+        // 0x00 - bit 6 is NOT set → bus-powered
+        assert_eq!(parse_bm_attributes_self_powered("00"), Some(false));
+
+        // 0x40 = 0100_0000 - bit 6 is set → self-powered
+        assert_eq!(parse_bm_attributes_self_powered("40"), Some(true));
+
+        // 0x80 = 1000_0000 - bit 6 is NOT set → bus-powered
+        assert_eq!(parse_bm_attributes_self_powered("80"), Some(false));
+    }
+
+    #[test]
+    fn test_parse_bm_attributes_invalid() {
+        assert_eq!(parse_bm_attributes_self_powered(""), None);
+        assert_eq!(parse_bm_attributes_self_powered("zz"), None);
+        assert_eq!(parse_bm_attributes_self_powered("not hex"), None);
     }
 
     #[test]

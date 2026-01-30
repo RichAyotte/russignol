@@ -445,7 +445,15 @@ fn display_hardware_status(verbose: bool, data: HardwareData) {
             if let Some(ref power_info) = data.power_info {
                 if power_info.behind_hub {
                     if let Some(ref hub_info) = power_info.hub_info {
-                        println!("      USB connection: Through hub ({})", hub_info.hub_path);
+                        let power_type = if hub_info.is_bus_powered {
+                            "bus-powered"
+                        } else {
+                            "self-powered"
+                        };
+                        println!(
+                            "      USB connection: Through {} hub ({})",
+                            power_type, hub_info.hub_path
+                        );
                     } else {
                         println!("      USB connection: Through hub");
                     }
