@@ -1831,7 +1831,7 @@ dependencies = [
 
 [[package]]
 name = "russignol-setup"
-version = "0.13.8"
+version = "0.13.10"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1859,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "russignol-signer"
-version = "0.13.8"
+version = "0.13.10"
 dependencies = [
  "chrono",
  "crossbeam-channel",

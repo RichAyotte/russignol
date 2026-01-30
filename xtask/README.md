@@ -43,12 +43,24 @@ cargo xtask image --dev            # Development build (SSH enabled)
 **Prerequisites:** Buildroot in `./buildroot/`, ~10GB disk space
 
 ### `release`
-Full release build: test + build all artifacts.
+Full release build: bump version, test, build all artifacts, and tag.
 
 ```bash
-cargo xtask release
+cargo xtask release                # Build and tag locally
 cargo xtask release --clean        # Clean before building
-cargo xtask release --github       # Create GitHub release
+cargo xtask release --github       # Also publish to GitHub
+cargo xtask release --website      # Also publish website
+```
+
+Version is automatically bumped based on conventional commits (feat → minor, fix → patch, breaking → major). A local git tag is created to prevent duplicate releases.
+
+### `publish`
+Publish existing release artifacts without rebuilding.
+
+```bash
+cargo xtask publish --github       # Publish to GitHub releases
+cargo xtask publish --website      # Publish website to Cloudflare Pages
+cargo xtask publish --github --website  # Both
 ```
 
 ### `test`

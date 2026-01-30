@@ -208,8 +208,20 @@ enum Commands {
     /// Validate build environment
     Validate,
 
-    /// Publish website to Cloudflare Pages (requires wrangler CLI)
-    Website,
+    /// Publish to GitHub and/or Cloudflare Pages without rebuilding
+    Publish {
+        /// Component to publish (default: all for full release)
+        #[arg(short, long, default_value = "all")]
+        component: ReleaseComponent,
+
+        /// Publish to GitHub releases (requires gh CLI)
+        #[arg(long)]
+        github: bool,
+
+        /// Publish website to Cloudflare Pages (requires wrangler CLI)
+        #[arg(long)]
+        website: bool,
+    },
 
     /// Run watermark protection E2E tests on a physical device
     WatermarkTest {
@@ -361,7 +373,11 @@ fn try_main() -> Result<()> {
         Commands::Test { no_fuzz } => cmd_test(!no_fuzz),
         Commands::Clean { buildroot, deep } => do_clean(buildroot, deep),
         Commands::Validate => cmd_validate(),
-        Commands::Website => cmd_website(),
+        Commands::Publish {
+            component,
+            github,
+            website,
+        } => cmd_publish(component, github, website),
         Commands::WatermarkTest {
             device,
             port,
@@ -623,12 +639,31 @@ fn copy_release_assets() -> Result<Vec<String>> {
     Ok(assets)
 }
 
-fn cmd_website() -> Result<()> {
-    check_command("wrangler", "Install with: bun add -g wrangler")?;
-    cmd_website_publish()
+fn cmd_publish(component: ReleaseComponent, github: bool, website: bool) -> Result<()> {
+    if !github && !website {
+        bail!("Specify --github and/or --website to publish");
+    }
+
+    if github {
+        cmd_github_release(component)?;
+    }
+
+    if website {
+        if component == ReleaseComponent::All {
+            cmd_website_publish()?;
+        } else {
+            println!(
+                "  {} --website is only supported for full releases, ignoring",
+                "⚠".yellow()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn cmd_website_publish() -> Result<()> {
+    check_command("wrangler", "Install with: bun add -g wrangler")?;
     println!(
         "{}",
         "Publishing website to Cloudflare Pages...".cyan().bold()
@@ -962,6 +997,18 @@ fn commit_version_bump(component: ReleaseComponent, version: &str) -> Result<()>
     }
 
     println!("  Committed: {}", commit_msg.cyan());
+
+    // Create local git tag to prevent duplicate releases
+    let status = Command::new("git")
+        .args(["tag", &tag])
+        .status()
+        .context("Failed to run git tag")?;
+
+    if !status.success() {
+        bail!("Failed to create tag {tag}");
+    }
+
+    println!("  Tagged: {}", tag.cyan());
 
     Ok(())
 }

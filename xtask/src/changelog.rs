@@ -140,7 +140,40 @@ pub fn parse_commit(line: &str) -> Option<ParsedCommit> {
     }
 }
 
-/// Get the previous tag from git history
+/// Get the most recent tag reachable from HEAD
+pub fn get_current_tag() -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["describe", "--tags", "--abbrev=0", "HEAD"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .context("Failed to run git describe")?;
+
+    if output.status.success() {
+        let tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if tag.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(tag))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+/// Check if HEAD is exactly at a tag (no commits after it)
+pub fn head_is_tagged() -> Result<bool> {
+    let output = Command::new("git")
+        .args(["describe", "--tags", "--exact-match", "HEAD"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .context("Failed to run git describe")?;
+
+    Ok(output.status.success())
+}
+
+/// Get the previous tag from git history (tag before HEAD)
 pub fn get_previous_tag() -> Result<Option<String>> {
     let output = Command::new("git")
         .args(["describe", "--tags", "--abbrev=0", "HEAD^"])
@@ -266,6 +299,15 @@ pub fn determine_bump_type(commits: &[ParsedCommit]) -> BumpType {
     BumpType::Patch
 }
 
+/// Check if a commit is a release meta-commit that shouldn't trigger a version bump
+fn is_release_commit(commit: &ParsedCommit) -> bool {
+    commit.commit_type == CommitType::Chore
+        && commit
+            .scope
+            .as_ref()
+            .is_some_and(|s| s == "release" || s == "xtask")
+}
+
 /// Determine bump type from commits since the last tag for a component
 pub fn get_bump_type_for_component(
     component_prefix: Option<&str>,
@@ -273,11 +315,16 @@ pub fn get_bump_type_for_component(
 ) -> Result<BumpType> {
     fetch_remote_tags()?;
 
-    // For component releases, try component-specific tag first, fall back to full release tag
+    // Check if HEAD is already tagged - if so, nothing to bump
+    if head_is_tagged()? {
+        bail!("HEAD is already tagged. Nothing to bump.");
+    }
+
+    // Get the most recent tag reachable from HEAD
     let tag = if let Some(prefix) = component_prefix {
-        get_previous_component_tag(prefix)?.or(get_previous_tag()?)
+        get_previous_component_tag(prefix)?.or(get_current_tag()?)
     } else {
-        get_previous_tag()?
+        get_current_tag()?
     };
 
     let commit_lines = get_commits_since(tag.as_deref(), scope_filter)?;
@@ -286,10 +333,16 @@ pub fn get_bump_type_for_component(
         bail!("No commits found since last release. Nothing to bump.");
     }
 
+    // Filter out release meta-commits (chore(release), chore(xtask))
     let commits: Vec<ParsedCommit> = commit_lines
         .iter()
         .filter_map(|line| parse_commit(line))
+        .filter(|c| !is_release_commit(c))
         .collect();
+
+    if commits.is_empty() {
+        bail!("No substantive commits found since last release. Nothing to bump.");
+    }
 
     Ok(determine_bump_type(&commits))
 }
