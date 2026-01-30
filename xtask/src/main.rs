@@ -1010,6 +1010,18 @@ fn commit_version_bump(component: ReleaseComponent, version: &str) -> Result<()>
 
     println!("  Tagged: {}", tag.cyan());
 
+    // Push commit and tag to remote
+    let status = Command::new("git")
+        .args(["push", "--follow-tags"])
+        .status()
+        .context("Failed to push to remote")?;
+
+    if !status.success() {
+        bail!("Failed to push commit and tag to remote");
+    }
+
+    println!("  Pushed to remote");
+
     Ok(())
 }
 
