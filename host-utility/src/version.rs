@@ -10,8 +10,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// GitHub repository for releases
 const GITHUB_REPO: &str = "RichAyotte/russignol";
 
-/// GitHub API URL for latest release
-const GITHUB_API_URL: &str = "https://api.github.com/repos/RichAyotte/russignol/releases/latest";
+/// GitHub API URL for releases list
+const GITHUB_RELEASES_URL: &str = "https://api.github.com/repos/RichAyotte/russignol/releases";
 
 /// GitHub release asset download URL pattern
 fn github_release_url(version: &str, filename: &str) -> String {
@@ -147,16 +147,37 @@ fn fetch_checksums(agent: &ureq::Agent, assets: &[GitHubAsset]) -> HashMap<Strin
 }
 
 /// Fetch latest version info from GitHub releases API
+///
+/// Looks for releases with `host-utility-v*` tags first, falling back to `v*` tags
+/// for backwards compatibility with full releases.
 pub fn fetch_latest_version() -> Result<VersionInfo> {
     let agent = create_http_agent(30);
-    let json = http_get_json(&agent, GITHUB_API_URL)
-        .with_context(|| format!("Failed to fetch release info from {GITHUB_API_URL}"))?;
+    let json = http_get_json(&agent, GITHUB_RELEASES_URL)
+        .with_context(|| format!("Failed to fetch releases from {GITHUB_RELEASES_URL}"))?;
 
-    let release: GitHubRelease =
-        serde_json::from_value(json).context("Failed to parse GitHub release response")?;
+    let releases: Vec<GitHubRelease> =
+        serde_json::from_value(json).context("Failed to parse GitHub releases response")?;
 
-    // Parse version from tag (strip 'v' prefix)
-    let version = release.tag_name.trim_start_matches('v').to_string();
+    // Find the first release with host-utility binaries
+    // Priority: host-utility-v* tags, then v* tags (full releases)
+    let release = releases
+        .iter()
+        .find(|r| {
+            let dominated = r.tag_name.starts_with("host-utility-v") || r.tag_name.starts_with('v');
+            let has_binaries = r
+                .assets
+                .iter()
+                .any(|a| a.name == "russignol-amd64" || a.name == "russignol-aarch64");
+            dominated && has_binaries
+        })
+        .context("No host-utility release found")?;
+
+    // Parse version from tag (strip prefix)
+    let version = release
+        .tag_name
+        .trim_start_matches("host-utility-v")
+        .trim_start_matches('v')
+        .to_string();
 
     // Parse release date (extract date from ISO timestamp)
     let release_date = release
