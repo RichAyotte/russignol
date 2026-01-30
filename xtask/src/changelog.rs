@@ -273,8 +273,9 @@ pub fn get_bump_type_for_component(
 ) -> Result<BumpType> {
     fetch_remote_tags()?;
 
+    // For component releases, try component-specific tag first, fall back to full release tag
     let tag = if let Some(prefix) = component_prefix {
-        get_previous_component_tag(prefix)?
+        get_previous_component_tag(prefix)?.or(get_previous_tag()?)
     } else {
         get_previous_tag()?
     };
@@ -397,8 +398,9 @@ pub fn create_changelog_file_for_component(
     fetch_remote_tags()?;
 
     // Get the appropriate previous tag
+    // For component releases, try component-specific tag first, fall back to full release tag
     let tag = if let Some(prefix) = component_prefix {
-        get_previous_component_tag(prefix)?
+        get_previous_component_tag(prefix)?.or(get_previous_tag()?)
     } else {
         get_previous_tag()?
     };
