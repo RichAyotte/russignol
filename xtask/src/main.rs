@@ -704,6 +704,9 @@ fn cmd_github_release(component: ReleaseComponent) -> Result<()> {
 
     check_command("gh", "Install with: https://cli.github.com/")?;
 
+    // Ensure tag is pushed to remote (--follow-tags in commit_version_bump may not always work)
+    ensure_tag_pushed(&tag)?;
+
     // Collect release assets based on component
     let assets = collect_release_assets(component);
 
@@ -1021,6 +1024,45 @@ fn commit_version_bump(component: ReleaseComponent, version: &str) -> Result<()>
     }
 
     println!("  Pushed to remote");
+
+    Ok(())
+}
+
+/// Ensure a tag exists on the remote, pushing it if necessary
+fn ensure_tag_pushed(tag: &str) -> Result<()> {
+    // Check if tag exists on remote
+    let output = Command::new("git")
+        .args(["ls-remote", "--tags", "origin", tag])
+        .output()
+        .context("Failed to check remote tags")?;
+
+    if output.status.success() && !output.stdout.is_empty() {
+        // Tag already exists on remote
+        return Ok(());
+    }
+
+    // Tag not on remote - check if it exists locally
+    let status = Command::new("git")
+        .args(["rev-parse", "--verify", &format!("refs/tags/{tag}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("Failed to check local tag")?;
+
+    if !status.success() {
+        bail!("Tag {tag} does not exist locally");
+    }
+
+    // Push the tag to remote
+    println!("  Pushing tag {tag} to remote...");
+    let status = Command::new("git")
+        .args(["push", "origin", tag])
+        .status()
+        .context("Failed to push tag")?;
+
+    if !status.success() {
+        bail!("Failed to push tag {tag} to remote");
+    }
 
     Ok(())
 }
