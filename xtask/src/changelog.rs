@@ -178,10 +178,28 @@ pub fn head_is_tagged() -> Result<bool> {
     Ok(output.status.success())
 }
 
+/// Check if a specific tag exists
+pub fn tag_exists(tag: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", &format!("refs/tags/{tag}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("Failed to check tag existence")?;
+
+    Ok(output.success())
+}
+
 /// Get the previous tag from git history (tag before HEAD)
 pub fn get_previous_tag() -> Result<Option<String>> {
+    get_tag_before("HEAD")
+}
+
+/// Get the tag before a given reference (tag or commit)
+pub fn get_tag_before(reference: &str) -> Result<Option<String>> {
+    let ref_parent = format!("{reference}^");
     let output = Command::new("git")
-        .args(["describe", "--tags", "--abbrev=0", "HEAD^"])
+        .args(["describe", "--tags", "--abbrev=0", &ref_parent])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -455,9 +473,21 @@ pub fn create_changelog_file_for_component(
 ) -> Result<String> {
     fetch_remote_tags()?;
 
-    // Get the appropriate previous tag
-    // For component releases, try component-specific tag first, fall back to full release tag
-    let tag = if let Some(prefix) = component_prefix {
+    // Construct the current version's tag name
+    let current_tag = if let Some(prefix) = component_prefix {
+        format!("{prefix}-v{version}")
+    } else {
+        format!("v{version}")
+    };
+
+    // Get the previous tag relative to the current version's tag
+    // This ensures we get the correct range even when called after the release commit
+    // (e.g., during publish --github retry after a failed release)
+    let tag = if tag_exists(&current_tag)? {
+        // Current tag exists - find the tag before it
+        get_tag_before(&current_tag)?
+    } else if let Some(prefix) = component_prefix {
+        // Current tag doesn't exist yet - use component tag or fall back to release tag
         get_previous_component_tag(prefix)?.or(get_previous_tag()?)
     } else {
         get_previous_tag()?
