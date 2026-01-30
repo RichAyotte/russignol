@@ -843,9 +843,15 @@ fn bump_component_version(component: ReleaseComponent) -> Result<String> {
     let new_version = changelog::bump_version(&current_version, bump_type)?;
     println!("  {} → {}", current_version, new_version.green());
 
-    // Update Cargo.toml
-    let cargo_toml_path = component.cargo_toml_path();
-    update_cargo_version(cargo_toml_path, &new_version)?;
+    // Update Cargo.toml(s)
+    if component == ReleaseComponent::All {
+        // Full release: update both signer and host-utility versions
+        update_cargo_version("rpi-signer/Cargo.toml", &new_version)?;
+        update_cargo_version("host-utility/Cargo.toml", &new_version)?;
+    } else {
+        let cargo_toml_path = component.cargo_toml_path();
+        update_cargo_version(cargo_toml_path, &new_version)?;
+    }
 
     // Commit the change
     commit_version_bump(component, &new_version)?;
@@ -897,16 +903,27 @@ fn update_cargo_version(cargo_toml_path: &str, new_version: &str) -> Result<()> 
 
 /// Commit the version bump with a conventional commit message
 fn commit_version_bump(component: ReleaseComponent, version: &str) -> Result<()> {
-    let cargo_toml_path = component.cargo_toml_path();
-
-    // Stage the Cargo.toml
-    let status = Command::new("git")
-        .args(["add", cargo_toml_path])
-        .status()
-        .context("Failed to run git add")?;
-
-    if !status.success() {
-        bail!("Failed to stage {cargo_toml_path}");
+    // Stage the Cargo.toml file(s)
+    if component == ReleaseComponent::All {
+        // Full release: stage both signer and host-utility
+        for path in ["rpi-signer/Cargo.toml", "host-utility/Cargo.toml"] {
+            let status = Command::new("git")
+                .args(["add", path])
+                .status()
+                .context("Failed to run git add")?;
+            if !status.success() {
+                bail!("Failed to stage {path}");
+            }
+        }
+    } else {
+        let cargo_toml_path = component.cargo_toml_path();
+        let status = Command::new("git")
+            .args(["add", cargo_toml_path])
+            .status()
+            .context("Failed to run git add")?;
+        if !status.success() {
+            bail!("Failed to stage {cargo_toml_path}");
+        }
     }
 
     // Create commit message
