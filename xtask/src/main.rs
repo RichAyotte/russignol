@@ -903,10 +903,23 @@ fn update_cargo_version(cargo_toml_path: &str, new_version: &str) -> Result<()> 
 
 /// Commit the version bump with a conventional commit message
 fn commit_version_bump(component: ReleaseComponent, version: &str) -> Result<()> {
-    // Stage the Cargo.toml file(s)
+    // Update Cargo.lock to reflect the version changes
+    let status = Command::new("cargo")
+        .args(["update", "--workspace"])
+        .status()
+        .context("Failed to run cargo update")?;
+    if !status.success() {
+        bail!("Failed to update Cargo.lock");
+    }
+
+    // Stage the Cargo.toml file(s) and Cargo.lock
     if component == ReleaseComponent::All {
         // Full release: stage both signer and host-utility
-        for path in ["rpi-signer/Cargo.toml", "host-utility/Cargo.toml"] {
+        for path in [
+            "rpi-signer/Cargo.toml",
+            "host-utility/Cargo.toml",
+            "Cargo.lock",
+        ] {
             let status = Command::new("git")
                 .args(["add", path])
                 .status()
@@ -917,12 +930,14 @@ fn commit_version_bump(component: ReleaseComponent, version: &str) -> Result<()>
         }
     } else {
         let cargo_toml_path = component.cargo_toml_path();
-        let status = Command::new("git")
-            .args(["add", cargo_toml_path])
-            .status()
-            .context("Failed to run git add")?;
-        if !status.success() {
-            bail!("Failed to stage {cargo_toml_path}");
+        for path in [cargo_toml_path, "Cargo.lock"] {
+            let status = Command::new("git")
+                .args(["add", path])
+                .status()
+                .context("Failed to run git add")?;
+            if !status.success() {
+                bail!("Failed to stage {path}");
+            }
         }
     }
 
