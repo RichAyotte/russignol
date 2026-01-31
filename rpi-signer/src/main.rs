@@ -749,6 +749,13 @@ fn run_ui_loop(
 
                 // Check if it's a "level too low" error (has current_level and requested_level)
                 if let (Some(current), Some(requested)) = (current_level, requested_level) {
+                    // Wake display if screensaver is active
+                    if screensaver_active {
+                        log::info!("Waking display to show watermark error dialog");
+                        device.display_wake()?;
+                        screensaver_active = false;
+                        saved_page = None;
+                    }
                     log::warn!("Watermark error detected: {error_message}");
 
                     let chain_id_str = chain_id.to_b58check();
@@ -806,6 +813,14 @@ fn run_ui_loop(
                 if current_page.is_modal() {
                     log::debug!("Ignoring LargeWatermarkGap - modal dialog already showing");
                     continue;
+                }
+
+                // Wake display if screensaver is active
+                if screensaver_active {
+                    log::info!("Waking display to show large watermark gap dialog");
+                    device.display_wake()?;
+                    screensaver_active = false;
+                    saved_page = None;
                 }
 
                 let gap = requested_level.saturating_sub(current_level);
