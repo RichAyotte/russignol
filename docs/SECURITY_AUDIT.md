@@ -32,6 +32,7 @@ This security assessment analyzes the Russignol project (hardened build), a hard
 11. [Code Quality](#11-code-quality)
 12. [Vulnerability Summary](#12-vulnerability-summary)
 13. [Recommendations](#13-recommendations)
+14. [Appendix C: PIN Brute-Force Cracking Estimates](#appendix-c-pin-brute-force-cracking-estimates)
 
 ## 1. Project Architecture
 
@@ -384,6 +385,39 @@ The following security measures are in place:
 | Process Monitoring | ✅ Removed (htop) |
 | File Watching | ✅ Removed (inotify-tools) |
 | PIN Rate Limiting | ✅ Enabled |
+
+## Appendix C: PIN Brute-Force Cracking Estimates
+
+### Encryption Parameters
+
+Keys are protected by AES-256-GCM with Scrypt KDF (log_n=18, 256MB memory-hard). The 256MB memory requirement severely limits GPU parallelization and makes ASICs impractical.
+
+### Time to Crack
+
+Assuming ~1 second per Scrypt hash on a single modern CPU:
+
+| PIN Length | Keyspace | Single Machine | 100 Machines | 1000 Machines |
+|------------|----------|----------------|--------------|---------------|
+| 5 digits | 10^5 | ~1.2 days | ~17 min | ~2 min |
+| 6 digits | 10^6 | ~12 days | ~2.8 hours | ~17 min |
+| 7 digits | 10^7 | ~116 days | ~1.2 days | ~2.8 hours |
+| 8 digits | 10^8 | ~3.2 years | ~12 days | ~1.2 days |
+| 9 digits | 10^9 | ~32 years | ~116 days | ~12 days |
+| 10 digits | 10^10 | ~317 years | ~3.2 years | ~116 days |
+
+### Notes
+
+- **GPU attacks limited**: 256MB per attempt means a 24GB GPU can only run ~96 parallel operations (vs millions for weak KDFs)
+- **Average case**: Expected crack time is half the maximum (attacker finds PIN midway through keyspace on average)
+- **Offline attack**: These estimates assume offline attack on extracted SD card; the 5-attempt lockout only protects against on-device attacks
+
+### Recommendations
+
+| PIN Length | Security Level |
+|------------|----------------|
+| 5-6 digits | Vulnerable to determined attacker with modest resources |
+| 7-8 digits | Reasonable for typical threat models |
+| 9-10 digits | Strong protection even against well-funded attackers |
 
 ---
 
