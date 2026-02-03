@@ -30,9 +30,9 @@ blake2 = "0.10.6"
 blst = { version = "0.3.16", features = ["portable"] }
 bs58 = { version = "0.5.1", features = ["check"] }
 bson = "3.1.0"
-clap = { version = "4.5.54", features = ["derive"] }
+clap = { version = "4.5.57", features = ["derive"] }
 directories = "6.0.0"
-getrandom = "0.3.4"
+getrandom = "0.4.1"
 hex = "0.4.3"
 hmac = "0.12.1"
 log = "0.4.29"
