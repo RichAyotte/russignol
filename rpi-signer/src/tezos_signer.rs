@@ -4,14 +4,27 @@
 //! This module provides utilities for reading public keys.
 
 use crate::constants::KEYS_DIR;
-use russignol_signer_lib::wallet::KeyManager as WalletKeyManager;
+use russignol_signer_lib::wallet::{KeyManager as WalletKeyManager, StoredKey};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Deserialize)]
 pub struct TezosKey {
     pub name: String,
     pub value: String,
+}
+
+/// Order stored keys: consensus first, then companion.
+fn order_keys(stored_keys: &HashMap<String, StoredKey>) -> Vec<TezosKey> {
+    [stored_keys.get("consensus"), stored_keys.get("companion")]
+        .into_iter()
+        .flatten()
+        .map(|k| TezosKey {
+            name: k.alias.clone(),
+            value: k.public_key_hash.clone(),
+        })
+        .collect()
 }
 
 /// Get public key info (readable without PIN)
@@ -26,22 +39,12 @@ pub fn get_keys() -> Vec<TezosKey> {
     let key_manager = WalletKeyManager::new(Some(PathBuf::from(KEYS_DIR)));
     let stored_keys = key_manager.load_keys();
 
-    // Look up keys by alias in the expected order: consensus first, companion second
-    [stored_keys.get("consensus"), stored_keys.get("companion")]
-        .into_iter()
-        .flatten()
-        .map(|k| TezosKey {
-            name: k.alias.clone(),
-            value: k.public_key_hash.clone(),
-        })
-        .collect()
+    order_keys(&stored_keys)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use russignol_signer_lib::wallet::StoredKey;
-    use std::collections::HashMap;
 
     fn make_stored_key(alias: &str) -> StoredKey {
         StoredKey {
@@ -52,24 +55,13 @@ mod tests {
         }
     }
 
-    fn lookup_keys(stored_keys: &HashMap<String, StoredKey>) -> Vec<TezosKey> {
-        [stored_keys.get("consensus"), stored_keys.get("companion")]
-            .into_iter()
-            .flatten()
-            .map(|k| TezosKey {
-                name: k.alias.clone(),
-                value: k.public_key_hash.clone(),
-            })
-            .collect()
-    }
-
     #[test]
     fn test_keys_returned_in_correct_order() {
         let mut stored_keys = HashMap::new();
         stored_keys.insert("companion".to_string(), make_stored_key("companion"));
         stored_keys.insert("consensus".to_string(), make_stored_key("consensus"));
 
-        let keys = lookup_keys(&stored_keys);
+        let keys = order_keys(&stored_keys);
 
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].name, "consensus");
@@ -81,7 +73,7 @@ mod tests {
         let mut stored_keys = HashMap::new();
         stored_keys.insert("companion".to_string(), make_stored_key("companion"));
 
-        let keys = lookup_keys(&stored_keys);
+        let keys = order_keys(&stored_keys);
 
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].name, "companion");
@@ -90,7 +82,7 @@ mod tests {
     #[test]
     fn test_empty_keys() {
         let stored_keys = HashMap::new();
-        let keys = lookup_keys(&stored_keys);
+        let keys = order_keys(&stored_keys);
         assert!(keys.is_empty());
     }
 }
