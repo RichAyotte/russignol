@@ -18,15 +18,79 @@ pub struct TezosKey {
 ///
 /// Returns alias and public key hash from the unencrypted `public_key_hashs` file.
 /// Secret keys are only available in memory after PIN decryption.
+///
+/// Keys are returned in deterministic order: consensus first, then companion.
+/// The host utility expects `[0]` = consensus and `[1]` = companion.
 pub fn get_keys() -> Vec<TezosKey> {
     // Only load public keys - secret keys are passed in memory, never read from disk
     let key_manager = WalletKeyManager::new(Some(PathBuf::from(KEYS_DIR)));
     let stored_keys = key_manager.load_keys();
-    stored_keys
-        .into_values()
-        .map(|stored_key| TezosKey {
-            name: stored_key.alias,
-            value: stored_key.public_key_hash,
+
+    // Look up keys by alias in the expected order: consensus first, companion second
+    [stored_keys.get("consensus"), stored_keys.get("companion")]
+        .into_iter()
+        .flatten()
+        .map(|k| TezosKey {
+            name: k.alias.clone(),
+            value: k.public_key_hash.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use russignol_signer_lib::wallet::StoredKey;
+    use std::collections::HashMap;
+
+    fn make_stored_key(alias: &str) -> StoredKey {
+        StoredKey {
+            alias: alias.to_string(),
+            public_key_hash: format!("tz1{alias}hash"),
+            public_key: String::new(),
+            secret_key: None,
+        }
+    }
+
+    fn lookup_keys(stored_keys: &HashMap<String, StoredKey>) -> Vec<TezosKey> {
+        [stored_keys.get("consensus"), stored_keys.get("companion")]
+            .into_iter()
+            .flatten()
+            .map(|k| TezosKey {
+                name: k.alias.clone(),
+                value: k.public_key_hash.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_keys_returned_in_correct_order() {
+        let mut stored_keys = HashMap::new();
+        stored_keys.insert("companion".to_string(), make_stored_key("companion"));
+        stored_keys.insert("consensus".to_string(), make_stored_key("consensus"));
+
+        let keys = lookup_keys(&stored_keys);
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].name, "consensus");
+        assert_eq!(keys[1].name, "companion");
+    }
+
+    #[test]
+    fn test_missing_consensus_key() {
+        let mut stored_keys = HashMap::new();
+        stored_keys.insert("companion".to_string(), make_stored_key("companion"));
+
+        let keys = lookup_keys(&stored_keys);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "companion");
+    }
+
+    #[test]
+    fn test_empty_keys() {
+        let stored_keys = HashMap::new();
+        let keys = lookup_keys(&stored_keys);
+        assert!(keys.is_empty());
+    }
 }

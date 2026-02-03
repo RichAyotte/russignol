@@ -518,6 +518,13 @@ fn discover_and_import_keys(
         );
     }
 
+    // Validate keys are distinct (defensive check against signer bugs)
+    if remote_keys[0] == remote_keys[1] {
+        anyhow::bail!(
+            "Signer returned duplicate keys - consensus and companion have the same public key hash"
+        );
+    }
+
     // Check if keys are already correctly imported
     let signer_ip = config.signer_ip();
     if let Ok((consensus_ok, companion_ok)) = check_keys_correctly_imported(
