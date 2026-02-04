@@ -1,6 +1,7 @@
 //! Changelog generation from Conventional Commits
 
 use anyhow::{Context, Result, bail};
+use chrono::{Local, NaiveDate};
 use regex::Regex;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -64,13 +65,13 @@ impl CommitType {
 
     fn section_title(self) -> &'static str {
         match self {
-            Self::Feat => "Features",
-            Self::Fix => "Bug Fixes",
+            Self::Feat => "Added",
+            Self::Fix => "Fixed",
             Self::Docs => "Documentation",
             Self::Refactor => "Refactoring",
             Self::Test => "Tests",
             Self::Chore => "Chores",
-            Self::Perf => "Performance",
+            Self::Perf => "Changed",
             Self::Style => "Style",
             Self::Ci => "CI",
             Self::Build => "Build",
@@ -241,6 +242,34 @@ pub fn get_previous_component_tag(component_prefix: &str) -> Result<Option<Strin
     Ok(None)
 }
 
+/// Get the current date in YYYY-MM-DD format
+pub fn get_current_date() -> String {
+    Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// Get the date a tag was created in YYYY-MM-DD format
+pub fn get_tag_date(tag: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args(["log", "-1", "--format=%ci", tag])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .context("Failed to run git log")?;
+
+    if output.status.success() {
+        let date_str = String::from_utf8_lossy(&output.stdout);
+        // Parse YYYY-MM-DD from "YYYY-MM-DD HH:MM:SS +ZZZZ"
+        if let Some(date_part) = date_str.split_whitespace().next()
+            && NaiveDate::parse_from_str(date_part, "%Y-%m-%d").is_ok()
+        {
+            return Ok(date_part.to_string());
+        }
+    }
+
+    // Fall back to current date if we can't get the tag date
+    Ok(get_current_date())
+}
+
 /// Fetch tags from remote to ensure we have all tags for changelog generation
 pub fn fetch_remote_tags() -> Result<()> {
     eprintln!("Fetching tags from remote...");
@@ -260,10 +289,18 @@ pub fn fetch_remote_tags() -> Result<()> {
 }
 
 /// Get commits since a tag (or all commits if no tag), optionally filtered by scope
-pub fn get_commits_since(tag: Option<&str>, scope_filter: Option<&str>) -> Result<Vec<String>> {
+///
+/// - `tag`: The starting tag (exclusive). If None, gets all commits up to `end_ref`.
+/// - `end_ref`: The ending reference (inclusive). Usually a tag or "HEAD".
+/// - `scope_filter`: Optional scope to filter commits by.
+pub fn get_commits_since(
+    tag: Option<&str>,
+    end_ref: &str,
+    scope_filter: Option<&str>,
+) -> Result<Vec<String>> {
     let range = match tag {
-        Some(t) => format!("{t}..HEAD"),
-        None => "HEAD".to_string(),
+        Some(t) => format!("{t}..{end_ref}"),
+        None => end_ref.to_string(),
     };
 
     let output = Command::new("git")
@@ -350,7 +387,7 @@ pub fn get_bump_type_for_component(
         get_current_tag()?
     };
 
-    let commit_lines = get_commits_since(tag.as_deref(), scope_filter)?;
+    let commit_lines = get_commits_since(tag.as_deref(), "HEAD", scope_filter)?;
 
     if commit_lines.is_empty() {
         bail!("No commits found since last release. Nothing to bump.");
@@ -404,9 +441,19 @@ pub fn bump_version(version: &str, bump_type: BumpType) -> Result<String> {
 }
 
 /// Generate changelog markdown from parsed commits
-pub fn generate_changelog(version: &str, commits: &[ParsedCommit]) -> String {
+///
+/// - `version`: The version string (e.g., "1.2.3")
+/// - `date`: The release date in YYYY-MM-DD format
+/// - `previous_tag`: The previous version tag for the compare link (e.g., "v1.2.2")
+/// - `commits`: The parsed commits to include
+pub fn generate_changelog(
+    version: &str,
+    date: &str,
+    previous_tag: Option<&str>,
+    commits: &[ParsedCommit],
+) -> String {
     let mut output = String::new();
-    output.push_str("## What's Changed\n");
+    let _ = writeln!(output, "## [{version}] - {date}");
 
     // Separate breaking changes
     let breaking: Vec<_> = commits.iter().filter(|c| c.breaking).collect();
@@ -438,10 +485,13 @@ pub fn generate_changelog(version: &str, commits: &[ParsedCommit]) -> String {
         }
     }
 
-    let _ = write!(
-        output,
-        "\n**Full Changelog**: https://github.com/RichAyotte/russignol/compare/v{version}...HEAD\n"
-    );
+    // Compare link: previous_tag...v{version}
+    if let Some(prev) = previous_tag {
+        let _ = write!(
+            output,
+            "\n**Full Changelog**: https://github.com/RichAyotte/russignol/compare/{prev}...v{version}\n"
+        );
+    }
 
     output
 }
@@ -483,17 +533,22 @@ pub fn create_changelog_file_for_component(
     // Get the previous tag relative to the current version's tag
     // This ensures we get the correct range even when called after the release commit
     // (e.g., during publish --github retry after a failed release)
-    let tag = if tag_exists(&current_tag)? {
-        // Current tag exists - find the tag before it
-        get_tag_before(&current_tag)?
+    // Determine the commit range: previous_tag..end_ref
+    // When current_tag exists, use it as end_ref to avoid including commits after this release
+    let (tag, end_ref) = if tag_exists(&current_tag)? {
+        // Current tag exists - find the tag before it and use current tag as end
+        (get_tag_before(&current_tag)?, current_tag.clone())
     } else if let Some(prefix) = component_prefix {
         // Current tag doesn't exist yet - use component tag or fall back to release tag
-        get_previous_component_tag(prefix)?.or(get_previous_tag()?)
+        (
+            get_previous_component_tag(prefix)?.or(get_previous_tag()?),
+            "HEAD".to_string(),
+        )
     } else {
-        get_previous_tag()?
+        (get_previous_tag()?, "HEAD".to_string())
     };
 
-    let commit_lines = get_commits_since(tag.as_deref(), scope_filter)?;
+    let commit_lines = get_commits_since(tag.as_deref(), &end_ref, scope_filter)?;
 
     // Only include user-facing commits (feat, fix, perf) and breaking changes
     let commits: Vec<ParsedCommit> = commit_lines
@@ -502,7 +557,14 @@ pub fn create_changelog_file_for_component(
         .filter(|c| c.breaking || c.commit_type.is_user_facing())
         .collect();
 
-    let changelog = generate_changelog(version, &commits);
+    // Get date: if tag exists, use tag date; otherwise use current date
+    let date = if tag_exists(&current_tag)? {
+        get_tag_date(&current_tag)?
+    } else {
+        get_current_date()
+    };
+
+    let changelog = generate_changelog(version, &date, tag.as_deref(), &commits);
 
     // Include component prefix in filename if present
     let path = if let Some(prefix) = component_prefix {
@@ -605,18 +667,15 @@ mod tests {
             },
         ];
 
-        let changelog = generate_changelog("1.0.0", &commits);
+        let changelog = generate_changelog("1.0.0", "2024-01-15", Some("v0.9.0"), &commits);
 
-        // Features should come before Bug Fixes, which should come before Documentation
-        let feat_pos = changelog.find("### Features").unwrap();
-        let fix_pos = changelog.find("### Bug Fixes").unwrap();
+        // Added should come before Fixed, which should come before Documentation
+        let feat_pos = changelog.find("### Added").unwrap();
+        let fix_pos = changelog.find("### Fixed").unwrap();
         let docs_pos = changelog.find("### Documentation").unwrap();
 
-        assert!(feat_pos < fix_pos, "Features should come before Bug Fixes");
-        assert!(
-            fix_pos < docs_pos,
-            "Bug Fixes should come before Documentation"
-        );
+        assert!(feat_pos < fix_pos, "Added should come before Fixed");
+        assert!(fix_pos < docs_pos, "Fixed should come before Documentation");
     }
 
     #[test]
@@ -638,14 +697,61 @@ mod tests {
             },
         ];
 
-        let changelog = generate_changelog("1.0.0", &commits);
+        let changelog = generate_changelog("1.0.0", "2024-01-15", Some("v0.9.0"), &commits);
 
         let breaking_pos = changelog.find("### Breaking Changes").unwrap();
-        let feat_pos = changelog.find("### Features").unwrap();
+        let feat_pos = changelog.find("### Added").unwrap();
 
         assert!(
             breaking_pos < feat_pos,
-            "Breaking Changes should come before Features"
+            "Breaking Changes should come before Added"
+        );
+    }
+
+    #[test]
+    fn test_generate_changelog_header_and_compare_link() {
+        let commits = vec![ParsedCommit {
+            commit_type: CommitType::Feat,
+            scope: None,
+            description: "new feature".to_string(),
+            hash: "abc1234".to_string(),
+            breaking: false,
+        }];
+
+        let changelog = generate_changelog("1.2.0", "2024-03-15", Some("v1.1.0"), &commits);
+
+        // Check version header format: ## [version] - YYYY-MM-DD
+        assert!(
+            changelog.contains("## [1.2.0] - 2024-03-15"),
+            "Should have Keep a Changelog header format"
+        );
+
+        // Check compare link format: compare/previous_tag...v{version}
+        assert!(
+            changelog.contains("compare/v1.1.0...v1.2.0"),
+            "Should have correct compare link format"
+        );
+    }
+
+    #[test]
+    fn test_generate_changelog_no_previous_tag() {
+        let commits = vec![ParsedCommit {
+            commit_type: CommitType::Feat,
+            scope: None,
+            description: "initial feature".to_string(),
+            hash: "abc1234".to_string(),
+            breaking: false,
+        }];
+
+        let changelog = generate_changelog("0.1.0", "2024-01-01", None, &commits);
+
+        // Header should still be present
+        assert!(changelog.contains("## [0.1.0] - 2024-01-01"));
+
+        // Compare link should be omitted when no previous tag
+        assert!(
+            !changelog.contains("Full Changelog"),
+            "Should not have compare link without previous tag"
         );
     }
 
