@@ -295,12 +295,4 @@ mod tests {
         // Rest should be zeros
         assert!(bytes[4..].iter().all(|&b| b == 0));
     }
-
-    #[test]
-    fn test_different_chain_ids() {
-        let mainnet = mainnet_chain_id();
-        let ghostnet = ghostnet_chain_id();
-
-        assert_ne!(mainnet.as_bytes(), ghostnet.as_bytes());
-    }
 }

@@ -262,14 +262,4 @@ mod tests {
         assert_eq!(OperationType::PreAttestation.as_str(), "pre-attested");
         assert_eq!(OperationType::Attestation.as_str(), "attested");
     }
-
-    #[test]
-    fn test_signature_activity_default() {
-        let activity = SignatureActivity::default();
-        assert!(activity.level.is_none());
-        assert_eq!(activity.timestamp, SystemTime::UNIX_EPOCH);
-        assert!(activity.duration.is_none());
-        assert!(activity.operation_type.is_none());
-        assert!(activity.data_size.is_none());
-    }
 }

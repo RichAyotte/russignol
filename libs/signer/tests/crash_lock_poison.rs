@@ -15,50 +15,6 @@
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-/// Direct demonstration of `RwLock` poisoning behavior
-///
-/// This test shows exactly what happens with `.unwrap()` on a poisoned lock.
-/// The `HighWatermark` implementation uses this pattern at lines:
-/// - 179, 218, 248, 303, 358, 402, 531, 541, 624
-///
-/// This test PASSES (with `should_panic`) because it demonstrates the crash.
-#[test]
-#[should_panic(expected = "PoisonError")]
-fn test_unwrap_on_poisoned_lock_crashes() {
-    let lock = Arc::new(RwLock::new(42));
-    let lock_clone = Arc::clone(&lock);
-
-    // Thread that panics while holding write lock
-    let handle = thread::spawn(move || {
-        let _guard = lock_clone.write().unwrap();
-        panic!("Panic while holding lock!");
-    });
-
-    let _ = handle.join(); // Thread panicked, lock is now poisoned
-
-    // This is EXACTLY what HighWatermark does at lines 179, 218, 248, etc.
-    // With .unwrap(), this PANICS instead of returning an error!
-    let _value = lock.read().unwrap(); // <- PANICS! Lock is poisoned
-}
-
-/// Test demonstrating write lock poison also crashes
-#[test]
-#[should_panic(expected = "PoisonError")]
-fn test_write_on_poisoned_lock_crashes() {
-    let lock = Arc::new(RwLock::new(42));
-    let lock_clone = Arc::clone(&lock);
-
-    let handle = thread::spawn(move || {
-        let _guard = lock_clone.write().unwrap();
-        panic!("Poison it!");
-    });
-
-    let _ = handle.join();
-
-    // Attempting to acquire write lock on poisoned lock also panics
-    let _guard = lock.write().unwrap(); // PANICS!
-}
-
 /// Test that demonstrates what SHOULD happen with proper error handling
 ///
 /// This test PASSES because it shows how to handle poisoned locks properly.

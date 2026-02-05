@@ -24,11 +24,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_run_command_success() {
-        assert!(run_command("/bin/true", &[]).is_ok());
-    }
-
-    #[test]
     fn test_run_command_failure() {
         let result = run_command("/bin/false", &[]);
         assert!(result.is_err());

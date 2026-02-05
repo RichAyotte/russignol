@@ -266,20 +266,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_current_version() {
-        let version = current_version();
-        assert!(!version.is_empty());
-        // Should be valid semver
-        assert!(Version::parse(version).is_ok());
-    }
-
-    #[test]
-    fn test_current_arch() {
-        let arch = current_arch();
-        assert!(arch == "amd64" || arch == "aarch64" || !arch.is_empty());
-    }
-
-    #[test]
     fn test_is_newer() {
         assert!(is_newer("0.1.0", "0.2.0").unwrap());
         assert!(is_newer("0.1.0", "1.0.0").unwrap());

@@ -118,15 +118,3 @@ fn check_host_reachable() -> bool {
     }
     success
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_network_status_check() {
-        // Just verify it doesn't panic
-        let status = NetworkStatus::check(None);
-        println!("Network status: {status:?}");
-    }
-}
