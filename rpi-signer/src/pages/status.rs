@@ -18,6 +18,7 @@ use embedded_graphics::{
 };
 use russignol_signer_lib::signing_activity::SigningActivity;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use u8g2_fonts::FontRenderer;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -33,16 +34,13 @@ fn truncate_key(key: &str) -> String {
 }
 
 pub struct StatusPage {
-    // Event sender for navigation
     app_sender: Sender<AppEvent>,
-    // Signing activity for tracking last request time
-    signing_activity: Arc<Mutex<SigningActivity>>,
+    network_status: Arc<Mutex<NetworkStatus>>,
     // Cached values
     chain_name: String,
     chain_id: String,
     consensus_pkh: Option<String>,
     companion_pkh: Option<String>,
-    network_status: NetworkStatus,
 }
 
 impl StatusPage {
@@ -70,33 +68,56 @@ impl StatusPage {
             }
         };
 
+        // Seed with a fast interface check so the first draw shows "Offline" vs
+        // "No Host" correctly. The slow ping runs on the background thread.
+        let initial = NetworkStatus {
+            interface_configured: crate::network_status::check_interface_configured(),
+            ..NetworkStatus::default()
+        };
+        let network_status = Arc::new(Mutex::new(initial));
+
+        // Spawn background thread to check network status periodically.
+        // The thread holds a Weak ref to network_status — when StatusPage drops
+        // (page navigation, dialog overlay, etc.), the Weak fails to upgrade
+        // and the thread exits on its own.
+        let ns_weak = Arc::downgrade(&network_status);
+        let tx = app_sender.clone();
+        std::thread::spawn(move || {
+            loop {
+                let Some(ns) = ns_weak.upgrade() else {
+                    return;
+                };
+
+                let last_sig_time = signing_activity.lock().ok().and_then(|activity| {
+                    let ct = activity.consensus.as_ref().map(|c| c.timestamp);
+                    let cpt = activity.companion.as_ref().map(|c| c.timestamp);
+                    match (ct, cpt) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (Some(t), None) | (None, Some(t)) => Some(t),
+                        (None, None) => None,
+                    }
+                });
+
+                let status = NetworkStatus::check(last_sig_time);
+                if let Ok(mut guard) = ns.lock() {
+                    *guard = status;
+                }
+                // Drop the strong ref before sleeping so StatusPage can be dropped mid-sleep
+                drop(ns);
+
+                let _ = tx.send(AppEvent::DirtyDisplay);
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+
         Self {
             app_sender,
-            signing_activity,
+            network_status,
             chain_name,
             chain_id,
             consensus_pkh,
             companion_pkh,
-            network_status: NetworkStatus::default(),
         }
-    }
-
-    /// Update cached values before rendering
-    fn update_state(&mut self) {
-        // Update network status based on last signing activity
-        let last_sig_time = if let Ok(activity) = self.signing_activity.lock() {
-            let consensus_time = activity.consensus.as_ref().map(|c| c.timestamp);
-            let companion_time = activity.companion.as_ref().map(|c| c.timestamp);
-            match (consensus_time, companion_time) {
-                (Some(c), Some(comp)) => Some(c.max(comp)),
-                (Some(c), None) => Some(c),
-                (None, Some(comp)) => Some(comp),
-                (None, None) => None,
-            }
-        } else {
-            None
-        };
-        self.network_status = NetworkStatus::check(last_sig_time);
     }
 }
 
@@ -117,9 +138,12 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for StatusPage {
     }
 
     fn draw(&mut self, display: &mut D) -> Result<(), D::Error> {
-        self.update_state();
+        let network_status = self
+            .network_status
+            .lock()
+            .map_or_else(|e| *e.into_inner(), |guard| *guard);
 
-        draw_header(display, self.network_status);
+        draw_header(display, network_status);
         draw_separator(display)?;
         draw_chain_info(display, &self.chain_name, &self.chain_id);
         draw_key_row(display, self.consensus_pkh.as_ref(), "1", CONTENT_ROW_3);

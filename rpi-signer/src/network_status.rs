@@ -42,7 +42,7 @@ impl NetworkStatus {
 }
 
 /// Check if the network interface has an IP address configured
-fn check_interface_configured() -> bool {
+pub fn check_interface_configured() -> bool {
     // Try to get IP address using `ip addr show usb0`
     let output = match Command::new("ip")
         .args(["addr", "show", INTERFACE_NAME])
