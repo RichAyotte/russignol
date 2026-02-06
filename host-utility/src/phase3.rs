@@ -7,8 +7,6 @@ use crate::utils::{JsonValueExt, read_file, run_octez_client_command};
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
-use std::thread::sleep;
-use std::time::Duration;
 
 pub fn run(
     backup_dir: &Path,
@@ -246,37 +244,7 @@ fn get_baker_key(
                     anyhow::bail!("Failed to re-register delegate: {stderr}");
                 }
 
-                // Wait and verify
-                std::thread::sleep(std::time::Duration::from_secs(5));
-
-                for attempt in 1..=12 {
-                    log::debug!("Verification attempt {attempt}/12");
-                    let verify_output = run_octez_client_command(
-                        &[
-                            "rpc",
-                            "get",
-                            &format!("/chains/main/blocks/head/context/delegates/{baker_key}"),
-                        ],
-                        config,
-                    );
-
-                    if let Ok(verify_output) = verify_output
-                        && verify_output.status.success()
-                        && let Ok(info) =
-                            serde_json::from_slice::<serde_json::Value>(&verify_output.stdout)
-                    {
-                        let still_deactivated = info.get_bool("deactivated").unwrap_or(true);
-
-                        if !still_deactivated {
-                            log::info!("Baker {baker_key} successfully reactivated");
-                            break;
-                        }
-                    }
-
-                    if attempt < 12 {
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-                    }
-                }
+                log::info!("Baker {baker_key} successfully reactivated");
             } else {
                 log::info!("User declined to re-register deactivated baker {baker_key}");
                 anyhow::bail!(
@@ -673,10 +641,6 @@ fn validate_keys_in_filesystem(client_dir: &Path, signer_ip: &str) -> Result<()>
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "multi-step key assignment and verification"
-)]
 fn assign_and_verify_keys(
     baker_key: &str,
     dry_run: bool,
@@ -733,43 +697,6 @@ fn assign_and_verify_keys(
             let stderr = String::from_utf8_lossy(&set_consensus.stderr);
             anyhow::bail!("Failed to set consensus key: {stderr}");
         }
-
-        // Wait for consensus key operation to be included in a block before setting companion key (silent - progress shown in main)
-        sleep(Duration::from_secs(5));
-
-        // Poll for consensus key confirmation
-        let mut consensus_confirmed = false;
-        for i in 0..12 {
-            log::debug!(
-                "Polling for consensus key confirmation (attempt {}/12)",
-                i + 1
-            );
-
-            match check_individual_keys_on_chain(baker_key, &consensus_pkh, &companion_pkh, config)
-            {
-                Ok((true, _)) => {
-                    consensus_confirmed = true;
-                    break;
-                }
-                Ok((false, _)) => {
-                    if i < 11 {
-                        sleep(Duration::from_secs(5));
-                    }
-                }
-                Err(e) => {
-                    log::debug!("Error checking consensus key status: {e}");
-                    if i < 11 {
-                        sleep(Duration::from_secs(5));
-                    }
-                }
-            }
-        }
-
-        if !consensus_confirmed {
-            anyhow::bail!(
-                "Consensus key operation submitted but not confirmed after 60 seconds. Please check status manually before setting companion key."
-            );
-        }
     }
 
     // Set companion key only if needed
@@ -793,146 +720,7 @@ fn assign_and_verify_keys(
         }
     }
 
-    // If both were already set, we're done
-    if consensus_matches && companion_matches {
-        return Ok(());
-    }
-
-    // Wait for operations to be included in a block (silent - progress shown in main)
-    sleep(Duration::from_secs(5)); // Give some time for injection
-
-    // Poll for up to 60 seconds
-    let mut confirmed = false;
-    for i in 0..12 {
-        log::debug!("Polling for operation confirmation (attempt {}/12)", i + 1);
-
-        // Check if keys are set on-chain
-        match verify_keys_on_chain(baker_key, &consensus_pkh, &companion_pkh, config) {
-            Ok(true) => {
-                confirmed = true;
-                break;
-            }
-            Ok(false) => {
-                if i < 11 {
-                    sleep(Duration::from_secs(5));
-                }
-            }
-            Err(e) => {
-                log::debug!("Error checking on-chain status: {e}");
-                if i < 11 {
-                    sleep(Duration::from_secs(5));
-                }
-            }
-        }
-    }
-
-    if !confirmed {
-        anyhow::bail!(
-            "Operations submitted but not yet confirmed after 60 seconds. Check operations status manually with octez-client."
-        );
-    }
-
     Ok(())
-}
-
-fn verify_keys_on_chain(
-    baker_key: &str,
-    expected_consensus: &str,
-    expected_companion: &str,
-    config: &RussignolConfig,
-) -> Result<bool> {
-    let output = run_octez_client_command(
-        &[
-            "rpc",
-            "get",
-            &format!("/chains/main/blocks/head/context/delegates/{baker_key}"),
-        ],
-        config,
-    )?;
-
-    if !output.status.success() {
-        return Ok(false);
-    }
-
-    let delegate_info: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("Failed to parse delegate info")?;
-
-    // Check consensus key (active or pending)
-    let consensus_key_obj = delegate_info.get_nested("consensus_key");
-
-    let active_consensus = consensus_key_obj
-        .and_then(|ck| ck.get_nested("active"))
-        .and_then(|active| active.get_str("pkh"))
-        .unwrap_or("");
-
-    // Also check pendings array for consensus key
-    let mut pending_consensus = false;
-    if let Some(pendings) = consensus_key_obj
-        .and_then(|ck| ck.get_nested("pendings"))
-        .and_then(|p| p.as_array())
-    {
-        for pending in pendings {
-            if let Some(pkh) = pending.get_str("pkh")
-                && pkh == expected_consensus
-            {
-                pending_consensus = true;
-                break;
-            }
-        }
-    }
-
-    let consensus_match = active_consensus == expected_consensus || pending_consensus;
-
-    // Check companion key (active or pending)
-    let companion_key_obj = delegate_info.get_nested("companion_key");
-
-    let active_companion = companion_key_obj
-        .and_then(|ck| ck.get_nested("active"))
-        .and_then(|active| {
-            if active.is_null() {
-                None
-            } else {
-                active.get_str("pkh")
-            }
-        })
-        .unwrap_or("");
-
-    // Also check pendings array for companion key
-    let mut pending_companion = false;
-    if let Some(pendings) = companion_key_obj
-        .and_then(|ck| ck.get_nested("pendings"))
-        .and_then(|p| p.as_array())
-    {
-        for pending in pendings {
-            if let Some(pkh) = pending.get_str("pkh")
-                && pkh == expected_companion
-            {
-                pending_companion = true;
-                break;
-            }
-        }
-    }
-
-    let companion_match = active_companion == expected_companion || pending_companion;
-
-    log::debug!("On-chain active consensus key: {active_consensus}");
-    log::debug!("Consensus key pending: {pending_consensus}");
-    log::debug!("Expected consensus key: {expected_consensus}");
-    log::debug!("On-chain active companion key: {active_companion}");
-    log::debug!("Companion key pending: {pending_companion}");
-    log::debug!("Expected companion key: {expected_companion}");
-
-    if consensus_match && companion_match {
-        Ok(true)
-    } else {
-        if !consensus_match {
-            log::debug!("Consensus key mismatch");
-        }
-        if !companion_match {
-            log::debug!("Companion key mismatch");
-        }
-        Ok(false)
-    }
 }
 
 fn check_individual_keys_on_chain(

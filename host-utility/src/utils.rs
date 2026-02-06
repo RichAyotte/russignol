@@ -105,6 +105,8 @@ pub fn run_octez_client_command(
         .to_str()
         .context("Invalid client directory path")?;
     let mut full_args = vec![
+        "--wait",
+        "1",
         "--endpoint",
         config.rpc_endpoint.as_str(),
         "--base-dir",

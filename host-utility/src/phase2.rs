@@ -193,7 +193,7 @@ fn manage_udev_rule(backup_dir: &Path, dry_run: bool, verbose: bool) -> Result<(
 
 // find_russignol_network_interface moved to hardware::find_russignol_network_interface()
 
-/// Install NetworkManager unmanaged config early so NM won't interfere with the
+/// Install `NetworkManager` unmanaged config early so NM won't interfere with the
 /// russignol interface when the udev rule triggers or the device reconnects.
 fn install_nm_unmanaged_config(
     backup_dir: &Path,
