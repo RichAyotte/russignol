@@ -3,7 +3,7 @@ use crate::blockchain;
 use crate::config::RussignolConfig;
 use crate::constants::{COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, ORANGE_RGB};
 use crate::keys;
-use crate::utils::{JsonValueExt, read_file, run_octez_client_command};
+use crate::utils::{JsonValueExt, info, read_file, run_octez_client_command, success};
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
@@ -202,6 +202,8 @@ fn get_baker_key(
         .map(|(_, alias, addr)| (alias.clone(), addr.clone()))
         .context("Selected address not found")?;
 
+    info("Checking baker registration status...");
+
     let is_registered = blockchain::is_registered_delegate(&baker_key, config);
 
     if is_registered {
@@ -234,6 +236,8 @@ fn get_baker_key(
             if should_reregister {
                 log::info!("User chose to re-register deactivated baker {baker_key}");
 
+                info("Re-registering baker...");
+
                 let register_output = run_octez_client_command(
                     &["register", "key", &input_key, "as", "delegate"],
                     config,
@@ -244,6 +248,7 @@ fn get_baker_key(
                     anyhow::bail!("Failed to re-register delegate: {stderr}");
                 }
 
+                success("Baker re-registered");
                 log::info!("Baker {baker_key} successfully reactivated");
             } else {
                 log::info!("User declined to re-register deactivated baker {baker_key}");
@@ -261,6 +266,7 @@ fn get_baker_key(
         Ok(baker_key)
     } else {
         // Not registered yet, check balance first
+        info("Checking baker balance and requirements...");
 
         // Get the minimum stake requirement from chain constants
         let constants_output = run_octez_client_command(
@@ -321,6 +327,8 @@ fn get_baker_key(
             crate::utils::prompt_yes_no("Would you like to register it now?", auto_confirm)?;
 
         if should_register {
+            info("Registering baker as delegate...");
+
             let register_output = run_octez_client_command(
                 &["register", "key", &input_key, "as", "delegate"],
                 config,
@@ -331,7 +339,7 @@ fn get_baker_key(
                 anyhow::bail!("Failed to register delegate: {stderr}");
             }
 
-            crate::utils::success("Delegate registered successfully");
+            success("Delegate registered successfully");
 
             // Check if stake has been set for the newly registered baker
             if let Err(e) =
@@ -355,6 +363,8 @@ fn check_and_set_stake(
     auto_confirm: bool,
     config: &RussignolConfig,
 ) -> Result<()> {
+    info("Checking staking parameters...");
+
     // Query the baker's staking parameters
     let delegate_output = run_octez_client_command(
         &[
@@ -435,6 +445,8 @@ fn check_and_set_stake(
                 "Setting stake for baker {baker_key}: amount={stake_amount} ꜩ, alias={baker_alias}"
             );
 
+            info("Setting stake...");
+
             let stake_output =
                 run_octez_client_command(&["stake", &stake_amount, "for", baker_alias], config)?;
 
@@ -448,12 +460,16 @@ fn check_and_set_stake(
                 anyhow::bail!("Failed to set stake: {stderr}");
             }
 
+            success("Stake set successfully");
             log::info!("Stake operation submitted successfully for baker {baker_key}");
         } else {
             log::info!("User declined to set stake for baker {baker_key}");
         }
     } else {
         let stake_percentage = crate::blockchain::percentage(staked_balance, full_balance);
+        success(&format!(
+            "Stake already set: {staked_balance_tez:.2} ꜩ ({stake_percentage:.1}% of balance)"
+        ));
         log::info!(
             "Baker {baker_key} already has stake set: {staked_balance_tez:.2} ꜩ ({stake_percentage:.1}% of total balance)"
         );
@@ -477,6 +493,8 @@ fn discover_and_import_keys(
     }
 
     // Discover keys from the remote signer
+    info("Discovering remote keys from signer...");
+
     let remote_keys = keys::discover_remote_keys(config)?;
 
     if remote_keys.len() < 2 {
@@ -493,6 +511,8 @@ fn discover_and_import_keys(
         );
     }
 
+    success(&format!("Found {} remote keys", remote_keys.len()));
+
     // Check if keys are already correctly imported
     let signer_ip = config.signer_ip();
     if let Ok((consensus_ok, companion_ok)) = check_keys_correctly_imported(
@@ -503,7 +523,9 @@ fn discover_and_import_keys(
     ) && consensus_ok
         && companion_ok
     {
-        // Validation: Primary - CLI check (silent - progress shown in main)
+        info("Validating imported keys...");
+
+        // Validation: Primary - CLI check
         let list_output = run_octez_client_command(&["list", "known", "addresses"], config)
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .context("Failed to list known addresses")?;
@@ -517,13 +539,16 @@ fn discover_and_import_keys(
             anyhow::bail!("Keys not found in octez-client after import (CLI validation failed)");
         }
 
-        // Validation: Secondary - File system check (silent - progress shown in main)
+        // Validation: Secondary - File system check
         validate_keys_in_filesystem(client_dir, signer_ip)?;
+
+        success("Keys validated");
 
         return Ok(());
     }
 
     // Import the first two keys as consensus and companion
+    info("Importing consensus key...");
     import_key_with_backup(
         CONSENSUS_KEY_ALIAS,
         &remote_keys[0],
@@ -533,7 +558,9 @@ fn discover_and_import_keys(
         verbose,
         config,
     )?;
+    success("Consensus key imported");
 
+    info("Importing companion key...");
     import_key_with_backup(
         COMPANION_KEY_ALIAS,
         &remote_keys[1],
@@ -543,8 +570,11 @@ fn discover_and_import_keys(
         verbose,
         config,
     )?;
+    success("Companion key imported");
 
-    // Validation: Primary - CLI check (silent - progress shown in main)
+    info("Validating imported keys...");
+
+    // Validation: Primary - CLI check
     let list_output = run_octez_client_command(&["list", "known", "addresses"], config)
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .context("Failed to list known addresses")?;
@@ -558,8 +588,10 @@ fn discover_and_import_keys(
         anyhow::bail!("Keys not found in octez-client after import (CLI validation failed)");
     }
 
-    // Validation: Secondary - File system check (silent - progress shown in main)
+    // Validation: Secondary - File system check
     validate_keys_in_filesystem(client_dir, config.signer_ip())?;
+
+    success("Keys validated");
 
     Ok(())
 }
@@ -652,7 +684,9 @@ fn assign_and_verify_keys(
         return Ok(());
     }
 
-    // Get the public key hashes for the imported keys (in parallel, silent - progress shown in main)
+    info("Checking key assignments...");
+
+    // Get the public key hashes for the imported keys (in parallel)
     let (consensus_result, companion_result) = std::thread::scope(|s| {
         let config_ref = config;
 
@@ -668,7 +702,7 @@ fn assign_and_verify_keys(
     let consensus_pkh = consensus_result?;
     let companion_pkh = companion_result?;
 
-    // Check current key assignments on blockchain (silent - progress shown in main)
+    // Check current key assignments on blockchain
     let (consensus_matches, companion_matches) =
         match check_individual_keys_on_chain(baker_key, &consensus_pkh, &companion_pkh, config) {
             Ok((cons, comp)) => (cons, comp),
@@ -679,7 +713,10 @@ fn assign_and_verify_keys(
         };
 
     // Set consensus key only if needed
-    if !consensus_matches {
+    if consensus_matches {
+        success("Consensus key already set on-chain");
+    } else {
+        info("Setting consensus key on-chain...");
         let set_consensus = run_octez_client_command(
             &[
                 "set",
@@ -697,10 +734,14 @@ fn assign_and_verify_keys(
             let stderr = String::from_utf8_lossy(&set_consensus.stderr);
             anyhow::bail!("Failed to set consensus key: {stderr}");
         }
+        success("Consensus key set");
     }
 
     // Set companion key only if needed
-    if !companion_matches {
+    if companion_matches {
+        success("Companion key already set on-chain");
+    } else {
+        info("Setting companion key on-chain...");
         let set_companion = run_octez_client_command(
             &[
                 "set",
@@ -718,6 +759,7 @@ fn assign_and_verify_keys(
             let stderr = String::from_utf8_lossy(&set_companion.stderr);
             anyhow::bail!("Failed to set companion key: {stderr}");
         }
+        success("Companion key set");
     }
 
     Ok(())
