@@ -143,6 +143,8 @@ pub fn read_file(path: &Path) -> Result<String> {
 
 /// Run a command with sudo
 pub fn sudo_command(program: &str, args: &[&str]) -> Result<std::process::Output> {
+    let cmd_line = format!("  $ sudo {} {}", program, args.join(" "));
+    println!("{}", cmd_line.dimmed());
     let mut sudo_args = vec![program];
     sudo_args.extend(args);
     run_command("sudo", &sudo_args)
