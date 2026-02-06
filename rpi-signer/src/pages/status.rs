@@ -79,6 +79,7 @@ impl StatusPage {
         let ns_weak = Arc::downgrade(&network_status);
         let tx = app_sender.clone();
         std::thread::spawn(move || {
+            let mut prev_status: Option<NetworkStatus> = None;
             loop {
                 let Some(ns) = ns_weak.upgrade() else {
                     return;
@@ -101,7 +102,10 @@ impl StatusPage {
                 // Drop the strong ref before sleeping so StatusPage can be dropped mid-sleep
                 drop(ns);
 
-                let _ = tx.send(AppEvent::DirtyDisplay);
+                if prev_status.as_ref() != Some(&status) {
+                    let _ = tx.send(AppEvent::DirtyDisplay);
+                    prev_status = Some(status);
+                }
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
