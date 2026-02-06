@@ -35,7 +35,7 @@ fn truncate_key(key: &str) -> String {
 
 pub struct StatusPage {
     app_sender: Sender<AppEvent>,
-    network_status: Arc<Mutex<NetworkStatus>>,
+    network_status: Arc<Mutex<Option<NetworkStatus>>>,
     // Cached values
     chain_name: String,
     chain_id: String,
@@ -68,13 +68,9 @@ impl StatusPage {
             }
         };
 
-        // Seed with a fast interface check so the first draw shows "Offline" vs
-        // "No Host" correctly. The slow ping runs on the background thread.
-        let initial = NetworkStatus {
-            interface_configured: crate::network_status::check_interface_configured(),
-            ..NetworkStatus::default()
-        };
-        let network_status = Arc::new(Mutex::new(initial));
+        // Seed with None so the first draw shows "Verifying" until the
+        // background thread completes its first check.
+        let network_status: Arc<Mutex<Option<NetworkStatus>>> = Arc::new(Mutex::new(None));
 
         // Spawn background thread to check network status periodically.
         // The thread holds a Weak ref to network_status — when StatusPage drops
@@ -100,7 +96,7 @@ impl StatusPage {
 
                 let status = NetworkStatus::check(last_sig_time);
                 if let Ok(mut guard) = ns.lock() {
-                    *guard = status;
+                    *guard = Some(status);
                 }
                 // Drop the strong ref before sleeping so StatusPage can be dropped mid-sleep
                 drop(ns);
@@ -143,7 +139,7 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for StatusPage {
             .lock()
             .map_or_else(|e| *e.into_inner(), |guard| *guard);
 
-        draw_header(display, network_status);
+        draw_header(display, network_status.as_ref());
         draw_separator(display)?;
         draw_chain_info(display, &self.chain_name, &self.chain_id);
         draw_key_row(display, self.consensus_pkh.as_ref(), "1", CONTENT_ROW_3);
@@ -153,7 +149,10 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for StatusPage {
     }
 }
 
-fn draw_header<D: DrawTarget<Color = BinaryColor>>(display: &mut D, network_status: NetworkStatus) {
+fn draw_header<D: DrawTarget<Color = BinaryColor>>(
+    display: &mut D,
+    network_status: Option<&NetworkStatus>,
+) {
     let font = FontRenderer::new::<fonts::FONT_MEDIUM>();
 
     let version_str = format!("Russignol v{VERSION}");
@@ -167,14 +166,12 @@ fn draw_header<D: DrawTarget<Color = BinaryColor>>(display: &mut D, network_stat
     )
     .ok();
 
-    let status_str = if !network_status.interface_configured {
-        "Offline"
-    } else if !network_status.host_reachable {
-        "No Host"
-    } else if network_status.baker_active {
-        "Active"
-    } else {
-        "Ready"
+    let status_str = match network_status {
+        None => "Checking Host...",
+        Some(s) if !s.interface_configured => "Offline",
+        Some(s) if !s.host_reachable => "No Host",
+        Some(s) if s.baker_active => "Active",
+        Some(_) => "Ready",
     };
     font.render_aligned(
         status_str,
