@@ -125,6 +125,12 @@ pub fn run(
     // plugdev Group Membership Check (silent - progress shown in main)
     system::check_plugdev_with_warning()?;
 
+    // Install NM unmanaged config before udev rule so NetworkManager won't
+    // interfere when the udev trigger fires or the device reconnects
+    if nm_needs_update {
+        install_nm_unmanaged_config(backup_dir, config)?;
+    }
+
     // Udev Rule Management and Validation (silent - progress shown in main)
     if udev_needs_update {
         manage_udev_rule(backup_dir, config.dry_run, config.verbose)?;
@@ -132,7 +138,7 @@ pub fn run(
 
     // Network Configuration and Validation (silent - progress shown in main)
     if any_network_files_change {
-        manage_network_config(backup_dir, config, network_needs_update, nm_needs_update)?;
+        manage_network_config(backup_dir, config, network_needs_update)?;
     }
 
     Ok(())
@@ -168,7 +174,7 @@ fn manage_udev_rule(backup_dir: &Path, dry_run: bool, verbose: bool) -> Result<(
     // Wait and validate network interface appears (silent - progress shown in main)
     let mut interface_found = false;
 
-    for _ in 0..10 {
+    for _ in 0..45 {
         if hardware::find_russignol_network_interface() {
             interface_found = true;
             break;
@@ -187,11 +193,46 @@ fn manage_udev_rule(backup_dir: &Path, dry_run: bool, verbose: bool) -> Result<(
 
 // find_russignol_network_interface moved to hardware::find_russignol_network_interface()
 
+/// Install NetworkManager unmanaged config early so NM won't interfere with the
+/// russignol interface when the udev rule triggers or the device reconnects.
+fn install_nm_unmanaged_config(
+    backup_dir: &Path,
+    config: &crate::confirmation::ConfirmationConfig,
+) -> Result<()> {
+    if config.dry_run {
+        return Ok(());
+    }
+
+    let nm_path = Path::new(NETWORKMANAGER_CONFIG_PATH);
+    if nm_path.exists() {
+        backup::backup_file_if_exists(
+            nm_path,
+            backup_dir,
+            "unmanaged-russignol.conf",
+            config.verbose,
+        )?;
+    }
+    let nm_dir = nm_path.parent().unwrap();
+    sudo_command_success("mkdir", &["-p", &nm_dir.to_string_lossy()])?;
+    create_network_file(NETWORKMANAGER_CONFIG_PATH, NETWORKMANAGER_CONFIG_CONTENT)?;
+
+    // Restart NM so it picks up the unmanaged config immediately
+    if command_exists("systemctl") {
+        let nm_status = run_command("systemctl", &["is-active", "NetworkManager"]);
+        if let Ok(output) = nm_status
+            && String::from_utf8_lossy(&output.stdout).trim() == "active"
+        {
+            let _ = sudo_command("systemctl", &["restart", "NetworkManager"]);
+        }
+    }
+
+    Ok(())
+}
+
 fn manage_network_config(
     backup_dir: &Path,
     config: &crate::confirmation::ConfirmationConfig,
     network_needs_update: bool,
-    nm_needs_update: bool,
 ) -> Result<()> {
     if config.dry_run {
         return Ok(());
@@ -211,23 +252,8 @@ fn manage_network_config(
         create_network_file(NETWORK_CONFIG_PATH, NETWORK_CONFIG_CONTENT)?;
     }
 
-    // Backup and create NetworkManager configuration if needed
-    if nm_needs_update {
-        let nm_path = Path::new(NETWORKMANAGER_CONFIG_PATH);
-        if nm_path.exists() {
-            backup::backup_file_if_exists(
-                nm_path,
-                backup_dir,
-                "unmanaged-russignol.conf",
-                config.verbose,
-            )?;
-        }
-        let nm_dir = Path::new(NETWORKMANAGER_CONFIG_PATH).parent().unwrap();
-        sudo_command_success("mkdir", &["-p", &nm_dir.to_string_lossy()])?;
-        create_network_file(NETWORKMANAGER_CONFIG_PATH, NETWORKMANAGER_CONFIG_CONTENT)?;
-    }
-
-    // Restart networking services (only if we changed something)
+    // NM config already installed by install_nm_unmanaged_config() before
+    // the udev rule — restart remaining networking services
     restart_networking_services();
 
     // Wait and validate (silent - progress shown in main)
