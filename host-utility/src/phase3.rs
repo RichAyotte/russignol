@@ -686,18 +686,9 @@ fn assign_and_verify_keys(
 
     info("Checking key assignments...");
 
-    // Get the public key hashes for the imported keys (in parallel)
-    let (consensus_result, companion_result) = std::thread::scope(|s| {
-        let config_ref = config;
-
-        let consensus_handle = s.spawn(move || keys::get_key_hash(CONSENSUS_KEY_ALIAS, config_ref));
-        let companion_handle = s.spawn(move || keys::get_key_hash(COMPANION_KEY_ALIAS, config_ref));
-
-        (
-            consensus_handle.join().unwrap(),
-            companion_handle.join().unwrap(),
-        )
-    });
+    // Get the public key hashes for the imported keys
+    let consensus_result = keys::get_key_hash(CONSENSUS_KEY_ALIAS, config);
+    let companion_result = keys::get_key_hash(COMPANION_KEY_ALIAS, config);
 
     let consensus_pkh = consensus_result?;
     let companion_pkh = companion_result?;

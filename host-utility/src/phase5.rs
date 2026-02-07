@@ -68,19 +68,8 @@ fn print_key_activation_status(baker_key: &str, config: &RussignolConfig) {
 }
 
 fn print_baking_rights(baker_key: &str, config: &RussignolConfig) {
-    let (baking_result, attesting_result) = std::thread::scope(|s| {
-        let config_ref = config;
-
-        let baking_handle =
-            s.spawn(move || blockchain::query_next_baking_rights(baker_key, config_ref));
-        let attesting_handle =
-            s.spawn(move || blockchain::query_next_attesting_rights(baker_key, config_ref));
-
-        (
-            baking_handle.join().unwrap(),
-            attesting_handle.join().unwrap(),
-        )
-    });
+    let baking_result = blockchain::query_next_baking_rights(baker_key, config);
+    let attesting_result = blockchain::query_next_attesting_rights(baker_key, config);
 
     match baking_result {
         Ok(Some((level, estimated_time))) => {

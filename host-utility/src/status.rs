@@ -1,6 +1,5 @@
 use anyhow::Result;
 use colored::Colorize;
-use std::sync::mpsc;
 
 // Import shared modules
 use crate::blockchain;
@@ -10,68 +9,42 @@ use crate::constants::{
 };
 use crate::hardware;
 use crate::keys;
-use crate::progress::{self, CheckEvent};
+use crate::progress;
 use crate::system;
 use crate::utils::print_title_bar;
 
 pub fn run_status(verbose: bool, config: &RussignolConfig) {
-    // Don't print title and separator yet - progress bar will include title
     println!();
 
-    // Create progress tracking using shared progress module
-    let total_checks = 18; // Total number of individual checks
-    let (progress_tx, progress_handle) = progress::create_concurrent_progress(total_checks);
+    let spinner = progress::create_spinner("Gathering status...");
 
-    // Fetch all data concurrently with progress tracking
-    let tx1 = progress_tx.clone();
-    let tx2 = progress_tx.clone();
-    let tx3 = progress_tx.clone();
-    let tx4 = progress_tx.clone();
-    let tx5 = progress_tx.clone();
+    // Fetch all data sequentially
+    spinner.set_message("Checking hardware...");
+    let hardware_data = fetch_hardware_data();
 
-    let (hardware_data, system_data, connectivity_data, keys_data, delegate_result) =
-        std::thread::scope(|s| {
-            let config_ref = config;
+    spinner.set_message("Checking system...");
+    let system_data = fetch_system_data(config);
 
-            let h1 = s.spawn(move || fetch_hardware_data(&tx1));
-            let h2 = s.spawn(move || fetch_system_data(&tx2, config_ref));
-            let h3 = s.spawn(move || fetch_connectivity_data(&tx3, config_ref));
-            let h4 = s.spawn(move || fetch_keys_data(&tx4, config_ref));
-            let h5 = s.spawn(move || find_delegate_address_tracked(&tx5, config_ref));
+    spinner.set_message("Checking connectivity...");
+    let connectivity_data = fetch_connectivity_data(config);
 
-            (
-                h1.join().unwrap(),
-                h2.join().unwrap(),
-                h3.join().unwrap(),
-                h4.join().unwrap(),
-                h5.join().unwrap(),
-            )
-        });
+    spinner.set_message("Checking keys...");
+    let keys_data = fetch_keys_data(config);
 
-    // Fetch blockchain and rights data concurrently (they depend on delegate_result)
-    let tx6 = progress_tx.clone();
-    let tx7 = progress_tx.clone();
+    spinner.set_message("Finding delegate...");
+    let delegate_result = blockchain::find_delegate_address(config);
 
-    let (blockchain_data, rights_data) = std::thread::scope(|s| {
-        let delegate_ref = &delegate_result;
-        let config_ref = config;
+    spinner.set_message("Querying blockchain...");
+    let blockchain_data = fetch_blockchain_data(&delegate_result, config);
 
-        let h6 = s.spawn(move || fetch_blockchain_data(delegate_ref, &tx6, config_ref));
-        let h7 = s.spawn(move || fetch_rights_data(delegate_ref, &tx7, config_ref));
+    spinner.set_message("Fetching baking rights...");
+    let rights_data = fetch_rights_data(&delegate_result, config);
 
-        (h6.join().unwrap(), h7.join().unwrap())
-    });
+    spinner.finish_and_clear();
 
-    // Drop the main sender to signal completion
-    drop(progress_tx);
-
-    // Wait for progress indicator to finish
-    let _ = progress_handle.join();
-
-    // NOW print the title and separator (progress line was cleared)
     print_title_bar("🔐 Russignol Signer Status");
 
-    // Display all results sequentially (no interleaved output)
+    // Display all results
     display_hardware_status(verbose, hardware_data);
     display_system_status(verbose, system_data);
     display_connectivity_status(verbose, &connectivity_data, config.signer_uri());
@@ -119,49 +92,12 @@ struct ConnectivityData {
     network_backend: Option<&'static str>,
 }
 
-// Fetch functions (run concurrently)
-fn fetch_hardware_data(progress: &mpsc::Sender<CheckEvent>) -> HardwareData {
-    let tx1 = progress.clone();
-    let tx2 = progress.clone();
-    let tx3 = progress.clone();
-    let tx4 = progress.clone();
-
-    let (device_detected, serial, mac, power_info) = std::thread::scope(|s| {
-        let h1 = s.spawn(move || {
-            let _ = tx1.send(CheckEvent::Started("Detecting USB"));
-            let result = hardware::detect_hardware_device();
-            let _ = tx1.send(CheckEvent::Completed("Detecting USB"));
-            result
-        });
-
-        let h2 = s.spawn(move || {
-            let _ = tx2.send(CheckEvent::Started("Reading serial"));
-            let result = hardware::get_usb_serial_number();
-            let _ = tx2.send(CheckEvent::Completed("Reading serial"));
-            result
-        });
-
-        let h3 = s.spawn(move || {
-            let _ = tx3.send(CheckEvent::Started("Reading MAC"));
-            let result = hardware::get_mac_address();
-            let _ = tx3.send(CheckEvent::Completed("Reading MAC"));
-            result
-        });
-
-        let h4 = s.spawn(move || {
-            let _ = tx4.send(CheckEvent::Started("Checking USB power"));
-            let result = hardware::get_usb_power_info();
-            let _ = tx4.send(CheckEvent::Completed("Checking USB power"));
-            result
-        });
-
-        (
-            h1.join().unwrap(),
-            h2.join().unwrap(),
-            h3.join().unwrap(),
-            h4.join().unwrap(),
-        )
-    });
+// Fetch functions
+fn fetch_hardware_data() -> HardwareData {
+    let device_detected = hardware::detect_hardware_device();
+    let serial = hardware::get_usb_serial_number();
+    let mac = hardware::get_mac_address();
+    let power_info = hardware::get_usb_power_info();
 
     HardwareData {
         device_detected,
@@ -171,55 +107,16 @@ fn fetch_hardware_data(progress: &mpsc::Sender<CheckEvent>) -> HardwareData {
     }
 }
 
-fn fetch_system_data(progress: &mpsc::Sender<CheckEvent>, config: &RussignolConfig) -> SystemData {
-    let tx1 = progress.clone();
-    let tx2 = progress.clone();
-    let tx3 = progress.clone();
-    let tx4 = progress.clone();
-
-    let (dependencies, node_block, client_dir, plugdev) = std::thread::scope(|s| {
-        let config_ref = config;
-
-        let h1 = s.spawn(move || {
-            let _ = tx1.send(CheckEvent::Started("Verifying deps"));
-            let result = system::verify_dependencies();
-            let _ = tx1.send(CheckEvent::Completed("Verifying deps"));
-            result
-        });
-
-        let h2 = s.spawn(move || {
-            let _ = tx2.send(CheckEvent::Started("Checking node"));
-            let result = system::get_node_block_height(config_ref);
-            let _ = tx2.send(CheckEvent::Completed("Checking node"));
-            result
-        });
-
-        let h3 = s.spawn(move || {
-            let _ = tx3.send(CheckEvent::Started("Checking client"));
-            let result = system::verify_octez_client_directory(config_ref);
-            let _ = tx3.send(CheckEvent::Completed("Checking client"));
-            result
-        });
-
-        let h4 = s.spawn(move || {
-            let _ = tx4.send(CheckEvent::Started("Checking plugdev"));
-            let result = system::check_plugdev_membership().and_then(|(in_group, _)| {
-                if in_group {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!("Not in plugdev"))
-                }
-            });
-            let _ = tx4.send(CheckEvent::Completed("Checking plugdev"));
-            result
-        });
-
-        (
-            h1.join().unwrap(),
-            h2.join().unwrap(),
-            h3.join().unwrap(),
-            h4.join().unwrap(),
-        )
+fn fetch_system_data(config: &RussignolConfig) -> SystemData {
+    let dependencies = system::verify_dependencies();
+    let node_block = system::get_node_block_height(config);
+    let client_dir = system::verify_octez_client_directory(config);
+    let plugdev = system::check_plugdev_membership().and_then(|(in_group, _)| {
+        if in_group {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Not in plugdev"))
+        }
     });
 
     SystemData {
@@ -230,40 +127,10 @@ fn fetch_system_data(progress: &mpsc::Sender<CheckEvent>, config: &RussignolConf
     }
 }
 
-fn fetch_connectivity_data(
-    progress: &mpsc::Sender<CheckEvent>,
-    config: &RussignolConfig,
-) -> ConnectivityData {
-    let tx1 = progress.clone();
-    let tx2 = progress.clone();
-    let tx3 = progress.clone();
-
-    let (interface_ok, ip_assigned, remote_signer) = std::thread::scope(|s| {
-        let config_ref = config;
-
-        let h1 = s.spawn(move || {
-            let _ = tx1.send(CheckEvent::Started("Finding interface"));
-            let result = hardware::find_russignol_network_interface();
-            let _ = tx1.send(CheckEvent::Completed("Finding interface"));
-            result
-        });
-
-        let h2 = s.spawn(move || {
-            let _ = tx2.send(CheckEvent::Started("Checking IP"));
-            let result = crate::phase2::check_ip_assigned();
-            let _ = tx2.send(CheckEvent::Completed("Checking IP"));
-            result
-        });
-
-        let h3 = s.spawn(move || {
-            let _ = tx3.send(CheckEvent::Started("Pinging signer"));
-            let result = keys::check_remote_signer(config_ref);
-            let _ = tx3.send(CheckEvent::Completed("Pinging signer"));
-            result
-        });
-
-        (h1.join().unwrap(), h2.join().unwrap(), h3.join().unwrap())
-    });
+fn fetch_connectivity_data(config: &RussignolConfig) -> ConnectivityData {
+    let interface_ok = hardware::find_russignol_network_interface();
+    let ip_assigned = crate::phase2::check_ip_assigned();
+    let remote_signer = keys::check_remote_signer(config);
 
     // Infer which network backend is configured from files on disk
     let network_backend = if std::path::Path::new(NETWORK_CONFIG_PATH).exists() {
@@ -282,32 +149,10 @@ fn fetch_connectivity_data(
     }
 }
 
-fn fetch_keys_data(progress: &mpsc::Sender<CheckEvent>, config: &RussignolConfig) -> KeysData {
-    let tx1 = progress.clone();
-    let tx2 = progress.clone();
+fn fetch_keys_data(config: &RussignolConfig) -> KeysData {
+    let consensus_exists = keys::check_key_alias_exists(CONSENSUS_KEY_ALIAS, config);
+    let companion_exists = keys::check_key_alias_exists(COMPANION_KEY_ALIAS, config);
 
-    // Check if keys exist
-    let (consensus_exists, companion_exists) = std::thread::scope(|s| {
-        let config_ref = config;
-
-        let h1 = s.spawn(move || {
-            let _ = tx1.send(CheckEvent::Started("Checking consensus"));
-            let result = keys::check_key_alias_exists(CONSENSUS_KEY_ALIAS, config_ref);
-            let _ = tx1.send(CheckEvent::Completed("Checking consensus"));
-            result
-        });
-
-        let h2 = s.spawn(move || {
-            let _ = tx2.send(CheckEvent::Started("Checking companion"));
-            let result = keys::check_key_alias_exists(COMPANION_KEY_ALIAS, config_ref);
-            let _ = tx2.send(CheckEvent::Completed("Checking companion"));
-            result
-        });
-
-        (h1.join().unwrap(), h2.join().unwrap())
-    });
-
-    // Then fetch hashes for existing keys (these are quick operations, no progress update needed)
     let consensus_hash = if consensus_exists {
         keys::get_key_hash(CONSENSUS_KEY_ALIAS, config).ok()
     } else {
@@ -328,47 +173,13 @@ fn fetch_keys_data(progress: &mpsc::Sender<CheckEvent>, config: &RussignolConfig
     }
 }
 
-fn find_delegate_address_tracked(
-    progress: &mpsc::Sender<CheckEvent>,
-    config: &RussignolConfig,
-) -> Result<Option<String>> {
-    let _ = progress.send(CheckEvent::Started("Finding delegate"));
-    let result = blockchain::find_delegate_address(config);
-    let _ = progress.send(CheckEvent::Completed("Finding delegate"));
-    result
-}
-
 fn fetch_blockchain_data(
     delegate_result: &Result<Option<String>>,
-    progress: &mpsc::Sender<CheckEvent>,
     config: &RussignolConfig,
 ) -> BlockchainData {
     if let Ok(Some(delegate)) = delegate_result {
-        let tx1 = progress.clone();
-        let tx2 = progress.clone();
-
-        let (key_activation, staking_info) = std::thread::scope(|s| {
-            let delegate_ref = delegate;
-            let config_ref = config;
-
-            let h1 = s.spawn(move || {
-                let _ = tx1.send(CheckEvent::Started("Querying activation"));
-                let result = blockchain::query_key_activation_status(delegate_ref, config_ref);
-                let _ = tx1.send(CheckEvent::Completed("Querying activation"));
-                result
-            });
-
-            let h2 = s.spawn(move || {
-                let _ = tx2.send(CheckEvent::Started("Querying staking"));
-                let result = blockchain::query_staking_info(delegate_ref, config_ref);
-                let _ = tx2.send(CheckEvent::Completed("Querying staking"));
-                result
-            });
-
-            (h1.join().unwrap(), h2.join().unwrap())
-        });
-
-        // Check if delegate is registered (doesn't require extra progress notification)
+        let key_activation = blockchain::query_key_activation_status(delegate, config);
+        let staking_info = blockchain::query_staking_info(delegate, config);
         let delegate_registered = blockchain::is_registered_delegate(delegate, config);
 
         BlockchainData {
@@ -377,12 +188,6 @@ fn fetch_blockchain_data(
             staking_info: staking_info.ok(),
         }
     } else {
-        // Still count these as "checked" even if skipped (send start+complete for each)
-        let _ = progress.send(CheckEvent::Started("Querying activation"));
-        let _ = progress.send(CheckEvent::Completed("Querying activation"));
-        let _ = progress.send(CheckEvent::Started("Querying staking"));
-        let _ = progress.send(CheckEvent::Completed("Querying staking"));
-
         BlockchainData {
             delegate_registered: false,
             key_activation: None,
@@ -393,45 +198,17 @@ fn fetch_blockchain_data(
 
 fn fetch_rights_data(
     delegate_result: &Result<Option<String>>,
-    progress: &mpsc::Sender<CheckEvent>,
     config: &RussignolConfig,
 ) -> RightsData {
     if let Ok(Some(delegate)) = delegate_result {
-        let tx1 = progress.clone();
-        let tx2 = progress.clone();
-
-        let (baking, attesting) = std::thread::scope(|s| {
-            let delegate_ref = delegate;
-            let config_ref = config;
-
-            let h1 = s.spawn(move || {
-                let _ = tx1.send(CheckEvent::Started("Fetching baking"));
-                let result = blockchain::query_next_baking_rights(delegate_ref, config_ref);
-                let _ = tx1.send(CheckEvent::Completed("Fetching baking"));
-                result
-            });
-
-            let h2 = s.spawn(move || {
-                let _ = tx2.send(CheckEvent::Started("Fetching attesting"));
-                let result = blockchain::query_next_attesting_rights(delegate_ref, config_ref);
-                let _ = tx2.send(CheckEvent::Completed("Fetching attesting"));
-                result
-            });
-
-            (h1.join().unwrap(), h2.join().unwrap())
-        });
+        let baking = blockchain::query_next_baking_rights(delegate, config);
+        let attesting = blockchain::query_next_attesting_rights(delegate, config);
 
         RightsData {
             baking: baking.ok().flatten(),
             attesting: attesting.ok().flatten(),
         }
     } else {
-        // Still count these as "checked" even if skipped (send start+complete for each)
-        let _ = progress.send(CheckEvent::Started("Fetching baking"));
-        let _ = progress.send(CheckEvent::Completed("Fetching baking"));
-        let _ = progress.send(CheckEvent::Started("Fetching attesting"));
-        let _ = progress.send(CheckEvent::Completed("Fetching attesting"));
-
         RightsData {
             baking: None,
             attesting: None,
