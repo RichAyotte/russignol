@@ -1,3 +1,6 @@
+use std::thread::sleep;
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -541,6 +544,52 @@ fn initialize_setup_environment(
     Ok(confirmation.clone())
 }
 
+/// Detect hardware with retries to handle USB enumeration delays.
+fn detect_hardware_with_retry() -> Result<()> {
+    progress::run_step_detail("Detecting hardware", "lsusb", || {
+        const MAX_RETRIES: u32 = 5;
+        let mut last_err = None;
+        for attempt in 1..=MAX_RETRIES {
+            match hardware::detect_hardware_device() {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    log::debug!("Hardware detection attempt {attempt}/{MAX_RETRIES} failed: {e}");
+                    last_err = Some(e);
+                    if attempt < MAX_RETRIES {
+                        sleep(Duration::from_secs(1));
+                    }
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+        let serial = hardware::get_usb_serial_number()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let detail = if serial.is_empty() {
+            "Russignol device found".to_string()
+        } else {
+            format!("Russignol device found (serial: {serial})")
+        };
+        Ok(((), detail))
+    })?;
+
+    if let Ok(Some(power_info)) = hardware::get_usb_power_info()
+        && let Some(warning_msg) = hardware::check_power_warning(&power_info)
+    {
+        println!();
+        utils::warning(&warning_msg);
+        println!();
+    }
+
+    Ok(())
+}
+
 fn run_setup_phases(
     confirmation_config: &confirmation::ConfirmationConfig,
     config: &config::RussignolConfig,
@@ -552,29 +601,9 @@ fn run_setup_phases(
     let dry_run = confirmation_config.dry_run;
     let verbose = confirmation_config.verbose;
 
-    // Phase 0: Hardware detection (inlined)
+    // Phase 0: Hardware detection
     if !skip_hardware_check {
-        progress::run_step_detail("Detecting hardware", "lsusb", || {
-            hardware::detect_hardware_device()?;
-            let serial = hardware::get_usb_serial_number()
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            let detail = if serial.is_empty() {
-                "Russignol device found".to_string()
-            } else {
-                format!("Russignol device found (serial: {serial})")
-            };
-            Ok(((), detail))
-        })?;
-
-        if let Ok(Some(power_info)) = hardware::get_usb_power_info()
-            && let Some(warning_msg) = hardware::check_power_warning(&power_info)
-        {
-            println!();
-            utils::warning(&warning_msg);
-            println!();
-        }
+        detect_hardware_with_retry()?;
     }
 
     // Phase 1: System validation (inlined)
