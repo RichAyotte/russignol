@@ -98,10 +98,6 @@ enum Commands {
     },
     /// Install russignol to ~/.local/bin
     Install {
-        /// Force overwrite without confirmation
-        #[arg(long, short = 'y')]
-        yes: bool,
-
         /// Create backup of existing installation
         #[arg(long)]
         backup: bool,
@@ -276,8 +272,8 @@ fn main() -> Result<()> {
             let config = config::RussignolConfig::load()?;
             purge::run_purge(dry_run, &config)?;
         }
-        Some(Commands::Install { yes, backup }) => {
-            install::run_install(yes, backup)?;
+        Some(Commands::Install { backup }) => {
+            install::run_install(backup)?;
         }
         Some(Commands::Upgrade { check, yes }) => {
             upgrade::run_upgrade(check, yes)?;
