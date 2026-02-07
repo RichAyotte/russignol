@@ -9,115 +9,116 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
 
-pub fn run(
-    backup_dir: &Path,
-    confirmation_config: &crate::confirmation::ConfirmationConfig,
-    provided_baker_key: Option<&str>,
-    russignol_config: &RussignolConfig,
-) -> Result<String> {
-    // Build mutation list for confirmation
-    let mutations = crate::confirmation::PhaseMutations {
-        phase_name: "Key Configuration".to_string(),
-        actions: vec![
-            crate::confirmation::MutationAction {
-                description: "Select and verify baker key".to_string(),
-                detailed_info: Some("May require baker re-registration if deactivated".to_string()),
-            },
-            crate::confirmation::MutationAction {
-                description: "Configure staking parameters (if not set)".to_string(),
-                detailed_info: Some("Required for baker to participate in consensus".to_string()),
-            },
-            crate::confirmation::MutationAction {
-                description: "Import remote BLS keys from signer".to_string(),
-                detailed_info: Some(format!(
-                    "Import {CONSENSUS_KEY_ALIAS} and {COMPANION_KEY_ALIAS}"
-                )),
-            },
-            crate::confirmation::MutationAction {
-                description: "Set consensus key on-chain".to_string(),
-                detailed_info: Some("Blockchain transaction to assign consensus key".to_string()),
-            },
-            crate::confirmation::MutationAction {
-                description: "Set companion key on-chain".to_string(),
-                detailed_info: Some("Blockchain transaction to assign companion key".to_string()),
-            },
-        ],
-    };
-
-    // Get confirmation
-    match crate::confirmation::confirm_phase_mutations(&mutations, confirmation_config) {
-        crate::confirmation::ConfirmationResult::Confirmed => {
-            // Continue with phase
-        }
-        crate::confirmation::ConfirmationResult::Skipped => {
-            // Return a dummy baker key since phase5 expects one
-            return Ok("tz1skipped".to_string());
-        }
-        crate::confirmation::ConfirmationResult::Cancelled => {
-            anyhow::bail!("Setup cancelled by user");
-        }
-    }
-
-    // Get Baker Key (silent - progress shown in main)
-    let baker_key = get_baker_key(
-        confirmation_config.dry_run,
-        confirmation_config.verbose,
-        confirmation_config.auto_confirm,
-        provided_baker_key,
-        russignol_config,
-    )?;
-
-    // Ensure signer is accessible before attempting key operations
-    if !confirmation_config.dry_run {
-        keys::wait_for_signer(confirmation_config.auto_confirm, russignol_config)?;
-    }
-
-    // Discover, Import, and Verify Keys (silent - progress shown in main)
-    discover_and_import_keys(
-        backup_dir,
-        confirmation_config.dry_run,
-        confirmation_config.verbose,
-        confirmation_config.auto_confirm,
-        russignol_config,
-    )?;
-
-    // Assign and Verify Keys on Blockchain (silent - progress shown in main)
-    assign_and_verify_keys(
-        &baker_key,
-        confirmation_config.dry_run,
-        confirmation_config.verbose,
-        confirmation_config.auto_confirm,
-        russignol_config,
-    )?;
-
-    Ok(baker_key)
+/// Baker state captured from a single delegate RPC fetch.
+///
+/// Distinguishes three states: unregistered, registered-but-deactivated,
+/// and registered-and-active. Fixes a bug where the old code conflated
+/// "unregistered" and "deactivated" via `is_registered_delegate()`.
+struct BakerStatus {
+    alias: String,
+    address: String,
+    registered: bool,
+    deactivated: bool,
+    staked_balance: u64,
+    full_balance: u64,
+    /// Active and pending consensus key pkhs from delegate info.
+    consensus_pkhs: Vec<String>,
+    /// Active and pending companion key pkhs from delegate info.
+    companion_pkhs: Vec<String>,
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "display-only balance/stake values"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "interactive baker key selection workflow"
-)]
-fn get_baker_key(
+/// Extract active and pending pkhs from a `consensus_key` or `companion_key` object.
+///
+/// For consensus keys, the active pkh is always present (defaults to the baker's
+/// own key). For companion keys, active may be null. Set `include_active_always`
+/// to true for consensus keys, false for companion keys.
+fn extract_key_pkhs(
+    key_obj: Option<&serde_json::Value>,
+    include_active_always: bool,
+) -> Vec<String> {
+    let mut pkhs = Vec::new();
+    let Some(obj) = key_obj else {
+        return pkhs;
+    };
+
+    if let Some(active) = obj.get_nested("active")
+        && (include_active_always || !active.is_null())
+        && let Some(pkh) = active.get_str("pkh")
+    {
+        pkhs.push(pkh.to_string());
+    }
+
+    if let Some(pendings) = obj.get_nested("pendings").and_then(|p| p.as_array()) {
+        for pending in pendings {
+            if let Some(pkh) = pending.get_str("pkh") {
+                pkhs.push(pkh.to_string());
+            }
+        }
+    }
+
+    pkhs
+}
+
+/// Read imported key hashes from the local `secret_keys` file.
+///
+/// Returns the key hashes for the consensus and companion aliases if they
+/// exist and point to the current signer IP. This is a local file read —
+/// no network calls.
+fn read_imported_key_hashes(config: &RussignolConfig) -> (Option<String>, Option<String>) {
+    let secret_keys_file = config.octez_client_dir.join("secret_keys");
+    let signer_ip = config.signer_ip();
+
+    let Ok(content) = read_file(&secret_keys_file) else {
+        return (None, None);
+    };
+    let Ok(keys) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return (None, None);
+    };
+
+    let mut consensus_hash = None;
+    let mut companion_hash = None;
+
+    if let Some(keys_array) = keys.as_array() {
+        for key in keys_array {
+            if let Some(name) = key.get_str("name")
+                && let Some(value) = key.get_str("value")
+                && value.contains(signer_ip)
+            {
+                // Extract key hash from URI like "tcp://ip:port/tz4..."
+                if let Some(hash) = value.rsplit('/').next()
+                    && hash.starts_with("tz")
+                {
+                    if name == CONSENSUS_KEY_ALIAS {
+                        consensus_hash = Some(hash.to_string());
+                    } else if name == COMPANION_KEY_ALIAS {
+                        companion_hash = Some(hash.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    (consensus_hash, companion_hash)
+}
+
+/// Select baker address interactively or from CLI args.
+///
+/// Returns `(alias, address)`. No RPC calls or mutations — purely selection.
+fn select_baker(
     dry_run: bool,
-    verbose: bool,
     auto_confirm: bool,
     provided_baker_key: Option<&str>,
     config: &RussignolConfig,
-) -> Result<String> {
+) -> Result<(String, String)> {
     use inquire::{Select, ui::RenderConfig, ui::Styled};
 
     if dry_run {
-        return Ok("tz1dummyKeyForDryRun".to_string());
+        return Ok(("dry-run".to_string(), "tz1dummyKeyForDryRun".to_string()));
     }
 
     // If auto_confirm is enabled and a baker key was provided, use it directly
     if auto_confirm {
         if let Some(key) = provided_baker_key {
-            // Validate that the key exists
             let list_output = run_octez_client_command(&["list", "known", "addresses"], config)?;
             if list_output.status.success() {
                 let stdout = String::from_utf8_lossy(&list_output.stdout);
@@ -125,12 +126,10 @@ fn get_baker_key(
                 for line in stdout.lines() {
                     if let Some((alias_part, rest)) = line.split_once(':') {
                         let alias = alias_part.trim();
-                        if let Some(addr) = rest.split_whitespace().next() {
-                            // Check if provided key matches either alias or address
-                            if alias == key || addr == key {
-                                // Return the address (tz...), not the alias
-                                return Ok(addr.to_string());
-                            }
+                        if let Some(addr) = rest.split_whitespace().next()
+                            && (alias == key || addr == key)
+                        {
+                            return Ok((alias.to_string(), addr.to_string()));
                         }
                     }
                 }
@@ -139,9 +138,8 @@ fn get_baker_key(
                     "Provided baker key '{key}' not found in octez-client known addresses"
                 );
             }
-        } else {
-            anyhow::bail!("--yes flag requires --baker-key to be specified");
         }
+        anyhow::bail!("--yes flag requires --baker-key to be specified");
     }
 
     // List known addresses and parse them
@@ -151,16 +149,12 @@ fn get_baker_key(
     if list_output.status.success() {
         let stdout = String::from_utf8_lossy(&list_output.stdout);
 
-        // Parse the list to build selection options
-        // Format: "alias: address (type)"
         for line in stdout.lines() {
             if let Some((alias_part, rest)) = line.split_once(':') {
                 let alias = alias_part.trim();
-                // Extract address (starts with tz)
                 if let Some(addr) = rest.split_whitespace().next()
                     && addr.starts_with("tz")
                 {
-                    // Create display string: "alias (address)"
                     let display = format!("{alias} ({addr})");
                     choices.push((display, alias.to_string(), addr.to_string()));
                 }
@@ -174,13 +168,11 @@ fn get_baker_key(
         );
     }
 
-    // Use inquire to present interactive selection (only reached in non-auto-confirm mode)
     let display_choices: Vec<String> = choices
         .iter()
         .map(|(display, _, _)| display.clone())
         .collect();
 
-    // Create custom theme with orange color
     let render_config = RenderConfig {
         prompt_prefix: Styled::new(">").with_fg(ORANGE_RGB),
         highlighted_option_prefix: Styled::new(">").with_fg(ORANGE_RGB),
@@ -190,246 +182,437 @@ fn get_baker_key(
         ..Default::default()
     };
 
+    println!();
     let selection = Select::new("Select baker address/alias:", display_choices.clone())
         .with_help_message("↑↓ to navigate, Enter to select")
         .with_render_config(render_config)
         .prompt()
         .context("Failed to get user selection")?;
 
-    // Find the corresponding alias and address
-    let (input_key, baker_key) = choices
+    choices
         .iter()
         .find(|(display, _, _)| display == &selection)
         .map(|(_, alias, addr)| (alias.clone(), addr.clone()))
-        .context("Selected address not found")?;
+        .context("Selected address not found")
+}
 
-    let rpc_path = format!("/chains/main/blocks/head/context/delegates/{baker_key}");
-    let is_deactivated = run_step(
-        "Checking baker registration",
-        &format!("octez-client rpc get .../delegates/{baker_key}",),
+/// Validate baker against the blockchain with a single delegate RPC fetch.
+///
+/// Returns `BakerStatus` distinguishing unregistered, deactivated, and active.
+/// Fixes a bug where `is_registered_delegate()` conflated unregistered and
+/// deactivated bakers.
+fn validate_baker(alias: &str, address: &str, config: &RussignolConfig) -> Result<BakerStatus> {
+    let rpc_path = format!("/chains/main/blocks/head/context/delegates/{address}");
+
+    run_step(
+        "Validating baker",
+        &format!("octez-client rpc get .../delegates/{address}"),
         || {
-            let is_registered = blockchain::is_registered_delegate(&baker_key, config);
-            if !is_registered {
-                return Ok(None);
-            }
+            let result = crate::utils::rpc_get_json(&rpc_path, config);
 
-            let output = run_octez_client_command(&["rpc", "get", &rpc_path], config)?;
-            let delegate_info: serde_json::Value =
-                serde_json::from_slice(&output.stdout).context("Failed to parse delegate info")?;
-            let deactivated = delegate_info.get_bool("deactivated").unwrap_or(false);
-            log::info!("Baker {baker_key} deactivation status: {deactivated}");
-            Ok(Some(deactivated))
+            if let Ok(delegate_info) = result {
+                let deactivated = delegate_info.get_bool("deactivated").unwrap_or(false);
+                let staked_balance = delegate_info
+                    .get("total_staked")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let full_balance = delegate_info
+                    .get("own_full_balance")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+
+                let consensus_pkhs =
+                    extract_key_pkhs(delegate_info.get_nested("consensus_key"), true);
+                let companion_pkhs =
+                    extract_key_pkhs(delegate_info.get_nested("companion_key"), false);
+
+                log::info!(
+                    "Baker {address}: registered=true, deactivated={deactivated}, \
+                     staked={staked_balance}, balance={full_balance}"
+                );
+
+                Ok(BakerStatus {
+                    alias: alias.to_string(),
+                    address: address.to_string(),
+                    registered: true,
+                    deactivated,
+                    staked_balance,
+                    full_balance,
+                    consensus_pkhs,
+                    companion_pkhs,
+                })
+            } else {
+                log::info!("Baker {address}: not registered as delegate");
+                Ok(BakerStatus {
+                    alias: alias.to_string(),
+                    address: address.to_string(),
+                    registered: false,
+                    deactivated: false,
+                    staked_balance: 0,
+                    full_balance: 0,
+                    consensus_pkhs: Vec::new(),
+                    companion_pkhs: Vec::new(),
+                })
+            }
         },
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "orchestrates full key configuration phase"
+)]
+pub fn run(
+    backup_dir: &Path,
+    confirmation_config: &crate::confirmation::ConfirmationConfig,
+    provided_baker_key: Option<&str>,
+    russignol_config: &RussignolConfig,
+) -> Result<String> {
+    let dry_run = confirmation_config.dry_run;
+    let auto_confirm = confirmation_config.auto_confirm;
+
+    // ── Before confirmation (read-only) ──────────────────────────────────
+
+    // Step 1: Select baker (interactive prompt or CLI arg)
+    let (alias, address) =
+        select_baker(dry_run, auto_confirm, provided_baker_key, russignol_config)?;
+
+    // Step 2: Validate baker against blockchain (single delegate RPC)
+    let baker = if dry_run {
+        BakerStatus {
+            alias,
+            address: address.clone(),
+            registered: true,
+            deactivated: false,
+            staked_balance: 0,
+            full_balance: 0,
+            consensus_pkhs: Vec::new(),
+            companion_pkhs: Vec::new(),
+        }
+    } else {
+        validate_baker(&alias, &address, russignol_config)?
+    };
+
+    // Step 3: Show stake status if already set
+    if baker.registered && baker.staked_balance > 0 {
+        let staked_tez = blockchain::mutez_to_tez(baker.staked_balance);
+        let pct = blockchain::percentage(baker.staked_balance, baker.full_balance);
+        success(&format!(
+            "Stake already set: {staked_tez:.2} ꜩ ({pct:.1}% of balance)"
+        ));
+    }
+
+    // Step 4: Check local key state to determine which mutations are needed
+    let (imported_consensus, imported_companion) = if dry_run {
+        (None, None)
+    } else {
+        read_imported_key_hashes(russignol_config)
+    };
+    let keys_imported = imported_consensus.is_some() && imported_companion.is_some();
+    let consensus_key_set = imported_consensus
+        .as_ref()
+        .is_some_and(|h| baker.consensus_pkhs.contains(h));
+    let companion_key_set = imported_companion
+        .as_ref()
+        .is_some_and(|h| baker.companion_pkhs.contains(h));
+
+    // Step 5: Build dynamic mutations list based on baker state
+    let mut actions = Vec::new();
+
+    if !baker.registered {
+        actions.push(crate::confirmation::MutationAction {
+            description: "Register baker as delegate".to_string(),
+            detailed_info: Some("Blockchain transaction to register as delegate".to_string()),
+        });
+        actions.push(crate::confirmation::MutationAction {
+            description: "Configure staking parameters".to_string(),
+            detailed_info: Some("Required for baker to participate in consensus".to_string()),
+        });
+    } else if baker.deactivated {
+        actions.push(crate::confirmation::MutationAction {
+            description: "Re-register baker as delegate".to_string(),
+            detailed_info: Some("Baker is deactivated and needs re-registration".to_string()),
+        });
+        actions.push(crate::confirmation::MutationAction {
+            description: "Configure staking parameters".to_string(),
+            detailed_info: Some("Required for baker to participate in consensus".to_string()),
+        });
+    } else if baker.staked_balance == 0 {
+        actions.push(crate::confirmation::MutationAction {
+            description: "Configure staking parameters".to_string(),
+            detailed_info: Some("Required for baker to participate in consensus".to_string()),
+        });
+    }
+
+    if !keys_imported {
+        actions.push(crate::confirmation::MutationAction {
+            description: "Import remote BLS keys from signer".to_string(),
+            detailed_info: Some(format!(
+                "Import {CONSENSUS_KEY_ALIAS} and {COMPANION_KEY_ALIAS}"
+            )),
+        });
+    }
+    if !consensus_key_set {
+        actions.push(crate::confirmation::MutationAction {
+            description: "Set consensus key on-chain".to_string(),
+            detailed_info: Some("Blockchain transaction to assign consensus key".to_string()),
+        });
+    }
+    if !companion_key_set {
+        actions.push(crate::confirmation::MutationAction {
+            description: "Set companion key on-chain".to_string(),
+            detailed_info: Some("Blockchain transaction to assign companion key".to_string()),
+        });
+    }
+
+    // Step 6: Get confirmation (skip if nothing to do)
+    if actions.is_empty() {
+        log::info!("Key configuration already complete — no changes needed");
+    } else {
+        let mutations = crate::confirmation::PhaseMutations {
+            phase_name: "Key Configuration".to_string(),
+            actions,
+        };
+
+        match crate::confirmation::confirm_phase_mutations(&mutations, confirmation_config) {
+            crate::confirmation::ConfirmationResult::Confirmed => {}
+            crate::confirmation::ConfirmationResult::Skipped => {
+                return Ok("tz1skipped".to_string());
+            }
+            crate::confirmation::ConfirmationResult::Cancelled => {
+                anyhow::bail!("Setup cancelled by user");
+            }
+        }
+    }
+
+    // ── After confirmation (mutations) ───────────────────────────────────
+
+    // Handle baker registration if needed
+    if !dry_run {
+        handle_baker_registration(&baker, auto_confirm, russignol_config)?;
+    }
+
+    // Check and set stake using pre-fetched BakerStatus
+    if !dry_run
+        && baker.registered
+        && baker.staked_balance == 0
+        && let Err(e) = check_and_set_stake(&baker, auto_confirm, russignol_config)
+    {
+        log::debug!("Stake check failed: {e}");
+    }
+
+    // Ensure signer is accessible and discover remote keys
+    let remote_keys = if dry_run {
+        Vec::new()
+    } else {
+        keys::wait_for_signer(auto_confirm, russignol_config)?
+    };
+
+    // Import and verify keys
+    discover_and_import_keys(
+        backup_dir,
+        dry_run,
+        confirmation_config.verbose,
+        auto_confirm,
+        &remote_keys,
+        russignol_config,
     )?;
 
-    match is_deactivated {
-        Some(true) => {
-            // Baker is registered but deactivated
-            log::warn!("Baker {baker_key} is deactivated and needs re-registration");
+    // Assign and verify keys on blockchain
+    assign_and_verify_keys(
+        &baker.address,
+        dry_run,
+        confirmation_config.verbose,
+        auto_confirm,
+        russignol_config,
+    )?;
 
-            let should_reregister = crate::utils::prompt_yes_no(
-                "Would you like to re-register the baker to reactivate it?",
-                auto_confirm,
-            )?;
+    Ok(baker.address)
+}
 
-            if should_reregister {
-                log::info!("User chose to re-register deactivated baker {baker_key}");
+/// Handle baker registration or re-registration based on `BakerStatus`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "registration/re-registration workflow with balance checks"
+)]
+#[expect(clippy::cast_precision_loss, reason = "display-only balance values")]
+fn handle_baker_registration(
+    baker: &BakerStatus,
+    auto_confirm: bool,
+    config: &RussignolConfig,
+) -> Result<()> {
+    if baker.registered && baker.deactivated {
+        // Baker is registered but deactivated — offer re-registration
+        log::warn!(
+            "Baker {} is deactivated and needs re-registration",
+            baker.address
+        );
 
-                run_step(
-                    "Re-registering baker",
-                    &format!("octez-client register key {input_key} as delegate"),
-                    || {
-                        let register_output = run_octez_client_command(
-                            &["register", "key", &input_key, "as", "delegate"],
-                            config,
-                        )?;
+        let should_reregister = crate::utils::prompt_yes_no(
+            "Would you like to re-register the baker to reactivate it?",
+            auto_confirm,
+        )?;
 
-                        if !register_output.status.success() {
-                            let stderr = String::from_utf8_lossy(&register_output.stderr);
-                            anyhow::bail!("Failed to re-register delegate: {stderr}");
-                        }
+        if should_reregister {
+            log::info!(
+                "User chose to re-register deactivated baker {}",
+                baker.address
+            );
 
-                        log::info!("Baker {baker_key} successfully reactivated");
-                        Ok(())
-                    },
-                )?;
-            } else {
-                log::info!("User declined to re-register deactivated baker {baker_key}");
-                anyhow::bail!(
-                    "Baker {baker_key} is inactive and must be re-registered before continuing. You can re-register it manually with: octez-client register key {input_key} as delegate"
-                );
-            }
-
-            // Check if stake has been set
-            if let Err(e) =
-                check_and_set_stake(&baker_key, &input_key, verbose, auto_confirm, config)
-            {
-                log::debug!("Stake check failed: {e}");
-            }
-
-            Ok(baker_key)
-        }
-        Some(false) => {
-            // Baker is registered and active
-            if let Err(e) =
-                check_and_set_stake(&baker_key, &input_key, verbose, auto_confirm, config)
-            {
-                log::debug!("Stake check failed: {e}");
-            }
-
-            Ok(baker_key)
-        }
-        None => {
-            // Not registered yet, check balance first
             run_step(
-                "Checking baker balance",
-                &format!("octez-client rpc get .../contracts/{baker_key}/balance",),
+                "Re-registering baker",
+                &format!("octez-client register key {} as delegate", baker.alias),
                 || {
-                    let constants_output = run_octez_client_command(
-                        &["rpc", "get", "/chains/main/blocks/head/context/constants"],
+                    let register_output = run_octez_client_command(
+                        &["register", "key", &baker.alias, "as", "delegate"],
                         config,
                     )?;
 
-                    if !constants_output.status.success() {
-                        anyhow::bail!("Failed to query chain constants");
+                    if !register_output.status.success() {
+                        let stderr = String::from_utf8_lossy(&register_output.stderr);
+                        anyhow::bail!("Failed to re-register delegate: {stderr}");
                     }
 
-                    let constants: serde_json::Value =
-                        serde_json::from_slice(&constants_output.stdout)
-                            .context("Failed to parse chain constants")?;
+                    log::info!("Baker {} successfully reactivated", baker.address);
+                    Ok(())
+                },
+            )?;
+        } else {
+            log::info!(
+                "User declined to re-register deactivated baker {}",
+                baker.address
+            );
+            anyhow::bail!(
+                "Baker {} is inactive and must be re-registered before continuing. You can re-register it manually with: octez-client register key {} as delegate",
+                baker.address,
+                baker.alias
+            );
+        }
+    } else if !baker.registered {
+        // Not registered yet — check balance, then offer registration
+        run_step(
+            "Checking baker balance",
+            &format!(
+                "octez-client rpc get .../contracts/{}/balance",
+                baker.address
+            ),
+            || {
+                let constants_output = run_octez_client_command(
+                    &["rpc", "get", "/chains/main/blocks/head/context/constants"],
+                    config,
+                )?;
 
-                    let min_stake_mutez: u64 = constants
-                        .get("minimal_stake")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse().ok())
-                        .context("Failed to get minimal_stake from chain constants")?;
+                if !constants_output.status.success() {
+                    anyhow::bail!("Failed to query chain constants");
+                }
 
-                    let min_stake_tez = min_stake_mutez as f64 / 1_000_000.0;
+                let constants: serde_json::Value = serde_json::from_slice(&constants_output.stdout)
+                    .context("Failed to parse chain constants")?;
 
-                    let balance_output = run_octez_client_command(
-                        &[
-                            "rpc",
-                            "get",
-                            &format!(
-                                "/chains/main/blocks/head/context/contracts/{baker_key}/balance"
-                            ),
-                        ],
+                let min_stake_mutez: u64 = constants
+                    .get("minimal_stake")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok())
+                    .context("Failed to get minimal_stake from chain constants")?;
+
+                let min_stake_tez = min_stake_mutez as f64 / 1_000_000.0;
+
+                let balance_output = run_octez_client_command(
+                    &[
+                        "rpc",
+                        "get",
+                        &format!(
+                            "/chains/main/blocks/head/context/contracts/{}/balance",
+                            baker.address
+                        ),
+                    ],
+                    config,
+                )?;
+
+                if !balance_output.status.success() {
+                    anyhow::bail!(
+                        "Could not check balance for {}. The account may not exist on-chain or may need to be revealed.",
+                        baker.address
+                    );
+                }
+
+                let balance_str = String::from_utf8_lossy(&balance_output.stdout);
+                let balance_mutez: u64 = balance_str
+                    .trim()
+                    .trim_matches('"')
+                    .parse()
+                    .context("Failed to parse balance")?;
+
+                let balance_tez = balance_mutez as f64 / 1_000_000.0;
+
+                if balance_tez < min_stake_tez {
+                    anyhow::bail!(
+                        "Insufficient balance for baking. The account has {balance_tez:.2} ꜩ but needs at least {min_stake_tez:.2} ꜩ to register as a delegate and participate in baking."
+                    );
+                }
+
+                Ok(())
+            },
+        )?;
+
+        // Ensure node is synced before prompting — otherwise registration will hang
+        crate::system::wait_for_node_sync(config)?;
+
+        let should_register =
+            crate::utils::prompt_yes_no("Would you like to register it now?", auto_confirm)?;
+
+        if should_register {
+            run_step(
+                "Registering baker as delegate",
+                &format!("octez-client register key {} as delegate", baker.alias),
+                || {
+                    let register_output = run_octez_client_command(
+                        &["register", "key", &baker.alias, "as", "delegate"],
                         config,
                     )?;
 
-                    if !balance_output.status.success() {
-                        anyhow::bail!(
-                            "Could not check balance for {baker_key}. The account may not exist on-chain or may need to be revealed."
-                        );
-                    }
-
-                    let balance_str = String::from_utf8_lossy(&balance_output.stdout);
-                    let balance_mutez: u64 = balance_str
-                        .trim()
-                        .trim_matches('"')
-                        .parse()
-                        .context("Failed to parse balance")?;
-
-                    let balance_tez = balance_mutez as f64 / 1_000_000.0;
-
-                    if balance_tez < min_stake_tez {
-                        anyhow::bail!(
-                            "Insufficient balance for baking. The account has {balance_tez:.2} ꜩ but needs at least {min_stake_tez:.2} ꜩ to register as a delegate and participate in baking."
-                        );
+                    if !register_output.status.success() {
+                        let stderr = String::from_utf8_lossy(&register_output.stderr);
+                        anyhow::bail!("Failed to register delegate: {stderr}");
                     }
 
                     Ok(())
                 },
             )?;
-
-            // Ensure node is synced before prompting - otherwise registration will hang
-            crate::system::wait_for_node_sync(config)?;
-
-            let should_register =
-                crate::utils::prompt_yes_no("Would you like to register it now?", auto_confirm)?;
-
-            if should_register {
-                run_step(
-                    "Registering baker as delegate",
-                    &format!("octez-client register key {input_key} as delegate"),
-                    || {
-                        let register_output = run_octez_client_command(
-                            &["register", "key", &input_key, "as", "delegate"],
-                            config,
-                        )?;
-
-                        if !register_output.status.success() {
-                            let stderr = String::from_utf8_lossy(&register_output.stderr);
-                            anyhow::bail!("Failed to register delegate: {stderr}");
-                        }
-
-                        Ok(())
-                    },
-                )?;
-
-                // Check if stake has been set for the newly registered baker
-                if let Err(e) =
-                    check_and_set_stake(&baker_key, &input_key, verbose, auto_confirm, config)
-                {
-                    log::debug!("Stake check failed: {e}");
-                }
-
-                return Ok(baker_key);
-            }
+        } else {
             anyhow::bail!(
-                "Address {baker_key} must be registered as a delegate before continuing. You can register it manually with: octez-client register key {input_key} as delegate"
+                "Address {} must be registered as a delegate before continuing. You can register it manually with: octez-client register key {} as delegate",
+                baker.address,
+                baker.alias
             );
         }
     }
+
+    Ok(())
 }
 
 fn check_and_set_stake(
-    baker_key: &str,
-    baker_alias: &str,
-    _verbose: bool,
+    baker: &BakerStatus,
     auto_confirm: bool,
     config: &RussignolConfig,
 ) -> Result<()> {
-    let rpc_path = format!("/chains/main/blocks/head/context/delegates/{baker_key}");
-    let (staked_balance, full_balance) = run_step(
-        "Checking staking parameters",
-        &format!("octez-client rpc get .../delegates/{baker_key}"),
-        || {
-            let delegate_output = run_octez_client_command(&["rpc", "get", &rpc_path], config)?;
-
-            if !delegate_output.status.success() {
-                anyhow::bail!("Failed to query delegate staking info");
-            }
-
-            let delegate_info: serde_json::Value = serde_json::from_slice(&delegate_output.stdout)
-                .context("Failed to parse delegate info")?;
-
-            let staked = delegate_info
-                .get("total_staked")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-
-            let full = delegate_info
-                .get("own_full_balance")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-
-            log::debug!("Staked balance: {staked} mutez, Full balance: {full} mutez");
-            Ok((staked, full))
-        },
-    )?;
-
-    let staked_balance_tez = crate::blockchain::mutez_to_tez(staked_balance);
-    let full_balance_tez = crate::blockchain::mutez_to_tez(full_balance);
+    let staked_balance_tez = blockchain::mutez_to_tez(baker.staked_balance);
+    let full_balance_tez = blockchain::mutez_to_tez(baker.full_balance);
 
     log::info!(
-        "Baker {baker_key}: staked_balance={staked_balance} mutez ({staked_balance_tez:.2} ꜩ), full_balance={full_balance} mutez ({full_balance_tez:.2} ꜩ)"
+        "Baker {}: staked_balance={} mutez ({staked_balance_tez:.2} ꜩ), full_balance={} mutez ({full_balance_tez:.2} ꜩ)",
+        baker.address,
+        baker.staked_balance,
+        baker.full_balance
     );
 
-    if staked_balance == 0 {
-        log::warn!("Baker {baker_key} has not set their stake (total_staked=0)");
+    if baker.staked_balance == 0 {
+        log::warn!(
+            "Baker {} has not set their stake (total_staked=0)",
+            baker.address
+        );
 
         let should_set_stake =
             crate::utils::prompt_yes_no("Would you like to set the stake now?", auto_confirm)?;
@@ -463,15 +646,17 @@ fn check_and_set_stake(
             };
 
             log::info!(
-                "Setting stake for baker {baker_key}: amount={stake_amount} ꜩ, alias={baker_alias}"
+                "Setting stake for baker {}: amount={stake_amount} ꜩ, alias={}",
+                baker.address,
+                baker.alias
             );
 
             run_step(
                 "Setting stake",
-                &format!("octez-client stake {stake_amount} for {baker_alias}"),
+                &format!("octez-client stake {stake_amount} for {}", baker.alias),
                 || {
                     let stake_output = run_octez_client_command(
-                        &["stake", &stake_amount, "for", baker_alias],
+                        &["stake", &stake_amount, "for", &baker.alias],
                         config,
                     )?;
 
@@ -479,26 +664,30 @@ fn check_and_set_stake(
                         let stderr = String::from_utf8_lossy(&stake_output.stderr);
                         log::error!(
                             "Failed to set stake for baker {}: {}",
-                            baker_key,
+                            baker.address,
                             stderr.trim()
                         );
                         anyhow::bail!("Failed to set stake: {stderr}");
                     }
 
-                    log::info!("Stake operation submitted successfully for baker {baker_key}");
+                    log::info!(
+                        "Stake operation submitted successfully for baker {}",
+                        baker.address
+                    );
                     Ok(())
                 },
             )?;
         } else {
-            log::info!("User declined to set stake for baker {baker_key}");
+            log::info!("User declined to set stake for baker {}", baker.address);
         }
     } else {
-        let stake_percentage = crate::blockchain::percentage(staked_balance, full_balance);
+        let stake_percentage = blockchain::percentage(baker.staked_balance, baker.full_balance);
         success(&format!(
             "Stake already set: {staked_balance_tez:.2} ꜩ ({stake_percentage:.1}% of balance)"
         ));
         log::info!(
-            "Baker {baker_key} already has stake set: {staked_balance_tez:.2} ꜩ ({stake_percentage:.1}% of total balance)"
+            "Baker {} already has stake set: {staked_balance_tez:.2} ꜩ ({stake_percentage:.1}% of total balance)",
+            baker.address
         );
     }
 
@@ -510,6 +699,7 @@ fn discover_and_import_keys(
     dry_run: bool,
     verbose: bool,
     auto_confirm: bool,
+    remote_keys: &[String],
     config: &RussignolConfig,
 ) -> Result<()> {
     let client_dir = &config.octez_client_dir;
@@ -521,29 +711,27 @@ fn discover_and_import_keys(
 
     let signer_uri = config.signer_uri();
 
-    // Discover keys from the remote signer
-    let remote_keys = run_step_detail(
+    // Validate pre-discovered keys
+    run_step_detail(
         "Discovering remote keys",
         &format!("octez-client list known remote keys {signer_uri}"),
         || {
-            let keys = keys::discover_remote_keys(config)?;
-
-            if keys.len() < 2 {
+            if remote_keys.len() < 2 {
                 anyhow::bail!(
                     "Expected at least 2 remote keys but found {}. Please ensure the signer is properly configured.",
-                    keys.len()
+                    remote_keys.len()
                 );
             }
 
             // Validate keys are distinct (defensive check against signer bugs)
-            if keys[0] == keys[1] {
+            if remote_keys[0] == remote_keys[1] {
                 anyhow::bail!(
                     "Signer returned duplicate keys - consensus and companion have the same public key hash"
                 );
             }
 
-            let detail = format!("found {} keys", keys.len());
-            Ok((keys, detail))
+            let detail = format!("found {} keys", remote_keys.len());
+            Ok(((), detail))
         },
     )?;
 

@@ -74,14 +74,19 @@ pub fn check_remote_signer(config: &crate::config::RussignolConfig) -> bool {
 /// This polls `check_remote_signer` until it succeeds (signer accessible with ≥2 keys),
 /// displaying progress to the user. If `auto_confirm` is true and the signer isn't
 /// immediately available, returns an error. Otherwise prompts the user to retry.
-pub fn wait_for_signer(auto_confirm: bool, config: &crate::config::RussignolConfig) -> Result<()> {
+pub fn wait_for_signer(
+    auto_confirm: bool,
+    config: &crate::config::RussignolConfig,
+) -> Result<Vec<String>> {
     use crate::progress::create_spinner;
     use crate::utils::{info, success, warning};
     use std::time::Duration;
 
-    // Quick check first - if already accessible, return immediately
-    if check_remote_signer(config) {
-        return Ok(());
+    // Quick check first - if already accessible, return discovered keys
+    if let Ok(keys) = discover_remote_keys(config)
+        && keys.len() >= 2
+    {
+        return Ok(keys);
     }
 
     // Not accessible, show spinner and check
@@ -90,9 +95,11 @@ pub fn wait_for_signer(auto_confirm: bool, config: &crate::config::RussignolConf
 
     // Wait a moment and check again (network might just be slow)
     std::thread::sleep(Duration::from_secs(2));
-    if check_remote_signer(config) {
+    if let Ok(keys) = discover_remote_keys(config)
+        && keys.len() >= 2
+    {
         spinner.finish_and_clear();
-        return Ok(());
+        return Ok(keys);
     }
 
     spinner.finish_and_clear();
@@ -119,17 +126,20 @@ pub fn wait_for_signer(auto_confirm: bool, config: &crate::config::RussignolConf
     let spinner = create_spinner("Rechecking signer...");
 
     std::thread::sleep(Duration::from_secs(2));
-    let signer_ok = check_remote_signer(config);
+    let keys = discover_remote_keys(config).ok().filter(|k| k.len() >= 2);
     spinner.finish_and_clear();
 
-    if !signer_ok {
-        anyhow::bail!(
-            "Signer still not accessible. Please check the device connection and try again."
-        );
+    match keys {
+        Some(keys) => {
+            success("Signer is accessible");
+            Ok(keys)
+        }
+        None => {
+            anyhow::bail!(
+                "Signer still not accessible. Please check the device connection and try again."
+            );
+        }
     }
-
-    success("Signer is accessible");
-    Ok(())
 }
 
 /// Import a key from the remote signer with optional force overwrite

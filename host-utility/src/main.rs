@@ -1,7 +1,7 @@
 use std::thread::sleep;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use colored::Colorize;
@@ -641,51 +641,6 @@ fn run_setup_phases(
 
     // Phase 3: Key configuration
     let baker_key_result = phase3::run(backup_dir, confirmation_config, baker_key, config)?;
-
-    // Phase 4: Final verification (inlined)
-    if !dry_run {
-        let signer_uri = config.signer_uri();
-        progress::run_step_detail(
-            "Verifying signer keys",
-            &format!("octez-client list known remote keys {signer_uri}"),
-            || {
-                let remote_keys = keys::discover_remote_keys(config)
-                    .context("Failed to connect to remote signer")?;
-
-                if remote_keys.len() < 2 {
-                    anyhow::bail!(
-                        "Expected at least 2 remote keys but found {}. Signer may not be properly configured.",
-                        remote_keys.len()
-                    );
-                }
-                let detail = format!("{} keys available", remote_keys.len());
-                Ok(((), detail))
-            },
-        )?;
-
-        progress::run_step(
-            "Verifying key aliases",
-            "octez-client list known addresses",
-            || {
-                let list_output =
-                    utils::run_octez_client_command(&["list", "known", "addresses"], config)
-                        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                        .context("Failed to list known addresses")?;
-
-                let has_consensus = list_output.contains(constants::CONSENSUS_KEY_ALIAS)
-                    && (list_output.contains("tcp sk known")
-                        || list_output.contains("tcp:sk known"));
-                let has_companion = list_output.contains(constants::COMPANION_KEY_ALIAS)
-                    && (list_output.contains("tcp sk known")
-                        || list_output.contains("tcp:sk known"));
-
-                if !has_consensus || !has_companion {
-                    anyhow::bail!("Imported key aliases not found in octez-client");
-                }
-                Ok(())
-            },
-        )?;
-    }
 
     // Phase 5: Summary
     println!();
