@@ -116,6 +116,16 @@ pub fn run_octez_client_command(
     run_command("octez-client", &full_args)
 }
 
+/// Check if a systemd service is currently active
+pub fn is_service_active(service: &str) -> bool {
+    if !command_exists("systemctl") {
+        return false;
+    }
+    run_command("systemctl", &["is-active", service])
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "active")
+        .unwrap_or(false)
+}
+
 /// Check if a command exists in PATH
 pub fn command_exists(program: &str) -> bool {
     Command::new("which")

@@ -5,7 +5,9 @@ use std::sync::mpsc;
 // Import shared modules
 use crate::blockchain;
 use crate::config::RussignolConfig;
-use crate::constants::{COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, USB_VID_PID};
+use crate::constants::{
+    COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, NETWORK_CONFIG_PATH, NM_CONNECTION_PATH, USB_VID_PID,
+};
 use crate::hardware;
 use crate::keys;
 use crate::progress::{self, CheckEvent};
@@ -114,6 +116,7 @@ struct ConnectivityData {
     interface_ok: bool,
     ip_assigned: bool,
     remote_signer: bool,
+    network_backend: Option<&'static str>,
 }
 
 // Fetch functions (run concurrently)
@@ -262,10 +265,20 @@ fn fetch_connectivity_data(
         (h1.join().unwrap(), h2.join().unwrap(), h3.join().unwrap())
     });
 
+    // Infer which network backend is configured from files on disk
+    let network_backend = if std::path::Path::new(NETWORK_CONFIG_PATH).exists() {
+        Some("systemd-networkd")
+    } else if std::path::Path::new(NM_CONNECTION_PATH).exists() {
+        Some("NetworkManager")
+    } else {
+        None
+    };
+
     ConnectivityData {
         interface_ok,
         ip_assigned: ip_assigned.unwrap_or(false),
         remote_signer,
+        network_backend,
     }
 }
 
@@ -597,6 +610,9 @@ fn display_connectivity_status(verbose: bool, data: &ConnectivityData, signer_ur
         if verbose {
             println!("      Host IP: 169.254.1.2/30");
             println!("      Signer IP: 169.254.1.1/30");
+            if let Some(backend) = data.network_backend {
+                println!("      Backend: {backend}");
+            }
         }
     } else if data.interface_ok {
         println!(

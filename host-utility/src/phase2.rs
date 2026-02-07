@@ -1,8 +1,12 @@
 use crate::backup;
-use crate::constants::{NETWORK_CONFIG_PATH, NETWORKMANAGER_CONFIG_PATH, UDEV_RULE_PATH};
+use crate::constants::{
+    NETWORK_CONFIG_PATH, NETWORKMANAGER_CONFIG_PATH, NM_CONNECTION_PATH, UDEV_RULE_PATH,
+};
 use crate::hardware;
 use crate::system;
-use crate::utils::{command_exists, run_command, sudo_command, sudo_command_success};
+use crate::utils::{
+    command_exists, is_service_active, run_command, sudo_command, sudo_command_success,
+};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::thread::sleep;
@@ -25,10 +29,75 @@ LinkLocalAddressing=no
 IPv6AcceptRA=no
 ";
 
-// NetworkManager configuration content
+// NetworkManager configuration content (unmanaged — used with systemd-networkd backend)
 const NETWORKMANAGER_CONFIG_CONTENT: &str = r"[keyfile]
 unmanaged-devices=interface-name:russignol
 ";
+
+// NetworkManager connection profile (used with NetworkManager backend)
+const NM_CONNECTION_CONTENT: &str = r"[connection]
+id=russignol
+type=ethernet
+interface-name=russignol
+autoconnect=yes
+
+[ipv4]
+method=manual
+addresses=169.254.1.2/30
+
+[ipv6]
+method=disabled
+";
+
+/// Which network management service is in use on this system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum NetworkBackend {
+    /// systemd-networkd
+    #[value(name = "networkd")]
+    SystemdNetworkd,
+    /// `NetworkManager`
+    #[value(name = "nm")]
+    NetworkManager,
+}
+
+impl std::fmt::Display for NetworkBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetworkBackend::SystemdNetworkd => write!(f, "networkd"),
+            NetworkBackend::NetworkManager => write!(f, "nm"),
+        }
+    }
+}
+
+/// Detect the active network management backend.
+///
+/// If `override_backend` is `Some`, returns it immediately.
+/// Otherwise prefers systemd-networkd if both are running (preserves existing behaviour).
+/// Bails if neither is active or if `systemctl` is missing.
+fn detect_network_backend(override_backend: Option<NetworkBackend>) -> Result<NetworkBackend> {
+    if let Some(backend) = override_backend {
+        return Ok(backend);
+    }
+
+    anyhow::ensure!(
+        command_exists("systemctl"),
+        "systemctl not found — cannot detect network backend"
+    );
+
+    if is_service_active("systemd-networkd") {
+        return Ok(NetworkBackend::SystemdNetworkd);
+    }
+
+    if is_service_active("NetworkManager") {
+        anyhow::ensure!(
+            command_exists("nmcli"),
+            "NetworkManager is active but nmcli is not installed"
+        );
+        return Ok(NetworkBackend::NetworkManager);
+    }
+
+    anyhow::bail!("Neither systemd-networkd nor NetworkManager is running")
+}
 
 // Helper function to check if a file needs to be updated
 fn file_needs_update(path: &str, expected_content: &str) -> bool {
@@ -42,6 +111,7 @@ pub fn run(
     backup_dir: &Path,
     config: &crate::confirmation::ConfirmationConfig,
     russignol_config: &crate::config::RussignolConfig,
+    network_backend_override: Option<NetworkBackend>,
 ) -> Result<()> {
     // Skip network setup when using a remote signer
     if russignol_config.signer_endpoint.is_some() {
@@ -52,54 +122,13 @@ pub fn run(
         return Ok(());
     }
 
-    // Check which files actually need to be changed
+    let backend = detect_network_backend(network_backend_override)?;
+    log::info!("Detected network backend: {backend:?}");
+
     let udev_needs_update = file_needs_update(UDEV_RULE_PATH, UDEV_RULE_CONTENT);
-    let network_needs_update = file_needs_update(NETWORK_CONFIG_PATH, NETWORK_CONFIG_CONTENT);
-    let nm_needs_update =
-        file_needs_update(NETWORKMANAGER_CONFIG_PATH, NETWORKMANAGER_CONFIG_CONTENT);
+    let network_files_change = network_files_need_update(backend);
 
-    let any_network_files_change = network_needs_update || nm_needs_update;
-
-    // Build mutation list for only files that need to change
-    let mut actions = Vec::new();
-
-    if udev_needs_update {
-        actions.push(crate::confirmation::MutationAction {
-            description: format!("Write udev rule to {UDEV_RULE_PATH}"),
-            detailed_info: Some("Configures USB device naming for russignol interface".to_string()),
-        });
-    }
-
-    if network_needs_update {
-        actions.push(crate::confirmation::MutationAction {
-            description: format!("Write network config to {NETWORK_CONFIG_PATH}"),
-            detailed_info: Some("Sets up systemd-networkd for 169.254.1.2/30".to_string()),
-        });
-    }
-
-    if nm_needs_update {
-        actions.push(crate::confirmation::MutationAction {
-            description: format!("Write NetworkManager config to {NETWORKMANAGER_CONFIG_PATH}"),
-            detailed_info: Some(
-                "Prevents NetworkManager from managing russignol interface".to_string(),
-            ),
-        });
-    }
-
-    if any_network_files_change {
-        actions.push(crate::confirmation::MutationAction {
-            description: "Restart systemd-networkd service".to_string(),
-            detailed_info: Some("Applies network configuration changes".to_string()),
-        });
-        actions.push(crate::confirmation::MutationAction {
-            description: "Restart NetworkManager service (if running)".to_string(),
-            detailed_info: Some(
-                "Ensures NetworkManager recognizes unmanaged interface".to_string(),
-            ),
-        });
-    }
-
-    // If no changes needed, skip confirmation
+    let actions = build_mutation_actions(backend, udev_needs_update, network_files_change);
     if actions.is_empty() {
         return Ok(());
     }
@@ -109,36 +138,137 @@ pub fn run(
         actions,
     };
 
-    // Get confirmation
     match crate::confirmation::confirm_phase_mutations(&mutations, config) {
-        crate::confirmation::ConfirmationResult::Confirmed => {
-            // Continue with phase
-        }
-        crate::confirmation::ConfirmationResult::Skipped => {
-            return Ok(()); // Return success but skip phase
-        }
+        crate::confirmation::ConfirmationResult::Confirmed => {}
+        crate::confirmation::ConfirmationResult::Skipped => return Ok(()),
         crate::confirmation::ConfirmationResult::Cancelled => {
             anyhow::bail!("Setup cancelled by user");
         }
     }
 
-    // plugdev Group Membership Check (silent - progress shown in main)
     system::check_plugdev_with_warning()?;
 
-    // Install NM unmanaged config before udev rule so NetworkManager won't
-    // interfere when the udev trigger fires or the device reconnects
-    if nm_needs_update {
-        install_nm_unmanaged_config(backup_dir, config)?;
-    }
+    apply_network_config(
+        backend,
+        backup_dir,
+        config,
+        udev_needs_update,
+        network_files_change,
+    )
+}
 
-    // Udev Rule Management and Validation (silent - progress shown in main)
+fn network_files_need_update(backend: NetworkBackend) -> bool {
+    match backend {
+        NetworkBackend::SystemdNetworkd => {
+            file_needs_update(NETWORK_CONFIG_PATH, NETWORK_CONFIG_CONTENT)
+                || file_needs_update(NETWORKMANAGER_CONFIG_PATH, NETWORKMANAGER_CONFIG_CONTENT)
+        }
+        NetworkBackend::NetworkManager => {
+            file_needs_update(NM_CONNECTION_PATH, NM_CONNECTION_CONTENT)
+        }
+    }
+}
+
+fn build_mutation_actions(
+    backend: NetworkBackend,
+    udev_needs_update: bool,
+    network_files_change: bool,
+) -> Vec<crate::confirmation::MutationAction> {
+    let mut actions = Vec::new();
+
     if udev_needs_update {
-        manage_udev_rule(backup_dir, config.dry_run, config.verbose)?;
+        actions.push(crate::confirmation::MutationAction {
+            description: format!("Write udev rule to {UDEV_RULE_PATH}"),
+            detailed_info: Some("Configures USB device naming for russignol interface".to_string()),
+        });
     }
 
-    // Network Configuration and Validation (silent - progress shown in main)
-    if any_network_files_change {
-        manage_network_config(backup_dir, config, network_needs_update)?;
+    match backend {
+        NetworkBackend::SystemdNetworkd => {
+            if file_needs_update(NETWORK_CONFIG_PATH, NETWORK_CONFIG_CONTENT) {
+                actions.push(crate::confirmation::MutationAction {
+                    description: format!("Write network config to {NETWORK_CONFIG_PATH}"),
+                    detailed_info: Some("Sets up systemd-networkd for 169.254.1.2/30".to_string()),
+                });
+            }
+            if file_needs_update(NETWORKMANAGER_CONFIG_PATH, NETWORKMANAGER_CONFIG_CONTENT) {
+                actions.push(crate::confirmation::MutationAction {
+                    description: format!(
+                        "Write NetworkManager config to {NETWORKMANAGER_CONFIG_PATH}"
+                    ),
+                    detailed_info: Some(
+                        "Prevents NetworkManager from managing russignol interface".to_string(),
+                    ),
+                });
+            }
+            if network_files_change {
+                actions.push(crate::confirmation::MutationAction {
+                    description: "Restart systemd-networkd service".to_string(),
+                    detailed_info: Some("Applies network configuration changes".to_string()),
+                });
+                actions.push(crate::confirmation::MutationAction {
+                    description: "Restart NetworkManager service (if running)".to_string(),
+                    detailed_info: Some(
+                        "Ensures NetworkManager recognizes unmanaged interface".to_string(),
+                    ),
+                });
+            }
+        }
+        NetworkBackend::NetworkManager => {
+            if file_needs_update(NM_CONNECTION_PATH, NM_CONNECTION_CONTENT) {
+                actions.push(crate::confirmation::MutationAction {
+                    description: format!("Write NetworkManager connection to {NM_CONNECTION_PATH}"),
+                    detailed_info: Some(
+                        "Creates NM connection profile for 169.254.1.2/30".to_string(),
+                    ),
+                });
+            }
+            if network_files_change {
+                actions.push(crate::confirmation::MutationAction {
+                    description: "Activate NetworkManager connection".to_string(),
+                    detailed_info: Some(
+                        "Runs nmcli connection reload and activates russignol profile".to_string(),
+                    ),
+                });
+            }
+        }
+    }
+
+    actions
+}
+
+fn apply_network_config(
+    backend: NetworkBackend,
+    backup_dir: &Path,
+    config: &crate::confirmation::ConfirmationConfig,
+    udev_needs_update: bool,
+    network_files_change: bool,
+) -> Result<()> {
+    match backend {
+        NetworkBackend::SystemdNetworkd => {
+            // Install NM unmanaged config before udev rule so NetworkManager won't
+            // interfere when the udev trigger fires or the device reconnects
+            if file_needs_update(NETWORKMANAGER_CONFIG_PATH, NETWORKMANAGER_CONFIG_CONTENT) {
+                install_nm_unmanaged_config(backup_dir, config)?;
+            }
+
+            if udev_needs_update {
+                manage_udev_rule(backup_dir, config.dry_run, config.verbose)?;
+            }
+
+            if network_files_change {
+                manage_network_config_networkd(backup_dir, config)?;
+            }
+        }
+        NetworkBackend::NetworkManager => {
+            if udev_needs_update {
+                manage_udev_rule(backup_dir, config.dry_run, config.verbose)?;
+            }
+
+            if network_files_change {
+                manage_network_config_nm(backup_dir, config)?;
+            }
+        }
     }
 
     Ok(())
@@ -217,29 +347,23 @@ fn install_nm_unmanaged_config(
     create_network_file(NETWORKMANAGER_CONFIG_PATH, NETWORKMANAGER_CONFIG_CONTENT)?;
 
     // Restart NM so it picks up the unmanaged config immediately
-    if command_exists("systemctl") {
-        let nm_status = run_command("systemctl", &["is-active", "NetworkManager"]);
-        if let Ok(output) = nm_status
-            && String::from_utf8_lossy(&output.stdout).trim() == "active"
-        {
-            let _ = sudo_command("systemctl", &["restart", "NetworkManager"]);
-        }
+    if is_service_active("NetworkManager") {
+        let _ = sudo_command("systemctl", &["restart", "NetworkManager"]);
     }
 
     Ok(())
 }
 
-fn manage_network_config(
+fn manage_network_config_networkd(
     backup_dir: &Path,
     config: &crate::confirmation::ConfirmationConfig,
-    network_needs_update: bool,
 ) -> Result<()> {
     if config.dry_run {
         return Ok(());
     }
 
     // Backup and create systemd-networkd configuration if needed
-    if network_needs_update {
+    if file_needs_update(NETWORK_CONFIG_PATH, NETWORK_CONFIG_CONTENT) {
         let network_path = Path::new(NETWORK_CONFIG_PATH);
         if network_path.exists() {
             backup::backup_file_if_exists(
@@ -254,8 +378,54 @@ fn manage_network_config(
 
     // NM config already installed by install_nm_unmanaged_config() before
     // the udev rule — restart remaining networking services
-    restart_networking_services();
+    let _ = sudo_command("systemctl", &["restart", "systemd-networkd"]);
+    if is_service_active("NetworkManager") {
+        let _ = sudo_command("systemctl", &["restart", "NetworkManager"]);
+    }
 
+    validate_network_connectivity()
+}
+
+fn manage_network_config_nm(
+    backup_dir: &Path,
+    config: &crate::confirmation::ConfirmationConfig,
+) -> Result<()> {
+    if config.dry_run {
+        return Ok(());
+    }
+
+    // Backup existing connection profile if present
+    let nm_conn_path = Path::new(NM_CONNECTION_PATH);
+    if nm_conn_path.exists() {
+        backup::backup_file_if_exists(
+            nm_conn_path,
+            backup_dir,
+            "russignol.nmconnection",
+            config.verbose,
+        )?;
+    }
+
+    // Ensure parent directory exists
+    let nm_conn_dir = nm_conn_path.parent().unwrap();
+    sudo_command_success("mkdir", &["-p", &nm_conn_dir.to_string_lossy()])?;
+
+    // Write connection profile (NM requires root:root ownership and 0600)
+    let temp_file = create_temp_file()?;
+    std::fs::write(&temp_file, NM_CONNECTION_CONTENT)
+        .context("Failed to write temporary NM connection file")?;
+    sudo_command_success("mv", &[&temp_file, NM_CONNECTION_PATH])?;
+    sudo_command_success("chown", &["root:root", NM_CONNECTION_PATH])?;
+    sudo_command_success("chmod", &["600", NM_CONNECTION_PATH])?;
+
+    // Reload and activate
+    sudo_command_success("nmcli", &["connection", "reload"])?;
+    sudo_command_success("nmcli", &["connection", "up", "russignol"])?;
+
+    validate_network_connectivity()
+}
+
+/// Wait for IP assignment, then verify ping and TCP reachability to the signer.
+fn validate_network_connectivity() -> Result<()> {
     // Wait and validate (silent - progress shown in main)
     let mut ip_assigned = false;
 
@@ -304,21 +474,6 @@ fn create_network_file(path: &str, content: &str) -> Result<()> {
     sudo_command_success("chmod", &["644", path])?;
 
     Ok(())
-}
-
-fn restart_networking_services() {
-    // Try to restart systemd-networkd
-    if command_exists("systemctl") {
-        let _ = sudo_command("systemctl", &["restart", "systemd-networkd"]);
-
-        // Also try NetworkManager if it's running
-        let nm_status = run_command("systemctl", &["is-active", "NetworkManager"]);
-        if let Ok(output) = nm_status
-            && String::from_utf8_lossy(&output.stdout).trim() == "active"
-        {
-            let _ = sudo_command("systemctl", &["restart", "NetworkManager"]);
-        }
-    }
 }
 
 pub fn check_ip_assigned() -> Result<bool> {

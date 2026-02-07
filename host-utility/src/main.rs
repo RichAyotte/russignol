@@ -69,6 +69,10 @@ enum Commands {
         #[arg(long)]
         signer_endpoint: Option<String>,
 
+        /// Network backend override (auto-detected by default)
+        #[arg(long, value_enum)]
+        network_backend: Option<phase2::NetworkBackend>,
+
         /// Baker key or alias to use (required when using --yes)
         #[arg(long)]
         baker_key: Option<String>,
@@ -245,6 +249,7 @@ fn main() -> Result<()> {
             yes,
             endpoint,
             signer_endpoint,
+            network_backend,
             baker_key,
         }) => {
             run_setup(&SetupConfig {
@@ -257,6 +262,7 @@ fn main() -> Result<()> {
                 baker_key: baker_key.as_deref(),
                 endpoint: endpoint.as_deref(),
                 signer_endpoint: signer_endpoint.as_deref(),
+                network_backend,
             })?;
         }
         Some(Commands::Status {
@@ -460,6 +466,7 @@ struct SetupConfig<'a> {
     baker_key: Option<&'a str>,
     endpoint: Option<&'a str>,
     signer_endpoint: Option<&'a str>,
+    network_backend: Option<phase2::NetworkBackend>,
 }
 
 fn run_setup(setup_config: &SetupConfig<'_>) -> Result<()> {
@@ -469,6 +476,7 @@ fn run_setup(setup_config: &SetupConfig<'_>) -> Result<()> {
         baker_key,
         endpoint,
         signer_endpoint,
+        network_backend,
     } = setup_config;
 
     let confirmation_config = initialize_setup_environment(confirmation, *baker_key)?;
@@ -482,6 +490,7 @@ fn run_setup(setup_config: &SetupConfig<'_>) -> Result<()> {
         &backup_dir,
         *skip_hardware_check,
         *baker_key,
+        *network_backend,
     )
 }
 
@@ -542,6 +551,7 @@ fn run_setup_phases(
     backup_dir: &std::path::Path,
     skip_hardware_check: bool,
     baker_key: Option<&str>,
+    network_backend: Option<phase2::NetworkBackend>,
 ) -> Result<()> {
     const TOTAL_STEPS: usize = 6;
 
@@ -558,7 +568,9 @@ fn run_setup_phases(
     })?;
 
     run_phase_with_error_handler(&display, 3, "Configuring system...", || {
-        display.suspend_for_prompt(|| phase2::run(backup_dir, confirmation_config, config))
+        display.suspend_for_prompt(|| {
+            phase2::run(backup_dir, confirmation_config, config, network_backend)
+        })
     })?;
 
     display.update(4, "Configuring keys...");

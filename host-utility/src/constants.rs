@@ -79,6 +79,10 @@ pub const NETWORK_CONFIG_PATH: &str = "/etc/systemd/network/80-russignol.network
 /// Path to the `NetworkManager` configuration file
 pub const NETWORKMANAGER_CONFIG_PATH: &str = "/etc/NetworkManager/conf.d/unmanaged-russignol.conf";
 
+/// Path to the `NetworkManager` connection profile for russignol
+pub const NM_CONNECTION_PATH: &str =
+    "/etc/NetworkManager/system-connections/russignol.nmconnection";
+
 // ============================================================================
 // Required Dependencies
 // ============================================================================

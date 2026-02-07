@@ -1,16 +1,15 @@
 use crate::config::RussignolConfig;
-use crate::constants::{COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS};
+use crate::constants::{
+    COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, NETWORK_CONFIG_PATH, NETWORKMANAGER_CONFIG_PATH,
+    NM_CONNECTION_PATH, UDEV_RULE_PATH,
+};
 use crate::utils::{
-    command_exists, info, print_title_bar, run_command, run_octez_client_command, success,
-    sudo_command, warning,
+    info, is_service_active, print_title_bar, run_octez_client_command, success, sudo_command,
+    warning,
 };
 use anyhow::Result;
 use colored::Colorize;
 use std::io::Write;
-
-const UDEV_RULE_PATH: &str = "/etc/udev/rules.d/20-russignol.rules";
-const NETWORK_CONFIG_PATH: &str = "/etc/systemd/network/80-russignol.network";
-const NETWORKMANAGER_CONFIG_PATH: &str = "/etc/NetworkManager/conf.d/unmanaged-russignol.conf";
 
 pub fn run_cleanup(dry_run: bool, config: &RussignolConfig) -> Result<()> {
     print_title_bar("🧹 Russignol Cleanup");
@@ -45,16 +44,11 @@ pub fn run_cleanup(dry_run: bool, config: &RussignolConfig) -> Result<()> {
         let _ = sudo_command("udevadm", &["trigger"]);
 
         info("Restarting networking services...");
-        if command_exists("systemctl") {
+        if is_service_active("systemd-networkd") {
             let _ = sudo_command("systemctl", &["restart", "systemd-networkd"]);
-
-            // Also try NetworkManager if it's running
-            let nm_status = run_command("systemctl", &["is-active", "NetworkManager"]);
-            if let Ok(output) = nm_status
-                && String::from_utf8_lossy(&output.stdout).trim() == "active"
-            {
-                let _ = sudo_command("systemctl", &["restart", "NetworkManager"]);
-            }
+        }
+        if is_service_active("NetworkManager") {
+            let _ = sudo_command("systemctl", &["restart", "NetworkManager"]);
         }
     }
 
@@ -80,6 +74,7 @@ fn remove_system_files(dry_run: bool) {
         UDEV_RULE_PATH,
         NETWORK_CONFIG_PATH,
         NETWORKMANAGER_CONFIG_PATH,
+        NM_CONNECTION_PATH,
     ];
 
     for file in files {
@@ -192,6 +187,7 @@ fn verify_cleanup(config: &RussignolConfig) {
         UDEV_RULE_PATH,
         NETWORK_CONFIG_PATH,
         NETWORKMANAGER_CONFIG_PATH,
+        NM_CONNECTION_PATH,
     ] {
         if std::path::Path::new(file).exists() {
             warning(&format!("File still exists: {file}"));
