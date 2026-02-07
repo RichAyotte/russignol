@@ -3,9 +3,11 @@ use crate::constants::{
     NETWORK_CONFIG_PATH, NETWORKMANAGER_CONFIG_PATH, NM_CONNECTION_PATH, UDEV_RULE_PATH,
 };
 use crate::hardware;
+use crate::progress::run_step;
 use crate::system;
 use crate::utils::{
-    command_exists, is_service_active, run_command, sudo_command, sudo_command_success,
+    command_exists, ensure_sudo, is_service_active, run_command, sudo_command_quiet,
+    sudo_command_success_quiet,
 };
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -148,6 +150,10 @@ pub fn run(
 
     system::check_plugdev_with_warning()?;
 
+    if !config.dry_run {
+        ensure_sudo()?;
+    }
+
     apply_network_config(
         backend,
         backup_dir,
@@ -203,11 +209,11 @@ fn build_mutation_actions(
             }
             if network_files_change {
                 actions.push(crate::confirmation::MutationAction {
-                    description: "Restart systemd-networkd service".to_string(),
+                    description: "Reload systemd-networkd service".to_string(),
                     detailed_info: Some("Applies network configuration changes".to_string()),
                 });
                 actions.push(crate::confirmation::MutationAction {
-                    description: "Restart NetworkManager service (if running)".to_string(),
+                    description: "Reload NetworkManager service (if running)".to_string(),
                     detailed_info: Some(
                         "Ensures NetworkManager recognizes unmanaged interface".to_string(),
                     ),
@@ -288,37 +294,44 @@ fn manage_udev_rule(backup_dir: &Path, dry_run: bool, verbose: bool) -> Result<(
         return Ok(());
     }
 
-    // Write the udev rule
-    let temp_file = create_temp_file()?;
-    std::fs::write(&temp_file, UDEV_RULE_CONTENT)
-        .context("Failed to write temporary udev rule file")?;
+    run_step(
+        "Installing udev rule",
+        &format!("sudo cp <rule> {UDEV_RULE_PATH}"),
+        || {
+            let temp_file = create_temp_file()?;
+            std::fs::write(&temp_file, UDEV_RULE_CONTENT)
+                .context("Failed to write temporary udev rule file")?;
+            sudo_command_success_quiet("mv", &[&temp_file, UDEV_RULE_PATH])?;
+            sudo_command_success_quiet("chmod", &["644", UDEV_RULE_PATH])?;
+            Ok(())
+        },
+    )?;
 
-    // Move to /etc/udev/rules.d/ with sudo
-    sudo_command_success("mv", &[&temp_file, UDEV_RULE_PATH])?;
-    sudo_command_success("chmod", &["644", UDEV_RULE_PATH])?;
+    run_step(
+        "Reloading udev rules",
+        "sudo udevadm control --reload-rules",
+        || {
+            sudo_command_success_quiet("udevadm", &["control", "--reload-rules"])?;
+            sudo_command_success_quiet("udevadm", &["trigger", "--subsystem-match=net"])?;
+            Ok(())
+        },
+    )?;
 
-    // Reload udev rules
-    sudo_command_success("udevadm", &["control", "--reload-rules"])?;
-    sudo_command_success("udevadm", &["trigger", "--subsystem-match=net"])?;
-
-    // Wait and validate network interface appears (silent - progress shown in main)
-    let mut interface_found = false;
-
-    for _ in 0..45 {
-        if hardware::find_russignol_network_interface() {
-            interface_found = true;
-            break;
-        }
-        sleep(Duration::from_secs(1));
-    }
-
-    if !interface_found {
-        anyhow::bail!(
-            "russignol network interface not detected after udev configuration. Please check hardware connection and udev rule."
-        );
-    }
-
-    Ok(())
+    run_step(
+        "Waiting for network interface",
+        "ip link show russignol",
+        || {
+            for _ in 0..45 {
+                if hardware::find_russignol_network_interface() {
+                    return Ok(());
+                }
+                sleep(Duration::from_secs(1));
+            }
+            anyhow::bail!(
+                "russignol network interface not detected after udev configuration. Please check hardware connection and udev rule."
+            )
+        },
+    )
 }
 
 // find_russignol_network_interface moved to hardware::find_russignol_network_interface()
@@ -342,16 +355,22 @@ fn install_nm_unmanaged_config(
             config.verbose,
         )?;
     }
-    let nm_dir = nm_path.parent().unwrap();
-    sudo_command_success("mkdir", &["-p", &nm_dir.to_string_lossy()])?;
-    create_network_file(NETWORKMANAGER_CONFIG_PATH, NETWORKMANAGER_CONFIG_CONTENT)?;
 
-    // Restart NM so it picks up the unmanaged config immediately
-    if is_service_active("NetworkManager") {
-        let _ = sudo_command("systemctl", &["restart", "NetworkManager"]);
-    }
+    run_step(
+        "Installing NM unmanaged config",
+        &format!("sudo cp <config> {NETWORKMANAGER_CONFIG_PATH}"),
+        || {
+            let nm_dir = nm_path.parent().unwrap();
+            sudo_command_success_quiet("mkdir", &["-p", &nm_dir.to_string_lossy()])?;
+            create_network_file(NETWORKMANAGER_CONFIG_PATH, NETWORKMANAGER_CONFIG_CONTENT)?;
 
-    Ok(())
+            // Reload NM so it picks up the unmanaged config immediately
+            if is_service_active("NetworkManager") {
+                let _ = sudo_command_quiet("systemctl", &["reload", "NetworkManager"]);
+            }
+            Ok(())
+        },
+    )
 }
 
 fn manage_network_config_networkd(
@@ -373,15 +392,27 @@ fn manage_network_config_networkd(
                 config.verbose,
             )?;
         }
-        create_network_file(NETWORK_CONFIG_PATH, NETWORK_CONFIG_CONTENT)?;
+
+        run_step(
+            "Installing network config",
+            &format!("sudo cp <config> {NETWORK_CONFIG_PATH}"),
+            || create_network_file(NETWORK_CONFIG_PATH, NETWORK_CONFIG_CONTENT),
+        )?;
     }
 
     // NM config already installed by install_nm_unmanaged_config() before
     // the udev rule — restart remaining networking services
-    let _ = sudo_command("systemctl", &["restart", "systemd-networkd"]);
-    if is_service_active("NetworkManager") {
-        let _ = sudo_command("systemctl", &["restart", "NetworkManager"]);
-    }
+    run_step(
+        "Reloading network services",
+        "sudo systemctl reload systemd-networkd",
+        || {
+            let _ = sudo_command_quiet("systemctl", &["reload", "systemd-networkd"]);
+            if is_service_active("NetworkManager") {
+                let _ = sudo_command_quiet("systemctl", &["reload", "NetworkManager"]);
+            }
+            Ok(())
+        },
+    )?;
 
     validate_network_connectivity()
 }
@@ -405,56 +436,72 @@ fn manage_network_config_nm(
         )?;
     }
 
-    // Ensure parent directory exists
-    let nm_conn_dir = nm_conn_path.parent().unwrap();
-    sudo_command_success("mkdir", &["-p", &nm_conn_dir.to_string_lossy()])?;
+    run_step(
+        "Installing NM connection",
+        &format!("sudo cp <config> {NM_CONNECTION_PATH}"),
+        || {
+            let nm_conn_dir = nm_conn_path.parent().unwrap();
+            sudo_command_success_quiet("mkdir", &["-p", &nm_conn_dir.to_string_lossy()])?;
 
-    // Write connection profile (NM requires root:root ownership and 0600)
-    let temp_file = create_temp_file()?;
-    std::fs::write(&temp_file, NM_CONNECTION_CONTENT)
-        .context("Failed to write temporary NM connection file")?;
-    sudo_command_success("mv", &[&temp_file, NM_CONNECTION_PATH])?;
-    sudo_command_success("chown", &["root:root", NM_CONNECTION_PATH])?;
-    sudo_command_success("chmod", &["600", NM_CONNECTION_PATH])?;
+            let temp_file = create_temp_file()?;
+            std::fs::write(&temp_file, NM_CONNECTION_CONTENT)
+                .context("Failed to write temporary NM connection file")?;
+            sudo_command_success_quiet("mv", &[&temp_file, NM_CONNECTION_PATH])?;
+            sudo_command_success_quiet("chown", &["root:root", NM_CONNECTION_PATH])?;
+            sudo_command_success_quiet("chmod", &["600", NM_CONNECTION_PATH])?;
+            Ok(())
+        },
+    )?;
 
-    // Reload and activate
-    sudo_command_success("nmcli", &["connection", "reload"])?;
-    sudo_command_success("nmcli", &["connection", "up", "russignol"])?;
+    run_step(
+        "Activating NM connection",
+        "sudo nmcli connection up russignol",
+        || {
+            sudo_command_success_quiet("nmcli", &["connection", "reload"])?;
+            sudo_command_success_quiet("nmcli", &["connection", "up", "russignol"])?;
+            Ok(())
+        },
+    )?;
 
     validate_network_connectivity()
 }
 
 /// Wait for IP assignment, then verify ping and TCP reachability to the signer.
 fn validate_network_connectivity() -> Result<()> {
-    // Wait and validate (silent - progress shown in main)
-    let mut ip_assigned = false;
+    run_step(
+        "Verifying network connectivity",
+        "ping -c 3 169.254.1.1",
+        || {
+            // Wait for IP assignment
+            let mut ip_assigned = false;
+            for _ in 0..10 {
+                if check_ip_assigned()? {
+                    ip_assigned = true;
+                    break;
+                }
+                sleep(Duration::from_secs(1));
+            }
 
-    for _ in 0..10 {
-        if check_ip_assigned()? {
-            ip_assigned = true;
-            break;
-        }
-        sleep(Duration::from_secs(1));
-    }
+            if !ip_assigned {
+                anyhow::bail!(
+                    "Failed to configure network interface. IP 169.254.1.2 not assigned after 10 seconds."
+                );
+            }
 
-    if !ip_assigned {
-        anyhow::bail!(
-            "Failed to configure network interface. IP 169.254.1.2 not assigned after 10 seconds."
-        );
-    }
+            // Ping test
+            let ping_output = run_command("ping", &["-c", "3", "-W", "2", "169.254.1.1"])?;
+            if !ping_output.status.success() {
+                anyhow::bail!(
+                    "Network interface configured but signer at 169.254.1.1 not reachable via ping"
+                );
+            }
 
-    // Ping test to signer (silent - progress shown in main)
-    let ping_output = run_command("ping", &["-c", "3", "-W", "2", "169.254.1.1"])?;
-    if !ping_output.status.success() {
-        anyhow::bail!(
-            "Network interface configured but signer at 169.254.1.1 not reachable via ping"
-        );
-    }
+            // TCP connection test to signer service
+            let _ = std::net::TcpStream::connect("169.254.1.1:7732");
 
-    // TCP connection test to signer service (silent - progress shown in main)
-    let _ = std::net::TcpStream::connect("169.254.1.1:7732");
-
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 /// Create a temporary file using mktemp
@@ -470,8 +517,8 @@ fn create_network_file(path: &str, content: &str) -> Result<()> {
     let temp_file = create_temp_file()?;
     std::fs::write(&temp_file, content).context("Failed to write temporary network config file")?;
 
-    sudo_command_success("mv", &[&temp_file, path])?;
-    sudo_command_success("chmod", &["644", path])?;
+    sudo_command_success_quiet("mv", &[&temp_file, path])?;
+    sudo_command_success_quiet("chmod", &["644", path])?;
 
     Ok(())
 }

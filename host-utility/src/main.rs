@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use colored::Colorize;
@@ -11,16 +11,12 @@ mod cleanup;
 mod config;
 mod confirmation;
 mod constants;
-mod display;
 mod hardware;
 mod image;
 mod install;
 mod keys;
-mod phase0;
-mod phase1;
 mod phase2;
 mod phase3;
-mod phase4;
 mod phase5;
 mod progress;
 mod rotate_keys;
@@ -553,55 +549,122 @@ fn run_setup_phases(
     baker_key: Option<&str>,
     network_backend: Option<phase2::NetworkBackend>,
 ) -> Result<()> {
-    const TOTAL_STEPS: usize = 6;
-
     let dry_run = confirmation_config.dry_run;
     let verbose = confirmation_config.verbose;
-    let display = display::SetupDisplay::new(TOTAL_STEPS);
 
-    run_phase_with_error_handler(&display, 1, "Detecting hardware...", || {
-        phase0::run(skip_hardware_check, dry_run, verbose)
-    })?;
+    // Phase 0: Hardware detection (inlined)
+    if !skip_hardware_check {
+        progress::run_step_detail("Detecting hardware", "lsusb", || {
+            hardware::detect_hardware_device()?;
+            let serial = hardware::get_usb_serial_number()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let detail = if serial.is_empty() {
+                "Russignol device found".to_string()
+            } else {
+                format!("Russignol device found (serial: {serial})")
+            };
+            Ok(((), detail))
+        })?;
 
-    run_phase_with_error_handler(&display, 2, "Validating system...", || {
-        phase1::run(dry_run, verbose, config)
-    })?;
+        if let Ok(Some(power_info)) = hardware::get_usb_power_info()
+            && let Some(warning_msg) = hardware::check_power_warning(&power_info)
+        {
+            println!();
+            utils::warning(&warning_msg);
+            println!();
+        }
+    }
 
-    run_phase_with_error_handler(&display, 3, "Configuring system...", || {
-        display.suspend_for_prompt(|| {
-            phase2::run(backup_dir, confirmation_config, config, network_backend)
-        })
-    })?;
+    // Phase 1: System validation (inlined)
+    progress::run_step(
+        "Checking dependencies",
+        "which octez-client octez-node ...",
+        system::verify_dependencies,
+    )?;
 
-    display.update(4, "Configuring keys...");
-    let baker_key_result = display
-        .suspend_for_prompt(|| phase3::run(backup_dir, confirmation_config, baker_key, config))?;
+    progress::run_step_detail(
+        "Checking octez-node",
+        &format!(
+            "octez-client rpc get /version --endpoint {}",
+            config.rpc_endpoint
+        ),
+        || {
+            system::verify_octez_node(config)?;
+            let detail = utils::rpc_get_json("/version", config)
+                .ok()
+                .and_then(|v| {
+                    let product = v.get("version")?.get("product")?.as_str()?;
+                    Some(product.to_string())
+                })
+                .unwrap_or_default();
+            Ok(((), detail))
+        },
+    )?;
 
-    run_phase_with_error_handler(&display, 5, "Testing connectivity...", || {
-        phase4::run(dry_run, verbose, config)
-    })?;
+    progress::run_step(
+        "Checking client directory",
+        &config.octez_client_dir.display().to_string(),
+        || system::verify_octez_client_directory(config),
+    )?;
 
-    display.update(6, "Finalizing...");
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    display.finish();
+    // Phase 2: Network configuration
+    phase2::run(backup_dir, confirmation_config, config, network_backend)?;
 
+    // Phase 3: Key configuration
+    let baker_key_result = phase3::run(backup_dir, confirmation_config, baker_key, config)?;
+
+    // Phase 4: Final verification (inlined)
+    if !dry_run {
+        let signer_uri = config.signer_uri();
+        progress::run_step_detail(
+            "Verifying signer keys",
+            &format!("octez-client list known remote keys {signer_uri}"),
+            || {
+                let remote_keys = keys::discover_remote_keys(config)
+                    .context("Failed to connect to remote signer")?;
+
+                if remote_keys.len() < 2 {
+                    anyhow::bail!(
+                        "Expected at least 2 remote keys but found {}. Signer may not be properly configured.",
+                        remote_keys.len()
+                    );
+                }
+                let detail = format!("{} keys available", remote_keys.len());
+                Ok(((), detail))
+            },
+        )?;
+
+        progress::run_step(
+            "Verifying key aliases",
+            "octez-client list known addresses",
+            || {
+                let list_output =
+                    utils::run_octez_client_command(&["list", "known", "addresses"], config)
+                        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                        .context("Failed to list known addresses")?;
+
+                let has_consensus = list_output.contains(constants::CONSENSUS_KEY_ALIAS)
+                    && (list_output.contains("tcp sk known")
+                        || list_output.contains("tcp:sk known"));
+                let has_companion = list_output.contains(constants::COMPANION_KEY_ALIAS)
+                    && (list_output.contains("tcp sk known")
+                        || list_output.contains("tcp:sk known"));
+
+                if !has_consensus || !has_companion {
+                    anyhow::bail!("Imported key aliases not found in octez-client");
+                }
+                Ok(())
+            },
+        )?;
+    }
+
+    // Phase 5: Summary
     println!();
     println!();
     print_title_bar("🔐 Russignol Hardware Signer Setup Complete!");
     phase5::run(backup_dir, &baker_key_result, dry_run, verbose, config);
 
     Ok(())
-}
-
-fn run_phase_with_error_handler<F>(
-    display: &display::SetupDisplay,
-    step: usize,
-    message: &str,
-    phase_fn: F,
-) -> Result<()>
-where
-    F: FnOnce() -> Result<()>,
-{
-    display.update(step, message);
-    phase_fn()
 }

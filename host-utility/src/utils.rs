@@ -153,6 +153,26 @@ pub fn read_file(path: &Path) -> Result<String> {
         .with_context(|| format!("Failed to read file: {}", path.display()))
 }
 
+/// Ensure sudo credentials are cached so subsequent sudo calls don't prompt
+///
+/// Runs `sudo -v` with inherited stdio so the user can see the password prompt
+/// and type their password. This must be called _outside_ any spinner context.
+pub fn ensure_sudo() -> Result<()> {
+    let status = Command::new("sudo")
+        .arg("-v")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("Failed to run sudo -v")?;
+
+    if !status.success() {
+        anyhow::bail!("sudo authentication failed");
+    }
+
+    Ok(())
+}
+
 /// Run a command with sudo
 pub fn sudo_command(program: &str, args: &[&str]) -> Result<std::process::Output> {
     let cmd_line = format!("  $ sudo {} {}", program, args.join(" "));
@@ -165,6 +185,30 @@ pub fn sudo_command(program: &str, args: &[&str]) -> Result<std::process::Output
 /// Run a command with sudo and check success
 pub fn sudo_command_success(program: &str, args: &[&str]) -> Result<String> {
     let output = sudo_command(program, args)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Sudo command failed: {} {}\nError: {}",
+            program,
+            args.join(" "),
+            stderr
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Run a command with sudo (quiet — no printed command line)
+pub fn sudo_command_quiet(program: &str, args: &[&str]) -> Result<std::process::Output> {
+    let mut sudo_args = vec![program];
+    sudo_args.extend(args);
+    run_command("sudo", &sudo_args)
+}
+
+/// Run a command with sudo and check success (quiet — no printed command line)
+pub fn sudo_command_success_quiet(program: &str, args: &[&str]) -> Result<String> {
+    let output = sudo_command_quiet(program, args)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

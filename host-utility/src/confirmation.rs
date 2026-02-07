@@ -53,6 +53,7 @@ pub fn confirm_phase_mutations(
     }
 
     // Interactive confirmation
+    println!();
     let subtitle = format!(
         "The following changes will be made to {}:",
         mutations.phase_name
