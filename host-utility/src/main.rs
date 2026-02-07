@@ -506,8 +506,6 @@ fn initialize_setup_environment(
         .filter_level(log_level)
         .init();
 
-    println!();
-
     if confirmation.dry_run {
         println!(
             "{}",
