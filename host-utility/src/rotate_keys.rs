@@ -22,8 +22,9 @@ use crate::keys;
 use crate::progress::create_spinner;
 use crate::system;
 use crate::utils::{
-    JsonValueExt, create_orange_theme, info, print_subtitle_bar, print_title_bar, prompt_yes_no,
-    rpc_get_json, run_command, run_octez_client_command, success, sudo_command_success, warning,
+    JsonValueExt, create_orange_theme, ensure_sudo, info, print_subtitle_bar, print_title_bar,
+    prompt_yes_no, rpc_get_json, run_command, run_octez_client_command, success,
+    sudo_command_success, warning,
 };
 use std::fmt::Write as _;
 
@@ -1426,6 +1427,7 @@ fn execute_swap_sequence(
 fn stop_baker(restart_config: &ResolvedRestartConfig) -> Result<()> {
     match restart_config.method {
         RestartMethod::Systemd => {
+            ensure_sudo()?;
             sudo_command_success("systemctl", &["stop", &restart_config.service])?;
         }
         RestartMethod::Script => {
@@ -1454,6 +1456,7 @@ fn stop_baker(restart_config: &ResolvedRestartConfig) -> Result<()> {
 fn start_baker(restart_config: &ResolvedRestartConfig) -> Result<()> {
     match restart_config.method {
         RestartMethod::Systemd => {
+            ensure_sudo()?;
             sudo_command_success("systemctl", &["start", &restart_config.service])?;
         }
         RestartMethod::Script => {

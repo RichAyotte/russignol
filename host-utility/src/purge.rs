@@ -5,7 +5,7 @@ use crate::constants::{
 };
 use crate::progress::create_spinner;
 use crate::utils::{
-    info, is_service_active, run_command, run_octez_client_command, success, warning,
+    ensure_sudo, info, is_service_active, run_command, run_octez_client_command, success, warning,
 };
 use anyhow::Result;
 use std::io::Write;
@@ -84,6 +84,7 @@ pub fn run_purge(dry_run: bool, config: &RussignolConfig) -> Result<()> {
             println!("Purge cancelled.");
             return Ok(());
         }
+        ensure_sudo()?;
         println!();
         let tasks: Vec<SpinnerTask<'_>> = displays.iter().map(|d| sudo_task(d)).collect();
         run_with_spinner(tasks, "System configuration removed.");
