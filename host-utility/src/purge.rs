@@ -17,7 +17,7 @@ const ALL_CONFIG_FILES: &[&str] = &[
     NM_CONNECTION_PATH,
 ];
 
-pub fn run_cleanup(dry_run: bool, config: &RussignolConfig) -> Result<()> {
+pub fn run_purge(dry_run: bool, config: &RussignolConfig) -> Result<()> {
     // Determine which actions are needed
     let files_to_remove: Vec<&str> = ALL_CONFIG_FILES
         .iter()
@@ -81,7 +81,7 @@ pub fn run_cleanup(dry_run: bool, config: &RussignolConfig) -> Result<()> {
         std::io::stdin().read_line(&mut input)?;
 
         if input.trim().to_lowercase() != "yes" {
-            println!("Cleanup cancelled.");
+            println!("Purge cancelled.");
             return Ok(());
         }
         println!();
@@ -99,7 +99,7 @@ pub fn run_cleanup(dry_run: bool, config: &RussignolConfig) -> Result<()> {
     // Verify removal
     if !dry_run {
         println!();
-        verify_cleanup(config);
+        verify_purge(config);
     }
 
     Ok(())
@@ -204,7 +204,7 @@ fn remove_keys(dry_run: bool, aliases: &[&str], config: &RussignolConfig) -> Res
     Ok(())
 }
 
-fn verify_cleanup(config: &RussignolConfig) {
+fn verify_purge(config: &RussignolConfig) {
     for file in ALL_CONFIG_FILES {
         if std::path::Path::new(file).exists() {
             warning(&format!("File still exists: {file}"));

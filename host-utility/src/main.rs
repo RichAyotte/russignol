@@ -7,7 +7,6 @@ use utils::print_title_bar;
 
 mod backup;
 mod blockchain;
-mod cleanup;
 mod config;
 mod confirmation;
 mod constants;
@@ -19,6 +18,7 @@ mod phase2;
 mod phase3;
 mod phase5;
 mod progress;
+mod purge;
 mod rotate_keys;
 mod status;
 mod system;
@@ -88,7 +88,7 @@ enum Commands {
         signer_endpoint: Option<String>,
     },
     /// Remove all system configuration
-    Cleanup {
+    Purge {
         /// Simulate all operations without making any changes
         #[arg(long)]
         dry_run: bool,
@@ -268,10 +268,10 @@ fn main() -> Result<()> {
         }) => {
             handle_status_command(verbose, endpoint.as_deref(), signer_endpoint.as_deref())?;
         }
-        Some(Commands::Cleanup { dry_run }) => {
+        Some(Commands::Purge { dry_run }) => {
             // Load configuration
             let config = config::RussignolConfig::load()?;
-            cleanup::run_cleanup(dry_run, &config)?;
+            purge::run_purge(dry_run, &config)?;
         }
         Some(Commands::Install { yes, backup }) => {
             install::run_install(yes, backup)?;

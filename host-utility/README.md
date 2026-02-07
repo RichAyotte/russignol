@@ -40,6 +40,9 @@ russignol config reset              Re-run auto-detection
 russignol rotate-keys               Start key rotation workflow
 russignol rotate-keys --monitor     Check pending rotation status
 
+russignol purge                     Remove all system configuration
+russignol purge --dry-run           Simulate without changes
+
 russignol status                    Check device connectivity
 russignol status --endpoint <URL>   Check status using remote node
 russignol completions <shell>       Install shell completions (bash/zsh/fish)
