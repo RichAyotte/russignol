@@ -11,11 +11,8 @@ use crate::hardware;
 use crate::keys;
 use crate::progress;
 use crate::system;
-use crate::utils::print_title_bar;
 
 pub fn run_status(verbose: bool, config: &RussignolConfig) {
-    println!();
-
     let spinner = progress::create_spinner("Gathering status...");
 
     // Fetch all data sequentially
@@ -41,8 +38,6 @@ pub fn run_status(verbose: bool, config: &RussignolConfig) {
     let rights_data = fetch_rights_data(&delegate_result, config);
 
     spinner.finish_and_clear();
-
-    print_title_bar("🔐 Russignol Signer Status");
 
     // Display all results
     display_hardware_status(verbose, hardware_data);
