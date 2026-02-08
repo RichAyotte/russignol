@@ -52,8 +52,6 @@ flowchart TB
         octez[octez-client]
     end
 
-    octez -->|TCP/7732| server
-
     subgraph signer[Russignol Signer]
         subgraph display[E-Ink Display]
             pages[PIN Entry UI]
@@ -74,13 +72,13 @@ flowchart TB
             constant[Constant-time Ops]
             pop[Proof of Possession]
         end
-
-        server --> keys
-        keys --> crypto
-        display -.->|PIN| keys
     end
 
-    host ===|USB Ethernet| signer
+    octez -->|TCP/7732| server
+    server --> keys
+    keys --> crypto
+    display -.->|PIN| keys
+    host ==>|USB Ethernet| signer
 ```
 
 ## 2. Custom Distribution Security
@@ -228,7 +226,7 @@ The display enters sleep mode after 3 minutes of inactivity. Touch to wake. This
 Protection against brute-force PIN attacks:
 
 - **Max Attempts:** 5 failed attempts before lockout
-- **Lockout Duration:** Requires power cycle to retry
+- **Lockout Duration:** Process exits; requires power cycle to restart
 
 ### 7.3 PIN Minimum Length
 
@@ -249,7 +247,7 @@ The signer tracks metadata about signing operations (not persisted to disk):
 Protection against stale watermarks that could indicate misconfiguration:
 
 - **Threshold:** 4 cycles worth of blocks
-- **Behavior:** Prompts user confirmation via UI before signing
+- **Behavior:** Rejects signing request and prompts user to update watermark via UI; subsequent requests succeed after confirmation
 
 ## 8. Physical Attack Surface
 
