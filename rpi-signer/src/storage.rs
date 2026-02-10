@@ -18,10 +18,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-// Constants
-const MIN_ALIGNMENT: u64 = 16 * 1024 * 1024; // 16MB minimum alignment
-const F2FS_PARTITION_SIZE: u64 = 64 * 1024 * 1024; // 64MB for each partition
-const SECTOR_SIZE: u64 = 512;
+use russignol_storage::{self, F2FS_FORMAT_FEATURES, MIN_ALIGNMENT, SECTOR_SIZE};
 
 // Device paths
 const DISK: &str = "/dev/mmcblk0";
@@ -49,15 +46,15 @@ const BLKPG_ADD_PARTITION: libc::c_int = 1;
 
 use crate::util::run_command;
 
-/// Partition layout calculated from hardware parameters
+/// Extended partition layout with hardware-specific fields.
+///
+/// Wraps the shared [`russignol_storage::PartitionLayout`] with additional
+/// fields needed for first-boot setup (alignment, trim, disk size).
 #[derive(Debug)]
 #[allow(dead_code)] // Fields used for Debug output and diagnostic logging
 pub struct PartitionLayout {
+    pub partitions: russignol_storage::PartitionLayout,
     pub alignment: u64,
-    pub keys_start_sector: u64,
-    pub keys_size_sectors: u64,
-    pub data_start_sector: u64,
-    pub data_size_sectors: u64,
     pub disk_size_sectors: u64,
     pub trim_supported: bool,
 }
@@ -107,14 +104,14 @@ where
     if trim_supported {
         progress("Optimizing keys area...", 40)?;
         trim_partition_range(
-            layout.keys_start_sector * SECTOR_SIZE,
-            layout.keys_size_sectors * SECTOR_SIZE,
+            layout.partitions.keys_start_sector * SECTOR_SIZE,
+            layout.partitions.keys_size_sectors * SECTOR_SIZE,
         )?;
 
         progress("Optimizing data area...", 50)?;
         trim_partition_range(
-            layout.data_start_sector * SECTOR_SIZE,
-            layout.data_size_sectors * SECTOR_SIZE,
+            layout.partitions.data_start_sector * SECTOR_SIZE,
+            layout.partitions.data_size_sectors * SECTOR_SIZE,
         )?;
     }
 
@@ -168,11 +165,6 @@ fn calculate_alignment() -> u64 {
     }
 }
 
-/// Round up to alignment boundary
-fn align_up(value: u64, alignment: u64) -> u64 {
-    value.div_ceil(alignment) * alignment
-}
-
 /// Read a sysfs value as u64
 fn read_sysfs_u64(path: &str) -> Result<u64, String> {
     fs::read_to_string(path)
@@ -196,59 +188,34 @@ fn calculate_partition_layout(
     let p2_size_sectors = read_sysfs_u64("/sys/block/mmcblk0/mmcblk0p2/size")?;
     let p2_end_bytes = (p2_start_sectors + p2_size_sectors) * SECTOR_SIZE;
 
-    // Keys partition (p3): starts at first aligned boundary after rootfs
-    let keys_start_bytes = align_up(p2_end_bytes, alignment);
-    let keys_size_bytes = align_up(F2FS_PARTITION_SIZE, alignment);
-    let keys_end_bytes = keys_start_bytes + keys_size_bytes;
+    let partitions =
+        russignol_storage::calculate_partition_layout(p2_end_bytes, alignment, disk_size_bytes)
+            .map_err(|e| e.to_string())?;
 
-    // Data partition (p4): starts at first aligned boundary after keys
-    let data_start_bytes = keys_end_bytes; // Already aligned
-    let data_size_bytes = align_up(F2FS_PARTITION_SIZE, alignment);
-    let data_end_bytes = data_start_bytes + data_size_bytes;
-
-    // Validation
-    if data_end_bytes > disk_size_bytes {
-        return Err(format!(
-            "Insufficient disk space: need {}MB for partitions, have {}MB",
-            data_end_bytes / (1024 * 1024),
-            disk_size_bytes / (1024 * 1024)
-        ));
-    }
-
-    let layout = PartitionLayout {
-        alignment,
-        keys_start_sector: keys_start_bytes / SECTOR_SIZE,
-        keys_size_sectors: keys_size_bytes / SECTOR_SIZE,
-        data_start_sector: data_start_bytes / SECTOR_SIZE,
-        data_size_sectors: data_size_bytes / SECTOR_SIZE,
-        disk_size_sectors,
-        trim_supported,
-    };
-
+    let data_end_bytes =
+        (partitions.data_start_sector + partitions.data_size_sectors) * SECTOR_SIZE;
     log::info!(
         "Partition layout: keys={}MB@sector{}, data={}MB@sector{}, over-prov={}MB",
-        keys_size_bytes / (1024 * 1024),
-        layout.keys_start_sector,
-        data_size_bytes / (1024 * 1024),
-        layout.data_start_sector,
+        partitions.keys_size_sectors * SECTOR_SIZE / (1024 * 1024),
+        partitions.keys_start_sector,
+        partitions.data_size_sectors * SECTOR_SIZE / (1024 * 1024),
+        partitions.data_start_sector,
         (disk_size_bytes - data_end_bytes) / (1024 * 1024)
     );
 
-    Ok(layout)
+    Ok(PartitionLayout {
+        partitions,
+        alignment,
+        disk_size_sectors,
+        trim_supported,
+    })
 }
 
 /// Create partitions using sfdisk (util-linux)
 fn create_partitions(layout: &PartitionLayout) -> Result<(), String> {
     log::info!("Creating partitions using sfdisk...");
 
-    // sfdisk script format: start=<sector>, size=<sectors>, type=<hex>
-    let script = format!(
-        "start={}, size={}, type=83\nstart={}, size={}, type=83\n",
-        layout.keys_start_sector,
-        layout.keys_size_sectors,
-        layout.data_start_sector,
-        layout.data_size_sectors
-    );
+    let script = russignol_storage::generate_sfdisk_script(&layout.partitions);
 
     log::info!("sfdisk script:\n{script}");
 
@@ -287,13 +254,13 @@ fn create_partitions(layout: &PartitionLayout) -> Result<(), String> {
     // Notify kernel immediately via BLKPG (no partprobe needed)
     notify_kernel_blkpg(
         3,
-        layout.keys_start_sector * SECTOR_SIZE,
-        layout.keys_size_sectors * SECTOR_SIZE,
+        layout.partitions.keys_start_sector * SECTOR_SIZE,
+        layout.partitions.keys_size_sectors * SECTOR_SIZE,
     )?;
     notify_kernel_blkpg(
         4,
-        layout.data_start_sector * SECTOR_SIZE,
-        layout.data_size_sectors * SECTOR_SIZE,
+        layout.partitions.data_start_sector * SECTOR_SIZE,
+        layout.partitions.data_size_sectors * SECTOR_SIZE,
     )?;
 
     // Trigger mdev to create device nodes
@@ -425,7 +392,8 @@ fn trim_partition_range(offset_bytes: u64, length_bytes: u64) -> Result<(), Stri
 
 /// TRIM the over-provisioning area (unallocated tail of disk)
 fn trim_over_provisioning(layout: &PartitionLayout) -> Result<(), String> {
-    let data_end_bytes = (layout.data_start_sector + layout.data_size_sectors) * SECTOR_SIZE;
+    let data_end_bytes =
+        (layout.partitions.data_start_sector + layout.partitions.data_size_sectors) * SECTOR_SIZE;
     let disk_size_bytes = layout.disk_size_sectors * SECTOR_SIZE;
     let overprov_size = disk_size_bytes - data_end_bytes;
 
@@ -451,7 +419,7 @@ fn format_partition(device: &str, label: &str) -> Result<(), String> {
             "-l",
             label,
             "-O",
-            "extra_attr,compression",
+            F2FS_FORMAT_FEATURES,
             "-f", // Force overwrite
             device,
         ])

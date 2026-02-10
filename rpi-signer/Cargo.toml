@@ -35,6 +35,7 @@ embedded-layout = "0.4.2"
 embedded-text = "0.7.3"
 u8g2-fonts = { version = "0.7.2", features = ["embedded_graphics_textstyle"] }
 ctrlc = "3.5"
+russignol-storage = { version = "0.1.0", path = "../libs/storage" }
 
 [dev-dependencies]
 tempfile = "3"

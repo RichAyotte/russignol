@@ -12,7 +12,8 @@ use crate::image;
 use crate::system;
 use crate::utils::{
     create_http_agent, create_orange_theme, format_with_separators, get_partition_path,
-    http_get_json, info, print_title_bar, success, warning,
+    http_get_json, info, mount_partition, print_title_bar, resolve_tool, success,
+    unmount_partition, warning,
 };
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
@@ -132,7 +133,7 @@ pub fn write_watermark_config(device: &Path, chain_info: &ChainInfo) -> Result<(
 
     // Mount boot partition
     let boot_partition = get_boot_partition_path(device);
-    let mount_point = mount_boot_partition(&boot_partition)?;
+    let mount_point = mount_partition(&boot_partition, "vfat", false)?;
 
     // Generate and write config
     let wm_config = WatermarkConfig {
@@ -157,7 +158,7 @@ pub fn write_watermark_config(device: &Path, chain_info: &ChainInfo) -> Result<(
 /// Used to verify that the config was written correctly after flashing.
 pub fn read_watermark_config(device: &Path) -> Result<WatermarkConfig> {
     let boot_partition = get_boot_partition_path(device);
-    let mount_point = mount_boot_partition(&boot_partition)?;
+    let mount_point = mount_partition(&boot_partition, "vfat", true)?;
 
     let config_path = mount_point.join(CONFIG_FILENAME);
     let result = std::fs::read_to_string(&config_path)
@@ -185,7 +186,7 @@ pub fn cmd_watermark_init(
     let device = detect_and_verify_device(device)?;
     let boot_partition = get_boot_partition_path(&device);
     verify_boot_partition(&boot_partition)?;
-    let mount_point = mount_boot_partition(&boot_partition)?;
+    let mount_point = mount_partition(&boot_partition, "vfat", false)?;
 
     // All operations after mounting need cleanup on error
     let result = do_watermark_init(&device, &boot_partition, &mount_point, auto_confirm, config);
@@ -348,35 +349,12 @@ fn write_watermark_config_and_cleanup(
 // Helper functions
 // =============================================================================
 
-/// Check if a tool exists (checks common paths since /sbin may not be in PATH)
-#[cfg(target_os = "linux")]
-fn tool_exists(name: &str) -> bool {
-    // Check PATH first via 'which'
-    if Command::new("which")
-        .arg(name)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-
-    // Check /sbin and /usr/sbin (not always in user's PATH)
-    for dir in ["/sbin", "/usr/sbin"] {
-        if Path::new(dir).join(name).exists() {
-            return true;
-        }
-    }
-
-    false
-}
-
 /// Check for required tools and warn about missing ones
 fn check_required_tools() {
     #[cfg(target_os = "linux")]
     {
         // Check for udisksctl (preferred for unprivileged mounting)
-        if !tool_exists("udisksctl") {
+        if resolve_tool("udisksctl").is_none() {
             warning(
                 "udisksctl not found. Mounting will require sudo privileges.\n  \
                  Install with: sudo apt install udisks2  (Debian/Ubuntu)\n  \
@@ -386,7 +364,7 @@ fn check_required_tools() {
 
         // Check for blkid (used for partition type verification)
         // Note: blkid is often in /sbin which may not be in PATH
-        if !tool_exists("blkid") {
+        if resolve_tool("blkid").is_none() {
             warning(
                 "blkid not found. Partition verification will be skipped.\n  \
                  Install with: sudo apt install util-linux  (Debian/Ubuntu)",
@@ -472,179 +450,6 @@ fn write_config_file(path: &Path, config: &WatermarkConfig) -> Result<()> {
 
 fn get_boot_partition_path(device: &Path) -> PathBuf {
     get_partition_path(device, 1)
-}
-
-/// Create a temporary mount point directory using mktemp
-fn create_temp_mount_point() -> Result<PathBuf> {
-    let output = Command::new("mktemp")
-        .args(["-d", "-t", "russignol-boot.XXXXXX"])
-        .output()
-        .context("Failed to run mktemp")?;
-
-    if !output.status.success() {
-        bail!(
-            "Failed to create temp directory: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(PathBuf::from(path))
-}
-
-fn mount_boot_partition(partition: &Path) -> Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        // Check if partition is already mounted (desktop may auto-mount after flash)
-        let output = Command::new("findmnt")
-            .args(["-n", "-o", "TARGET"])
-            .arg(partition)
-            .output();
-
-        if let Ok(output) = output
-            && output.status.success()
-        {
-            let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !mount_point.is_empty() {
-                info(&format!("Partition already mounted at {mount_point}"));
-                return Ok(PathBuf::from(mount_point));
-            }
-        }
-
-        // Try udisksctl first (works without sudo for removable media)
-        let output = Command::new("udisksctl")
-            .args(["mount", "-b"])
-            .arg(partition)
-            .output();
-
-        if let Ok(output) = output
-            && output.status.success()
-        {
-            // Parse mount point from output: "Mounted /dev/sdc1 at /run/media/user/BOOT."
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(mount_point) = stdout
-                .split(" at ")
-                .nth(1)
-                .map(|s| s.trim().trim_end_matches('.'))
-            {
-                return Ok(PathBuf::from(mount_point));
-            }
-        }
-
-        // Fall back to traditional mount (requires sudo)
-        let mount_point = create_temp_mount_point()?;
-
-        let output = Command::new("mount")
-            .args(["-t", "vfat", "-o", "rw"])
-            .arg(partition)
-            .arg(&mount_point)
-            .output()
-            .context("Failed to run mount")?;
-
-        if !output.status.success() {
-            // Clean up temp directory on failure
-            let _ = std::fs::remove_dir(&mount_point);
-            bail!(
-                "Failed to mount boot partition: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        Ok(mount_point)
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let mount_point = create_temp_mount_point()?;
-
-        let output = Command::new("mount")
-            .args(["-t", "msdos"])
-            .arg(partition)
-            .arg(&mount_point)
-            .output()
-            .context("Failed to run mount")?;
-
-        if !output.status.success() {
-            // Clean up temp directory on failure
-            let _ = std::fs::remove_dir(&mount_point);
-            bail!(
-                "Failed to mount boot partition: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        Ok(mount_point)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        bail!("Mounting not supported on this platform")
-    }
-}
-
-fn unmount_partition(mount_point: &Path, partition: &Path) -> Result<()> {
-    // Sync first
-    let _ = Command::new("sync").output();
-
-    #[cfg(target_os = "linux")]
-    {
-        // Try udisksctl first (matches how we mounted)
-        let output = Command::new("udisksctl")
-            .args(["unmount", "-b"])
-            .arg(partition)
-            .output();
-
-        if let Ok(output) = output
-            && output.status.success()
-        {
-            // udisksctl handles cleanup automatically
-            return Ok(());
-        }
-
-        // Fall back to traditional umount (requires sudo)
-        let output = Command::new("umount")
-            .arg(mount_point)
-            .output()
-            .context("Failed to run umount")?;
-
-        if !output.status.success() {
-            bail!(
-                "Failed to unmount: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        // Clean up mount point (only needed for traditional mount)
-        let _ = std::fs::remove_dir(mount_point);
-
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let output = Command::new("umount")
-            .arg(mount_point)
-            .output()
-            .context("Failed to run umount")?;
-
-        if !output.status.success() {
-            bail!(
-                "Failed to unmount: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        // Clean up mount point
-        let _ = std::fs::remove_dir(mount_point);
-
-        return Ok(());
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (mount_point, partition);
-        bail!("Unmounting not supported on this platform")
-    }
 }
 
 // =============================================================================

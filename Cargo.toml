@@ -2,6 +2,7 @@
 members = [
     "libs/crypto",
     "libs/signer",
+    "libs/storage",
     "libs/epd-2in13-v4",
     "libs/ui",
     "rpi-signer",

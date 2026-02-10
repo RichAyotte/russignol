@@ -1898,6 +1898,7 @@ dependencies = [
  "lzma-rs",
  "nix 0.31.1",
  "regex",
+ "russignol-storage",
  "semver",
  "serde",
  "serde_json",
@@ -1907,6 +1908,7 @@ dependencies = [
  "thiserror",
  "unicode-width",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]
@@ -1928,6 +1930,7 @@ dependencies = [
  "rand",
  "russignol-crypto",
  "russignol-signer-lib",
+ "russignol-storage",
  "russignol-ui",
  "serde",
  "serde_json",
@@ -1961,6 +1964,10 @@ dependencies = [
  "tempfile",
  "thiserror",
 ]
+
+[[package]]
+name = "russignol-storage"
+version = "0.1.0"
 
 [[package]]
 name = "russignol-ui"

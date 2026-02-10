@@ -36,5 +36,7 @@ sha2 = "0.10"
 tempfile = "3.24"
 lzma-rs = "0.3"
 unicode-width = "0.2"
+zeroize = { version = "1.8.2", features = ["derive"] }
+russignol-storage = { version = "0.1.0", path = "../libs/storage" }
 
 [dev-dependencies]

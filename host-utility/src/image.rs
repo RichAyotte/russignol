@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 
 use crate::config;
 use crate::constants::ORANGE_256;
+use crate::progress;
 use crate::utils::{
     self, JsonValueExt, create_http_agent, create_orange_theme, format_with_separators,
     print_title_bar,
@@ -64,6 +65,11 @@ pub enum ImageCommands {
         /// Skip all confirmation prompts (dangerous!)
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Restore keys and watermarks from an existing SD card (Linux only).
+        /// Optionally specify the source device, or omit to auto-detect.
+        #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
+        restore_keys: Option<PathBuf>,
     },
 
     /// Download and flash in one step
@@ -83,6 +89,11 @@ pub enum ImageCommands {
         /// Skip all confirmation prompts (dangerous!)
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Restore keys and watermarks from an existing SD card (Linux only).
+        /// Optionally specify the source device, or omit to auto-detect.
+        #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
+        restore_keys: Option<PathBuf>,
     },
 
     /// List available images
@@ -97,6 +108,24 @@ pub struct BlockDevice {
     pub transport: String,
     pub size: String,
     pub model: String,
+}
+
+impl BlockDevice {
+    /// Create a minimal `BlockDevice` from a device path when lookup fails.
+    pub fn from_path(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        Self {
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            path,
+            transport: "unknown".to_string(),
+            size: "unknown".to_string(),
+            model: "Unknown".to_string(),
+        }
+    }
 }
 
 impl std::fmt::Display for BlockDevice {
@@ -125,13 +154,27 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
             device,
             endpoint,
             yes,
-        } => cmd_flash(&image, device, endpoint.as_deref(), yes),
+            restore_keys,
+        } => cmd_flash(
+            &image,
+            device,
+            endpoint.as_deref(),
+            yes,
+            restore_keys.as_deref(),
+        ),
         ImageCommands::DownloadAndFlash {
             url,
             device,
             endpoint,
             yes,
-        } => cmd_download_and_flash(url, device, endpoint.as_deref(), yes),
+            restore_keys,
+        } => cmd_download_and_flash(
+            url,
+            device,
+            endpoint.as_deref(),
+            yes,
+            restore_keys.as_deref(),
+        ),
         ImageCommands::List => cmd_list(),
     }
 }
@@ -158,31 +201,6 @@ fn user_in_disk_group() -> bool {
     }
 }
 
-/// Check if a tool exists (checks common paths since /sbin may not be in PATH)
-#[cfg(target_os = "linux")]
-fn tool_exists(name: &str) -> bool {
-    use std::path::Path;
-
-    // Check PATH first via 'which'
-    if Command::new("which")
-        .arg(name)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-
-    // Check /sbin and /usr/sbin (not always in user's PATH)
-    for dir in ["/sbin", "/usr/sbin"] {
-        if Path::new(dir).join(name).exists() {
-            return true;
-        }
-    }
-
-    false
-}
-
 /// Check for required flash tools and bail if critical ones are missing
 fn check_flash_tools() -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -191,7 +209,7 @@ fn check_flash_tools() -> Result<()> {
 
         // Critical tools - can't proceed without these
         for tool in ["dd", "lsblk"] {
-            if !tool_exists(tool) {
+            if utils::resolve_tool(tool).is_none() {
                 missing.push(tool);
             }
         }
@@ -219,7 +237,7 @@ fn check_flash_tools() -> Result<()> {
         }
 
         // Check for udisksctl (needed for mounting boot partition during watermark config)
-        if !tool_exists("udisksctl") {
+        if utils::resolve_tool("udisksctl").is_none() {
             utils::warning(
                 "udisksctl not found. Mounting boot partition for watermark config may fail.\n  \
                  Install with: sudo apt install udisks2  (Debian/Ubuntu)\n  \
@@ -229,7 +247,7 @@ fn check_flash_tools() -> Result<()> {
 
         // Check for blkid (used for partition type verification)
         // Note: blkid is often in /sbin which may not be in PATH
-        if !tool_exists("blkid") {
+        if utils::resolve_tool("blkid").is_none() {
             utils::warning(
                 "blkid not found. Partition verification will be skipped.\n  \
                  Install with: sudo apt install util-linux  (Debian/Ubuntu)",
@@ -237,7 +255,7 @@ fn check_flash_tools() -> Result<()> {
         }
 
         // Check for findmnt (used to detect already-mounted partitions)
-        if !tool_exists("findmnt") {
+        if utils::resolve_tool("findmnt").is_none() {
             utils::warning(
                 "findmnt not found. Auto-mount detection will be skipped.\n  \
                  Install with: sudo apt install util-linux  (Debian/Ubuntu)",
@@ -371,11 +389,62 @@ fn cmd_download(url: Option<String>, output: Option<PathBuf>, skip_verify: bool)
     Ok(())
 }
 
+/// Shared restore-flash logic used by both `cmd_flash` and `cmd_download_and_flash`
+fn run_restore_flash(
+    restore_source: &Path,
+    image: &Path,
+    device: Option<PathBuf>,
+    yes: bool,
+    uncompressed_size: Option<u64>,
+) -> Result<()> {
+    use crate::restore_keys;
+
+    restore_keys::check_restore_tools()?;
+
+    let detected = detect_removable_devices().unwrap_or_default();
+    let single_reader =
+        restore_keys::is_single_reader_mode(restore_source, device.as_deref(), &detected);
+
+    if single_reader {
+        return restore_keys::run_single_reader_restore(
+            restore_source,
+            image,
+            yes,
+            uncompressed_size,
+        );
+    }
+
+    // Dual reader: read source card first
+    restore_keys::ensure_source_partitions_visible(restore_source)?;
+    let spinner = progress::create_spinner("Reading source card...");
+    let backup = restore_keys::read_source_card(restore_source)?;
+    spinner.finish_and_clear();
+
+    // Select/validate target device
+    let target = if let Some(dev) = device {
+        utils::info(&format!("Using specified device: {}", dev.display()));
+        lookup_block_device(&dev).unwrap_or_else(|_| BlockDevice::from_path(dev))
+    } else {
+        let target = detected
+            .into_iter()
+            .find(|d| d.path != *restore_source)
+            .context("No target device found. Use --device to specify the target SD card.")?;
+        utils::info(&format!("Using target device: {}", target.path.display()));
+        target
+    };
+
+    check_device_not_mounted(&target.path)?;
+    check_device_has_media(&target.path)?;
+
+    restore_keys::run_dual_reader_restore(&target, image, yes, uncompressed_size, &backup)
+}
+
 fn cmd_flash(
     image: &Path,
     device: Option<PathBuf>,
     endpoint: Option<&str>,
     yes: bool,
+    restore_keys: Option<&Path>,
 ) -> Result<()> {
     // Check for required tools first
     check_flash_tools()?;
@@ -389,7 +458,15 @@ fn cmd_flash(
     {
         bail!("Device not found: {}", dev.display());
     }
+    // Restore-keys path
+    if let Some(restore_keys_arg) = restore_keys {
+        println!();
+        print_title_bar("💾 Flash SD Card (with key restore)");
+        let restore_source = crate::restore_keys::resolve_restore_source(restore_keys_arg)?;
+        return run_restore_flash(&restore_source, image, device, yes, None);
+    }
 
+    // Normal path
     println!();
     print_title_bar("💾 Flash SD Card");
 
@@ -518,6 +595,7 @@ fn cmd_download_and_flash(
     device: Option<PathBuf>,
     endpoint: Option<&str>,
     yes: bool,
+    restore_keys: Option<&Path>,
 ) -> Result<()> {
     // Check for required tools first
     check_flash_tools()?;
@@ -528,7 +606,30 @@ fn cmd_download_and_flash(
     {
         bail!("Device not found: {}", dev.display());
     }
+    // Restore-keys path
+    if let Some(restore_keys_arg) = restore_keys {
+        println!();
+        print_title_bar("📥💾 Download and Flash SD Card (with key restore)");
 
+        let restore_source = crate::restore_keys::resolve_restore_source(restore_keys_arg)?;
+
+        // Download first (can happen before touching cards)
+        let dl = resolve_download_info(url)?;
+        let checksum = dl.checksum.as_deref().filter(|s| !s.is_empty()).context(
+            "Checksum not available for this release. Cannot safely flash without verification.",
+        )?;
+        let image_path = download_with_cache(&dl.url, Some(checksum), dl.compressed_size)?;
+
+        return run_restore_flash(
+            &restore_source,
+            &image_path,
+            device,
+            yes,
+            dl.uncompressed_size,
+        );
+    }
+
+    // Normal path
     println!();
     print_title_bar("📥💾 Download and Flash SD Card");
 
@@ -799,6 +900,41 @@ fn get_macos_disk_info(disk_id: &str) -> Result<BlockDevice> {
     })
 }
 
+/// Look up block device info for a specific device path via lsblk
+pub(crate) fn lookup_block_device(device: &Path) -> Result<BlockDevice> {
+    let output = Command::new("lsblk")
+        .args(["-d", "-o", "NAME,TRAN,SIZE,MODEL", "--json"])
+        .arg(device)
+        .output()
+        .context("Failed to run lsblk")?;
+
+    if !output.status.success() {
+        bail!("lsblk failed for {}", device.display());
+    }
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("Failed to parse lsblk JSON")?;
+
+    let dev = json
+        .get_nested("blockdevices")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .context("No device info returned by lsblk")?;
+
+    let name = dev.get_str("name").unwrap_or("unknown");
+    let tran = dev.get_str("tran").unwrap_or("unknown");
+    let size = dev.get_str("size").unwrap_or("unknown");
+    let model = dev.get_str("model").unwrap_or("Unknown");
+
+    Ok(BlockDevice {
+        name: name.to_string(),
+        path: device.to_path_buf(),
+        transport: tran.to_string(),
+        size: size.to_string(),
+        model: model.trim().to_string(),
+    })
+}
+
 /// Interactive device selection
 fn select_device() -> Result<BlockDevice> {
     let devices = detect_removable_devices()?;
@@ -847,7 +983,7 @@ fn select_device() -> Result<BlockDevice> {
 // =============================================================================
 
 /// Check that no partitions of the device are mounted
-fn check_device_not_mounted(device: &Path) -> Result<()> {
+pub(crate) fn check_device_not_mounted(device: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let mounts =
@@ -1249,7 +1385,11 @@ fn verify_checksum(file: &Path, expected: &str) -> Result<()> {
 
 /// Flash image to device
 /// `expected_size` is the uncompressed image size for progress estimation (from version.json)
-fn flash_image_to_device(image: &Path, device: &Path, expected_size: Option<u64>) -> Result<()> {
+pub(crate) fn flash_image_to_device(
+    image: &Path,
+    device: &Path,
+    expected_size: Option<u64>,
+) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         flash_image_linux(image, device, expected_size)
@@ -1439,7 +1579,7 @@ fn flash_image_linux(image: &Path, device: &Path, expected_size: Option<u64>) ->
 ///
 /// This is needed because after dd writes a new image, the kernel's cached
 /// partition table is stale. Without this, mounting may fail.
-fn reread_partition_table(device: &Path) {
+pub(crate) fn reread_partition_table(device: &Path) {
     #[cfg(target_os = "linux")]
     {
         // Try partprobe first (from parted package)

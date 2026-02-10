@@ -339,6 +339,231 @@ pub fn get_partition_path(device: &Path, partition_num: u8) -> PathBuf {
 }
 
 // =============================================================================
+// Tool Resolution
+// =============================================================================
+
+/// Resolve a tool to its full path, checking PATH then /sbin and /usr/sbin
+#[cfg(target_os = "linux")]
+pub fn resolve_tool(name: &str) -> Option<PathBuf> {
+    // Check PATH first via 'which'
+    if let Ok(output) = Command::new("which").arg(name).output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+
+    // Check /sbin and /usr/sbin (not always in user's PATH)
+    for dir in ["/sbin", "/usr/sbin"] {
+        let path = Path::new(dir).join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn resolve_tool(_name: &str) -> Option<PathBuf> {
+    None
+}
+
+// =============================================================================
+// Mount / Unmount Helpers
+// =============================================================================
+
+/// Create a temporary mount point directory using mktemp
+fn create_temp_mount_point() -> Result<PathBuf> {
+    let output = Command::new("mktemp")
+        .args(["-d", "-t", "russignol-mount.XXXXXX"])
+        .output()
+        .context("Failed to run mktemp")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to create temp directory: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(PathBuf::from(path))
+}
+
+/// Mount a partition, auto-detecting existing mounts and trying udisksctl first.
+///
+/// `fs_type` is the filesystem type passed to `mount -t` (e.g. `"vfat"`, `"f2fs"`).
+/// When `read_only` is true the partition is mounted read-only.
+pub fn mount_partition(partition: &Path, fs_type: &str, read_only: bool) -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        // Check if partition is already mounted via findmnt
+        let output = Command::new("findmnt")
+            .args(["-n", "-o", "TARGET"])
+            .arg(partition)
+            .output();
+
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let mount_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !mount_point.is_empty() {
+                info(&format!("Partition already mounted at {mount_point}"));
+                return Ok(PathBuf::from(mount_point));
+            }
+        }
+
+        // Try udisksctl first (works without sudo for removable media)
+        let mut udisks_args = vec!["mount", "-b"];
+        let partition_str = partition.to_string_lossy().to_string();
+        udisks_args.push(&partition_str);
+        if read_only {
+            udisks_args.push("-o");
+            udisks_args.push("ro");
+        }
+
+        let output = Command::new("udisksctl").args(&udisks_args).output();
+
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(mount_point) = stdout
+                .split(" at ")
+                .nth(1)
+                .map(|s| s.trim().trim_end_matches('.'))
+            {
+                return Ok(PathBuf::from(mount_point));
+            }
+        }
+
+        // Fall back to traditional mount
+        let mount_point = create_temp_mount_point()?;
+        let mut args = vec!["-t", fs_type];
+        let mount_opts = if read_only { "ro" } else { "rw" };
+        args.push("-o");
+        args.push(mount_opts);
+        let partition_str = partition.to_string_lossy().to_string();
+        args.push(&partition_str);
+        let mount_point_str = mount_point.to_string_lossy().to_string();
+        args.push(&mount_point_str);
+
+        let output = Command::new("mount")
+            .args(&args)
+            .output()
+            .context("Failed to run mount")?;
+
+        if !output.status.success() {
+            let _ = std::fs::remove_dir(&mount_point);
+            anyhow::bail!(
+                "Failed to mount {} partition {}: {}",
+                fs_type,
+                partition.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(mount_point)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = read_only;
+        let mount_point = create_temp_mount_point()?;
+        let mac_fs = if fs_type == "vfat" { "msdos" } else { fs_type };
+
+        let output = Command::new("mount")
+            .args(["-t", mac_fs])
+            .arg(partition)
+            .arg(&mount_point)
+            .output()
+            .context("Failed to run mount")?;
+
+        if !output.status.success() {
+            let _ = std::fs::remove_dir(&mount_point);
+            anyhow::bail!(
+                "Failed to mount partition: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(mount_point)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (partition, fs_type, read_only);
+        anyhow::bail!("Mounting not supported on this platform")
+    }
+}
+
+/// Unmount a partition, trying udisksctl first then falling back to umount.
+pub fn unmount_partition(mount_point: &Path, partition: &Path) -> Result<()> {
+    // Sync first
+    let _ = Command::new("sync").output();
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try udisksctl first (matches how we mounted)
+        let output = Command::new("udisksctl")
+            .args(["unmount", "-b"])
+            .arg(partition)
+            .output();
+
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            return Ok(());
+        }
+
+        // Fall back to traditional umount
+        let output = Command::new("umount")
+            .arg(mount_point)
+            .output()
+            .context("Failed to run umount")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to unmount {}: {}",
+                mount_point.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let _ = std::fs::remove_dir(mount_point);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = partition;
+        let output = Command::new("umount")
+            .arg(mount_point)
+            .output()
+            .context("Failed to run umount")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to unmount: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let _ = std::fs::remove_dir(mount_point);
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (mount_point, partition);
+        anyhow::bail!("Unmounting not supported on this platform")
+    }
+}
+
+// =============================================================================
 // JSON Value Extraction Utilities
 // =============================================================================
 
