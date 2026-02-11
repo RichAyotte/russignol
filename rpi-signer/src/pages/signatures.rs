@@ -1,6 +1,6 @@
 use crate::events::AppEvent;
 use crate::fonts;
-use russignol_signer_lib::signing_activity::{OperationType, SigningActivity};
+use russignol_signer_lib::signing_activity::{KeyType, OperationType, SigningActivity};
 
 use super::Page;
 use crossbeam_channel::Sender;
@@ -8,18 +8,17 @@ use embedded_graphics::{
     pixelcolor::BinaryColor,
     prelude::{DrawTarget, Point},
 };
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use u8g2_fonts::FontRenderer;
 
 /// Record of a signing operation for display in the table
 #[derive(Clone, Debug)]
-pub struct SigningRecord {
-    pub key: String,            // Signing key (will be truncated for display)
-    pub level: u32,             // Block height/level
-    pub op_type: OperationType, // Type of operation (Block, Attestation, etc.)
-    pub sign_time: Duration,    // Time it took to sign
+struct SigningRecord {
+    key: String,            // Signing key (will be truncated for display)
+    level: u32,             // Block height/level
+    op_type: OperationType, // Type of operation (Block, Attestation, etc.)
+    sign_time: Duration,    // Time it took to sign
 }
 
 pub fn format_key_short(s: &str) -> String {
@@ -37,12 +36,8 @@ pub fn format_key_short(s: &str) -> String {
 pub struct SignaturesPage {
     // Event sender for navigation
     app_sender: Sender<AppEvent>,
-    signing_activity: SigningActivity,
-    signing_records: VecDeque<SigningRecord>,
     // Reference to shared signing activity for reading latest state
     signing_activity_shared: Arc<Mutex<SigningActivity>>,
-    // Track previous signing activity to detect new signatures
-    last_signing_activity: SigningActivity,
     // Public key hashes for consensus and companion keys
     consensus_pkh: Option<String>,
     companion_pkh: Option<String>,
@@ -66,134 +61,51 @@ impl SignaturesPage {
 
         Self {
             app_sender,
-            signing_activity: SigningActivity::default(),
-            signing_records: VecDeque::with_capacity(5),
             signing_activity_shared: signing_activity,
-            last_signing_activity: SigningActivity::default(),
             consensus_pkh,
             companion_pkh,
         }
     }
 
-    /// Update state by polling current signing activity
-    fn update_state(&mut self) {
-        // Update signing activity from shared state
-        let current = if let Ok(activity) = self.signing_activity_shared.lock() {
-            *activity
-        } else {
-            return; // Mutex poisoned, can't update
-        };
-
-        // Detect new signatures for the signing records table
-        if current != self.last_signing_activity {
-            // Check consensus key for new signature
-            if let Some(ref current_consensus) = current.consensus {
-                let is_new = if let Some(ref last_consensus) = self.last_signing_activity.consensus
-                {
-                    current_consensus.timestamp > last_consensus.timestamp
-                } else {
-                    true
+    /// Build display records from shared state's ring buffer
+    fn build_records(&self, activity: &SigningActivity) -> Vec<SigningRecord> {
+        activity
+            .recent_events
+            .iter()
+            .filter_map(|event| {
+                let (Some(level), Some(duration), Some(op_type)) = (
+                    event.activity.level,
+                    event.activity.duration,
+                    event.activity.operation_type,
+                ) else {
+                    return None;
                 };
 
-                if is_new {
-                    log::debug!(
-                        "New consensus signature: level={:?}, duration={:?}, op_type={:?}",
-                        current_consensus.level,
-                        current_consensus.duration,
-                        current_consensus.operation_type
-                    );
-
-                    if let (Some(level), Some(duration), Some(op_type)) = (
-                        current_consensus.level,
-                        current_consensus.duration,
-                        current_consensus.operation_type,
-                    ) {
-                        // Use 'C' to indicate consensus (will be rendered with icon)
-                        let key_display = if let Some(ref pkh) = self.consensus_pkh {
+                let key = match event.key_type {
+                    KeyType::Consensus => {
+                        if let Some(ref pkh) = self.consensus_pkh {
                             format!("C{pkh}")
                         } else {
                             "C???".to_string()
-                        };
-                        let record = SigningRecord {
-                            key: key_display,
-                            level,
-                            op_type,
-                            sign_time: duration,
-                        };
-                        self.add_signing_record(record);
+                        }
                     }
-                }
-            }
-
-            // Check companion key for new signature
-            if let Some(ref current_companion) = current.companion {
-                let is_new = if let Some(ref last_companion) = self.last_signing_activity.companion
-                {
-                    current_companion.timestamp > last_companion.timestamp
-                } else {
-                    true
-                };
-
-                if is_new {
-                    log::debug!(
-                        "New companion signature: level={:?}, duration={:?}, op_type={:?}",
-                        current_companion.level,
-                        current_companion.duration,
-                        current_companion.operation_type
-                    );
-
-                    if let (Some(level), Some(duration), Some(op_type)) = (
-                        current_companion.level,
-                        current_companion.duration,
-                        current_companion.operation_type,
-                    ) {
-                        // Use 'P' to indicate companion (will be rendered with icon)
-                        let key_display = if let Some(ref pkh) = self.companion_pkh {
+                    KeyType::Companion => {
+                        if let Some(ref pkh) = self.companion_pkh {
                             format!("P{pkh}")
                         } else {
                             "P???".to_string()
-                        };
-                        let record = SigningRecord {
-                            key: key_display,
-                            level,
-                            op_type,
-                            sign_time: duration,
-                        };
-                        self.add_signing_record(record);
+                        }
                     }
-                }
-            }
+                };
 
-            self.last_signing_activity = current;
-        }
-
-        self.signing_activity = current;
-    }
-
-    // Private method to add a signing record
-    fn add_signing_record(&mut self, record: SigningRecord) {
-        // Skip if we already have a record for this exact key+level+op_type combination
-        if self
-            .signing_records
-            .iter()
-            .any(|r| r.key == record.key && r.level == record.level && r.op_type == record.op_type)
-        {
-            return;
-        }
-
-        // Insert in sorted order by level (descending)
-        let insert_pos = self
-            .signing_records
-            .iter()
-            .position(|r| r.level < record.level)
-            .unwrap_or(self.signing_records.len());
-
-        self.signing_records.insert(insert_pos, record);
-
-        // Keep only the last 5 records
-        if self.signing_records.len() > 5 {
-            self.signing_records.pop_back();
-        }
+                Some(SigningRecord {
+                    key,
+                    level,
+                    op_type,
+                    sign_time: duration,
+                })
+            })
+            .collect()
     }
 }
 
@@ -212,15 +124,19 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for SignaturesPage {
     }
 
     fn draw(&mut self, display: &mut D) -> Result<(), D::Error> {
-        self.update_state();
+        let activity = match self.signing_activity_shared.lock() {
+            Ok(a) => *a,
+            Err(_) => return Ok(()),
+        };
 
-        if self.signing_records.is_empty() {
+        let records = self.build_records(&activity);
+
+        if records.is_empty() {
             draw_empty_state(display);
             return Ok(());
         }
 
-        // Show oldest at top, newest at bottom (content scrolls up as new signatures arrive)
-        let records: Vec<_> = self.signing_records.iter().take(5).rev().collect();
+        // Ring buffer already yields oldest-first; display oldest at top, newest at bottom
         let num_records = records.len();
         let start_row = 5 - num_records;
 
@@ -337,4 +253,88 @@ fn draw_signing_record_row<D: DrawTarget<Color = BinaryColor>>(
             display,
         )
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use russignol_signer_lib::signing_activity::{KeyType, SignatureActivity, SigningEvent};
+    use std::time::{Duration, SystemTime};
+
+    fn make_activity(consensus_pkh: Option<&str>, companion_pkh: Option<&str>) -> SignaturesPage {
+        let shared = Arc::new(Mutex::new(SigningActivity::default()));
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        SignaturesPage {
+            app_sender: sender,
+            signing_activity_shared: shared,
+            consensus_pkh: consensus_pkh.map(String::from),
+            companion_pkh: companion_pkh.map(String::from),
+        }
+    }
+
+    fn make_event(key_type: KeyType, level: u32) -> SigningEvent {
+        SigningEvent {
+            key_type,
+            activity: SignatureActivity {
+                level: Some(level),
+                timestamp: SystemTime::now(),
+                duration: Some(Duration::from_millis(42)),
+                operation_type: Some(OperationType::Attestation),
+                data_size: Some(128),
+            },
+        }
+    }
+
+    #[test]
+    fn renders_events_from_shared_state() {
+        let page = make_activity(Some("tz4consensus"), Some("tz4companion"));
+
+        // Push events into shared state
+        {
+            let mut activity = page.signing_activity_shared.lock().unwrap();
+            activity
+                .recent_events
+                .push(make_event(KeyType::Consensus, 100));
+            activity
+                .recent_events
+                .push(make_event(KeyType::Companion, 101));
+        }
+
+        let activity = page.signing_activity_shared.lock().unwrap();
+        let records = page.build_records(&activity);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].level, 100);
+        assert!(records[0].key.starts_with('C'));
+        assert_eq!(records[1].level, 101);
+        assert!(records[1].key.starts_with('P'));
+    }
+
+    #[test]
+    fn events_missing_fields_are_skipped() {
+        let page = make_activity(Some("tz4consensus"), None);
+
+        {
+            let mut activity = page.signing_activity_shared.lock().unwrap();
+            // Event with no level — should be filtered out
+            activity.recent_events.push(SigningEvent {
+                key_type: KeyType::Consensus,
+                activity: SignatureActivity {
+                    level: None,
+                    timestamp: SystemTime::now(),
+                    duration: Some(Duration::from_millis(42)),
+                    operation_type: Some(OperationType::Block),
+                    data_size: Some(128),
+                },
+            });
+            // Valid event
+            activity
+                .recent_events
+                .push(make_event(KeyType::Consensus, 200));
+        }
+
+        let activity = page.signing_activity_shared.lock().unwrap();
+        let records = page.build_records(&activity);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].level, 200);
+    }
 }

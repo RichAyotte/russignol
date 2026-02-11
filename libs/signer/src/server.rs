@@ -483,6 +483,12 @@ impl RequestHandler {
             let key_name = keys.get_key_name(&pkh).unwrap_or("").to_lowercase();
             if key_name.contains("consensus") {
                 activity.consensus = Some(sig_activity);
+                activity
+                    .recent_events
+                    .push(crate::signing_activity::SigningEvent {
+                        key_type: crate::signing_activity::KeyType::Consensus,
+                        activity: sig_activity,
+                    });
                 log::debug!(
                     "Updated consensus signing activity: level={:?}, duration={:?}ms",
                     level,
@@ -490,6 +496,12 @@ impl RequestHandler {
                 );
             } else if key_name.contains("companion") {
                 activity.companion = Some(sig_activity);
+                activity
+                    .recent_events
+                    .push(crate::signing_activity::SigningEvent {
+                        key_type: crate::signing_activity::KeyType::Companion,
+                        activity: sig_activity,
+                    });
                 log::debug!(
                     "Updated companion signing activity: level={:?}, duration={:?}ms",
                     level,

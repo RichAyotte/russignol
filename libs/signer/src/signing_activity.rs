@@ -73,6 +73,53 @@ impl Default for SignatureActivity {
     }
 }
 
+/// Which key was used for signing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyType {
+    /// Consensus key
+    Consensus,
+    /// Companion key
+    Companion,
+}
+
+/// A single signing event with key type and activity details
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SigningEvent {
+    /// Which key was used
+    pub key_type: KeyType,
+    /// Activity details for this signing event
+    pub activity: SignatureActivity,
+}
+
+/// Fixed-size ring buffer of signing events (capacity 5, matching display rows)
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SigningEventRing {
+    events: [Option<SigningEvent>; 5],
+    head: u8,
+    len: u8,
+}
+
+impl SigningEventRing {
+    /// Push a new event into the ring buffer, overwriting the oldest if full
+    pub fn push(&mut self, event: SigningEvent) {
+        self.events[self.head as usize % 5] = Some(event);
+        self.head = (self.head + 1) % 5;
+        if self.len < 5 {
+            self.len += 1;
+        }
+    }
+
+    /// Iterate over events oldest-first
+    pub fn iter(&self) -> impl Iterator<Item = &SigningEvent> {
+        let len = self.len as usize;
+        let head = self.head as usize;
+        (0..len).filter_map(move |i| {
+            let idx = (head + 5 - len + i) % 5;
+            self.events[idx].as_ref()
+        })
+    }
+}
+
 /// Tracks signature activity for consensus and companion keys
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SigningActivity {
@@ -82,6 +129,8 @@ pub struct SigningActivity {
     pub companion: Option<SignatureActivity>,
     /// Chain ID detected from signature requests (first 4 bytes after magic byte)
     pub chain_id: Option<[u8; 4]>,
+    /// Recent signing events (ring buffer, newest last)
+    pub recent_events: SigningEventRing,
 }
 
 impl SigningActivity {
@@ -261,5 +310,60 @@ mod tests {
         assert_eq!(OperationType::Block.as_str(), "signed");
         assert_eq!(OperationType::PreAttestation.as_str(), "pre-attested");
         assert_eq!(OperationType::Attestation.as_str(), "attested");
+    }
+
+    fn make_event(key_type: KeyType, level: u32) -> SigningEvent {
+        SigningEvent {
+            key_type,
+            activity: SignatureActivity {
+                level: Some(level),
+                timestamp: SystemTime::now(),
+                duration: Some(Duration::from_millis(42)),
+                operation_type: Some(OperationType::Attestation),
+                data_size: Some(128),
+            },
+        }
+    }
+
+    #[test]
+    fn ring_empty_iterates_to_nothing() {
+        let ring = SigningEventRing::default();
+        assert_eq!(ring.iter().count(), 0);
+    }
+
+    #[test]
+    fn ring_push_and_iterate_roundtrip() {
+        let mut ring = SigningEventRing::default();
+        let e1 = make_event(KeyType::Consensus, 100);
+        let e2 = make_event(KeyType::Companion, 101);
+        ring.push(e1);
+        ring.push(e2);
+
+        let events: Vec<_> = ring.iter().collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].activity.level, Some(100));
+        assert_eq!(events[1].activity.level, Some(101));
+    }
+
+    #[test]
+    fn ring_push_exactly_5_returns_all_in_order() {
+        let mut ring = SigningEventRing::default();
+        for level in 1..=5 {
+            ring.push(make_event(KeyType::Consensus, level));
+        }
+
+        let levels: Vec<_> = ring.iter().map(|e| e.activity.level.unwrap()).collect();
+        assert_eq!(levels, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn ring_overflow_drops_oldest_preserves_newest() {
+        let mut ring = SigningEventRing::default();
+        for level in 1..=7 {
+            ring.push(make_event(KeyType::Consensus, level));
+        }
+
+        let levels: Vec<_> = ring.iter().map(|e| e.activity.level.unwrap()).collect();
+        assert_eq!(levels, vec![3, 4, 5, 6, 7]);
     }
 }

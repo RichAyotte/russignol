@@ -62,7 +62,9 @@ pub use magic_bytes::{MagicByte, MagicByteError};
 pub use protocol::{ProtocolError, SignerRequest, SignerResponse};
 pub use server::{KeyManager as ServerKeyManager, RequestHandler, ServerError, SignerServer};
 pub use signer::{SignatureVersion, SignerError, SignerHandler, UnencryptedSigner};
-pub use signing_activity::{OperationType, SignatureActivity, SigningActivity};
+pub use signing_activity::{
+    KeyType, OperationType, SignatureActivity, SigningActivity, SigningEvent, SigningEventRing,
+};
 pub use wallet::{KeyManager, StoredKey};
 
 /// Library version
