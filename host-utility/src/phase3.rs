@@ -21,84 +21,6 @@ struct BakerStatus {
     deactivated: bool,
     staked_balance: u64,
     full_balance: u64,
-    /// Active and pending consensus key pkhs from delegate info.
-    consensus_pkhs: Vec<String>,
-    /// Active and pending companion key pkhs from delegate info.
-    companion_pkhs: Vec<String>,
-}
-
-/// Extract active and pending pkhs from a `consensus_key` or `companion_key` object.
-///
-/// For consensus keys, the active pkh is always present (defaults to the baker's
-/// own key). For companion keys, active may be null. Set `include_active_always`
-/// to true for consensus keys, false for companion keys.
-fn extract_key_pkhs(
-    key_obj: Option<&serde_json::Value>,
-    include_active_always: bool,
-) -> Vec<String> {
-    let mut pkhs = Vec::new();
-    let Some(obj) = key_obj else {
-        return pkhs;
-    };
-
-    if let Some(active) = obj.get_nested("active")
-        && (include_active_always || !active.is_null())
-        && let Some(pkh) = active.get_str("pkh")
-    {
-        pkhs.push(pkh.to_string());
-    }
-
-    if let Some(pendings) = obj.get_nested("pendings").and_then(|p| p.as_array()) {
-        for pending in pendings {
-            if let Some(pkh) = pending.get_str("pkh") {
-                pkhs.push(pkh.to_string());
-            }
-        }
-    }
-
-    pkhs
-}
-
-/// Read imported key hashes from the local `secret_keys` file.
-///
-/// Returns the key hashes for the consensus and companion aliases if they
-/// exist and point to the current signer IP. This is a local file read —
-/// no network calls.
-fn read_imported_key_hashes(config: &RussignolConfig) -> (Option<String>, Option<String>) {
-    let secret_keys_file = config.octez_client_dir.join("secret_keys");
-    let signer_ip = config.signer_ip();
-
-    let Ok(content) = read_file(&secret_keys_file) else {
-        return (None, None);
-    };
-    let Ok(keys) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return (None, None);
-    };
-
-    let mut consensus_hash = None;
-    let mut companion_hash = None;
-
-    if let Some(keys_array) = keys.as_array() {
-        for key in keys_array {
-            if let Some(name) = key.get_str("name")
-                && let Some(value) = key.get_str("value")
-                && value.contains(signer_ip)
-            {
-                // Extract key hash from URI like "tcp://ip:port/tz4..."
-                if let Some(hash) = value.rsplit('/').next()
-                    && hash.starts_with("tz")
-                {
-                    if name == CONSENSUS_KEY_ALIAS {
-                        consensus_hash = Some(hash.to_string());
-                    } else if name == COMPANION_KEY_ALIAS {
-                        companion_hash = Some(hash.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    (consensus_hash, companion_hash)
 }
 
 /// Select baker address interactively or from CLI args.
@@ -223,11 +145,6 @@ fn validate_baker(alias: &str, address: &str, config: &RussignolConfig) -> Resul
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0);
 
-                let consensus_pkhs =
-                    extract_key_pkhs(delegate_info.get_nested("consensus_key"), true);
-                let companion_pkhs =
-                    extract_key_pkhs(delegate_info.get_nested("companion_key"), false);
-
                 log::info!(
                     "Baker {address}: registered=true, deactivated={deactivated}, \
                      staked={staked_balance}, balance={full_balance}"
@@ -240,8 +157,6 @@ fn validate_baker(alias: &str, address: &str, config: &RussignolConfig) -> Resul
                     deactivated,
                     staked_balance,
                     full_balance,
-                    consensus_pkhs,
-                    companion_pkhs,
                 })
             } else {
                 log::info!("Baker {address}: not registered as delegate");
@@ -252,18 +167,12 @@ fn validate_baker(alias: &str, address: &str, config: &RussignolConfig) -> Resul
                     deactivated: false,
                     staked_balance: 0,
                     full_balance: 0,
-                    consensus_pkhs: Vec::new(),
-                    companion_pkhs: Vec::new(),
                 })
             }
         },
     )
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "orchestrates full key configuration phase"
-)]
 pub fn run(
     backup_dir: &Path,
     confirmation_config: &crate::confirmation::ConfirmationConfig,
@@ -288,8 +197,6 @@ pub fn run(
             deactivated: false,
             staked_balance: 0,
             full_balance: 0,
-            consensus_pkhs: Vec::new(),
-            companion_pkhs: Vec::new(),
         }
     } else {
         validate_baker(&alias, &address, russignol_config)?
@@ -304,21 +211,7 @@ pub fn run(
         ));
     }
 
-    // Step 4: Check local key state to determine which mutations are needed
-    let (imported_consensus, imported_companion) = if dry_run {
-        (None, None)
-    } else {
-        read_imported_key_hashes(russignol_config)
-    };
-    let keys_imported = imported_consensus.is_some() && imported_companion.is_some();
-    let consensus_key_set = imported_consensus
-        .as_ref()
-        .is_some_and(|h| baker.consensus_pkhs.contains(h));
-    let companion_key_set = imported_companion
-        .as_ref()
-        .is_some_and(|h| baker.companion_pkhs.contains(h));
-
-    // Step 5: Build dynamic mutations list based on baker state
+    // Step 4: Build dynamic mutations list based on baker state
     let mut actions = Vec::new();
 
     if !baker.registered {
@@ -346,31 +239,8 @@ pub fn run(
         });
     }
 
-    if !keys_imported {
-        actions.push(crate::confirmation::MutationAction {
-            description: "Import remote BLS keys from signer".to_string(),
-            detailed_info: Some(format!(
-                "Import {CONSENSUS_KEY_ALIAS} and {COMPANION_KEY_ALIAS}"
-            )),
-        });
-    }
-    if !consensus_key_set {
-        actions.push(crate::confirmation::MutationAction {
-            description: "Set consensus key on-chain".to_string(),
-            detailed_info: Some("Blockchain transaction to assign consensus key".to_string()),
-        });
-    }
-    if !companion_key_set {
-        actions.push(crate::confirmation::MutationAction {
-            description: "Set companion key on-chain".to_string(),
-            detailed_info: Some("Blockchain transaction to assign companion key".to_string()),
-        });
-    }
-
-    // Step 6: Get confirmation (skip if nothing to do)
-    if actions.is_empty() {
-        log::info!("Key configuration already complete — no changes needed");
-    } else {
+    // Step 6: Get confirmation for registration/staking actions (skip if nothing to do)
+    if !actions.is_empty() {
         let mutations = crate::confirmation::PhaseMutations {
             phase_name: "Key Configuration".to_string(),
             actions,
@@ -410,22 +280,14 @@ pub fn run(
         keys::wait_for_signer(auto_confirm, russignol_config)?
     };
 
-    // Import and verify keys
+    // Import keys and set them on-chain
     discover_and_import_keys(
+        &baker.address,
         backup_dir,
         dry_run,
         confirmation_config.verbose,
         auto_confirm,
         &remote_keys,
-        russignol_config,
-    )?;
-
-    // Assign and verify keys on blockchain
-    assign_and_verify_keys(
-        &baker.address,
-        dry_run,
-        confirmation_config.verbose,
-        auto_confirm,
         russignol_config,
     )?;
 
@@ -695,6 +557,7 @@ fn check_and_set_stake(
 }
 
 fn discover_and_import_keys(
+    baker_key: &str,
     backup_dir: &Path,
     dry_run: bool,
     verbose: bool,
@@ -735,59 +598,154 @@ fn discover_and_import_keys(
         },
     )?;
 
-    // Check if keys are already correctly imported
+    // Check which keys are already correctly imported
     let signer_ip = config.signer_ip();
-    if let Ok((consensus_ok, companion_ok)) = check_keys_correctly_imported(
+    let (consensus_imported, companion_imported) = check_keys_correctly_imported(
         &secret_keys_file,
         &remote_keys[0],
         &remote_keys[1],
         signer_ip,
-    ) && consensus_ok
-        && companion_ok
-    {
-        return validate_imported_keys(client_dir, signer_ip, config);
+    )
+    .unwrap_or((false, false));
+
+    // Fast path: both keys imported AND set on-chain → skip all subprocess work
+    if consensus_imported && companion_imported {
+        let (ch, cph) = read_local_key_hashes(&secret_keys_file, signer_ip);
+        if let (Some(consensus_hash), Some(companion_hash)) = (ch, cph)
+            && let Ok((true, true)) =
+                check_individual_keys_on_chain(baker_key, &consensus_hash, &companion_hash, config)
+        {
+            success(&format!("Consensus key set to {consensus_hash}"));
+            success(&format!("Companion key set to {companion_hash}"));
+            validate_imported_keys(client_dir, signer_ip, config)?;
+            return Ok(());
+        }
     }
 
-    // Import the first two keys as consensus and companion
-    run_step(
-        "Importing consensus key",
-        &format!(
-            "octez-client import secret key {CONSENSUS_KEY_ALIAS} {signer_uri}/{}",
-            &remote_keys[0]
-        ),
-        || {
-            import_key_with_backup(
-                CONSENSUS_KEY_ALIAS,
-                &remote_keys[0],
-                &secret_keys_file,
-                backup_dir,
-                auto_confirm,
-                verbose,
-                config,
-            )
-        },
+    // ── Consensus key ───────────────────────────────────────────────────
+    import_and_set_key(
+        CONSENSUS_KEY_ALIAS,
+        "consensus",
+        &remote_keys[0],
+        consensus_imported,
+        baker_key,
+        &secret_keys_file,
+        backup_dir,
+        signer_uri,
+        verbose,
+        auto_confirm,
+        config,
     )?;
 
-    run_step(
-        "Importing companion key",
-        &format!(
-            "octez-client import secret key {COMPANION_KEY_ALIAS} {signer_uri}/{}",
-            &remote_keys[1]
-        ),
-        || {
-            import_key_with_backup(
-                COMPANION_KEY_ALIAS,
-                &remote_keys[1],
-                &secret_keys_file,
-                backup_dir,
-                auto_confirm,
-                verbose,
-                config,
-            )
-        },
+    // ── Companion key ───────────────────────────────────────────────────
+    import_and_set_key(
+        COMPANION_KEY_ALIAS,
+        "companion",
+        &remote_keys[1],
+        companion_imported,
+        baker_key,
+        &secret_keys_file,
+        backup_dir,
+        signer_uri,
+        verbose,
+        auto_confirm,
+        config,
     )?;
 
-    validate_imported_keys(client_dir, config.signer_ip(), config)
+    // Final filesystem validation
+    validate_imported_keys(client_dir, signer_ip, config)
+}
+
+/// Import a single key and set it on-chain, using one spinner that updates its
+/// message across phases, then prints a final success line with the key hash.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "orchestrates prompt, import, and on-chain set"
+)]
+fn import_and_set_key(
+    alias: &str,
+    kind: &str,
+    remote_key_hash: &str,
+    already_imported: bool,
+    baker_key: &str,
+    secret_keys_file: &Path,
+    backup_dir: &Path,
+    signer_uri: &str,
+    verbose: bool,
+    auto_confirm: bool,
+    config: &RussignolConfig,
+) -> Result<()> {
+    // Prompt OUTSIDE the spinner so stdin isn't corrupted
+    let force = if !already_imported && alias_exists_in_file(secret_keys_file, alias) {
+        let should_overwrite =
+            crate::utils::prompt_yes_no(&format!("Overwrite existing '{alias}'?"), auto_confirm)?;
+        if !should_overwrite {
+            anyhow::bail!("Cannot proceed without importing key '{alias}'");
+        }
+        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let backup_filename = format!("secret_keys.before-force-{timestamp}");
+        backup::backup_file_if_exists(secret_keys_file, backup_dir, &backup_filename, verbose)?;
+        true
+    } else {
+        false
+    };
+
+    let spinner = crate::progress::create_spinner(&format!(
+        "Importing {kind} key (octez-client import secret key {alias} {signer_uri}/{remote_key_hash})"
+    ));
+
+    let result = (|| -> Result<()> {
+        // Import if needed
+        if !already_imported {
+            keys::import_key_from_signer(alias, remote_key_hash, force, config)?;
+        }
+
+        // Resolve the imported key's public key hash
+        let pkh = keys::get_key_hash(alias, config)?;
+
+        // Check if already set on-chain (pass pkh in the correct slot)
+        let already_set = if kind == "consensus" {
+            check_individual_keys_on_chain(baker_key, &pkh, "", config)
+                .map(|(c, _)| c)
+                .unwrap_or(false)
+        } else {
+            check_individual_keys_on_chain(baker_key, "", &pkh, config)
+                .map(|(_, c)| c)
+                .unwrap_or(false)
+        };
+
+        if !already_set {
+            spinner.set_message(format!(
+                "Setting {kind} key (octez-client set {kind} key for {baker_key} to {alias})"
+            ));
+
+            let output = run_octez_client_command(
+                &["set", kind, "key", "for", baker_key, "to", alias],
+                config,
+            )?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // "already active" means the key is already set — not an error
+                if !stderr.contains("already active") {
+                    anyhow::bail!("Failed to set {kind} key: {stderr}");
+                }
+            }
+        }
+
+        spinner.finish_and_clear();
+        let label = format!(
+            "{}{} key set to {pkh}",
+            &kind[..1].to_uppercase(),
+            &kind[1..]
+        );
+        success(&label);
+        Ok(())
+    })();
+
+    if result.is_err() {
+        spinner.finish_and_clear();
+    }
+    result
 }
 
 fn validate_imported_keys(
@@ -865,6 +823,54 @@ fn check_keys_correctly_imported(
     Ok((consensus_correct, companion_correct))
 }
 
+/// Read the actual key hashes from the `secret_keys` file for our two aliases,
+/// filtered by signer IP. Returns `(consensus_hash, companion_hash)` with `None`
+/// for any alias that isn't found or can't be parsed.
+fn read_local_key_hashes(
+    secret_keys_file: &Path,
+    signer_ip: &str,
+) -> (Option<String>, Option<String>) {
+    let content = read_file(secret_keys_file).ok();
+    let keys: Option<serde_json::Value> = content.and_then(|c| serde_json::from_str(&c).ok());
+
+    let mut consensus_hash = None;
+    let mut companion_hash = None;
+
+    if let Some(arr) = keys.as_ref().and_then(|v| v.as_array()) {
+        for key in arr {
+            if let Some(name) = key.get_str("name")
+                && let Some(value) = key.get_str("value")
+                && value.contains(signer_ip)
+            {
+                let hash = value
+                    .rsplit('/')
+                    .next()
+                    .filter(|h| h.starts_with("tz"))
+                    .map(String::from);
+
+                if name == CONSENSUS_KEY_ALIAS {
+                    consensus_hash = hash;
+                } else if name == COMPANION_KEY_ALIAS {
+                    companion_hash = hash;
+                }
+            }
+        }
+    }
+
+    (consensus_hash, companion_hash)
+}
+
+fn alias_exists_in_file(secret_keys_file: &Path, alias: &str) -> bool {
+    let Ok(content) = read_file(secret_keys_file) else {
+        return false;
+    };
+    let Ok(keys) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    keys.as_array()
+        .is_some_and(|arr| arr.iter().any(|k| k.get_str("name") == Some(alias)))
+}
+
 fn validate_keys_in_filesystem(client_dir: &Path, signer_ip: &str) -> Result<()> {
     let secret_keys_file = client_dir.join("secret_keys");
 
@@ -893,97 +899,6 @@ fn validate_keys_in_filesystem(client_dir: &Path, signer_ip: &str) -> Result<()>
 
     if !found_consensus || !found_companion {
         anyhow::bail!("Keys validation failed: keys not found in filesystem with correct URIs");
-    }
-
-    Ok(())
-}
-
-fn assign_and_verify_keys(
-    baker_key: &str,
-    dry_run: bool,
-    _verbose: bool,
-    _auto_confirm: bool,
-    config: &RussignolConfig,
-) -> Result<()> {
-    if dry_run {
-        return Ok(());
-    }
-
-    // Get the public key hashes for the imported keys
-    let consensus_pkh = keys::get_key_hash(CONSENSUS_KEY_ALIAS, config)?;
-    let companion_pkh = keys::get_key_hash(COMPANION_KEY_ALIAS, config)?;
-
-    // Check current key assignments on blockchain
-    let (consensus_matches, companion_matches) = run_step(
-        "Checking key assignments",
-        &format!("octez-client rpc get .../delegates/{baker_key}"),
-        || match check_individual_keys_on_chain(baker_key, &consensus_pkh, &companion_pkh, config) {
-            Ok((cons, comp)) => Ok((cons, comp)),
-            Err(e) => {
-                log::debug!("Could not verify current key state: {e}");
-                Ok((false, false))
-            }
-        },
-    )?;
-
-    // Set consensus key only if needed
-    if consensus_matches {
-        success("Consensus key already set on-chain");
-    } else {
-        run_step(
-            "Setting consensus key",
-            &format!("octez-client set consensus key for {baker_key} to {CONSENSUS_KEY_ALIAS}"),
-            || {
-                let set_consensus = run_octez_client_command(
-                    &[
-                        "set",
-                        "consensus",
-                        "key",
-                        "for",
-                        baker_key,
-                        "to",
-                        CONSENSUS_KEY_ALIAS,
-                    ],
-                    config,
-                )?;
-
-                if !set_consensus.status.success() {
-                    let stderr = String::from_utf8_lossy(&set_consensus.stderr);
-                    anyhow::bail!("Failed to set consensus key: {stderr}");
-                }
-                Ok(())
-            },
-        )?;
-    }
-
-    // Set companion key only if needed
-    if companion_matches {
-        success("Companion key already set on-chain");
-    } else {
-        run_step(
-            "Setting companion key",
-            &format!("octez-client set companion key for {baker_key} to {COMPANION_KEY_ALIAS}"),
-            || {
-                let set_companion = run_octez_client_command(
-                    &[
-                        "set",
-                        "companion",
-                        "key",
-                        "for",
-                        baker_key,
-                        "to",
-                        COMPANION_KEY_ALIAS,
-                    ],
-                    config,
-                )?;
-
-                if !set_companion.status.success() {
-                    let stderr = String::from_utf8_lossy(&set_companion.stderr);
-                    anyhow::bail!("Failed to set companion key: {stderr}");
-                }
-                Ok(())
-            },
-        )?;
     }
 
     Ok(())
@@ -1099,45 +1014,4 @@ fn check_individual_keys_on_chain(
     }
 
     Ok((consensus_match, companion_match))
-}
-
-/// Import a key with backup before force overwrite
-///
-/// Handles the import flow with user prompts and optional backup
-/// when forcing overwrite of an existing alias.
-fn import_key_with_backup(
-    alias: &str,
-    key_hash: &str,
-    secret_keys_file: &Path,
-    backup_dir: &Path,
-    auto_confirm: bool,
-    verbose: bool,
-    config: &RussignolConfig,
-) -> Result<()> {
-    match keys::import_key_from_signer(alias, key_hash, false, config) {
-        Ok(()) => Ok(()),
-        Err(e) if e.to_string().starts_with("alias_exists:") => {
-            let should_overwrite = crate::utils::prompt_yes_no(
-                &format!("Overwrite existing '{alias}'?"),
-                auto_confirm,
-            )?;
-
-            if should_overwrite {
-                // Backup secret_keys before forcing overwrite
-                let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-                let backup_filename = format!("secret_keys.before-force-{timestamp}");
-                backup::backup_file_if_exists(
-                    secret_keys_file,
-                    backup_dir,
-                    &backup_filename,
-                    verbose,
-                )?;
-
-                keys::import_key_from_signer(alias, key_hash, true, config)
-            } else {
-                anyhow::bail!("Cannot proceed without importing key '{alias}'");
-            }
-        }
-        Err(e) => Err(e),
-    }
 }
