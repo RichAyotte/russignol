@@ -224,5 +224,6 @@ See [CONFIGURATION.md](../host-utility/CONFIGURATION.md#troubleshooting) for oct
 
 ## Next Steps
 
+- [Device Operation](DEVICE_OPERATION.md) — Using the device after installation
 - [Key Rotation](../host-utility/KEY_ROTATION.md) — Rotate to a new device
 - [Manual Installation](INSTALL_MANUAL.md) — Advanced setup without the utility

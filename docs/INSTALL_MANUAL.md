@@ -331,6 +331,7 @@ If no output or connection refused, check the device is unlocked by entering you
 
 ## Next Steps
 
+- [Device Operation](DEVICE_OPERATION.md) — Using the device after installation
 - [Automated Installation](INSTALL_HOST_UTILITY.md) — Simplified setup with host utility
 - [Key Rotation](../host-utility/KEY_ROTATION.md) — Rotate to a new device
 - [Configuration Reference](../host-utility/CONFIGURATION.md) — Multi-network setup

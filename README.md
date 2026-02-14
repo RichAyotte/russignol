@@ -2,6 +2,8 @@
 
 # Russignol
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **Hardware Signer for Tezos Baking on Raspberry Pi Zero 2W**
 
 Russignol is a dedicated hardware signing device. Your validator keys stay on isolated hardware.
@@ -21,6 +23,7 @@ Ledger Nano can't perform BLS signatures fast enough for 6-second blocks, and so
 - **High watermark protection** — Refuses to sign at or below previous levels, persists across reboots
 - **Touch-enabled e-ink display** — On-device PIN entry (never crosses USB), live signing activity
 - **Flash-optimized storage** — F2FS with hardware-adaptive alignment, over-provisioning for wear leveling
+- **Tap-to-shutdown** — 5 rapid taps on the touchscreen triggers a safe shutdown with confirmation
 
 ## Hardware Requirements
 
@@ -38,6 +41,7 @@ Ledger Nano can't perform BLS signatures fast enough for 6-second blocks, and so
 
 ## Documentation
 
+- [Device Operation](docs/DEVICE_OPERATION.md)
 - [Security Audit](docs/SECURITY_AUDIT.md)
 - [Host Utility](host-utility/README.md)
 - [Configuration](host-utility/CONFIGURATION.md)
@@ -54,10 +58,6 @@ Ledger Nano can't perform BLS signatures fast enough for 6-second blocks, and so
 - Powered by [blst](https://github.com/supranational/blst)
 - Logic ported from [Tezos octez-signer](https://gitlab.com/tezos/tezos/)
 - Icons by [Mobirise Icons](https://mobiriseicons.com/)
-
-## License
-
-MIT — see [LICENSE](LICENSE).
 
 ## Support
 
