@@ -1003,7 +1003,7 @@ fn commit_version_bump(component: ReleaseComponent, version: &str) -> Result<()>
 
     // Create local git tag to prevent duplicate releases
     let status = Command::new("git")
-        .args(["tag", &tag])
+        .args(["tag", "-m", &tag, &tag])
         .status()
         .context("Failed to run git tag")?;
 
