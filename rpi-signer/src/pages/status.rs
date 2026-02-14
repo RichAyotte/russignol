@@ -133,8 +133,9 @@ const CONTENT_ROW_4: i32 = 109;
 const ICON_GAP: i32 = 8;
 
 impl<D: DrawTarget<Color = BinaryColor>> Page<D> for StatusPage {
-    fn handle_touch(&mut self, _point: Point) {
+    fn handle_touch(&mut self, _point: Point) -> bool {
         let _ = self.app_sender.send(AppEvent::ShowSignatures);
+        false // Whole-page listener, not a specific button
     }
 
     fn draw(&mut self, display: &mut D) -> Result<(), D::Error> {

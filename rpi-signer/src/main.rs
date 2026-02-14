@@ -7,6 +7,7 @@ mod pages;
 mod setup;
 mod signer_server;
 mod storage;
+mod tap_counter;
 mod tezos_encrypt;
 mod tezos_signer;
 mod util;
@@ -262,11 +263,44 @@ fn run_ui_loop(
     // Inactivity tracking for screensaver (None until after PIN verification)
     let mut last_activity: Option<Instant> = None;
 
+    // Tap-to-shutdown state
+    let mut tap_counter = tap_counter::TapCounter::new(5, Duration::from_millis(300));
+    let mut shutdown_saved_page: Option<Box<dyn Page<Display>>> = None;
+
+    // Tap debounce state — delays the first tap of a potential multi-tap sequence
+    let mut pending_tap: Option<(Point, Instant)> = None;
+
     loop {
+        // Shorten timeout when a debounced tap is waiting to fire
+        let timeout = if let Some((_, tap_time)) = pending_tap {
+            let elapsed = tap_time.elapsed();
+            if elapsed >= tap_counter.max_gap() {
+                Duration::ZERO
+            } else {
+                tap_counter
+                    .max_gap()
+                    .checked_sub(elapsed)
+                    .unwrap()
+                    .min(animation_interval)
+            }
+        } else {
+            animation_interval
+        };
+
         // Use recv_timeout to drive animation when ProgressPage is active
-        let event = match rx.recv_timeout(animation_interval) {
+        let event = match rx.recv_timeout(timeout) {
             Ok(event) => event,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // Fire debounced tap if its delay has expired
+                if let Some((point, tap_time)) = pending_tap
+                    && tap_time.elapsed() >= tap_counter.max_gap()
+                {
+                    pending_tap = None;
+                    if current_page.handle_touch(point) {
+                        tap_counter.reset();
+                    }
+                }
+
                 // Check for inactivity timeout (screensaver)
                 if let Some(activity_time) = last_activity
                     && !screensaver_active
@@ -291,16 +325,68 @@ fn run_ui_loop(
 
         match event {
             AppEvent::Touch(touch_point) => {
+                let now = Instant::now();
+
                 if screensaver_active {
-                    log::debug!("Touch detected while screensaver active, waking up");
-                    // Wake from screensaver on any touch
-                    let _ = tx.send(AppEvent::DeactivateScreensaver);
-                } else {
-                    // Normal touch handling
+                    // Screensaver: all taps count toward shutdown
+                    if tap_counter.record_tap(now) {
+                        log::info!("Tap-to-shutdown threshold reached, showing confirmation");
+                        tap_counter.reset();
+                        device.display_wake()?;
+                        screensaver_active = false;
+                        shutdown_saved_page = saved_page.take();
+
+                        current_page = Box::new(ConfirmationPage::new(
+                            tx.clone(),
+                            "Shutdown the device?",
+                            AppEvent::Shutdown,
+                            AppEvent::CancelShutdown,
+                            false,
+                            "Shutdown",
+                        ));
+                        needs_animation = false;
+                        current_page.show(&mut device.display)?;
+                        device.display.update()?;
+                    } else {
+                        log::debug!("Touch detected while screensaver active, waking up");
+                        let _ = tx.send(AppEvent::DeactivateScreensaver);
+                    }
+                } else if current_page.is_modal() {
+                    // Modal pages: buttons must always work, no shutdown counter
                     current_page.handle_touch(touch_point);
-                    // Reset inactivity timer
-                    log::debug!("Touch detected, resetting inactivity timer");
-                    last_activity = Some(Instant::now());
+                    last_activity = Some(now);
+                } else {
+                    // Non-modal pages: debounce to suppress page-swap during multi-tap
+                    let is_followup = tap_counter.has_recent_taps(now);
+                    let triggered = tap_counter.record_tap(now);
+
+                    if triggered {
+                        // Threshold reached — show shutdown confirmation
+                        log::info!("Tap-to-shutdown threshold reached, showing confirmation");
+                        tap_counter.reset();
+                        pending_tap = None;
+                        shutdown_saved_page = Some(current_page);
+
+                        current_page = Box::new(ConfirmationPage::new(
+                            tx.clone(),
+                            "Shutdown the device?",
+                            AppEvent::Shutdown,
+                            AppEvent::CancelShutdown,
+                            false,
+                            "Shutdown",
+                        ));
+                        needs_animation = false;
+                        current_page.show(&mut device.display)?;
+                        device.display.update()?;
+                    } else if is_followup {
+                        // Follow-up tap in a sequence — suppress handle_touch
+                        pending_tap = None;
+                    } else {
+                        // First tap — defer handle_touch until debounce expires
+                        pending_tap = Some((touch_point, now));
+                    }
+
+                    last_activity = Some(now);
                 }
             }
 
@@ -707,6 +793,19 @@ fn run_ui_loop(
                     log::debug!("Screensaver deactivation skipped (not active)");
                 }
             }
+            AppEvent::CancelShutdown => {
+                log::info!("Shutdown cancelled, restoring previous page");
+                tap_counter.reset();
+                if let Some(page) = shutdown_saved_page.take() {
+                    current_page = page;
+                } else {
+                    current_page = Box::new(StatusPage::new(tx.clone(), signing_activity.clone()));
+                }
+                needs_animation = false;
+                current_page.show(&mut device.display)?;
+                device.display.update()?;
+                last_activity = Some(Instant::now());
+            }
             AppEvent::Shutdown => {
                 log::info!("Shutting down UI...");
 
@@ -721,6 +820,9 @@ fn run_ui_loop(
                         log::info!("Watermarks flushed to disk");
                     }
                 }
+
+                // Sync filesystem buffers to prevent data loss
+                setup::sync_disk();
 
                 // If screensaver is active, wake display first
                 if screensaver_active {
@@ -923,6 +1025,10 @@ fn run_ui_loop(
                 device.display.update()?;
             }
             AppEvent::ShowStatus => {
+                if current_page.is_modal() {
+                    log::debug!("Ignoring ShowStatus - modal dialog showing");
+                    continue;
+                }
                 log::info!("Showing status page");
                 current_page = Box::new(StatusPage::new(tx.clone(), signing_activity.clone()));
                 needs_animation = false;
@@ -930,6 +1036,10 @@ fn run_ui_loop(
                 device.display.update()?;
             }
             AppEvent::ShowSignatures => {
+                if current_page.is_modal() {
+                    log::debug!("Ignoring ShowSignatures - modal dialog showing");
+                    continue;
+                }
                 log::info!("Showing signatures page");
                 current_page = Box::new(SignaturesPage::new(tx.clone(), signing_activity.clone()));
                 needs_animation = false;

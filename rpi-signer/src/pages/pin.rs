@@ -157,7 +157,7 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for PinPage {
         Ok(())
     }
 
-    fn handle_touch(&mut self, point: Point) {
+    fn handle_touch(&mut self, point: Point) -> bool {
         for (i, button) in self.buttons.iter().enumerate() {
             if button.contains(point) {
                 match i {
@@ -235,8 +235,9 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for PinPage {
                         }
                     }
                 }
-                break;
+                return true;
             }
         }
+        false
     }
 }

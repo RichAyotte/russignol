@@ -16,8 +16,12 @@ pub trait Page<D: DrawTarget<Color = BinaryColor>> {
     /// Draw the page content to the display
     fn draw(&mut self, display: &mut D) -> Result<(), D::Error>;
 
-    /// Handle a touch event at the given point
-    fn handle_touch(&mut self, _point: Point) {}
+    /// Handle a touch event at the given point.
+    /// Returns `true` if the touch was consumed by an interactive element (button),
+    /// `false` if the touch landed on empty space.
+    fn handle_touch(&mut self, _point: Point) -> bool {
+        false
+    }
 
     /// Clear the display and draw the page (convenience method)
     fn show(&mut self, display: &mut D) -> Result<(), D::Error> {

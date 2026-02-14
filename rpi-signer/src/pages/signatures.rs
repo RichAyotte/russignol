@@ -118,9 +118,10 @@ const COL_KEY_X: i32 = 120;
 const COL_TIME_X: i32 = 228;
 
 impl<D: DrawTarget<Color = BinaryColor>> Page<D> for SignaturesPage {
-    fn handle_touch(&mut self, _point: Point) {
+    fn handle_touch(&mut self, _point: Point) -> bool {
         // Any touch shows the status page
         let _ = self.app_sender.send(AppEvent::ShowStatus);
+        false // Whole-page listener, not a specific button
     }
 
     fn draw(&mut self, display: &mut D) -> Result<(), D::Error> {

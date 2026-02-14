@@ -96,9 +96,12 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for GreetingPage {
         Ok(())
     }
 
-    fn handle_touch(&mut self, point: Point) {
+    fn handle_touch(&mut self, point: Point) -> bool {
         if self.button.contains(point) {
             let _ = self.app_sender.send(AppEvent::StartSetup);
+            true
+        } else {
+            false
         }
     }
 }

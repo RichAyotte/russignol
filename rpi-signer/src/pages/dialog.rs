@@ -75,9 +75,12 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for DialogPage {
         self.button.draw(display)
     }
 
-    fn handle_touch(&mut self, point: Point) {
+    fn handle_touch(&mut self, point: Point) -> bool {
         if self.button.contains(point) {
             let _ = self.app_sender.send(self.dismiss_event.clone());
+            true
+        } else {
+            false
         }
     }
 }

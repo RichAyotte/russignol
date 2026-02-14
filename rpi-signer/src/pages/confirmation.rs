@@ -225,8 +225,8 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for ConfirmationPage {
             // Draw message text with automatic word-wrapping (original behavior)
             let character_style = U8g2TextStyle::new(fonts::FONT_PROPORTIONAL, BinaryColor::Off);
             let textbox_style = TextBoxStyleBuilder::new()
-                .alignment(HorizontalAlignment::Left)
-                .vertical_alignment(VerticalAlignment::Top)
+                .alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Middle)
                 .build();
 
             TextBox::with_textbox_style(&self.message, text_bounds, character_style, textbox_style)
@@ -263,7 +263,7 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for ConfirmationPage {
         Ok(())
     }
 
-    fn handle_touch(&mut self, point: Point) {
+    fn handle_touch(&mut self, point: Point) -> bool {
         log::info!(
             "[ConfirmationPage id={}] handle_touch at {:?}, yes_bounds={:?}, no_bounds={:?}",
             self.id,
@@ -274,11 +274,14 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for ConfirmationPage {
         if self.yes_button.contains(point) {
             log::info!("[ConfirmationPage id={}] YES button pressed", self.id);
             let _ = self.app_sender.send(self.confirm_event.clone());
+            true
         } else if self.no_button.contains(point) {
             log::info!("[ConfirmationPage id={}] NO/Cancel button pressed", self.id);
             let _ = self.app_sender.send(self.cancel_event.clone());
+            true
         } else {
             log::info!("[ConfirmationPage id={}] Touch outside buttons", self.id);
+            false
         }
     }
 }

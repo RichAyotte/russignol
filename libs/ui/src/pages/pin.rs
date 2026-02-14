@@ -186,7 +186,7 @@ where
         Ok(())
     }
 
-    fn handle_touch(&mut self, point: Point) {
+    fn handle_touch(&mut self, point: Point) -> bool {
         for (i, button) in self.buttons.iter().enumerate() {
             if button.contains(point) {
                 match i {
@@ -236,8 +236,9 @@ where
                         }
                     }
                 }
-                break;
+                return true;
             }
         }
+        false
     }
 }

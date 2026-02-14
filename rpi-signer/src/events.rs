@@ -29,6 +29,7 @@ pub enum AppEvent {
     ActivateScreensaver,   // Trigger screensaver after inactivity
     DeactivateScreensaver, // Wake from screensaver on touch
     Shutdown,              // Signal to exit the application
+    CancelShutdown,        // Cancel shutdown confirmation, restore previous page
     WatermarkError {
         pkh: String,
         chain_id: ChainId,
