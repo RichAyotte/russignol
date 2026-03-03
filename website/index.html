@@ -37,9 +37,8 @@
             </button>
             <nav class="main-nav" id="main-nav">
                 <ul>
-                    <li><a href="#demo">Demo</a></li>
-                    <li><a href="#features">Features</a></li>
                     <li><a href="#why-russignol">Why Russignol?</a></li>
+                    <li><a href="#demo">Demo</a></li>
                     <li><a href="#setup">Get Started</a></li>
                 </ul>
             </nav>
@@ -68,41 +67,19 @@
             </div>
         </section>
 
-        <section id="demo" class="demo">
+        <section id="why-russignol" class="features">
             <div class="container">
-                <h2>See It In Action</h2>
-                <p class="demo-description">Watch a full walkthrough — from 3-second boot to live signing — and see how Russignol keeps your keys safe.</p>
-                <div class="demo-video-wrapper">
-                    <div class="demo-video">
-                        <iframe src="https://www.youtube-nocookie.com/embed/FO8th1GVkIg" title="Russignol Demo" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen loading="lazy"></iframe>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <section id="features" class="features">
-            <div class="container">
-                <h2>Features</h2>
+                <h2>Why Russignol?</h2>
                 <div class="feature-grid">
                     <div class="feature-card">
                         <div class="icon">
-                            <!-- Key Icon -->
                             <div class="feature-icon icon-key"></div>
                         </div>
-                        <h3>Secure Storage</h3>
-                        <p>Private keys are encrypted and stored securely on the device with PIN protection.</p>
+                        <h3>Physical Separation</h3>
+                        <p>Your private keys never leave the device. Key generation and PIN setup happen exclusively on the touchscreen.</p>
                     </div>
                     <div class="feature-card">
                         <div class="icon">
-                            <!-- Rocket Icon -->
-                            <div class="feature-icon icon-rocket"></div>
-                        </div>
-                        <h3>Fast BLS Signatures</h3>
-                        <p>Optimized for performance: the Pi Zero 2 generates BLS signatures in under 6ms, ready for future Tezos protocols.</p>
-                    </div>
-                    <div class="feature-card">
-                        <div class="icon">
-                            <!-- Touchscreen Icon -->
                             <div class="feature-icon icon-screen"></div>
                         </div>
                         <h3>E-Paper Touch Display</h3>
@@ -110,25 +87,21 @@
                     </div>
                     <div class="feature-card">
                         <div class="icon">
-                            <!-- Gears Icon -->
+                            <div class="feature-icon icon-rocket"></div>
+                        </div>
+                        <h3>Never Miss a Block</h3>
+                        <p>Sign blocks in under 6ms with no garbage collection pauses — at least 2x faster than comparable signers.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="icon">
                             <div class="feature-icon icon-gears"></div>
                         </div>
-                        <h3>Automated Setup</h3>
-                        <p>The companion CLI utility makes configuring your baker host effortless and verifiable.</p>
+                        <h3>Effortless Setup</h3>
+                        <p>A companion CLI utility handles host configuration automatically — fully automated and verifiable.</p>
                     </div>
                 </div>
-            </div>
-        </section>
-
-        <section id="why-russignol" class="features">
-            <div class="container">
-                <h2>Why Russignol?</h2>
-                <div class="tech-specs" style="margin-top: 0;">
+                <div class="tech-specs">
                     <ul>
-                        <li>
-                            <strong>Physical Separation:</strong>
-                            <span>Your private keys <span class="highlight">never leave the device</span>. Key generation and PIN setup happen exclusively on the touchscreen — even a compromised host <span class="highlight">cannot access or extract</span> your keys.</span>
-                        </li>
                         <li>
                             <strong>Hardened by Default:</strong>
                             <span>Sleep soundly with a purpose-built Linux distribution. <span class="highlight">No WiFi, no Bluetooth, no SSH, no logins</span> — attack vectors are eliminated, not just disabled.</span>
@@ -136,10 +109,6 @@
                         <li>
                             <strong>Memory-Safe Implementation:</strong>
                             <span>Built in Rust for <span class="highlight">guaranteed memory safety</span>. Cryptographic operations use the audited and formally verified <a href="https://github.com/supranational/blst" target="_blank" rel="noopener noreferrer">blst</a> library — <span class="highlight">no buffer overflows, no exploits</span>.</span>
-                        </li>
-                        <li>
-                            <strong>Never Miss a Block:</strong>
-                            <span>Sign blocks in <span class="highlight">under 6ms</span> with no garbage collection pauses — <span class="highlight">at least 2x faster</span> than comparable signers.</span>
                         </li>
                         <li>
                             <strong>Tiny Attack Surface:</strong>
@@ -154,6 +123,18 @@
                             <span>No more prematurely worn-out SD cards — no risky key migrations, no downtime, no unhappy delegators. F2FS expands to use your <span class="highlight">entire card</span> for maximum wear leveling. Your storage will <span class="highlight">outlive the hardware</span>.</span>
                         </li>
                     </ul>
+                </div>
+            </div>
+        </section>
+
+        <section id="demo" class="demo">
+            <div class="container">
+                <h2>See It In Action</h2>
+                <p class="demo-description">Watch a full walkthrough — from 3-second boot to live signing — and see how Russignol keeps your keys safe.</p>
+                <div class="demo-video-wrapper">
+                    <div class="demo-video">
+                        <iframe src="https://www.youtube-nocookie.com/embed/FO8th1GVkIg" title="Russignol Demo" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen loading="lazy"></iframe>
+                    </div>
                 </div>
             </div>
         </section>

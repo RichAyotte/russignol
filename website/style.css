@@ -427,10 +427,6 @@ ul {
     -webkit-mask-image: url(assets/touchscreen.svg);
     mask-image: url(assets/touchscreen.svg);
 }
-.icon-touch {
-    -webkit-mask-image: url(assets/touchscreen.svg);
-    mask-image: url(assets/touchscreen.svg);
-}
 .icon-gears {
     -webkit-mask-image: url(assets/gears.svg);
     mask-image: url(assets/gears.svg);
@@ -648,30 +644,7 @@ ul {
 .tech-specs {
     width: 100%;
     margin: 60px 0 0;
-    padding: 40px;
-    background-color: var(--card-bg);
-    border: 1px solid var(--border-color);
-    position: relative;
-}
-.tech-specs::before {
-    content: '';
-    position: absolute;
-    top: -4px;
-    left: -4px;
-    width: 20px;
-    height: 20px;
-    border-top: 2px solid var(--primary-color);
-    border-left: 2px solid var(--primary-color);
-}
-.tech-specs::after {
-    content: '';
-    position: absolute;
-    bottom: -4px;
-    right: -4px;
-    width: 20px;
-    height: 20px;
-    border-bottom: 2px solid var(--primary-color);
-    border-right: 2px solid var(--primary-color);
+    padding: 40px 0 0;
 }
 .tech-specs h3 {
     text-align: center;
