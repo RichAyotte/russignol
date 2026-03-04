@@ -537,6 +537,23 @@ fn run_ui_loop(
                     fatal_error(&mut device, "SECURITY ERROR", &e);
                 }
 
+                // Create in-memory watermark tracker (reads watermark files from /data)
+                log::info!("Creating high watermark tracker...");
+                let config = signer_server::SignerConfig::default();
+                let hwm = signer_server::create_high_watermark(&config).map_err(|e| {
+                    std::io::Error::other(format!("Failed to create watermark: {e}"))
+                })?;
+                {
+                    let Ok(mut wm_lock) = watermark.write() else {
+                        fatal_error(
+                            &mut device,
+                            "LOCK POISONED",
+                            "Watermark lock poisoned during first boot setup",
+                        );
+                    };
+                    *wm_lock = hwm;
+                }
+
                 log::info!("Setup complete! Transitioning to signing mode...");
 
                 // Transition directly to signing mode with keys already decrypted

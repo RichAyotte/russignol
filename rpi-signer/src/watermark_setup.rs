@@ -81,12 +81,30 @@ pub fn process_watermark_config() -> WatermarkResult {
 
 fn mount_boot_partition() -> Result<(), String> {
     fs::create_dir_all(BOOT_MOUNT).map_err(|e| format!("Failed to create mount point: {e}"))?;
+
+    // Check if already mounted (e.g. from a previous attempt or manual SSH inspection)
+    if is_mounted(BOOT_MOUNT) {
+        log::info!("Boot partition already mounted at {BOOT_MOUNT}");
+        return Ok(());
+    }
+
     run_command(
         "/bin/mount",
         &["-t", "vfat", "-o", "rw", BOOT_PARTITION, BOOT_MOUNT],
     )?;
     log::debug!("Mounted {BOOT_PARTITION} to {BOOT_MOUNT}");
     Ok(())
+}
+
+/// Check if a path is a mount point by reading /proc/mounts
+fn is_mounted(path: &str) -> bool {
+    fs::read_to_string("/proc/mounts")
+        .map(|contents| {
+            contents
+                .lines()
+                .any(|line| line.split(' ').nth(1) == Some(path))
+        })
+        .unwrap_or(false)
 }
 
 fn unmount_boot_partition() -> Result<(), String> {
