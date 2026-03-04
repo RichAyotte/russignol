@@ -4,8 +4,7 @@
 //! watermark protection and signing operations. The formats follow the
 //! Tenderbake consensus protocol specifications.
 
-use crate::bls::PublicKeyHash;
-use crate::high_watermark::ChainId;
+use crate::high_watermark::{ChainId, encode_entry};
 use crate::protocol::encoding::{decode_response, encode_request};
 use crate::protocol::{SignerRequest, SignerResponse};
 use std::fs;
@@ -145,46 +144,23 @@ pub fn ghostnet_chain_id() -> ChainId {
 
 /// Pre-initialize watermark files for testing
 ///
-/// Creates watermark files with an initial level/round for all three operation types
+/// Creates 40-byte binary watermark files for all three operation types
 /// (block, attestation, preattestation). This is required because the watermark system
 /// enforces mandatory initialization - signing attempts without pre-initialized
 /// watermarks are rejected.
 ///
 /// # Arguments
 /// * `base_dir` - Directory where watermark files will be created
-/// * `chain_id` - The chain ID to initialize watermarks for
-/// * `pkh` - The public key hash of the baker
 /// * `level` - The initial watermark level (signing will only succeed above this level)
-pub fn preinit_watermarks(base_dir: &Path, chain_id: ChainId, pkh: &PublicKeyHash, level: u32) {
-    let chain_id_b58 = chain_id.to_b58check();
-    let pkh_b58 = pkh.to_b58check();
-
-    let wm_entry = serde_json::json!({
-        "level": level,
-        "round": 0,
-        "hash": "",
-        "signature": ""
-    });
+pub fn preinit_watermarks(base_dir: &Path, level: u32) {
+    let buf = encode_entry(level, 0);
 
     for filename in &[
-        "block_high_watermark",
-        "attestation_high_watermark",
-        "preattestation_high_watermark",
+        "block_watermark",
+        "preattestation_watermark",
+        "attestation_watermark",
     ] {
-        let path = base_dir.join(filename);
-        let mut content: serde_json::Value = if path.exists() {
-            let existing = fs::read_to_string(&path).unwrap();
-            serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}))
-        } else {
-            serde_json::json!({})
-        };
-
-        if !content.as_object().unwrap().contains_key(&chain_id_b58) {
-            content[&chain_id_b58] = serde_json::json!({});
-        }
-        content[&chain_id_b58][&pkh_b58] = wm_entry.clone();
-
-        fs::write(&path, serde_json::to_string_pretty(&content).unwrap()).unwrap();
+        fs::write(base_dir.join(filename), buf).unwrap();
     }
 }
 

@@ -112,10 +112,10 @@ fn test_tcp_server_sign_with_watermark() {
     // Create chain_id matching the one used in block data ([0, 0, 0, 1])
     let mut chain_id_bytes = [0u8; 32];
     chain_id_bytes[..4].copy_from_slice(&[0, 0, 0, 1]);
-    let chain_id = ChainId::from_bytes(&chain_id_bytes);
+    let _chain_id = ChainId::from_bytes(&chain_id_bytes);
 
-    // Pre-initialize watermarks at level 99 (below 100 we'll sign)
-    preinit_watermarks(temp_dir.path(), chain_id, &pkh, 99);
+    // Pre-initialize watermarks BEFORE creating HighWatermark
+    preinit_watermarks(temp_dir.path(), 99);
 
     let mut key_mgr = ServerKeyManager::new();
     key_mgr.add_signer(pkh, signer, "test_key".to_string());

@@ -57,7 +57,7 @@ pub mod wallet;
 
 // Re-export commonly used types
 pub use bls::{BlsError, PublicKey, PublicKeyHash, SecretKey, Signature};
-pub use high_watermark::{ChainId, HighWatermark, Watermark, WatermarkError};
+pub use high_watermark::{ChainId, HighWatermark, WatermarkError};
 pub use magic_bytes::{MagicByte, MagicByteError};
 pub use protocol::{ProtocolError, SignerRequest, SignerResponse};
 pub use server::{KeyManager as ServerKeyManager, RequestHandler, ServerError, SignerServer};

@@ -256,10 +256,9 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
         .context("Failed to mount source data partition")?;
 
     let watermarks_dir = p4_mount.join("watermarks");
-    let block_watermark = fs::read(watermarks_dir.join("block_high_watermark")).ok();
-    let attestation_watermark = fs::read(watermarks_dir.join("attestation_high_watermark")).ok();
-    let preattestation_watermark =
-        fs::read(watermarks_dir.join("preattestation_high_watermark")).ok();
+    let block_watermark = fs::read(watermarks_dir.join("block_watermark")).ok();
+    let attestation_watermark = fs::read(watermarks_dir.join("attestation_watermark")).ok();
+    let preattestation_watermark = fs::read(watermarks_dir.join("preattestation_watermark")).ok();
 
     // p4 reads use .ok() so they can't fail, but unmount consistently
     utils::unmount_partition(&p4_mount, &p4_path)?;
@@ -410,16 +409,16 @@ pub fn write_backup_to_target(device: &Path, backup: &SourceBackup) -> Result<()
         fs::create_dir_all(&watermarks_dir).context("Failed to create watermarks directory")?;
 
         if let Some(ref data) = backup.block_watermark {
-            fs::write(watermarks_dir.join("block_high_watermark"), data)
-                .context("Failed to write block_high_watermark")?;
+            fs::write(watermarks_dir.join("block_watermark"), data)
+                .context("Failed to write block_watermark")?;
         }
         if let Some(ref data) = backup.attestation_watermark {
-            fs::write(watermarks_dir.join("attestation_high_watermark"), data)
-                .context("Failed to write attestation_high_watermark")?;
+            fs::write(watermarks_dir.join("attestation_watermark"), data)
+                .context("Failed to write attestation_watermark")?;
         }
         if let Some(ref data) = backup.preattestation_watermark {
-            fs::write(watermarks_dir.join("preattestation_high_watermark"), data)
-                .context("Failed to write preattestation_high_watermark")?;
+            fs::write(watermarks_dir.join("preattestation_watermark"), data)
+                .context("Failed to write preattestation_watermark")?;
         }
         Ok(())
     })();
@@ -481,24 +480,19 @@ fn parse_chain_info(chain_info: &[u8]) -> Option<(String, String)> {
     Some((name, id))
 }
 
-/// Extract the highest watermark level from a watermark file's bytes.
+/// Extract the watermark level from a 40-byte binary watermark file.
 ///
-/// Watermark format: `{ chain_id: { pkh: { level, round, ... } } }`
+/// Format: level (4B big-endian u32) + round (4B big-endian u32) + blake3 (32B)
 fn extract_watermark_level(watermark: &[u8]) -> Option<u32> {
-    let json: serde_json::Value = serde_json::from_slice(watermark).ok()?;
-    let obj = json.as_object()?;
-
-    let mut max_level: Option<u32> = None;
-    for chain in obj.values() {
-        let chain_obj = chain.as_object()?;
-        for pkh_data in chain_obj.values() {
-            if let Some(level) = pkh_data.get("level").and_then(serde_json::Value::as_u64) {
-                let level = u32::try_from(level).unwrap_or(u32::MAX);
-                max_level = Some(max_level.map_or(level, |cur| cur.max(level)));
-            }
-        }
+    if watermark.len() != 40 {
+        return None;
     }
-    max_level
+    let level = u32::from_be_bytes(watermark[0..4].try_into().ok()?);
+    let computed = blake3::hash(&watermark[0..8]);
+    if watermark[8..40] != *computed.as_bytes() {
+        return None;
+    }
+    Some(level)
 }
 
 /// Map a key alias to a user-friendly label

@@ -809,18 +809,6 @@ fn run_ui_loop(
             AppEvent::Shutdown => {
                 log::info!("Shutting down UI...");
 
-                // Flush watermarks to disk before shutdown to prevent data loss
-                if let Ok(guard) = watermark.read()
-                    && let Some(ref wm) = *guard
-                    && let Ok(wm_guard) = wm.read()
-                {
-                    if let Err(e) = wm_guard.flush_all() {
-                        log::error!("Failed to flush watermarks on shutdown: {e}");
-                    } else {
-                        log::info!("Watermarks flushed to disk");
-                    }
-                }
-
                 // Sync filesystem buffers to prevent data loss
                 setup::sync_disk();
 
@@ -974,7 +962,7 @@ fn run_ui_loop(
                 };
                 if let Some(wm_lock) = wm_opt.as_ref() {
                     if let Ok(pkh_parsed) = PublicKeyHash::from_b58check(&pkh) {
-                        let wm = match wm_lock.write() {
+                        let mut wm = match wm_lock.write() {
                             Ok(guard) => guard,
                             Err(poisoned) => {
                                 log::warn!(

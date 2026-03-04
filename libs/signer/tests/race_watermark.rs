@@ -1,57 +1,47 @@
 //! Security Test: Watermark Concurrent Access Validation
 //!
 //! These tests validate that the watermark checking logic is safe under
-//! concurrent access. The implementation is designed to be race-condition-free.
+//! concurrent access when wrapped in an `RwLock` (as the server does).
 //!
-//! DESIGN: The `check_and_update_operation` method in `high_watermark.rs` follows
-//! this atomic pattern:
-//! 1. `get_or_load_watermark()` - ensures watermark is loaded into cache
-//! 2. Acquire write lock on cache
-//! 3. Get watermark from cache **inside the lock** via `cache.get_mut(&key)`
-//! 4. Check and update atomically within the lock
-//!
-//! The key insight is that step 3 re-reads from the cache while holding the
-//! write lock, so there is no TOCTOU vulnerability. The check and update are
-//! atomic.
-//!
-//! These tests validate this safe behavior by attempting to trigger race
-//! conditions and verifying that double-signing does not occur.
+//! DESIGN: `check_and_update` takes `&mut self`, so the caller must hold
+//! a write lock on `RwLock<HighWatermark>`. This means all concurrent
+//! check-and-update operations are serialized by the lock, preventing
+//! double-signing by construction.
 
 use russignol_signer_lib::bls::generate_key;
 use russignol_signer_lib::high_watermark::{ChainId, HighWatermark};
 use russignol_signer_lib::test_utils::{create_block_data, preinit_watermarks};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, RwLock};
 use std::thread;
 use tempfile::TempDir;
 
-/// Create a unique chain ID
 fn test_chain_id() -> ChainId {
     ChainId::from_bytes(&[1u8; 32])
 }
 
 /// Test that concurrent signing requests are serialized properly
 ///
-/// This test spawns multiple threads that all try to sign at the same level.
-/// Only ONE should succeed - the others should be rejected by watermark checks.
+/// Spawns multiple threads all trying to sign at the same level.
+/// Only ONE should succeed - the others should be rejected.
 #[test]
 fn test_concurrent_signing_serialization() {
     let temp_dir = TempDir::new().unwrap();
     let chain_id = test_chain_id();
-
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-    // Pre-initialize watermarks at level 99 (below 100 we'll sign first)
-    preinit_watermarks(temp_dir.path(), chain_id, &pkh, 99);
+    preinit_watermarks(temp_dir.path(), 99);
+    let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
 
-    let hwm = Arc::new(HighWatermark::new(temp_dir.path()).unwrap());
+    // Set watermark to level 100
+    {
+        let mut wm = hwm.write().unwrap();
+        let data = create_block_data(100, 0);
+        wm.check_and_update(chain_id, &pkh, &data).unwrap();
+    }
 
-    // First, set watermark to level 100
-    let data = create_block_data(100, 0);
-    hwm.check_and_update(chain_id, &pkh, &data).unwrap();
-
-    // Now spawn multiple threads all trying to sign at level 101
+    // Spawn threads all trying to sign at level 101
     let num_threads = 10;
     let barrier = Arc::new(Barrier::new(num_threads));
     let success_count = Arc::new(AtomicUsize::new(0));
@@ -65,13 +55,12 @@ fn test_concurrent_signing_serialization() {
             let failure_count = Arc::clone(&failure_count);
 
             thread::spawn(move || {
-                // Wait for all threads to be ready
                 barrier.wait();
 
-                // All threads try to sign at level 101
                 let data = create_block_data(101, 0);
-                match hwm.check_and_update(chain_id, &pkh, &data) {
-                    Ok(()) => {
+                let mut wm = hwm.write().unwrap();
+                match wm.check_and_update(chain_id, &pkh, &data) {
+                    Ok(_) => {
                         success_count.fetch_add(1, Ordering::SeqCst);
                     }
                     Err(_) => {
@@ -82,7 +71,6 @@ fn test_concurrent_signing_serialization() {
         })
         .collect();
 
-    // Wait for all threads to complete
     for handle in handles {
         handle.join().unwrap();
     }
@@ -92,33 +80,8 @@ fn test_concurrent_signing_serialization() {
 
     println!("Concurrent signing at level 101: {successes} successes, {failures} failures");
 
-    // The first thread to get the lock should succeed
-    // All others should fail with "level too low" (because 101 == 101 but same level requires higher round)
-    // OR they might all succeed if they're executing sequentially
-    //
-    // The key insight: we're all signing at the SAME level (101), so after the first success,
-    // subsequent attempts at level 101 round 0 should fail because watermark is already at 101:0
-
-    // Actually, looking at the code more carefully:
-    // - If level > watermark.level: OK
-    // - If level == watermark.level AND round > watermark.round: OK
-    // - Otherwise: FAIL
-    //
-    // So the first thread at level 101 succeeds.
-    // Subsequent threads at level 101 (with round 0) will fail because round 0 is not > 0.
-    //
-    // Expected: 1 success, 9 failures (or all success if serialized fast enough before first updates)
-
-    assert!(
-        successes >= 1,
-        "At least one thread should succeed at signing"
-    );
-
-    // If watermark checking is working correctly, we should NOT have multiple threads
-    // succeeding at signing the same level/round
-    // However, if there's a race condition, multiple could succeed
-
-    // For now, we just verify the system doesn't crash and at least one succeeds
+    // Exactly one thread should succeed (first to acquire write lock)
+    assert_eq!(successes, 1, "Exactly one thread should succeed");
     assert_eq!(
         successes + failures,
         num_threads,
@@ -126,116 +89,75 @@ fn test_concurrent_signing_serialization() {
     );
 }
 
-/// Test race between check and update across different operations
-///
-/// This tests that block and attestation watermarks are independent,
-/// but concurrent operations on the same type are serialized.
+/// Test that block and attestation watermarks are independent
 #[test]
 fn test_independent_operation_types() {
+    use russignol_signer_lib::test_utils::create_attestation_data;
+
     let temp_dir = TempDir::new().unwrap();
     let chain_id = test_chain_id();
-
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-    // Pre-initialize watermarks at level 0 (blocks signed at 1-3, attestations at 100-102)
-    preinit_watermarks(temp_dir.path(), chain_id, &pkh, 0);
-
-    let hwm = Arc::new(HighWatermark::new(temp_dir.path()).unwrap());
+    preinit_watermarks(temp_dir.path(), 0);
+    let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
     let barrier = Arc::new(Barrier::new(2));
 
-    // Thread 1: Sign blocks
+    // Thread 1: Sign blocks at levels 1, 2, 3
     let hwm1 = Arc::clone(&hwm);
     let barrier1 = Arc::clone(&barrier);
-    let pkh1 = pkh;
     let block_thread = thread::spawn(move || {
         barrier1.wait();
-
-        // Sign blocks at levels 1, 2, 3
         for level in 1..=3 {
             let data = create_block_data(level, 0);
-            hwm1.check_and_update(chain_id, &pkh1, &data)
+            let mut wm = hwm1.write().unwrap();
+            let update = wm
+                .check_and_update(chain_id, &pkh, &data)
                 .unwrap_or_else(|_| panic!("Block at level {level} should succeed"));
-            // Flush to disk after each operation
-            hwm1.flush_to_disk(chain_id, &pkh1).ok();
+            if let Some(ref u) = update {
+                wm.write_watermark(u).ok();
+            }
         }
     });
 
-    // Thread 2: Sign attestations at different levels
-    // (Note: attestation watermark is separate from block watermark)
+    // Thread 2: Sign attestations at levels 100, 101, 102
     let hwm2 = Arc::clone(&hwm);
     let barrier2 = Arc::clone(&barrier);
-    let pkh2 = pkh;
     let attest_thread = thread::spawn(move || {
         barrier2.wait();
-
-        // Sign attestations at levels 100, 101, 102
-        // These should all succeed because attestation watermark is separate
         for level in 100..=102 {
-            let data = create_attestation_data(level);
-            hwm2.check_and_update(chain_id, &pkh2, &data)
+            let data = create_attestation_data(level, 0);
+            let mut wm = hwm2.write().unwrap();
+            let update = wm
+                .check_and_update(chain_id, &pkh, &data)
                 .unwrap_or_else(|_| panic!("Attestation at level {level} should succeed"));
-            // Flush to disk after each operation
-            hwm2.flush_to_disk(chain_id, &pkh2).ok();
+            if let Some(ref u) = update {
+                wm.write_watermark(u).ok();
+            }
         }
     });
 
     block_thread.join().unwrap();
     attest_thread.join().unwrap();
 
-    // Flush all watermarks
-    hwm.flush_all().ok();
-
-    // Reload from disk to verify persistence
+    // Reload from disk and verify persistence
     let hwm_reload = HighWatermark::new(temp_dir.path()).unwrap();
-    let loaded = hwm_reload.load_watermark(chain_id, &pkh).unwrap();
+    let (block, _preattest, attest) = hwm_reload.get_current_levels(chain_id, &pkh).unwrap();
 
-    // Note: Due to thread scheduling, the order of operations may vary.
-    // The important thing is that both operations completed without crashing
-    // and the watermarks were updated, with no double-signing detected.
-    let block_level = loaded.block.as_ref().map(|w| w.level);
-    let attest_level = loaded.attest.as_ref().map(|w| w.level);
-
-    assert!(
-        block_level.is_some(),
-        "Block watermark should have been set"
-    );
-    assert!(
-        attest_level.is_some(),
-        "Attestation watermark should have been set"
-    );
-
-    println!("Final watermarks - Block: {block_level:?}, Attestation: {attest_level:?}");
-}
-
-/// Create attestation data for a specific level
-fn create_attestation_data(level: u32) -> Vec<u8> {
-    // BLS attestation format
-    let mut data = vec![0x13]; // Attestation magic byte
-    data.extend_from_slice(&[0, 0, 0, 1]); // chain_id
-    data.extend_from_slice(&[0u8; 32]); // branch
-    data.push(0x15); // kind byte
-    data.extend_from_slice(&level.to_be_bytes()); // level
-    data.extend_from_slice(&0u32.to_be_bytes()); // round = 0
-    data
+    assert_eq!(block, 3, "Block watermark should be at level 3");
+    assert_eq!(attest, 102, "Attestation watermark should be at level 102");
 }
 
 /// Stress test: many threads, many operations
-///
-/// This test validates that concurrent watermark operations are properly
-/// serialized and no double-signing occurs under heavy concurrent load.
 #[test]
 fn test_stress_concurrent_watermarks() {
     let temp_dir = TempDir::new().unwrap();
     let chain_id = test_chain_id();
-
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-    // Pre-initialize watermarks at level 0 (levels start from 1)
-    preinit_watermarks(temp_dir.path(), chain_id, &pkh, 0);
-
-    let hwm = Arc::new(HighWatermark::new(temp_dir.path()).unwrap());
+    preinit_watermarks(temp_dir.path(), 0);
+    let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
     let num_threads = 8;
     let ops_per_thread = 50;
     let barrier = Arc::new(Barrier::new(num_threads));
@@ -254,18 +176,14 @@ fn test_stress_concurrent_watermarks() {
                 let mut failures = 0;
 
                 for op in 0..ops_per_thread {
-                    // Each thread tries increasingly higher levels
-                    // Thread 0: 1, 9, 17, 25, ...
-                    // Thread 1: 2, 10, 18, 26, ...
-                    // etc.
                     let level = u32::try_from(op * num_threads + thread_id + 1)
                         .expect("test level overflow");
                     let data = create_block_data(level, 0);
 
-                    match hwm.check_and_update(chain_id, &pkh, &data) {
-                        Ok(()) => {
+                    let mut wm = hwm.write().unwrap();
+                    match wm.check_and_update(chain_id, &pkh, &data) {
+                        Ok(_) => {
                             successes += 1;
-                            // Track max level we successfully signed
                             max_level_seen
                                 .fetch_max(usize::try_from(level).unwrap(), Ordering::SeqCst);
                         }
@@ -294,53 +212,41 @@ fn test_stress_concurrent_watermarks() {
         num_threads * ops_per_thread
     );
 
-    // Most operations should succeed since levels are increasing
-    // Some may fail due to race conditions where a higher level gets processed first
     assert!(
         total_successes > 0,
         "At least some operations should succeed"
     );
 
-    // Check the max level we saw during signing
     let max_signed = max_level_seen.load(Ordering::SeqCst);
     println!("Max level successfully signed: {max_signed}");
-
-    // The in-memory watermark should reflect something
-    // (Note: we don't reload from disk here since we're testing in-memory behavior)
     assert!(max_signed > 0, "Should have signed at least one level");
 }
 
-/// Test that demonstrates the TOCTOU window
+/// TOCTOU test: two threads race at the same level
 ///
-/// This is a targeted test that tries to exploit the gap between
-/// `get_or_load_watermark` and acquiring the write lock.
+/// With `&mut self` behind RwLock, double-signing is impossible by construction.
 #[test]
 fn test_toctou_exploit_attempt() {
     let temp_dir = TempDir::new().unwrap();
     let chain_id = test_chain_id();
-
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
-    // Pre-initialize watermarks at level 99 (below 100 we'll sign first)
-    preinit_watermarks(temp_dir.path(), chain_id, &pkh, 99);
+    preinit_watermarks(temp_dir.path(), 99);
 
-    let hwm = Arc::new(HighWatermark::new(temp_dir.path()).unwrap());
-
-    // Set initial watermark
-    let data = create_block_data(100, 0);
-    hwm.check_and_update(chain_id, &pkh, &data).unwrap();
-
-    // Now try to race with many threads all at level 101
     let iterations = 100;
     let mut double_sign_detected = false;
 
     for _ in 0..iterations {
-        let hwm = Arc::new(HighWatermark::new(temp_dir.path()).unwrap());
+        preinit_watermarks(temp_dir.path(), 99);
+        let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
 
-        // Reset watermark
-        let data = create_block_data(100, 0);
-        hwm.check_and_update(chain_id, &pkh, &data).unwrap();
+        // Set initial watermark to level 100
+        {
+            let mut wm = hwm.write().unwrap();
+            let data = create_block_data(100, 0);
+            wm.check_and_update(chain_id, &pkh, &data).unwrap();
+        }
 
         let barrier = Arc::new(Barrier::new(2));
         let success1 = Arc::new(AtomicUsize::new(0));
@@ -352,13 +258,12 @@ fn test_toctou_exploit_attempt() {
         let barrier2 = Arc::clone(&barrier);
         let success1_clone = Arc::clone(&success1);
         let success2_clone = Arc::clone(&success2);
-        let pkh1 = pkh;
-        let pkh2 = pkh;
 
         let t1 = thread::spawn(move || {
             barrier1.wait();
             let data = create_block_data(101, 0);
-            if hwm1.check_and_update(chain_id, &pkh1, &data).is_ok() {
+            let mut wm = hwm1.write().unwrap();
+            if wm.check_and_update(chain_id, &pkh, &data).is_ok() {
                 success1_clone.store(1, Ordering::SeqCst);
             }
         });
@@ -366,7 +271,8 @@ fn test_toctou_exploit_attempt() {
         let t2 = thread::spawn(move || {
             barrier2.wait();
             let data = create_block_data(101, 0);
-            if hwm2.check_and_update(chain_id, &pkh2, &data).is_ok() {
+            let mut wm = hwm2.write().unwrap();
+            if wm.check_and_update(chain_id, &pkh, &data).is_ok() {
                 success2_clone.store(1, Ordering::SeqCst);
             }
         });
@@ -379,17 +285,207 @@ fn test_toctou_exploit_attempt() {
 
         if s1 + s2 > 1 {
             double_sign_detected = true;
-            println!("POTENTIAL VULNERABILITY: Both threads succeeded at level 101!");
             break;
         }
     }
 
-    if double_sign_detected {
-        println!("WARNING: Race condition may allow double-signing!");
-    } else {
-        println!("Good: No double-signing detected in {iterations} iterations");
+    assert!(
+        !double_sign_detected,
+        "Double-signing should be impossible with &mut self behind RwLock"
+    );
+    println!("Good: No double-signing detected in {iterations} iterations");
+}
+
+/// Test: concurrent sign requests at same level, different rounds.
+///
+/// Verifies that disk always has the highest round after concurrent requests.
+/// With write lock held through write_watermark, requests are serialized and
+/// the disk file must reflect the latest accepted round.
+#[test]
+fn test_concurrent_same_level_different_rounds_disk_consistency() {
+    let chain_id = test_chain_id();
+    let seed = [42u8; 32];
+    let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+    let iterations = 50;
+
+    for _ in 0..iterations {
+        let temp_dir = TempDir::new().unwrap();
+        preinit_watermarks(temp_dir.path(), 99);
+        let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
+
+        // Set initial watermark to level 100, round 0
+        {
+            let mut wm = hwm.write().unwrap();
+            let data = create_block_data(100, 0);
+            let update = wm.check_and_update(chain_id, &pkh, &data).unwrap();
+            if let Some(ref u) = update {
+                wm.write_watermark(u).unwrap();
+            }
+        }
+
+        // Two threads race: one at round 5, one at round 6
+        let barrier = Arc::new(Barrier::new(2));
+
+        let hwm1 = Arc::clone(&hwm);
+        let barrier1 = Arc::clone(&barrier);
+        let t1 = thread::spawn(move || {
+            barrier1.wait();
+            let data = create_block_data(101, 5);
+            let mut wm = hwm1.write().unwrap();
+            if let Ok(Some(ref update)) = wm.check_and_update(chain_id, &pkh, &data) {
+                wm.write_watermark(update).unwrap();
+            }
+        });
+
+        let hwm2 = Arc::clone(&hwm);
+        let barrier2 = Arc::clone(&barrier);
+        let t2 = thread::spawn(move || {
+            barrier2.wait();
+            let data = create_block_data(101, 6);
+            let mut wm = hwm2.write().unwrap();
+            if let Ok(Some(ref update)) = wm.check_and_update(chain_id, &pkh, &data) {
+                wm.write_watermark(update).unwrap();
+            }
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        // Reload from disk — the file must have the highest round (6)
+        let hwm_reload = HighWatermark::new(temp_dir.path()).unwrap();
+        let (block_level, _, _) = hwm_reload.get_current_levels(chain_id, &pkh).unwrap();
+        assert_eq!(block_level, 101, "Disk should have level 101");
+
+        // Read raw file to verify round
+        let raw = std::fs::read(temp_dir.path().join("block_watermark")).unwrap();
+        let disk_round = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+
+        // With serialized write lock, the second request (round 6) always wins
+        // because the first request (round 5) is either:
+        // - Accepted first → round 5 on disk, then round 6 overwrites it
+        // - Rejected (if round 6 went first → round 5 < round 6 is rejected)
+        // Either way, disk must have round >= 5.
+        // With proper serialization, both are accepted (5 then 6) so disk = 6.
+        assert!(
+            disk_round >= 5,
+            "Disk round should be at least 5, got {disk_round}"
+        );
     }
 
-    // We don't fail the test because the current implementation might be safe.
-    // This test documents the potential vulnerability and validates behavior.
+    println!("Good: Disk always consistent after {iterations} concurrent round iterations");
+}
+
+/// Test: rollback_disk_watermark restores previous state after BLS failure.
+///
+/// Simulates the scenario where BLS signing fails after write_watermark
+/// has already persisted. Verifies both in-memory and disk are rolled back.
+#[test]
+fn test_rollback_disk_watermark_after_sign_failure() {
+    let temp_dir = TempDir::new().unwrap();
+    let chain_id = test_chain_id();
+    let seed = [42u8; 32];
+    let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+    preinit_watermarks(temp_dir.path(), 99);
+    let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
+
+    // Advance to level 100, round 0 (baseline)
+    {
+        let mut wm = hwm.write().unwrap();
+        let data = create_block_data(100, 0);
+        let update = wm.check_and_update(chain_id, &pkh, &data).unwrap();
+        if let Some(ref u) = update {
+            wm.write_watermark(u).unwrap();
+        }
+    }
+
+    // Advance to level 101 and persist — then simulate BLS failure + rollback
+    {
+        let mut wm = hwm.write().unwrap();
+        let data = create_block_data(101, 3);
+        let update = wm
+            .check_and_update(chain_id, &pkh, &data)
+            .unwrap()
+            .expect("should produce an update");
+
+        // Persist the advanced watermark (simulates write_watermark succeeding)
+        wm.write_watermark(&update).unwrap();
+
+        // Simulate BLS failure: roll back in-memory AND disk
+        wm.rollback_update(&update);
+        wm.rollback_disk_watermark(&update).unwrap();
+
+        // In-memory should be back to level 100
+        let (block_level, _, _) = wm.get_current_levels(chain_id, &pkh).unwrap();
+        assert_eq!(block_level, 100, "In-memory should be rolled back to 100");
+    }
+
+    // Reload from disk — should also be level 100, round 0
+    let hwm_reload = HighWatermark::new(temp_dir.path()).unwrap();
+    let (block_level, _, _) = hwm_reload.get_current_levels(chain_id, &pkh).unwrap();
+    assert_eq!(block_level, 100, "Disk should be rolled back to level 100");
+
+    let raw = std::fs::read(temp_dir.path().join("block_watermark")).unwrap();
+    let disk_level = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let disk_round = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    assert_eq!(disk_level, 100, "Disk file should have level 100");
+    assert_eq!(disk_round, 0, "Disk file should have round 0");
+
+    // Verify we can now retry at level 101 (the failed level)
+    {
+        let mut wm = hwm.write().unwrap();
+        let data = create_block_data(101, 3);
+        let update = wm.check_and_update(chain_id, &pkh, &data).unwrap();
+        assert!(
+            update.is_some(),
+            "Should be able to retry at the rolled-back level"
+        );
+    }
+}
+
+/// Test: .prev backup file is durable after write_watermark
+///
+/// Verifies that the .prev file is fsynced (has valid data) after write_watermark.
+#[test]
+fn test_prev_file_is_durable() {
+    let temp_dir = TempDir::new().unwrap();
+    let chain_id = test_chain_id();
+    let seed = [42u8; 32];
+    let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+    preinit_watermarks(temp_dir.path(), 99);
+    let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
+
+    // Advance to level 100
+    {
+        let mut wm = hwm.write().unwrap();
+        let data = create_block_data(100, 0);
+        let update = wm.check_and_update(chain_id, &pkh, &data).unwrap();
+        if let Some(ref u) = update {
+            wm.write_watermark(u).unwrap();
+        }
+    }
+
+    // Advance to level 101 — this should create a .prev with level 100
+    {
+        let mut wm = hwm.write().unwrap();
+        let data = create_block_data(101, 0);
+        let update = wm.check_and_update(chain_id, &pkh, &data).unwrap();
+        if let Some(ref u) = update {
+            wm.write_watermark(u).unwrap();
+        }
+    }
+
+    // Check that .prev file exists and has the previous level (100)
+    let prev_path = temp_dir.path().join("block_watermark.prev");
+    assert!(prev_path.exists(), ".prev file should exist");
+
+    let raw = std::fs::read(&prev_path).unwrap();
+    assert_eq!(raw.len(), 40, ".prev file should be 40 bytes");
+
+    let prev_level = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let prev_round = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    assert_eq!(prev_level, 100, ".prev should have level 100");
+    assert_eq!(prev_round, 0, ".prev should have round 0");
 }

@@ -410,26 +410,10 @@ impl RequestHandler {
             }
         }
 
-        // 2b. Check high watermark (level/round validation)
-        if let Some(chain_id) = operation_chain_id
-            && let Some(ref watermark) = self.watermark
-        {
-            let wm = watermark.write()?;
-            if let Err(e) = wm.check_and_update(chain_id, &pkh, data) {
-                // Drop lock BEFORE calling callback to avoid deadlock
-                // The callback may trigger UI events that could contend for locks
-                drop(wm);
-                if let Some(ref callback) = self.watermark_error_callback {
-                    callback(pkh, chain_id, &e);
-                }
-                return Err(ServerError::Watermark(e));
-            }
-        }
-
         #[cfg(feature = "perf-trace")]
         eprintln!("[PERF] Watermark check: {:?}", t.elapsed());
 
-        // 3. Get key and sign
+        // 3. Get key and prepare signer
         #[cfg(feature = "perf-trace")]
         let t = std::time::Instant::now();
 
@@ -443,32 +427,101 @@ impl RequestHandler {
             SignerHandler::new(signer.clone(), None)
         };
 
+        // Extract key name before dropping keys lock
+        let key_name = keys.get_key_name(&pkh).unwrap_or("").to_lowercase();
+        drop(keys);
+
         #[cfg(feature = "perf-trace")]
         eprintln!("[PERF] Get signer: {:?}", t.elapsed());
 
-        // Sign directly (requests are serial, no spawn_blocking needed)
+        // 2b+4. Check watermark, then BLS sign + watermark persist in parallel.
+        //    Write lock is held from check_and_update through write_watermark to
+        //    prevent concurrent requests from interleaving disk writes.
+        //    Both must succeed before the signature is returned.
         #[cfg(feature = "perf-trace")]
         let t = std::time::Instant::now();
 
         let sign_start = std::time::Instant::now();
-        let signature = handler.sign(data, None, None)?;
-        let sign_duration = sign_start.elapsed();
+
+        let (signature, sign_duration) = if let Some(chain_id) = operation_chain_id
+            && let Some(ref watermark) = self.watermark
+        {
+            let mut wm = watermark.write()?;
+            let watermark_update = match wm.check_and_update(chain_id, &pkh, data) {
+                Ok(update) => update,
+                Err(e) => {
+                    // Drop lock BEFORE calling callback to avoid deadlock
+                    // The callback may trigger UI events that could contend for locks
+                    drop(wm);
+                    if let Some(ref callback) = self.watermark_error_callback {
+                        callback(pkh, chain_id, &e);
+                    }
+                    return Err(ServerError::Watermark(e));
+                }
+            };
+
+            if let Some(ref update) = watermark_update {
+                // BLS sign (CPU-bound) runs in a scoped thread while main thread
+                // persists watermark (I/O-bound). Write lock held throughout to
+                // prevent concurrent requests from producing out-of-order disk writes.
+                let (sign_result, write_result) = std::thread::scope(|s| {
+                    let sign_handle = s.spawn(|| handler.sign(data, None, None));
+                    let write_result = wm.write_watermark(update);
+                    (
+                        sign_handle.join().expect("sign thread panicked"),
+                        write_result,
+                    )
+                });
+
+                // If either failed, roll back in-memory so baker can retry at this level.
+                // Roll back disk too if it was the sign that failed (disk already written).
+                if sign_result.is_err() || write_result.is_err() {
+                    wm.rollback_update(update);
+                    if sign_result.is_err()
+                        && write_result.is_ok()
+                        && let Err(e) = wm.rollback_disk_watermark(update)
+                    {
+                        log::warn!("Failed to roll back disk watermark: {e}");
+                    }
+                }
+
+                // Release write lock — both check and persist are complete
+                drop(wm);
+
+                // If watermark write failed, refuse to return signature (fail-safe)
+                if let Err(e) = write_result {
+                    log::error!(
+                        "CRITICAL: Watermark write failed, refusing to return signature: {e}"
+                    );
+                    return Err(ServerError::Watermark(e));
+                }
+
+                let signature = sign_result?;
+                (signature, sign_start.elapsed())
+            } else {
+                // Non-watermarked operation type
+                drop(wm);
+                let signature = handler.sign(data, None, None)?;
+                (signature, sign_start.elapsed())
+            }
+        } else {
+            // No watermark configured — just sign
+            let signature = handler.sign(data, None, None)?;
+            (signature, sign_start.elapsed())
+        };
 
         #[cfg(feature = "perf-trace")]
-        eprintln!("[PERF] BLS signing: {:?}", t.elapsed());
+        eprintln!("[PERF] BLS sign + watermark write: {:?}", t.elapsed());
 
         // Update signing activity with metrics
         if let Some(ref activity_tracker) = self.signing_activity
             && let Ok(mut activity) = activity_tracker.lock()
         {
-            // Extract operation details from data
             let operation_type = if data.is_empty() {
                 None
             } else {
                 crate::signing_activity::OperationType::from_magic_byte(data[0])
             };
-
-            // Extract level from data
             let level = Self::extract_level_from_data(data, &pkh);
 
             let sig_activity = crate::signing_activity::SignatureActivity {
@@ -479,8 +532,6 @@ impl RequestHandler {
                 data_size: Some(data.len()),
             };
 
-            // Determine if this is consensus or companion based on key name
-            let key_name = keys.get_key_name(&pkh).unwrap_or("").to_lowercase();
             if key_name.contains("consensus") {
                 activity.consensus = Some(sig_activity);
                 activity
@@ -509,20 +560,6 @@ impl RequestHandler {
                 );
             }
         }
-
-        // 4. Update watermark with signature
-        #[cfg(feature = "perf-trace")]
-        let t = std::time::Instant::now();
-
-        if let Some(chain_id) = operation_chain_id
-            && let Some(ref watermark) = self.watermark
-        {
-            let wm = watermark.write()?;
-            wm.update_signature(chain_id, &pkh, data, &signature)?;
-        }
-
-        #[cfg(feature = "perf-trace")]
-        eprintln!("[PERF] Update watermark signature: {:?}", t.elapsed());
 
         #[cfg(feature = "perf-trace")]
         eprintln!(
@@ -686,9 +723,7 @@ fn handle_connection(
         #[cfg(feature = "perf-trace")]
         let request_start = std::time::Instant::now();
 
-        let sign_info = process_request(&mut socket, addr, msg_len, handler)?;
-
-        flush_watermark_if_needed(handler, sign_info)?;
+        process_request(&mut socket, addr, msg_len, handler)?;
 
         #[cfg(feature = "perf-trace")]
         eprintln!(
@@ -762,13 +797,12 @@ fn check_http_and_size_error(len_buf: [u8; 2], addr: SocketAddr, msg_len: usize)
 }
 
 /// Process a single request: read, decode, handle, encode, write
-/// Returns (pkh, `chain_id`) if this was a sign request that needs watermark flush
 fn process_request(
     socket: &mut TcpStream,
     addr: SocketAddr,
     msg_len: usize,
     handler: &Arc<RequestHandler>,
-) -> Result<Option<(PublicKeyHash, ChainId)>> {
+) -> Result<()> {
     #[cfg(feature = "perf-trace")]
     let t = std::time::Instant::now();
 
@@ -787,15 +821,10 @@ fn process_request(
     #[cfg(feature = "perf-trace")]
     eprintln!("[PERF] Decode request: {:?}", t.elapsed());
 
-    let sign_pkh = match &request {
-        SignerRequest::Sign { pkh, .. } => Some(pkh.0),
-        _ => None,
-    };
-
     #[cfg(feature = "perf-trace")]
     let t = std::time::Instant::now();
 
-    let (response, sign_chain_id) = match handler.handle_request(request) {
+    let (response, _chain_id) = match handler.handle_request(request) {
         Ok((resp, chain_id)) => (resp, chain_id),
         Err(e) => (SignerResponse::Error(e.to_string()), None),
     };
@@ -829,29 +858,6 @@ fn process_request(
     #[cfg(feature = "perf-trace")]
     eprintln!("[PERF] TCP write: {:?}", t.elapsed());
 
-    Ok(sign_pkh.zip(sign_chain_id))
-}
-
-fn flush_watermark_if_needed(
-    handler: &Arc<RequestHandler>,
-    sign_info: Option<(PublicKeyHash, ChainId)>,
-) -> Result<()> {
-    if let Some((pkh, chain_id)) = sign_info {
-        #[cfg(feature = "perf-trace")]
-        let t = std::time::Instant::now();
-
-        if let Some(ref watermark) = handler.watermark {
-            let wm = watermark.read()?;
-            if let Err(e) = wm.flush_to_disk(chain_id, &pkh) {
-                log::error!(
-                    "CRITICAL: Failed to flush watermark for {pkh:?} on chain {chain_id:?}: {e}"
-                );
-            }
-        }
-
-        #[cfg(feature = "perf-trace")]
-        eprintln!("[PERF] Watermark flush to disk: {:?}", t.elapsed());
-    }
     Ok(())
 }
 
@@ -1073,11 +1079,11 @@ mod tests {
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh, signer, "test_key".to_string());
 
-        let hwm = HighWatermark::new(temp_dir.path()).unwrap();
         let chain_id = ChainId::from_bytes(&[1u8; 32]);
 
-        // Pre-initialize watermarks at level 99 (below the level 100 we'll sign)
-        preinit_watermarks(temp_dir.path(), chain_id, &pkh, 99);
+        // Pre-initialize watermarks BEFORE creating HighWatermark
+        preinit_watermarks(temp_dir.path(), 99);
+        let hwm = HighWatermark::new(temp_dir.path()).unwrap();
 
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
@@ -1134,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn test_watermark_stores_signature() {
+    fn test_watermark_persists_after_sign() {
         let temp_dir = TempDir::new().unwrap();
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
@@ -1143,15 +1149,9 @@ mod tests {
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh, signer, "test_key".to_string());
 
+        // Pre-initialize watermarks BEFORE creating HighWatermark
+        preinit_watermarks(temp_dir.path(), 99);
         let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
-
-        // Use a consistent chain_id for the test
-        let mut chain_id_bytes = [0u8; 32];
-        chain_id_bytes[..4].copy_from_slice(&[0, 0, 0, 1]);
-        let chain_id = ChainId::from_bytes(&chain_id_bytes);
-
-        // Pre-initialize watermarks at level 99 (below the level 100 we'll sign)
-        preinit_watermarks(temp_dir.path(), chain_id, &pkh, 99);
 
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
@@ -1173,37 +1173,26 @@ mod tests {
         data.extend_from_slice(&8u32.to_be_bytes()); // fitness_length
         data.extend_from_slice(&0u32.to_be_bytes()); // round
 
-        // Sign the data
+        // Sign the data (watermark write happens inside handle_request)
         let (response, _) = handler
             .handle_request(SignerRequest::Sign {
                 pkh: (pkh, 0),
-                data: data.clone(),
+                data,
                 signature: None,
             })
             .unwrap();
 
-        // Extract the signature
-        let SignerResponse::Signature(signature) = response else {
-            panic!("Expected Signature response");
-        };
+        assert!(matches!(response, SignerResponse::Signature(_)));
 
-        // Manually flush watermark to disk to simulate what the server loop does
-        handler
-            .watermark
-            .as_ref()
-            .unwrap()
-            .read()
-            .unwrap()
-            .flush_to_disk(chain_id, &pkh)
-            .unwrap();
-
-        // Load the watermark and verify signature was stored
-        let watermark = hwm.read().unwrap().load_watermark(chain_id, &pkh).unwrap();
-        assert!(watermark.block.is_some());
-        let block_wm = watermark.block.as_ref().unwrap();
-        assert_eq!(block_wm.level, 100);
-        assert_eq!(block_wm.signature, signature.to_b58check());
-        assert!(!block_wm.signature.is_empty());
+        // Verify watermark was persisted: reload from disk
+        let hwm2 = HighWatermark::new(temp_dir.path()).unwrap();
+        let chain_id = ChainId::from_bytes(&{
+            let mut b = [0u8; 32];
+            b[..4].copy_from_slice(&[0, 0, 0, 1]);
+            b
+        });
+        let (block_level, _, _) = hwm2.get_current_levels(chain_id, &pkh).unwrap();
+        assert_eq!(block_level, 100);
     }
 
     #[test]
@@ -1218,15 +1207,13 @@ mod tests {
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh, signer, "test_key".to_string());
 
-        let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
-
-        // Use a consistent chain_id
         let mut chain_id_bytes = [0u8; 32];
         chain_id_bytes[..4].copy_from_slice(&[0, 0, 0, 1]);
-        let chain_id = ChainId::from_bytes(&chain_id_bytes);
+        let _chain_id = ChainId::from_bytes(&chain_id_bytes);
 
-        // Pre-initialize watermarks at level 100
-        preinit_watermarks(temp_dir.path(), chain_id, &pkh, 100);
+        // Pre-initialize watermarks BEFORE creating HighWatermark
+        preinit_watermarks(temp_dir.path(), 100);
+        let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
 
         // Track if callback was triggered
         let callback_triggered = Arc::new(AtomicBool::new(false));
@@ -1295,14 +1282,13 @@ mod tests {
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh, signer, "test_key".to_string());
 
-        let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
-
         let mut chain_id_bytes = [0u8; 32];
         chain_id_bytes[..4].copy_from_slice(&[0, 0, 0, 1]);
-        let chain_id = ChainId::from_bytes(&chain_id_bytes);
+        let _chain_id = ChainId::from_bytes(&chain_id_bytes);
 
-        // Pre-initialize watermarks at level 100
-        preinit_watermarks(temp_dir.path(), chain_id, &pkh, 100);
+        // Pre-initialize watermarks BEFORE creating HighWatermark
+        preinit_watermarks(temp_dir.path(), 100);
+        let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
 
         // With blocks_per_cycle=100, threshold = 4 * 100 = 400 blocks
         let handler = RequestHandler::new(
@@ -1358,14 +1344,13 @@ mod tests {
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh, signer, "test_key".to_string());
 
-        let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
-
         let mut chain_id_bytes = [0u8; 32];
         chain_id_bytes[..4].copy_from_slice(&[0, 0, 0, 1]);
-        let chain_id = ChainId::from_bytes(&chain_id_bytes);
+        let _chain_id = ChainId::from_bytes(&chain_id_bytes);
 
-        // Pre-initialize watermarks at level 100
-        preinit_watermarks(temp_dir.path(), chain_id, &pkh, 100);
+        // Pre-initialize watermarks BEFORE creating HighWatermark
+        preinit_watermarks(temp_dir.path(), 100);
+        let hwm = Arc::new(RwLock::new(HighWatermark::new(temp_dir.path()).unwrap()));
 
         // Track if callback was triggered (it should NOT be triggered with blocks_per_cycle=0)
         let callback_triggered = Arc::new(AtomicBool::new(false));

@@ -230,8 +230,8 @@ fn launch_socket_signer(
 
     // Setup high watermark if enabled
     let watermark = if opts.check_high_watermark {
-        // OCaml stores watermark files directly in base_dir (not in a subdirectory)
-        // Files: block_high_watermark, attestation_high_watermark, preattestation_high_watermark
+        // Watermark files stored directly in base_dir
+        // Files: block_watermark, preattestation_watermark, attestation_watermark
         let hwm = HighWatermark::new(cli_key_manager.base_dir())
             .map_err(|e| format!("Failed to create high watermark: {e}"))?;
 

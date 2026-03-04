@@ -54,17 +54,8 @@ async fn handle_sign(&self, pkh: PublicKeyHash, data: Vec<u8>) -> Result<SignerR
     #[cfg(feature = "perf-trace")]
     eprintln!("[PERF] Direct sign (no spawn_blocking): {:?}", t.elapsed());
 
-    // 4. Update watermark with signature
-    #[cfg(feature = "perf-trace")]
-    let t = std::time::Instant::now();
-
-    if let Some(ref watermark) = self.watermark {
-        let wm = watermark.write().await;
-        wm.update_signature(self.chain_id, &pkh, &data, &signature)?;
-    }
-
-    #[cfg(feature = "perf-trace")]
-    eprintln!("[PERF] Update watermark signature: {:?}", t.elapsed());
+    // Note: watermark write now happens inside check_and_update flow
+    // (parallel with BLS sign in the synchronous server path)
 
     #[cfg(feature = "perf-trace")]
     eprintln!("[PERF] ===== TOTAL SIGN REQUEST: {:?} =====\n", request_start.elapsed());

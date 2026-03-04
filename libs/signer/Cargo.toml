@@ -27,6 +27,7 @@ insecure-disk-keys = []
 
 [dependencies]
 blake2 = "0.10.6"
+blake3 = "1.8.3"
 blst = { version = "0.3.16", features = ["portable"] }
 bs58 = { version = "0.5.1", features = ["check"] }
 bson = "3.1.0"

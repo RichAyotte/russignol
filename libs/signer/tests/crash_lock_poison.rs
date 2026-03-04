@@ -107,22 +107,16 @@ fn test_poison_affects_multiple_callers() {
     }
 }
 
-/// Demonstrates the exact pattern used in `high_watermark.rs` that should be fixed
+/// Demonstrates how to handle poisoned locks gracefully
 ///
-/// Current code (VULNERABLE):
+/// UNSAFE pattern (crashes on poisoned lock):
 /// ```ignore
-/// let cache = self.cache.write().unwrap();  // PANICS if poisoned!
+/// let guard = lock.write().unwrap();  // PANICS if poisoned!
 /// ```
 ///
-/// Fixed code (SAFE):
+/// SAFE pattern (recovers data):
 /// ```ignore
-/// let cache = self.cache.write()
-///     .map_err(|e| WatermarkError::Internal(format!("Lock poisoned: {}", e)))?;
-/// ```
-///
-/// Or for recovery without error:
-/// ```ignore
-/// let cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
+/// let guard = lock.write().unwrap_or_else(|e| e.into_inner());
 /// ```
 #[test]
 fn test_recommended_fix_pattern() {
@@ -158,12 +152,7 @@ fn test_recommended_fix_pattern() {
 
 // The tests above demonstrate the lock poisoning behavior with `.unwrap()`.
 //
-// The HighWatermark implementation has been fixed to handle lock poisoning
-// properly using `.map_err()` to convert poisoned locks to WatermarkError::Internal.
-// For example:
-//
-//   let mut cache = self.cache.write()
-//       .map_err(|e| WatermarkError::Internal(format!("Lock poisoned: {e}")))?;
-//
-// This allows the signer to return an error instead of crashing if a lock
-// becomes poisoned.
+// The HighWatermark is wrapped in `RwLock<HighWatermark>` by the server. If a
+// thread panics while holding the lock, the caller should use
+// `.unwrap_or_else(PoisonError::into_inner)` to recover the data. The server's
+// UpdateWatermarkToLevel handler demonstrates this pattern.

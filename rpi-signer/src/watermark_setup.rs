@@ -5,7 +5,7 @@
 //!
 //! The watermark config is a one-time use file that is deleted after processing.
 
-use crate::constants::{BOOT_MOUNT, BOOT_PARTITION, CHAIN_INFO_FILE, KEYS_DIR, WATERMARK_DIR};
+use crate::constants::{BOOT_MOUNT, BOOT_PARTITION, CHAIN_INFO_FILE, WATERMARK_DIR};
 use crate::util::run_command;
 use serde::Deserialize;
 use std::fs;
@@ -161,115 +161,30 @@ fn validate_config(config: &WatermarkConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Entry in the `public_key_hashs` JSON file (OCaml wallet format)
-#[derive(Debug, Deserialize)]
-struct KeyEntry {
-    value: String,
-}
-
-/// Read all BLS (tz4) public key hashes from the device's keys
-fn read_device_keys() -> Result<Vec<String>, String> {
-    let pkh_file = Path::new(KEYS_DIR).join("public_key_hashs");
-
-    let content = fs::read_to_string(&pkh_file)
-        .map_err(|e| format!("Failed to read {}: {}", pkh_file.display(), e))?;
-
-    let entries: Vec<KeyEntry> = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {}", pkh_file.display(), e))?;
-
-    // Filter to only BLS keys (tz4)
-    let keys: Vec<String> = entries
-        .into_iter()
-        .filter(|e| e.value.starts_with("tz4"))
-        .map(|e| e.value)
-        .collect();
-
-    if keys.is_empty() {
-        return Err("No BLS keys (tz4) found in device keys".into());
-    }
-
-    log::info!("Found {} BLS key(s) on device", keys.len());
-    Ok(keys)
-}
-
 fn create_watermark_files(config: &WatermarkConfig) -> Result<(), String> {
     const WATERMARK_FILES: &[&str] = &[
-        "block_high_watermark",
-        "attestation_high_watermark",
-        "preattestation_high_watermark",
+        "block_watermark",
+        "preattestation_watermark",
+        "attestation_watermark",
     ];
 
     // Ensure watermark directory exists
     fs::create_dir_all(WATERMARK_DIR)
         .map_err(|e| format!("Failed to create watermark directory: {e}"))?;
 
-    // Read device's own keys
-    let device_keys = read_device_keys()?;
-
-    let chain_id = &config.chain.id;
     let level = config.chain.level;
+    let buf = russignol_signer_lib::high_watermark::encode_entry(level, 0);
 
-    // Create watermarks for each device key
-    for pkh in &device_keys {
-        log::info!("Creating watermarks for {pkh} at level {level}");
-        for filename in WATERMARK_FILES {
-            create_operation_watermark(filename, chain_id, pkh, level)?;
-        }
+    for filename in WATERMARK_FILES {
+        let path = Path::new(WATERMARK_DIR).join(filename);
+        fs::write(&path, buf).map_err(|e| format!("Failed to write {filename}: {e}"))?;
+        log::debug!("Created {}", path.display());
     }
 
     // Change ownership to russignol user (we're still running as root at this point,
     // privileges are dropped later in main.rs after setup is complete)
     run_command("chown", &["-R", "russignol:russignol", WATERMARK_DIR])?;
-    log::info!("Watermark files created successfully");
-    Ok(())
-}
-
-fn create_operation_watermark(
-    filename: &str,
-    chain_id: &str,
-    pkh: &str,
-    level: u32,
-) -> Result<(), String> {
-    let path = Path::new(WATERMARK_DIR).join(filename);
-
-    // Load existing data or create new
-    let mut data: serde_json::Value = if path.exists() {
-        let content =
-            fs::read_to_string(&path).map_err(|e| format!("Failed to read {filename}: {e}"))?;
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    // Build watermark entry (matches OCaml format)
-    let wm_entry = serde_json::json!({
-        "level": level,
-        "round": 0,
-        "hash": "",
-        "signature": ""
-    });
-
-    // Insert into structure: { chain_id: { pkh: wm_entry } }
-    // Ensure data is an object
-    if !data.is_object() {
-        data = serde_json::json!({});
-    }
-    let obj = data.as_object_mut().unwrap();
-
-    // Get or create chain_id entry, then insert pkh
-    obj.entry(chain_id)
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .unwrap() // Safe: we just inserted an object
-        .insert(pkh.to_string(), wm_entry);
-
-    // Write file
-    let json =
-        serde_json::to_string_pretty(&data).map_err(|e| format!("Failed to serialize: {e}"))?;
-
-    fs::write(&path, json).map_err(|e| format!("Failed to write {filename}: {e}"))?;
-
-    log::debug!("Created/updated {}", path.display());
+    log::info!("Watermark files created at level {level} (40-byte binary format)");
     Ok(())
 }
 
