@@ -29,8 +29,6 @@ log_debug() {
 # 0. SIGNAL HANDLING
 # ==============================================================================
 init_signals() {
-    SHUTDOWN=0
-    trap 'SHUTDOWN=1' TERM INT
     trap ':' CHLD
 }
 
@@ -54,7 +52,7 @@ init_mounts() {
 # 2. DEVICE MANAGER
 # ==============================================================================
 init_mdev() {
-    echo "/sbin/mdev" > /proc/sys/kernel/hotplug
+    echo "/sbin/mdev" >/proc/sys/kernel/hotplug
     mdev -s
 }
 
@@ -65,7 +63,7 @@ init_rng() {
     if [ -r "/etc/default/seedrng" ]; then
         . "/etc/default/seedrng"
     fi
-    seedrng ${SEEDRNG_ARGS:-} || true
+    seedrng "${SEEDRNG_ARGS:-}" || true
 }
 
 # ==============================================================================
@@ -144,12 +142,12 @@ USB_CONFIGFS="/sys/kernel/config"
 load_usb_modules() {
     # uname not available in hardened busybox, find module dir directly
     MODULE_DIR=$(ls -d /lib/modules/*/ 2>/dev/null | head -1)
-    MODULE_DIR=${MODULE_DIR%/}  # remove trailing slash
+    MODULE_DIR=${MODULE_DIR%/} # remove trailing slash
     GADGET_DIR="$MODULE_DIR/kernel/drivers/usb/gadget"
     USB_DIR="$MODULE_DIR/kernel/drivers/usb"
 
     log_debug "  MODULE_DIR=$MODULE_DIR"
-    log_debug "  dir exists: $([ -d $MODULE_DIR ] && echo YES || echo NO)"
+    log_debug "  dir exists: $([ -d "$MODULE_DIR" ] && echo YES || echo NO)"
 
     # Skip if gadget framework already available (built-in case)
     if [ -d "$USB_CONFIGFS/usb_gadget" ] 2>/dev/null; then
@@ -159,9 +157,9 @@ load_usb_modules() {
 
     # Load configfs module first
     CONFIGFS_KO="$MODULE_DIR/kernel/fs/configfs/configfs.ko"
-    log_debug "  configfs.ko exists: $([ -f $CONFIGFS_KO ] && echo YES || echo NO)"
+    log_debug "  configfs.ko exists: $([ -f "$CONFIGFS_KO" ] && echo YES || echo NO)"
     if [ -f "$CONFIGFS_KO" ]; then
-        insmod "$CONFIGFS_KO" 2>&1 | while read line; do log_debug "  insmod configfs: $line"; done
+        insmod "$CONFIGFS_KO" 2>&1 | while read -r line; do log_debug "  insmod configfs: $line"; done
     fi
 
     # Mount configfs BEFORE loading libcomposite
@@ -181,11 +179,10 @@ load_usb_modules() {
         "$USB_DIR/dwc2/dwc2.ko" \
         "$GADGET_DIR/libcomposite.ko" \
         "$GADGET_DIR/function/u_ether.ko" \
-        "$GADGET_DIR/function/usb_f_ecm.ko"
-    do
+        "$GADGET_DIR/function/usb_f_ecm.ko"; do
         if [ -f "$mod" ]; then
             insmod "$mod" 2>&1
-            log_debug "  insmod $(basename $mod) ret=$?"
+            log_debug "  insmod $(basename "$mod") ret=$?"
         else
             log_debug "  MISSING: $mod"
         fi
@@ -193,7 +190,7 @@ load_usb_modules() {
 
     # Wait for UDC
     log_debug "  Waiting for UDC..."
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
         [ -n "$(ls /sys/class/udc 2>/dev/null)" ] && break
         sleep 0.1
     done
@@ -201,8 +198,11 @@ load_usb_modules() {
 
     # Wait for usb_gadget
     log_debug "  Waiting for usb_gadget..."
-    for i in $(seq 1 20); do
-        [ -d "$USB_CONFIGFS/usb_gadget" ] && { log_debug "  usb_gadget appeared"; return 0; }
+    for _ in $(seq 1 20); do
+        [ -d "$USB_CONFIGFS/usb_gadget" ] && {
+            log_debug "  usb_gadget appeared"
+            return 0
+        }
         sleep 0.1
     done
 
@@ -215,14 +215,6 @@ load_usb_modules() {
 # ==============================================================================
 USB_GADGET="$USB_CONFIGFS/usb_gadget/g1"
 USB_IFACE="usb0"
-USB_PERSIST="/data/usb-gadget-persist"
-
-get_random_hex() {
-    local count=$1
-    hexdump -n "$count" -e "$count/1 \"%02x\"" /dev/urandom 2>/dev/null || \
-        cat /dev/urandom | tr -dc 'a-f0-9' | head -c "$((count * 2))"
-}
-
 setup_gadget() {
     # Ensure ConfigFS is mounted
     if ! grep -q configfs /proc/mounts; then
@@ -231,52 +223,47 @@ setup_gadget() {
 
     # Cleanup previous
     if [ -d "$USB_GADGET" ]; then
-        echo "" > "$USB_GADGET/UDC" 2>/dev/null || true
+        echo "" >"$USB_GADGET/UDC" 2>/dev/null || true
         rm -rf "$USB_GADGET"
     fi
 
     mkdir -p "$USB_GADGET"
     cd "$USB_GADGET" || return 1
 
-    echo 0x1d6b > idVendor
-    echo 0x0104 > idProduct
-    echo 0x0100 > bcdDevice
-    echo 0x0200 > bcdUSB
+    echo 0x1d6b >idVendor
+    echo 0x0104 >idProduct
+    echo 0x0100 >bcdDevice
+    echo 0x0200 >bcdUSB
 
-    # Identity
-    if [ -f "$USB_PERSIST" ]; then
-        sed -i 's/\r$//' "$USB_PERSIST" 2>/dev/null
-        . "$USB_PERSIST"
-    else
-        USB_SERIAL=$(get_random_hex 16)
-        HOST_MAC="02:$(get_random_hex 5 | sed 's/../&:/g' | sed 's/:$//')"
-        DEV_MAC="02:$(get_random_hex 5 | sed 's/../&:/g' | sed 's/:$//')"
-    fi
+    # Deterministic identity from CPU serial (stable across reboots)
+    USB_SERIAL=$(grep Serial /proc/cpuinfo | sed 's/.*: //')
+    HOST_MAC=$(echo "$USB_SERIAL" | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/')
+    DEV_MAC=$(echo "$USB_SERIAL" | sed 's/^..\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/')
 
     mkdir -p strings/0x409
-    echo "${USB_SERIAL:-0123456789}" > strings/0x409/serialnumber
-    echo "Russignol" > strings/0x409/manufacturer
-    echo "Russignol Ethernet" > strings/0x409/product
+    echo "${USB_SERIAL:-0123456789}" >strings/0x409/serialnumber
+    echo "Russignol" >strings/0x409/manufacturer
+    echo "Russignol Ethernet" >strings/0x409/product
 
     mkdir -p configs/c.1/strings/0x409
-    echo "ECM Network" > configs/c.1/strings/0x409/configuration
-    echo 500 > configs/c.1/MaxPower
+    echo "ECM Network" >configs/c.1/strings/0x409/configuration
+    echo 500 >configs/c.1/MaxPower
 
     mkdir -p functions/ecm.usb0
-    echo "${HOST_MAC:-02:00:00:00:00:01}" > functions/ecm.usb0/host_addr
-    echo "${DEV_MAC:-02:00:00:00:00:02}" > functions/ecm.usb0/dev_addr
+    echo "${HOST_MAC:-02:00:00:00:00:01}" >functions/ecm.usb0/host_addr
+    echo "${DEV_MAC:-02:00:00:00:00:02}" >functions/ecm.usb0/dev_addr
 
     ln -s functions/ecm.usb0 configs/c.1/
 
     # Bind to UDC
-    for i in $(seq 1 10); do
+    for _ in $(seq 1 10); do
         UDC=$(ls /sys/class/udc 2>/dev/null | head -n1)
         [ -n "$UDC" ] && break
         sleep 0.5
     done
 
     if [ -n "$UDC" ]; then
-        echo "$UDC" > UDC
+        echo "$UDC" >UDC
     else
         return 1
     fi
@@ -311,13 +298,13 @@ start_watchdog() {
                     # Track reset count for diagnostics
                     RESET_COUNT=$(cat "$RESET_COUNT_FILE" 2>/dev/null || echo 0)
                     RESET_COUNT=$((RESET_COUNT + 1))
-                    echo "$RESET_COUNT" > "$RESET_COUNT_FILE"
+                    echo "$RESET_COUNT" >"$RESET_COUNT_FILE"
                     logger -t usb-watchdog "USB gadget reset #$RESET_COUNT (after $MAX_FAILURES ping failures)"
 
-                    echo "" > "$USB_GADGET/UDC" 2>/dev/null
+                    echo "" >"$USB_GADGET/UDC" 2>/dev/null
                     sleep 1
                     UDC=$(ls /sys/class/udc 2>/dev/null | head -n1)
-                    [ -n "$UDC" ] && echo "$UDC" > "$USB_GADGET/UDC"
+                    [ -n "$UDC" ] && echo "$UDC" >"$USB_GADGET/UDC"
                     sleep 2
                     FAIL_COUNT=0
                 fi
@@ -342,41 +329,38 @@ LOG_FILE="/data/logs/watchdog.log"
 LOG_MAX_LINES=10000
 
 run_supervisor() {
-    cd /home/russignol
+    cd /home/russignol || return 1
 
     # Main loop - run signer
     # First boot (no partitions): run as root for storage setup (sfdisk needs root)
     #   - Signer will drop privileges to russignol after storage completes
     #   - No log redirection (partitions don't exist yet, errors show on display)
     # After setup: run as unprivileged russignol user via su with logging
-    while true; do
-        # Determine if we need root privileges (first boot - no partitions yet)
-        # Grant russignol write access to CPU freq control (sysfs resets to root each boot)
-        chown russignol /sys/devices/system/cpu/cpufreq/policy0/scaling_setspeed 2>/dev/null
+    # Grant russignol write access to CPU freq control (sysfs resets to root each boot)
+    chown russignol /sys/devices/system/cpu/cpufreq/policy0/scaling_setspeed 2>/dev/null
 
-        if ! partition_exists 3 || ! partition_exists 4; then
-            # First boot: run as root, no log redirection (would fail anyway)
-            $R_CMD
-        else
-            # Normal boot: ensure log directory exists
-            mkdir -p "${DATA_MOUNT}/logs"
+    if ! partition_exists 3 || ! partition_exists 4; then
+        # First boot: run as root, no log redirection (would fail anyway)
+        $R_CMD
+    else
+        # Normal boot: ensure log directory exists
+        mkdir -p "${DATA_MOUNT}/logs"
 
-            # Log rotation - keep only last LOG_MAX_LINES
-            if [ -f "$LOG_FILE" ]; then
-                LOG_SIZE=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
-                if [ "$LOG_SIZE" -gt "$LOG_MAX_LINES" ]; then
-                    tail -n "$LOG_MAX_LINES" "$LOG_FILE" > "$LOG_FILE.tmp"
-                    mv "$LOG_FILE.tmp" "$LOG_FILE"
-                fi
+        # Log rotation - keep only last LOG_MAX_LINES
+        if [ -f "$LOG_FILE" ]; then
+            LOG_SIZE=$(wc -l <"$LOG_FILE" 2>/dev/null || echo 0)
+            if [ "$LOG_SIZE" -gt "$LOG_MAX_LINES" ]; then
+                tail -n "$LOG_MAX_LINES" "$LOG_FILE" >"$LOG_FILE.tmp"
+                mv "$LOG_FILE.tmp" "$LOG_FILE"
             fi
-
-            su -s /bin/sh -c "$R_CMD" "$R_USER" >> "$LOG_FILE" 2>&1
         fi
 
-        # Don't restart - error should remain visible on display
-        # System halts on panic (panic=0 in cmdline), power cycle to recover
-        exit 0
-    done
+        su -s /bin/sh -c "$R_CMD" "$R_USER" >>"$LOG_FILE" 2>&1
+    fi
+
+    # Don't restart - error should remain visible on display
+    # System halts on panic (panic=0 in cmdline), power cycle to recover
+    exit 0
 }
 
 # ==============================================================================
@@ -427,4 +411,3 @@ log_debug "After start_watchdog"
 
 log_debug "Before run_supervisor"
 run_supervisor
-log_debug "After run_supervisor"

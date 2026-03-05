@@ -10,8 +10,6 @@ CONFIGFS_MOUNT="/sys/kernel/config"
 GADGET="$CONFIGFS_MOUNT/usb_gadget/g1"
 UDC_DIR="/sys/class/udc"
 INTERFACE="usb0"
-PERSIST_FILE="/etc/usb-gadget-persist"
-
 # Config: Target to ping (The Host)
 HOST_IP="169.254.1.2"
 # Config: 6 failures * 5 seconds = 30 second timeout before USB reset
@@ -52,19 +50,18 @@ load_modules() {
         "$USB_DIR/dwc2/dwc2.ko" \
         "$GADGET_DIR/libcomposite.ko" \
         "$GADGET_DIR/function/u_ether.ko" \
-        "$GADGET_DIR/function/usb_f_ecm.ko"
-    do
+        "$GADGET_DIR/function/usb_f_ecm.ko"; do
         [ -f "$mod" ] && insmod "$mod" 2>/dev/null || true
     done
 
     # Wait for UDC to appear (dwc2 creates this)
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
         [ -n "$(ls $UDC_DIR 2>/dev/null)" ] && break
         sleep 0.1
     done
 
     # Wait for configfs usb_gadget directory to appear
-    for i in $(seq 1 20); do
+    for _ in $(seq 1 20); do
         [ -d "$CONFIGFS_MOUNT/usb_gadget" ] && return 0
         sleep 0.1
     done
@@ -74,78 +71,51 @@ load_modules() {
 }
 
 # -------------------------------------------------------------------------
-# 1. Random Hex Generator
-# -------------------------------------------------------------------------
-get_random_hex() {
-    local count=$1
-    if command -v hexdump >/dev/null 2>&1; then
-        hexdump -n "$count" -e "$count/1 \"%02x\"" /dev/urandom
-    else
-        cat /dev/urandom | tr -dc 'a-f0-9' | head -c "$((count * 2))"
-    fi
-}
-
-# -------------------------------------------------------------------------
-# 2. Create Gadget
+# 1. Create Gadget
 # -------------------------------------------------------------------------
 create_gadget() {
     if [ -d "$GADGET" ]; then
-        echo "" > "$GADGET/UDC" 2>/dev/null || true
+        echo "" >"$GADGET/UDC" 2>/dev/null || true
         rm -rf "$GADGET"
     fi
 
     mkdir -p "$GADGET"
     cd "$GADGET" || return 1
 
-    echo 0x1d6b > idVendor
-    echo 0x0104 > idProduct
-    echo 0x0100 > bcdDevice
-    echo 0x0200 > bcdUSB
+    echo 0x1d6b >idVendor
+    echo 0x0104 >idProduct
+    echo 0x0100 >bcdDevice
+    echo 0x0200 >bcdUSB
 
-    # --- Identity ---
-    if [ -f "$PERSIST_FILE" ]; then
-        sed -i 's/\r$//' "$PERSIST_FILE" 2>/dev/null
-        . "$PERSIST_FILE"
-    else
-        USB_SERIAL=$(get_random_hex 16)
-        gen_mac() {
-            local h=$(get_random_hex 5)
-            echo "02:${h:0:2}:${h:2:2}:${h:4:2}:${h:6:2}:${h:8:2}"
-        }
-        HOST_MAC=$(gen_mac)
-        DEV_MAC=$(gen_mac)
-
-        if touch "$PERSIST_FILE" 2>/dev/null; then
-            echo "USB_SERIAL=$USB_SERIAL" > "$PERSIST_FILE"
-            echo "HOST_MAC=$HOST_MAC" >> "$PERSIST_FILE"
-            echo "DEV_MAC=$DEV_MAC" >> "$PERSIST_FILE"
-        fi
-    fi
+    # Deterministic identity from CPU serial (stable across reboots)
+    USB_SERIAL=$(grep Serial /proc/cpuinfo | sed 's/.*: //')
+    HOST_MAC=$(echo "$USB_SERIAL" | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/')
+    DEV_MAC=$(echo "$USB_SERIAL" | sed 's/^..\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/')
 
     mkdir -p strings/0x409
-    echo "$USB_SERIAL"          > strings/0x409/serialnumber
-    echo "Russignol"            > strings/0x409/manufacturer
-    echo "Russignol Ethernet"   > strings/0x409/product
+    echo "$USB_SERIAL" >strings/0x409/serialnumber
+    echo "Russignol" >strings/0x409/manufacturer
+    echo "Russignol Ethernet" >strings/0x409/product
 
     mkdir -p configs/c.1/strings/0x409
-    echo "ECM Network" > configs/c.1/strings/0x409/configuration
-    echo 500           > configs/c.1/MaxPower
+    echo "ECM Network" >configs/c.1/strings/0x409/configuration
+    echo 500 >configs/c.1/MaxPower
 
     mkdir -p functions/ecm.usb0
-    echo "$HOST_MAC" > functions/ecm.usb0/host_addr
-    echo "$DEV_MAC"  > functions/ecm.usb0/dev_addr
+    echo "$HOST_MAC" >functions/ecm.usb0/host_addr
+    echo "$DEV_MAC" >functions/ecm.usb0/dev_addr
 
     ln -s functions/ecm.usb0 configs/c.1/
 
     # Bind
-    for i in $(seq 1 10); do
+    for _ in $(seq 1 10); do
         UDC=$(ls "$UDC_DIR" | head -n1)
         [ -n "$UDC" ] && break
         sleep 0.5
     done
 
     if [ -n "$UDC" ]; then
-        echo "$UDC" > UDC || return 1
+        echo "$UDC" >UDC || return 1
     else
         echo "Error: No UDC controller found available for binding."
         return 1
@@ -153,7 +123,7 @@ create_gadget() {
 }
 
 # -------------------------------------------------------------------------
-# 3. Network Janitor (Single Pass)
+# 2. Network Janitor (Single Pass)
 # -------------------------------------------------------------------------
 check_janitor() {
     if ip link show dev "$INTERFACE" >/dev/null 2>&1; then
@@ -173,7 +143,7 @@ check_janitor() {
 }
 
 # -------------------------------------------------------------------------
-# 4. Ping Watchdog (Single Pass)
+# 3. Ping Watchdog (Single Pass)
 # -------------------------------------------------------------------------
 # Global state for watchdog
 FAIL_COUNT=0
@@ -192,23 +162,23 @@ check_watchdog() {
             # Track reset count for diagnostics
             RESET_COUNT=$(cat "$RESET_COUNT_FILE" 2>/dev/null || echo 0)
             RESET_COUNT=$((RESET_COUNT + 1))
-            echo "$RESET_COUNT" > "$RESET_COUNT_FILE"
+            echo "$RESET_COUNT" >"$RESET_COUNT_FILE"
             logger -t usb-watchdog "USB gadget reset #$RESET_COUNT (after $MAX_FAILURES ping failures)"
 
-            echo "" > "$GADGET/UDC" 2>/dev/null
+            echo "" >"$GADGET/UDC" 2>/dev/null
             sleep 1
             UDC=$(ls "$UDC_DIR" | head -n1)
-            [ -n "$UDC" ] && echo "$UDC" > "$GADGET/UDC"
+            [ -n "$UDC" ] && echo "$UDC" >"$GADGET/UDC"
             FAIL_COUNT=0
         fi
     else
-         # Interface missing? Reset count so we don't panic loop.
-         FAIL_COUNT=0
+        # Interface missing? Reset count so we don't panic loop.
+        FAIL_COUNT=0
     fi
 }
 
 # -------------------------------------------------------------------------
-# 5. Daemon Loop
+# 4. Daemon Loop
 # -------------------------------------------------------------------------
 daemon_loop() {
     while true; do
@@ -245,20 +215,20 @@ case "$1" in
             fi
         ) &
 
-        echo $! > "$PIDFILE"
+        echo $! >"$PIDFILE"
         ;;
     stop)
-        echo -n "Stopping Russignol Gadget... "
+        printf "Stopping Russignol Gadget... "
         start-stop-daemon -K -p "$PIDFILE"
         RET=$?
         [ $RET -eq 0 ] && echo "OK" || echo "ERROR"
 
         # Cleanup hardware
         ip link set "$INTERFACE" down 2>/dev/null
-        echo "" > "$GADGET/UDC" 2>/dev/null
+        echo "" >"$GADGET/UDC" 2>/dev/null
         rm -rf "$GADGET"
         ;;
-    restart|reload)
+    restart | reload)
         $0 stop
         sleep 1
         $0 start
@@ -270,4 +240,5 @@ case "$1" in
     *)
         echo "Usage: $0 {start|stop|restart}"
         exit 1
+        ;;
 esac
