@@ -1034,6 +1034,47 @@ pub(crate) fn check_device_not_mounted(device: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Unmount all mounted partitions of the device before flashing.
+///
+/// This avoids a TOCTOU race where the automounter mounts partitions between
+/// `check_device_not_mounted` and `dd` opening the device (which would cause
+/// EBUSY on Linux 6.2+).
+fn unmount_device_partitions(device: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let mounts =
+            std::fs::read_to_string("/proc/mounts").context("Failed to read /proc/mounts")?;
+
+        let device_str = device.to_string_lossy();
+
+        for line in mounts.lines() {
+            let mut fields = line.split_whitespace();
+            let mount_device = fields.next().unwrap_or("");
+            let mount_point = fields.next().unwrap_or("");
+
+            if mount_device.starts_with(&*device_str) {
+                utils::info(&format!("Unmounting {mount_device} from {mount_point}"));
+                utils::unmount_partition(Path::new(mount_point), Path::new(mount_device))?;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("diskutil")
+            .args(["unmountDisk", &device.to_string_lossy()])
+            .output()
+            .context("Failed to unmount device")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to unmount {}: {stderr}", device.display());
+        }
+    }
+
+    Ok(())
+}
+
 /// Check that the device has media inserted (non-zero size)
 fn check_device_has_media(device: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -1519,7 +1560,10 @@ fn flash_image_linux(image: &Path, device: &Path, expected_size: Option<u64>) ->
             .unwrap_or(DEFAULT_IMAGE_SIZE)
     };
 
-    // Spawn dd process with stderr suppressed (we show our own progress)
+    // Unmount any automounted partitions right before opening the device
+    unmount_device_partitions(device)?;
+
+    // Spawn dd process with stderr captured for error reporting
     let mut dd = Command::new("dd")
         .args([
             &format!("of={}", device.display()),
@@ -1528,7 +1572,7 @@ fn flash_image_linux(image: &Path, device: &Path, expected_size: Option<u64>) ->
             "oflag=direct",
         ])
         .stdin(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .context("Failed to start dd. Are you running with sudo?")?;
 
@@ -1536,20 +1580,22 @@ fn flash_image_linux(image: &Path, device: &Path, expected_size: Option<u64>) ->
     let mut progress_writer = ProgressWriter::new(stdin, total_size);
 
     // Stream decompressed data to dd
-    match extension {
+    let write_result = match extension {
         Some("xz") => {
             let file = std::fs::File::open(image)
                 .with_context(|| format!("Failed to open image: {}", image.display()))?;
             let mut reader = BufReader::new(file);
 
             xz_decompress(&mut reader, &mut progress_writer)
-                .context("Failed to decompress XZ image")?;
+                .context("Failed to decompress XZ image")
         }
         Some("img") => {
             let mut file = std::fs::File::open(image)
                 .with_context(|| format!("Failed to open image: {}", image.display()))?;
 
-            std::io::copy(&mut file, &mut progress_writer).context("Failed to write image data")?;
+            std::io::copy(&mut file, &mut progress_writer)
+                .context("Failed to write image data")
+                .map(|_| ())
         }
         _ => {
             bail!(
@@ -1558,15 +1604,30 @@ fn flash_image_linux(image: &Path, device: &Path, expected_size: Option<u64>) ->
                 image.display()
             );
         }
-    }
+    };
 
     // Finish progress bar and close stdin
     progress_writer.finish();
 
     // Wait for dd to complete
-    let status = dd.wait().context("Failed to wait for dd")?;
-    if !status.success() {
-        bail!("dd failed with exit code: {:?}", status.code());
+    let output = dd.wait_with_output().context("Failed to wait for dd")?;
+
+    // If writing failed, check if dd reported the real cause
+    if let Err(write_err) = write_result {
+        let dd_errors = extract_dd_errors(&String::from_utf8_lossy(&output.stderr));
+        if dd_errors.is_empty() {
+            return Err(write_err);
+        }
+        // dd's error is the root cause; the write error (e.g. broken pipe) is just a consequence
+        bail!("{dd_errors}");
+    }
+
+    if !output.status.success() {
+        let dd_errors = extract_dd_errors(&String::from_utf8_lossy(&output.stderr));
+        if dd_errors.is_empty() {
+            bail!("dd failed with exit code: {:?}", output.status.code());
+        }
+        bail!("{dd_errors}");
     }
 
     // Sync to ensure all data is written
@@ -1656,34 +1717,39 @@ fn flash_image_macos(image: &Path, device: &Path, expected_size: Option<u64>) ->
             .unwrap_or(DEFAULT_IMAGE_SIZE)
     };
 
-    // Spawn dd process with macOS-specific args, stderr suppressed
+    // Unmount any automounted partitions right before opening the device
+    unmount_device_partitions(device)?;
+
+    // Spawn dd process with macOS-specific args, stderr captured for error reporting
     let mut dd = Command::new("dd")
         .args([
             &format!("of={}", raw_device),
             "bs=4m", // lowercase for BSD dd
         ])
         .stdin(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .context("Failed to start dd. Are you running with sudo?")?;
 
     let stdin = dd.stdin.take().context("Failed to get dd stdin")?;
     let mut progress_writer = ProgressWriter::new(stdin, total_size);
 
-    match extension {
+    let write_result = match extension {
         Some("xz") => {
             let file = std::fs::File::open(image)
                 .with_context(|| format!("Failed to open image: {}", image.display()))?;
             let mut reader = BufReader::new(file);
 
             xz_decompress(&mut reader, &mut progress_writer)
-                .context("Failed to decompress XZ image")?;
+                .context("Failed to decompress XZ image")
         }
         Some("img") => {
             let mut file = std::fs::File::open(image)
                 .with_context(|| format!("Failed to open image: {}", image.display()))?;
 
-            std::io::copy(&mut file, &mut progress_writer).context("Failed to write image data")?;
+            std::io::copy(&mut file, &mut progress_writer)
+                .context("Failed to write image data")
+                .map(|_| ())
         }
         _ => {
             bail!(
@@ -1692,19 +1758,45 @@ fn flash_image_macos(image: &Path, device: &Path, expected_size: Option<u64>) ->
                 image.display()
             );
         }
-    }
+    };
 
     progress_writer.finish();
 
-    let status = dd.wait().context("Failed to wait for dd")?;
-    if !status.success() {
-        bail!("dd failed with exit code: {:?}", status.code());
+    let output = dd.wait_with_output().context("Failed to wait for dd")?;
+
+    if let Err(write_err) = write_result {
+        let dd_errors = extract_dd_errors(&String::from_utf8_lossy(&output.stderr));
+        if dd_errors.is_empty() {
+            return Err(write_err);
+        }
+        bail!("{dd_errors}");
+    }
+
+    if !output.status.success() {
+        let dd_errors = extract_dd_errors(&String::from_utf8_lossy(&output.stderr));
+        if dd_errors.is_empty() {
+            bail!("dd failed with exit code: {:?}", output.status.code());
+        }
+        bail!("{dd_errors}");
     }
 
     // Sync and eject
     sync_with_spinner(Some(device))?;
 
     Ok(())
+}
+
+/// Extract dd error lines from stderr, filtering out transfer statistics.
+///
+/// dd always prints stats to stderr (e.g. "45+0 records in", "184549376 bytes copied").
+/// When dd fails, the actual error (e.g. "dd: error writing '/dev/sdc': Input/output error")
+/// is mixed in with these stats. This extracts only the error lines.
+fn extract_dd_errors(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with("dd:"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // =============================================================================

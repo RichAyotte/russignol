@@ -669,7 +669,9 @@ pub fn is_single_reader_mode(
     }
 }
 
-/// Wait for a device to reappear after card swap
+/// Wait for a device to appear (e.g. after initial insertion).
+///
+/// Polls for the device node to exist, then waits for udev to settle.
 pub fn wait_for_device_reappear(device: &Path) -> Result<()> {
     let spinner = progress::create_spinner("Waiting for device...");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -690,6 +692,129 @@ pub fn wait_for_device_reappear(device: &Path) -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+}
+
+/// Read the media sector count from sysfs. Returns 0 if no media is present.
+fn device_media_sectors(device: &Path) -> u64 {
+    let device_name = device.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let size_path = format!("/sys/block/{device_name}/size");
+    std::fs::read_to_string(size_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Format a sector count as a human-readable size string.
+fn format_sectors(sectors: u64) -> String {
+    const SECTOR: u64 = 512;
+    const GB: u64 = 1_000_000_000;
+    const MB: u64 = 1_000_000;
+    let bytes = sectors * SECTOR;
+    if bytes >= GB {
+        format!("{}.{}G", bytes / GB, (bytes % GB) * 10 / GB)
+    } else {
+        format!("{}M", bytes / MB)
+    }
+}
+
+/// Describe the card currently in the reader for status display.
+///
+/// Returns a string like "29.7G, 4 partitions, russignol" or "29.7G, empty".
+fn describe_card(device: &Path) -> String {
+    let sectors = device_media_sectors(device);
+    if sectors == 0 {
+        return "no media".into();
+    }
+    let size = format_sectors(sectors);
+
+    // Count visible partition nodes
+    let mut partitions = 0u8;
+    for i in 1..=8 {
+        if get_partition_path(device, i).exists() {
+            partitions += 1;
+        }
+    }
+
+    // A russignol card has 4 partitions with p3 (f2fs data) and p4 (f2fs watermarks)
+    let p3 = get_partition_path(device, 3);
+    let p4 = get_partition_path(device, 4);
+    let card_type = if partitions == 4 && p3.exists() && p4.exists() {
+        "russignol"
+    } else if partitions == 0 {
+        "empty"
+    } else {
+        "unknown layout"
+    };
+
+    format!(
+        "{size}, {partitions} partition{}, {card_type}",
+        if partitions == 1 { "" } else { "s" }
+    )
+}
+
+/// Wait for a card swap in a USB card reader.
+///
+/// A USB card reader keeps its `/dev/sdX` block device even when no card is
+/// inserted — only the media size drops to zero. This function:
+/// 1. Waits for the old card to be **removed** (media sectors → 0)
+/// 2. Waits for the new card to be **inserted** (media sectors > 0)
+/// 3. Runs `udevadm settle` to let the kernel finish initializing the device
+///
+/// Shows live status so the user knows exactly what the utility sees.
+fn wait_for_card_swap(device: &Path) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+
+    // Phase 1: wait for card removal (media disappears)
+    if device_media_sectors(device) > 0 {
+        let desc = describe_card(device);
+        let spinner = progress::create_spinner(&format!("Card present ({desc}) — remove it"));
+        loop {
+            if device_media_sectors(device) == 0 || !device.exists() {
+                spinner.finish_and_clear();
+                utils::success("Card removed");
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                spinner.finish_and_clear();
+                bail!(
+                    "Timed out waiting for card removal from {}.\n  \
+                     Remove the SD card from the reader.",
+                    device.display()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
+    // Phase 2: wait for new card insertion (media appears)
+    let spinner = progress::create_spinner("No card — insert target card");
+    loop {
+        if device.exists() && device_media_sectors(device) > 0 {
+            spinner.finish_and_clear();
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            spinner.finish_and_clear();
+            bail!(
+                "Timed out waiting for new card in {}.\n  \
+                 Insert the target SD card into the reader.",
+                device.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    // Phase 3: let udev fully settle (partition nodes, automounter, etc.)
+    let spinner = progress::create_spinner("Card detected — waiting for kernel to initialize");
+    let _ = Command::new("udevadm")
+        .args(["settle", "--timeout=5"])
+        .output();
+    spinner.finish_and_clear();
+
+    let desc = describe_card(device);
+    utils::success(&format!("Target card ready ({desc})"));
+
+    Ok(())
 }
 
 /// Ensure partition device nodes are visible for the source card.
@@ -751,15 +876,12 @@ pub fn run_single_reader_restore(
     let backup = read_source_card(restore_from)?;
     spinner.finish_and_clear();
 
-    // Step 2: Swap to target card
-    prompt_enter("Remove SOURCE card, insert TARGET card, and press Enter...")?;
-    wait_for_device_reappear(restore_from)?;
+    // Step 2: Swap to target card — auto-detect via media presence
+    utils::info("Remove SOURCE card from the reader, then insert TARGET card");
+    wait_for_card_swap(restore_from)?;
 
     // Verify the user actually swapped cards
     verify_not_source_card(restore_from, &backup)?;
-
-    // Check not mounted
-    image::check_device_not_mounted(restore_from)?;
 
     // Look up device info for the warning box
     let target = image::lookup_block_device(restore_from)
