@@ -475,17 +475,22 @@ impl RequestHandler {
             };
 
             if let Some(ref update) = watermark_update {
-                // BLS sign (CPU-bound) runs in a scoped thread while main thread
-                // persists watermark (I/O-bound). Write lock held throughout to
-                // prevent concurrent requests from producing out-of-order disk writes.
-                let (sign_result, write_result) = std::thread::scope(|s| {
-                    let sign_handle = s.spawn(|| handler.sign(data, None, None));
-                    let write_result = wm.write_watermark(update);
-                    (
-                        sign_handle.join().expect("sign thread panicked"),
-                        write_result,
-                    )
-                });
+                // Fast path: ceiling on stable storage covers this update — no disk
+                // I/O needed, just BLS sign. The background ceiling thread will
+                // update the file after we return the signature.
+                // Slow path: no ceiling — fdatasync needed, parallelize with BLS.
+                let (sign_result, write_result) = if wm.ceiling_covers(update) {
+                    (handler.sign(data, None, None), Ok(()))
+                } else {
+                    std::thread::scope(|s| {
+                        let sign_handle = s.spawn(|| handler.sign(data, None, None));
+                        let write_result = wm.write_watermark(update);
+                        (
+                            sign_handle.join().expect("sign thread panicked"),
+                            write_result,
+                        )
+                    })
+                };
 
                 // If either failed, roll back in-memory so baker can retry at this level.
                 // Roll back disk too if it was the sign that failed (disk already written).
@@ -511,6 +516,24 @@ impl RequestHandler {
                 }
 
                 let signature = sign_result?;
+
+                // Schedule background ceiling write for the next expected level.
+                // Delayed 1s so the full signing burst (~3 signs in ~20ms)
+                // completes before any ceiling thread acquires the write lock.
+                if let Some(ceil_level) = update.level().checked_add(1) {
+                    let watermark_arc = Arc::clone(watermark);
+                    let ceil_pkh = update.pkh();
+                    let ceil_idx = update.idx();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(1));
+                        if let Ok(mut wm) = watermark_arc.write()
+                            && let Err(e) = wm.write_ceiling(ceil_pkh, ceil_idx, ceil_level)
+                        {
+                            log::warn!("Failed to write ceiling watermark: {e}");
+                        }
+                    });
+                }
+
                 (signature, sign_start.elapsed())
             } else {
                 // Non-watermarked operation type
@@ -1200,7 +1223,9 @@ mod tests {
 
         assert!(matches!(response, SignerResponse::Signature(_)));
 
-        // Verify watermark was persisted: reload from disk
+        // Verify watermark was persisted: reload from disk.
+        // Disk has either the actual value (100) or the ceiling (101) depending
+        // on whether the background ceiling thread has run yet.
         let hwm2 = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
         let chain_id = ChainId::from_bytes(&{
             let mut b = [0u8; 32];
@@ -1208,7 +1233,10 @@ mod tests {
             b
         });
         let (block_level, _, _) = hwm2.get_current_levels(chain_id, &pkh).unwrap();
-        assert_eq!(block_level, 100);
+        assert!(
+            block_level == 100 || block_level == 101,
+            "Disk should have level 100 (actual) or 101 (ceiling), got {block_level}"
+        );
     }
 
     #[test]

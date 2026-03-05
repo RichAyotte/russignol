@@ -105,6 +105,10 @@ struct PerKeyWatermark {
     prev_files: [File; 3],
     /// In-memory cache, indexed by `OperationType as usize`
     entries: [Option<WatermarkEntry>; 3],
+    /// What ceiling entry is on stable storage, indexed by `OperationType as usize`.
+    /// A ceiling `(level, u32::MAX)` on disk means any crash recovery loads this value,
+    /// allowing fdatasync to be skipped for updates covered by the ceiling.
+    disk_ceiling: [Option<WatermarkEntry>; 3],
 }
 
 /// Info needed to persist a watermark update to disk.
@@ -119,6 +123,26 @@ pub struct WatermarkUpdate {
     round: u32,
     /// Previous entry for rollback if BLS signing fails
     prev: Option<WatermarkEntry>,
+}
+
+impl WatermarkUpdate {
+    /// Public key hash this update applies to
+    #[must_use]
+    pub fn pkh(&self) -> PublicKeyHash {
+        self.pkh
+    }
+
+    /// Operation type index (0=block, 1=preattestation, 2=attestation)
+    #[must_use]
+    pub fn idx(&self) -> usize {
+        self.idx
+    }
+
+    /// Block level of this update
+    #[must_use]
+    pub fn level(&self) -> u32 {
+        self.level
+    }
 }
 
 /// High watermark error
@@ -323,6 +347,13 @@ impl HighWatermark {
         }))
     }
 
+    /// Get mutable reference to a key's watermark state.
+    fn per_key_mut(&mut self, pkh: &PublicKeyHash) -> Result<&mut PerKeyWatermark> {
+        self.keys
+            .get_mut(pkh)
+            .ok_or_else(|| WatermarkError::Internal(format!("Unknown key: {}", pkh.to_b58check())))
+    }
+
     /// Roll back an in-memory watermark advance.
     ///
     /// Call this if BLS signing fails after [`check_and_update`](Self::check_and_update)
@@ -333,43 +364,51 @@ impl HighWatermark {
         }
     }
 
+    /// Check if a ceiling on stable storage covers the given update.
+    ///
+    /// Returns `true` when the disk ceiling is at or above the update's level/round,
+    /// meaning fdatasync can be safely skipped during [`write_watermark`](Self::write_watermark).
+    #[must_use]
+    pub fn ceiling_covers(&self, update: &WatermarkUpdate) -> bool {
+        let Some(per_key) = self.keys.get(&update.pkh) else {
+            return false;
+        };
+        per_key.disk_ceiling[update.idx].is_some_and(|c| {
+            c.level > update.level || (c.level == update.level && c.round >= update.round)
+        })
+    }
+
     /// Write the previous watermark value back to disk after a BLS signing failure.
     ///
     /// Call this after [`rollback_update`](Self::rollback_update) when BLS signing
     /// fails but `write_watermark` already persisted the advanced value.
     /// Restores disk state to match the rolled-back in-memory state.
-    pub fn rollback_disk_watermark(&self, update: &WatermarkUpdate) -> Result<()> {
+    pub fn rollback_disk_watermark(&mut self, update: &WatermarkUpdate) -> Result<()> {
         if let Some(prev) = update.prev {
-            let per_key = self.keys.get(&update.pkh).ok_or_else(|| {
-                WatermarkError::Internal(format!("Unknown key: {}", update.pkh.to_b58check()))
-            })?;
-            let file = &per_key.files[update.idx];
+            let per_key = self.per_key_mut(&update.pkh)?;
+            let idx = update.idx;
             let buf = encode_entry(prev.level, prev.round);
-            file.write_all_at(&buf, 0)?;
-            file.sync_data()?;
+            per_key.files[idx].write_all_at(&buf, 0)?;
+            per_key.files[idx].sync_data()?;
+            per_key.disk_ceiling[idx] = None;
         }
         Ok(())
     }
 
-    /// Persist watermark to disk: best-effort copy main → .prev, pwrite, fdatasync.
+    /// Persist watermark to disk: `.prev` backup + pwrite + fdatasync.
     ///
-    /// Uses `pwrite` (no seek) and takes `&self`, so it can run in parallel
-    /// with BLS signing on a scoped thread while the caller holds a write lock.
-    ///
-    /// The `.prev` backup is best-effort (no fsync) — it reaches disk via normal
-    /// OS writeback and may contain stale data after power loss, which is acceptable
-    /// since the main file is always fsynced.
-    pub fn write_watermark(&self, update: &WatermarkUpdate) -> Result<()> {
-        let per_key = self.keys.get(&update.pkh).ok_or_else(|| {
-            WatermarkError::Internal(format!("Unknown key: {}", update.pkh.to_b58check()))
-        })?;
-        let file = &per_key.files[update.idx];
+    /// Only called when no ceiling covers the update (slow path).
+    /// When a ceiling covers, the caller skips this entirely — no disk I/O
+    /// in the signing critical path.
+    pub fn write_watermark(&mut self, update: &WatermarkUpdate) -> Result<()> {
+        let per_key = self.per_key_mut(&update.pkh)?;
+        let idx = update.idx;
 
-        // Best-effort copy current main → .prev (no fsync, reaches disk via OS writeback)
-        let mut current = [0u8; WATERMARK_FILE_SIZE];
-        if file.read_exact_at(&mut current, 0).is_ok() {
-            let filename = FILENAMES[update.idx];
-            if let Err(e) = per_key.prev_files[update.idx].write_all_at(&current, 0) {
+        // Best-effort copy previous value → .prev (no fsync, reaches disk via OS writeback)
+        if let Some(prev) = update.prev {
+            let prev_buf = encode_entry(prev.level, prev.round);
+            let filename = FILENAMES[idx];
+            if let Err(e) = per_key.prev_files[idx].write_all_at(&prev_buf, 0) {
                 log::warn!("Failed to write {filename}.prev: {e}");
             }
         }
@@ -378,17 +417,18 @@ impl HighWatermark {
         let buf = encode_entry(update.level, update.round);
 
         // pwrite at offset 0 (no seek, no position change)
-        file.write_all_at(&buf, 0)?;
+        per_key.files[idx].write_all_at(&buf, 0)?;
 
         // fdatasync — flushes data to stable storage (skips metadata since size is constant)
-        file.sync_data()?;
+        per_key.files[idx].sync_data()?;
+        // Actual value is now on stable storage; clear stale ceiling
+        per_key.disk_ceiling[idx] = None;
 
-        // Read-back verification in debug/test builds only — after fdatasync, data is
-        // guaranteed on stable storage; this is defense-in-depth.
+        // Read-back verification in debug/test builds only
         #[cfg(debug_assertions)]
         {
-            let filename = FILENAMES[update.idx];
-            let readback = load_entry_from_file(file).ok_or_else(|| {
+            let filename = FILENAMES[idx];
+            let readback = load_entry_from_file(&per_key.files[idx]).ok_or_else(|| {
                 WatermarkError::Internal(format!(
                     "Read-back verification failed for {filename}: data on disk does not match expected watermark (level={}, round={})",
                     update.level, update.round
@@ -401,6 +441,43 @@ impl HighWatermark {
                 )));
             }
         }
+
+        Ok(())
+    }
+
+    /// Write a ceiling watermark for the next expected level during idle time.
+    ///
+    /// Encodes `(ceiling_level, u32::MAX)` and fdatasyncs it to stable storage.
+    /// On the next sign at `ceiling_level`, fdatasync can be skipped because
+    /// any crash would load this ceiling value (which safely blocks that level).
+    ///
+    /// Skips the write if the watermark already advanced past `ceiling_level`
+    /// or if an existing ceiling already covers it.
+    pub fn write_ceiling(
+        &mut self,
+        pkh: PublicKeyHash,
+        idx: usize,
+        ceiling_level: u32,
+    ) -> Result<()> {
+        let per_key = self.per_key_mut(&pkh)?;
+
+        // Skip if watermark already advanced to or past ceiling
+        if per_key.entries[idx].is_some_and(|e| e.level >= ceiling_level) {
+            return Ok(());
+        }
+
+        // Skip if existing ceiling already covers this level
+        if per_key.disk_ceiling[idx].is_some_and(|c| c.level >= ceiling_level) {
+            return Ok(());
+        }
+
+        let buf = encode_entry(ceiling_level, u32::MAX);
+        per_key.files[idx].write_all_at(&buf, 0)?;
+        per_key.files[idx].sync_data()?;
+        per_key.disk_ceiling[idx] = Some(WatermarkEntry {
+            level: ceiling_level,
+            round: u32::MAX,
+        });
 
         Ok(())
     }
@@ -500,6 +577,16 @@ impl HighWatermark {
     ) -> Option<&File> {
         Some(&self.keys.get(pkh)?.files[op_type as usize])
     }
+
+    /// Get disk ceiling for a specific key and operation type (test-only)
+    #[cfg(test)]
+    pub(crate) fn get_disk_ceiling(
+        &self,
+        pkh: &PublicKeyHash,
+        op_type: OperationType,
+    ) -> Option<WatermarkEntry> {
+        self.keys.get(pkh)?.disk_ceiling[op_type as usize]
+    }
 }
 
 /// Load or create per-key watermark files from a directory.
@@ -552,6 +639,7 @@ fn load_per_key_watermark(key_dir: &Path) -> io::Result<PerKeyWatermark> {
             prev_files_opt[2].take().unwrap(),
         ],
         entries,
+        disk_ceiling: [None; 3],
     })
 }
 
@@ -1164,5 +1252,263 @@ mod tests {
             load_entry_from_file(hwm.get_key_file(&pkh, OperationType::Block).unwrap()).unwrap();
         assert_eq!(entry.level, 101);
         assert_eq!(entry.round, 0);
+    }
+
+    #[test]
+    fn test_ceiling_covers_next_level_sign() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = create_test_chain_id();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+
+        // Sign at level 100
+        let data = create_block_data(100, 0);
+        let update = hwm
+            .check_and_update(chain_id, &pkh, &data)
+            .unwrap()
+            .unwrap();
+        hwm.write_watermark(&update).unwrap();
+
+        // Write ceiling for level 101
+        hwm.write_ceiling(pkh, OperationType::Block as usize, 101)
+            .unwrap();
+
+        // ceiling_covers should return true for sign at (101, 0)
+        let data2 = create_block_data(101, 0);
+        let update2 = hwm
+            .check_and_update(chain_id, &pkh, &data2)
+            .unwrap()
+            .unwrap();
+        assert!(
+            hwm.ceiling_covers(&update2),
+            "Ceiling at (101, MAX) should cover sign at (101, 0)"
+        );
+    }
+
+    #[test]
+    fn test_ceiling_does_not_cover_level_skip() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = create_test_chain_id();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+
+        // Sign at level 100
+        let data = create_block_data(100, 0);
+        let update = hwm
+            .check_and_update(chain_id, &pkh, &data)
+            .unwrap()
+            .unwrap();
+        hwm.write_watermark(&update).unwrap();
+
+        // Write ceiling for level 101
+        hwm.write_ceiling(pkh, OperationType::Block as usize, 101)
+            .unwrap();
+
+        // ceiling_covers should return false for sign at (102, 0)
+        let data2 = create_block_data(102, 0);
+        let update2 = hwm
+            .check_and_update(chain_id, &pkh, &data2)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !hwm.ceiling_covers(&update2),
+            "Ceiling at (101, MAX) should NOT cover sign at (102, 0)"
+        );
+    }
+
+    #[test]
+    fn test_ceiling_covers_any_round() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = create_test_chain_id();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+
+        // Sign at level 100
+        let data = create_block_data(100, 0);
+        let update = hwm
+            .check_and_update(chain_id, &pkh, &data)
+            .unwrap()
+            .unwrap();
+        hwm.write_watermark(&update).unwrap();
+
+        // Write ceiling for level 101
+        hwm.write_ceiling(pkh, OperationType::Block as usize, 101)
+            .unwrap();
+
+        // Should cover any round at level 101
+        for round in [0, 1, 999, u32::MAX - 1] {
+            let data = create_block_data(101, round);
+            let update = hwm
+                .check_and_update(chain_id, &pkh, &data)
+                .unwrap()
+                .unwrap();
+            assert!(
+                hwm.ceiling_covers(&update),
+                "Ceiling at (101, MAX) should cover (101, {round})"
+            );
+            // Roll back so next iteration can check_and_update at same level
+            hwm.rollback_update(&update);
+        }
+    }
+
+    #[test]
+    fn test_ceiling_cleared_after_fdatasync() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = create_test_chain_id();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+
+        // No ceiling — sign should do fdatasync and ceiling remains None
+        let data = create_block_data(100, 0);
+        let update = hwm
+            .check_and_update(chain_id, &pkh, &data)
+            .unwrap()
+            .unwrap();
+        hwm.write_watermark(&update).unwrap();
+
+        assert_eq!(
+            hwm.get_disk_ceiling(&pkh, OperationType::Block),
+            None,
+            "Ceiling should be None after fdatasync write"
+        );
+    }
+
+    #[test]
+    fn test_ceiling_cleared_after_rollback() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = create_test_chain_id();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+
+        // Sign at level 100
+        let data = create_block_data(100, 0);
+        let update = hwm
+            .check_and_update(chain_id, &pkh, &data)
+            .unwrap()
+            .unwrap();
+        hwm.write_watermark(&update).unwrap();
+
+        // Write ceiling for level 101
+        hwm.write_ceiling(pkh, OperationType::Block as usize, 101)
+            .unwrap();
+        assert!(hwm.get_disk_ceiling(&pkh, OperationType::Block).is_some());
+
+        // Sign at 101, then rollback disk watermark — ceiling should be cleared
+        let data2 = create_block_data(101, 0);
+        let update2 = hwm
+            .check_and_update(chain_id, &pkh, &data2)
+            .unwrap()
+            .unwrap();
+        hwm.write_watermark(&update2).unwrap();
+        hwm.rollback_update(&update2);
+        hwm.rollback_disk_watermark(&update2).unwrap();
+
+        assert_eq!(
+            hwm.get_disk_ceiling(&pkh, OperationType::Block),
+            None,
+            "Ceiling should be cleared after rollback"
+        );
+    }
+
+    #[test]
+    fn test_ceiling_safety_on_reload() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = create_test_chain_id();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+
+        // Sign at level 100, then write ceiling for 101
+        {
+            let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+            let data = create_block_data(100, 0);
+            let update = hwm
+                .check_and_update(chain_id, &pkh, &data)
+                .unwrap()
+                .unwrap();
+            hwm.write_watermark(&update).unwrap();
+            hwm.write_ceiling(pkh, OperationType::Block as usize, 101)
+                .unwrap();
+        }
+
+        // Simulate crash — reload from disk.
+        // Disk has (101, MAX) ceiling. Reload should see that.
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+
+        // Level 101 should be blocked (loaded ceiling has round=MAX, so
+        // round <= MAX is rejected by the same-level round check)
+        let data = create_block_data(101, 0);
+        assert!(
+            hwm.check_and_update(chain_id, &pkh, &data).is_err(),
+            "Level 101 should be blocked after loading ceiling"
+        );
+
+        // Level 102 should succeed
+        let data2 = create_block_data(102, 0);
+        assert!(
+            hwm.check_and_update(chain_id, &pkh, &data2).is_ok(),
+            "Level 102 should succeed after ceiling blocks 101"
+        );
+    }
+
+    #[test]
+    fn test_ceiling_write_skipped_when_advanced() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = create_test_chain_id();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+
+        // Sign at level 100, then at level 102 (skipping 101)
+        let data = create_block_data(100, 0);
+        let update = hwm
+            .check_and_update(chain_id, &pkh, &data)
+            .unwrap()
+            .unwrap();
+        hwm.write_watermark(&update).unwrap();
+
+        let data2 = create_block_data(102, 0);
+        let update2 = hwm
+            .check_and_update(chain_id, &pkh, &data2)
+            .unwrap()
+            .unwrap();
+        hwm.write_watermark(&update2).unwrap();
+
+        // Ceiling write for level 101 should be skipped (watermark at 102)
+        hwm.write_ceiling(pkh, OperationType::Block as usize, 101)
+            .unwrap();
+        assert_eq!(
+            hwm.get_disk_ceiling(&pkh, OperationType::Block),
+            None,
+            "Ceiling at 101 should be skipped when watermark is at 102"
+        );
+
+        // Verify disk still has level 102 (not regressed)
+        let hwm2 = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+        assert_eq!(
+            hwm2.get_entry(&pkh, OperationType::Block),
+            Some(WatermarkEntry {
+                level: 102,
+                round: 0
+            })
+        );
     }
 }

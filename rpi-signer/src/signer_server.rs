@@ -1,8 +1,7 @@
 use log::{error, info};
 use russignol_signer_lib::{
     ChainId, HighWatermark, RequestHandler, ServerKeyManager, SignerServer, SigningActivity,
-    UnencryptedSigner,
-    wallet::OcamlKeyEntry,
+    UnencryptedSigner, wallet::OcamlKeyEntry,
 };
 use std::fs;
 use std::net::SocketAddr;
