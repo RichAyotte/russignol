@@ -47,6 +47,10 @@ pub enum ImageCommands {
         /// Skip checksum verification (not recommended)
         #[arg(long)]
         skip_verify: bool,
+
+        /// Download the latest beta (pre-release) version
+        #[arg(long)]
+        beta: bool,
     },
 
     /// Flash an image to an SD card
@@ -94,10 +98,18 @@ pub enum ImageCommands {
         /// Optionally specify the source device, or omit to auto-detect.
         #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
         restore_keys: Option<PathBuf>,
+
+        /// Download the latest beta (pre-release) version
+        #[arg(long)]
+        beta: bool,
     },
 
     /// List available images
-    List,
+    List {
+        /// Include beta (pre-release) versions
+        #[arg(long)]
+        beta: bool,
+    },
 }
 
 /// Represents a detected block device
@@ -148,7 +160,8 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
             url,
             output,
             skip_verify,
-        } => cmd_download(url, output, skip_verify),
+            beta,
+        } => cmd_download(url, output, skip_verify, beta),
         ImageCommands::Flash {
             image,
             device,
@@ -168,14 +181,16 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
             endpoint,
             yes,
             restore_keys,
+            beta,
         } => cmd_download_and_flash(
             url,
             device,
             endpoint.as_deref(),
             yes,
             restore_keys.as_deref(),
+            beta,
         ),
-        ImageCommands::List => cmd_list(),
+        ImageCommands::List { beta } => cmd_list(beta),
     }
 }
 
@@ -324,7 +339,12 @@ fn check_node_for_watermarks(
     }
 }
 
-fn cmd_download(url: Option<String>, output: Option<PathBuf>, skip_verify: bool) -> Result<()> {
+fn cmd_download(
+    url: Option<String>,
+    output: Option<PathBuf>,
+    skip_verify: bool,
+    include_prerelease: bool,
+) -> Result<()> {
     println!();
     print_title_bar("📥 Download SD Card Image");
 
@@ -334,7 +354,7 @@ fn cmd_download(url: Option<String>, output: Option<PathBuf>, skip_verify: bool)
     } else {
         // Fetch version info to get image details
         utils::info("Fetching latest version info...");
-        let version_info = version::fetch_latest_version()
+        let version_info = version::fetch_latest_version(include_prerelease)
             .context("Failed to fetch version info from russignol.com")?;
 
         let image_info = version_info.images.get("pi-zero").context(
@@ -555,7 +575,7 @@ fn cmd_flash(
 }
 
 /// Resolve download URL and metadata from custom URL or latest release
-fn resolve_download_info(url: Option<String>) -> Result<DownloadInfo> {
+fn resolve_download_info(url: Option<String>, include_prerelease: bool) -> Result<DownloadInfo> {
     if let Some(custom_url) = url {
         utils::info(&format!("Using custom URL: {custom_url}"));
         Ok(DownloadInfo {
@@ -566,7 +586,7 @@ fn resolve_download_info(url: Option<String>) -> Result<DownloadInfo> {
         })
     } else {
         utils::info("Fetching latest version info...");
-        let version_info = version::fetch_latest_version()
+        let version_info = version::fetch_latest_version(include_prerelease)
             .context("Failed to fetch version info from russignol.com")?;
 
         let image_info = version_info
@@ -596,6 +616,7 @@ fn cmd_download_and_flash(
     endpoint: Option<&str>,
     yes: bool,
     restore_keys: Option<&Path>,
+    include_prerelease: bool,
 ) -> Result<()> {
     // Check for required tools first
     check_flash_tools()?;
@@ -614,7 +635,7 @@ fn cmd_download_and_flash(
         let restore_source = crate::restore_keys::resolve_restore_source(restore_keys_arg)?;
 
         // Download first (can happen before touching cards)
-        let dl = resolve_download_info(url)?;
+        let dl = resolve_download_info(url, include_prerelease)?;
         let checksum = dl.checksum.as_deref().filter(|s| !s.is_empty()).context(
             "Checksum not available for this release. Cannot safely flash without verification.",
         )?;
@@ -659,7 +680,7 @@ fn cmd_download_and_flash(
     check_device_has_media(&target_device.path)?;
 
     // Get download info (uncompressed_size is used for progress bar during flash)
-    let dl = resolve_download_info(url)?;
+    let dl = resolve_download_info(url, include_prerelease)?;
 
     // Safety confirmation BEFORE downloading
     if !confirm_flash_operation(&target_device, yes)? {
@@ -725,12 +746,13 @@ fn cmd_download_and_flash(
     Ok(())
 }
 
-fn cmd_list() -> Result<()> {
+fn cmd_list(include_prerelease: bool) -> Result<()> {
     println!();
     print_title_bar("📋 Available Images");
 
     utils::info("Fetching version info from russignol.com...");
-    let version_info = version::fetch_latest_version().context("Failed to fetch version info")?;
+    let version_info = version::fetch_latest_version(include_prerelease)
+        .context("Failed to fetch version info")?;
 
     println!();
     println!("  Version: {}", version_info.version);

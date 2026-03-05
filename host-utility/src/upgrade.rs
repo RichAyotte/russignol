@@ -11,11 +11,11 @@ use crate::utils::create_http_agent;
 use crate::version;
 
 /// Main entry point for upgrade command
-pub fn run_upgrade(check_only: bool, _yes: bool) -> Result<()> {
+pub fn run_upgrade(check_only: bool, _yes: bool, include_prerelease: bool) -> Result<()> {
     let start = std::time::Instant::now();
 
     // Check for updates
-    let update_info = match check_for_updates() {
+    let update_info = match check_for_updates(include_prerelease) {
         Ok(Some(info)) => info,
         Ok(None) => {
             println!(
@@ -74,8 +74,8 @@ pub fn run_upgrade(check_only: bool, _yes: bool) -> Result<()> {
 }
 
 /// Check if update is available, returns Some(VersionInfo) if update available
-fn check_for_updates() -> Result<Option<version::VersionInfo>> {
-    let latest = version::fetch_latest_version()?;
+fn check_for_updates(include_prerelease: bool) -> Result<Option<version::VersionInfo>> {
+    let latest = version::fetch_latest_version(include_prerelease)?;
 
     if version::is_newer(version::current_version(), &latest.version)? {
         Ok(Some(latest))

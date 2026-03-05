@@ -55,6 +55,8 @@ pub struct ImageInfo {
 struct GitHubRelease {
     tag_name: String,
     published_at: String,
+    #[serde(default)]
+    prerelease: bool,
     assets: Vec<GitHubAsset>,
 }
 
@@ -150,7 +152,7 @@ fn fetch_checksums(agent: &ureq::Agent, assets: &[GitHubAsset]) -> HashMap<Strin
 ///
 /// Looks for releases with `host-utility-v*` tags first, falling back to `v*` tags
 /// for backwards compatibility with full releases.
-pub fn fetch_latest_version() -> Result<VersionInfo> {
+pub fn fetch_latest_version(include_prerelease: bool) -> Result<VersionInfo> {
     let agent = create_http_agent(30);
     let json = http_get_json(&agent, GITHUB_RELEASES_URL)
         .with_context(|| format!("Failed to fetch releases from {GITHUB_RELEASES_URL}"))?;
@@ -168,7 +170,8 @@ pub fn fetch_latest_version() -> Result<VersionInfo> {
                 .assets
                 .iter()
                 .any(|a| a.name == "russignol-amd64" || a.name == "russignol-aarch64");
-            dominated && has_binaries
+            let prerelease_ok = include_prerelease || !r.prerelease;
+            dominated && has_binaries && prerelease_ok
         })
         .context("No host-utility release found")?;
 
@@ -372,5 +375,76 @@ def456  file2
         let as_option: Option<String> = Some(missing);
         let checksum = as_option.as_deref().filter(|s| !s.is_empty());
         assert!(checksum.is_none(), "Empty checksum should filter to None");
+    }
+
+    /// Helper to build a GitHubRelease for testing
+    fn make_release(tag: &str, prerelease: bool) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag.to_string(),
+            published_at: "2026-01-01T00:00:00Z".to_string(),
+            prerelease,
+            assets: vec![
+                GitHubAsset {
+                    name: "russignol-amd64".to_string(),
+                    size: 1000,
+                    browser_download_url: String::new(),
+                },
+                GitHubAsset {
+                    name: "russignol-aarch64".to_string(),
+                    size: 1000,
+                    browser_download_url: String::new(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_prerelease_filtering_excludes_prerelease_by_default() {
+        let releases = vec![
+            make_release("v0.20.0-beta.1", true),
+            make_release("v0.19.0", false),
+        ];
+
+        // Without include_prerelease, should skip beta and find stable
+        let found = releases
+            .iter()
+            .find(|r| {
+                let dominated =
+                    r.tag_name.starts_with("host-utility-v") || r.tag_name.starts_with('v');
+                let has_binaries = r
+                    .assets
+                    .iter()
+                    .any(|a| a.name == "russignol-amd64" || a.name == "russignol-aarch64");
+                let prerelease_ok = !r.prerelease;
+                dominated && has_binaries && prerelease_ok
+            })
+            .unwrap();
+
+        assert_eq!(found.tag_name, "v0.19.0");
+    }
+
+    #[test]
+    fn test_prerelease_filtering_includes_prerelease_when_requested() {
+        let releases = vec![
+            make_release("v0.20.0-beta.1", true),
+            make_release("v0.19.0", false),
+        ];
+
+        // With include_prerelease, should find the beta (first in list)
+        let found = releases
+            .iter()
+            .find(|r| {
+                let dominated =
+                    r.tag_name.starts_with("host-utility-v") || r.tag_name.starts_with('v');
+                let has_binaries = r
+                    .assets
+                    .iter()
+                    .any(|a| a.name == "russignol-amd64" || a.name == "russignol-aarch64");
+                let prerelease_ok = true; // include_prerelease = true
+                dominated && has_binaries && prerelease_ok
+            })
+            .unwrap();
+
+        assert_eq!(found.tag_name, "v0.20.0-beta.1");
     }
 }

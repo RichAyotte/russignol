@@ -112,6 +112,10 @@ enum Commands {
         /// Force upgrade without confirmation
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Download the latest beta (pre-release) version
+        #[arg(long)]
+        beta: bool,
     },
     /// Manage configuration settings
     Config {
@@ -276,8 +280,8 @@ fn main() -> Result<()> {
         Some(Commands::Install { backup }) => {
             install::run_install(backup)?;
         }
-        Some(Commands::Upgrade { check, yes }) => {
-            upgrade::run_upgrade(check, yes)?;
+        Some(Commands::Upgrade { check, yes, beta }) => {
+            upgrade::run_upgrade(check, yes, beta)?;
         }
         Some(Commands::Config { command }) => {
             config::run_config_command(command)?;

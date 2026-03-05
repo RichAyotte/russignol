@@ -864,6 +864,7 @@ fn check_sd_card_readiness(auto_confirm: bool) -> Result<bool> {
                     endpoint: None,
                     yes: false,
                     restore_keys: None,
+                    beta: false,
                 }) {
                     Ok(()) => {
                         println!();
