@@ -1,4 +1,4 @@
-use super::Page;
+use super::Page as PageTrait;
 use crate::fonts;
 use embedded_graphics::{
     Drawable,
@@ -13,16 +13,16 @@ use embedded_text::{
 };
 use u8g2_fonts::U8g2TextStyle;
 
-/// `ErrorPage` displays an error message with word-wrapped text.
+/// `Page` displays an error message with word-wrapped text.
 ///
 /// Used for first-boot setup to show error messages that may be long.
-pub struct ErrorPage {
+pub struct Page {
     title: String,
     message: String,
 }
 
-impl ErrorPage {
-    /// Create a new `ErrorPage` with title and message
+impl Page {
+    /// Create a new `Page` with title and message
     #[must_use]
     pub fn new(title: &str, message: &str) -> Self {
         Self {
@@ -38,7 +38,7 @@ impl ErrorPage {
     }
 }
 
-impl<D: DrawTarget<Color = BinaryColor>> Page<D> for ErrorPage {
+impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn draw(&mut self, display: &mut D) -> Result<(), D::Error> {
         let display_bounds = display.bounding_box();
         let display_width = display_bounds.size.width.cast_signed();

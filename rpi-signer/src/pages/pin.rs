@@ -1,4 +1,4 @@
-use super::Page;
+use super::Page as PageTrait;
 use crate::{events::AppEvent, fonts, widgets::Button};
 use crossbeam_channel::Sender;
 use embedded_graphics::{
@@ -27,7 +27,7 @@ const MIN_PIN_LENGTH: usize = 5;
 
 /// PIN mode
 #[derive(Clone, Copy, PartialEq)]
-pub enum PinMode {
+pub enum Mode {
     /// Create new PIN (first entry during setup)
     Create,
     /// Confirm PIN (second entry during setup)
@@ -36,16 +36,16 @@ pub enum PinMode {
     Verify,
 }
 
-pub struct PinPage {
+pub struct Page {
     buttons: [Button; 13],
     pin: Vec<u8>,
     title: String,
-    mode: PinMode,
+    mode: Mode,
     app_sender: Sender<AppEvent>,
 }
 
-impl PinPage {
-    pub fn new(app_sender: Sender<AppEvent>, title: &str, mode: PinMode) -> Self {
+impl Page {
+    pub fn new(app_sender: Sender<AppEvent>, title: &str, mode: Mode) -> Self {
         let std_size = Size::new(40, 40);
         let wide_size = Size::new(82, 40); // 2 * 40px + 2px gap
 
@@ -78,7 +78,7 @@ impl PinPage {
     }
 }
 
-impl<D: DrawTarget<Color = BinaryColor>> Page<D> for PinPage {
+impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn is_modal(&self) -> bool {
         true
     }
@@ -181,7 +181,7 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for PinPage {
                             match text.as_str() {
                                 "Enter" => {
                                     match self.mode {
-                                        PinMode::Create => {
+                                        Mode::Create => {
                                             // During creation, enforce minimum length
                                             if self.pin.len() >= MIN_PIN_LENGTH {
                                                 if self
@@ -202,7 +202,7 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for PinPage {
                                             }
                                             self.pin.clear();
                                         }
-                                        PinMode::Confirm | PinMode::Verify => {
+                                        Mode::Confirm | Mode::Verify => {
                                             // During confirm/verify, let short PINs fail
                                             // so they count toward the bad PIN limit.
                                             if self

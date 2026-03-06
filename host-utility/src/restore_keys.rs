@@ -1048,8 +1048,8 @@ mod tests {
         let json = serde_json::json!({
             "partitiontable": {
                 "partitions": [
-                    { "start": 8192u64, "size": 524288u64, "type": "c" },     // p1: boot (256MB)
-                    { "start": 532480u64, "size": 4194304u64, "type": "83" }  // p2: rootfs (2GB)
+                    { "start": 8192_u64, "size": 524_288_u64, "type": "c" },     // p1: boot (256MB)
+                    { "start": 532_480_u64, "size": 4_194_304_u64, "type": "83" }  // p2: rootfs (2GB)
                 ]
             }
         });
@@ -1062,7 +1062,7 @@ mod tests {
         //   = ceil(2420113408 / 16777216) * 16777216 = 145 * 16777216 = 2432696320
         // keys_start_sector = 2432696320 / 512 = 4751360
         let expected_keys_start =
-            russignol_storage::align_up((532480 + 4194304) * SECTOR_SIZE, MIN_ALIGNMENT)
+            russignol_storage::align_up((532_480 + 4_194_304) * SECTOR_SIZE, MIN_ALIGNMENT)
                 / SECTOR_SIZE;
         assert_eq!(layout.keys_start_sector, expected_keys_start);
 
@@ -1090,8 +1090,8 @@ mod tests {
         let json = serde_json::json!({
             "partitiontable": {
                 "partitions": [
-                    { "start": 8192u64, "size": 16384u64, "type": "c" },
-                    { "start": 24576u64, "size": 131072u64, "type": "83" }
+                    { "start": 8192_u64, "size": 16_384_u64, "type": "c" },
+                    { "start": 24_576_u64, "size": 131_072_u64, "type": "83" }
                 ]
             }
         });

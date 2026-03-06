@@ -15,7 +15,7 @@ pub type VersionedPublicKeyHash = (PublicKeyHash, u8);
 
 /// Protocol errors
 #[derive(Error, Debug)]
-pub enum ProtocolError {
+pub enum Error {
     /// Unknown request tag
     #[error("Unknown request tag: 0x{0:02X}")]
     UnknownTag(u8),
@@ -60,7 +60,7 @@ pub enum ProtocolError {
 }
 
 /// Result type for protocol operations
-pub type Result<T> = std::result::Result<T, ProtocolError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Request types from client to signer
 /// Corresponds to: `src/lib_signer_services/signer_messages.ml:310-389`
@@ -216,7 +216,7 @@ impl SignerResponse {
 /// Corresponds to: Tezos `Data_encoding` library
 pub mod encoding {
     use super::{
-        ProtocolError, PublicKey, PublicKeyHash, Result, Signature, SignerRequest, SignerResponse,
+        Error, PublicKey, PublicKeyHash, Result, Signature, SignerRequest, SignerResponse,
         VersionedPublicKeyHash,
     };
     use std::io::{Cursor, Read, Write};
@@ -227,6 +227,10 @@ pub mod encoding {
 
     /// Encode a `SignerRequest` to binary format
     /// Corresponds to: `signer_messages.ml:Request.encoding`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binary serialization or I/O fails.
     pub fn encode_request(req: &SignerRequest) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
 
@@ -271,6 +275,10 @@ pub mod encoding {
 
     /// Decode a `SignerRequest` from binary format
     /// Corresponds to: `signer_messages.ml:Request.encoding`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data is malformed, truncated, or contains an unknown tag.
     pub fn decode_request(data: &[u8]) -> Result<SignerRequest> {
         let mut cursor = Cursor::new(data);
 
@@ -323,7 +331,7 @@ pub mod encoding {
                 let override_pk = decode_option_pk(&mut cursor)?;
                 Ok(SignerRequest::BlsProveRequest { pkh, override_pk })
             }
-            _ => Err(ProtocolError::UnknownTag(tag)),
+            _ => Err(Error::UnknownTag(tag)),
         }
     }
 
@@ -335,6 +343,10 @@ pub mod encoding {
     /// - Tag 0x01 = Error(message)
     ///
     /// We handle `SignerResponse::Error` separately to wrap it in `Error` result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binary serialization or I/O fails.
     pub fn encode_response(resp: &SignerResponse) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
 
@@ -351,9 +363,9 @@ pub mod encoding {
             };
 
             let mut bson_bytes = Vec::new();
-            error_doc.to_writer(&mut bson_bytes).map_err(|e| {
-                ProtocolError::InvalidFormat(format!("BSON serialization error: {e}"))
-            })?;
+            error_doc
+                .to_writer(&mut bson_bytes)
+                .map_err(|e| Error::InvalidFormat(format!("BSON serialization error: {e}")))?;
 
             // Encode as a list (Trace) containing one error.
             //
@@ -365,9 +377,8 @@ pub mod encoding {
             // Where Item Len = bson_bytes.len()
             // And Total Len = Item Len + 4 (for the Item Len prefix)
 
-            let item_len = u32::try_from(bson_bytes.len()).map_err(|_| {
-                ProtocolError::InvalidFormat("BSON error message too large".to_string())
-            })?;
+            let item_len = u32::try_from(bson_bytes.len())
+                .map_err(|_| Error::InvalidFormat("BSON error message too large".to_string()))?;
             let total_len = item_len + 4;
 
             buf.write_all(&total_len.to_be_bytes())?; // Trace length
@@ -431,6 +442,10 @@ pub mod encoding {
 
     /// Decode a `SignerResponse` from binary format
     /// Corresponds to: `signer_messages.ml:Response.encoding`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data is malformed, truncated, or contains an invalid tag.
     pub fn decode_response(data: &[u8], request: &SignerRequest) -> Result<SignerResponse> {
         let mut cursor = Cursor::new(data);
 
@@ -528,7 +543,7 @@ pub mod encoding {
                     }
                 }
             }
-            tag => Err(ProtocolError::InvalidFormat(format!(
+            tag => Err(Error::InvalidFormat(format!(
                 "Invalid Result tag: 0x{tag:02X}"
             ))),
         }
@@ -567,10 +582,9 @@ pub mod encoding {
             0x03 => {
                 let mut bytes = [0u8; 20];
                 cursor.read_exact(&mut bytes)?;
-                PublicKeyHash::from_bytes(&bytes)
-                    .map_err(|e| ProtocolError::PkhDecodeError(e.to_string()))
+                PublicKeyHash::from_bytes(&bytes).map_err(|e| Error::PkhDecodeError(e.to_string()))
             }
-            _ => Err(ProtocolError::InvalidFormat(format!(
+            _ => Err(Error::InvalidFormat(format!(
                 "Unsupported PKH encoding tag: 0x{tag:02X}. Only BLS (tag 3) is supported."
             ))),
         }
@@ -592,7 +606,7 @@ pub mod encoding {
     fn decode_versioned_pkh<R: Read>(cursor: &mut R) -> Result<VersionedPublicKeyHash> {
         let outer_tag = read_u8(cursor)?;
         if outer_tag != 3 {
-            return Err(ProtocolError::InvalidFormat(format!(
+            return Err(Error::InvalidFormat(format!(
                 "Unsupported versioned PKH tag: 0x{outer_tag:02X}. Only BLS (tag 3) is supported."
             )));
         }
@@ -612,13 +626,13 @@ pub mod encoding {
     fn decode_pk<R: Read>(cursor: &mut R) -> Result<PublicKey> {
         let tag = read_u8(cursor)?;
         if tag != 3 {
-            return Err(ProtocolError::InvalidFormat(format!(
+            return Err(Error::InvalidFormat(format!(
                 "Unsupported PK encoding tag: 0x{tag:02X}. Only BLS (tag 3) is supported."
             )));
         }
         let mut bytes = [0u8; 48];
         cursor.read_exact(&mut bytes)?;
-        PublicKey::from_bytes(&bytes).map_err(|e| ProtocolError::PkDecodeError(e.to_string()))
+        PublicKey::from_bytes(&bytes).map_err(|e| Error::PkDecodeError(e.to_string()))
     }
 
     fn encode_signature<W: Write>(buf: &mut W, sig: &Signature) -> Result<()> {
@@ -630,15 +644,13 @@ pub mod encoding {
     fn decode_signature<R: Read>(cursor: &mut R) -> Result<Signature> {
         let mut bytes = [0u8; 96];
         cursor.read_exact(&mut bytes)?;
-        Signature::from_bytes(&bytes)
-            .map_err(|e| ProtocolError::SignatureDecodeError(e.to_string()))
+        Signature::from_bytes(&bytes).map_err(|e| Error::SignatureDecodeError(e.to_string()))
     }
 
     fn encode_bytes<W: Write>(buf: &mut W, data: &[u8]) -> Result<()> {
         // Length-prefixed bytes (4-byte big-endian length)
-        let len = u32::try_from(data.len()).map_err(|_| {
-            ProtocolError::InvalidFormat("Data length exceeds u32::MAX".to_string())
-        })?;
+        let len = u32::try_from(data.len())
+            .map_err(|_| Error::InvalidFormat("Data length exceeds u32::MAX".to_string()))?;
         buf.write_all(&len.to_be_bytes())?;
         buf.write_all(data)?;
         Ok(())
@@ -649,7 +661,7 @@ pub mod encoding {
 
         // Prevent DoS attack from malicious length prefix
         if len > MAX_DATA_LEN {
-            return Err(ProtocolError::DataTooLarge {
+            return Err(Error::DataTooLarge {
                 size: len,
                 max: MAX_DATA_LEN,
             });
@@ -680,7 +692,7 @@ pub mod encoding {
                 if buf[0] == 0xFF {
                     Ok(Some(decode_signature(cursor)?))
                 } else {
-                    Err(ProtocolError::InvalidFormat(format!(
+                    Err(Error::InvalidFormat(format!(
                         "Invalid option tag: 0x{:02X}",
                         buf[0]
                     )))
@@ -715,7 +727,7 @@ pub mod encoding {
         match tag {
             0xFF => Ok(Some(decode_pk(cursor)?)),
             0x00 => Ok(None),
-            _ => Err(ProtocolError::InvalidFormat(format!(
+            _ => Err(Error::InvalidFormat(format!(
                 "Invalid option tag: 0x{tag:02X}"
             ))),
         }
@@ -726,9 +738,8 @@ pub mod encoding {
         // not the number of items.
         // Each raw PKH is encoded as 1-byte tag + 20-byte hash = 21 bytes.
         let total_byte_size = list.len() * (1 + 20);
-        let len = u32::try_from(total_byte_size).map_err(|_| {
-            ProtocolError::InvalidFormat("List byte size exceeds u32::MAX".to_string())
-        })?;
+        let len = u32::try_from(total_byte_size)
+            .map_err(|_| Error::InvalidFormat("List byte size exceeds u32::MAX".to_string()))?;
         buf.write_all(&len.to_be_bytes())?;
         for pkh in list {
             encode_raw_pkh(buf, pkh)?;
@@ -753,7 +764,7 @@ pub mod encoding {
         match tag {
             0xFF => Ok(Some(decode_pkh_list(cursor)?)),
             0x00 => Ok(None),
-            _ => Err(ProtocolError::InvalidFormat(format!(
+            _ => Err(Error::InvalidFormat(format!(
                 "Invalid option tag: 0x{tag:02X}"
             ))),
         }
@@ -1002,7 +1013,7 @@ mod tests {
 
         // Verify the error is specifically DataTooLarge
         match result {
-            Err(ProtocolError::DataTooLarge { size, max }) => {
+            Err(Error::DataTooLarge { size, max }) => {
                 assert_eq!(size, SOCKET_FRAME_MAX + 1);
                 assert_eq!(
                     max, SOCKET_FRAME_MAX,

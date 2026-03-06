@@ -88,6 +88,10 @@ impl MagicByte {
 /// # Returns
 /// * `Ok(())` if the magic byte is allowed or no check is required
 /// * `Err(MagicByteError)` if the data is empty or magic byte is not allowed
+///
+/// # Errors
+///
+/// Returns an error if the data is empty or the first byte is not in the allowed list.
 pub fn check_magic_byte(data: &[u8], allowed_magic_bytes: Option<&[u8]>) -> Result<()> {
     // Corresponds to: handler.ml:247 - match magic_bytes with None -> return_unit
     let Some(allowed) = allowed_magic_bytes else {
@@ -126,6 +130,10 @@ pub fn check_magic_byte(data: &[u8], allowed_magic_bytes: Option<&[u8]>) -> Resu
 ///
 /// Returns error if round cannot be extracted (malformed block data).
 /// In Tenderbake, every block must have a round.
+///
+/// # Errors
+///
+/// Returns an error if the data is too short to extract level and round fields.
 pub fn get_level_and_round_for_tenderbake_block(data: &[u8]) -> Result<(u32, u32)> {
     const MIN_LENGTH: usize = 1 + 4 + 4 + 1 + 32 + 8 + 1 + 32;
 
@@ -185,6 +193,10 @@ pub fn get_level_and_round_for_tenderbake_block(data: &[u8]) -> Result<(u32, u32
 /// - slot (2 bytes) - only for non-BLS signatures (Ed25519, Secp256k1, P256)
 /// - level (4 bytes)
 /// - round (4 bytes)
+///
+/// # Errors
+///
+/// Returns an error if the data is too short to extract level and round fields.
 pub fn get_level_and_round_for_tenderbake_attestation(
     data: &[u8],
     is_bls: bool,

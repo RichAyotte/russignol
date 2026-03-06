@@ -30,7 +30,7 @@ const EPD_RST_CONSUMER: &str = "epd-rst";
 const TOUCH_RST_CONSUMER: &str = "touch-rst";
 
 #[derive(Default)]
-pub struct DeviceConfig {
+pub struct Config {
     pub spi_bus_path: Option<String>,
     pub spi_options: Option<SpidevOptions>,
     pub gpio_chip_path: Option<String>,
@@ -49,7 +49,12 @@ pub struct Device {
 }
 
 impl Device {
-    pub fn new(config: DeviceConfig) -> EpdResult<(Self, Receiver<Point>)> {
+    /// Create a new e-paper device with the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SPI, GPIO, I2C, or touch initialization fails.
+    pub fn new(config: Config) -> EpdResult<(Self, Receiver<Point>)> {
         let rotation = config.rotation.unwrap_or(DEFAULT_ROTATION);
         let spi_bus_path = config
             .spi_bus_path
@@ -120,15 +125,30 @@ impl Device {
         Ok((device, event_rx))
     }
 
+    /// Put both the display and touch controller to sleep.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the touch or display sleep command fails.
     pub fn sleep(&mut self) -> EpdResult<()> {
         self.touch.sleep()?;
         self.display.sleep()
     }
 
+    /// Put the display to sleep (touch controller remains active).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the display sleep command fails.
     pub fn display_sleep(&mut self) -> EpdResult<()> {
         self.display.sleep()
     }
 
+    /// Wake the display from sleep mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the display wake command fails.
     pub fn display_wake(&mut self) -> EpdResult<()> {
         self.display.wake()
     }

@@ -28,12 +28,20 @@ pub const SECRET_KEYS_ENC_PATH: &str = "/keys/secret_keys.enc";
 /// Hardened scrypt parameters: `log_n=18`, r=8, p=4 (256 MB, ~8s on `RPi` Zero 2W @ 1.3 GHz)
 /// - `log_n=18` provides 256 MB memory-hardness (safe for 512 MB device)
 /// - p=4 quadruples CPU work without increasing memory
+///
+/// # Panics
+///
+/// Cannot panic: scrypt parameters are hardcoded valid constants.
 #[must_use]
 pub fn scrypt_params() -> scrypt::Params {
     scrypt::Params::new(18, 8, 4, 32).expect("valid scrypt params")
 }
 
 /// Derive a 32-byte encryption key from password and salt using scrypt
+///
+/// # Errors
+///
+/// Returns an error if scrypt key derivation fails.
 pub fn derive_key(password: &[u8], salt: &SaltString) -> io::Result<[u8; 32]> {
     let mut key = [0u8; 32];
     let params = scrypt_params();
@@ -51,6 +59,10 @@ pub fn derive_key(password: &[u8], salt: &SaltString) -> io::Result<[u8; 32]> {
 /// Encrypt secret keys JSON, returning the encrypted blob
 ///
 /// Returns bytes in format: `[salt_len:1][salt:variable][nonce:12][ciphertext:variable]`
+///
+/// # Errors
+///
+/// Returns an error if key derivation, AES-GCM initialization, or encryption fails.
 pub fn encrypt(password: &[u8], plaintext: &str) -> io::Result<Vec<u8>> {
     debug!("Encrypting data...");
 
@@ -93,6 +105,11 @@ pub fn encrypt(password: &[u8], plaintext: &str) -> io::Result<Vec<u8>> {
 /// Decrypt secret keys from encrypted blob
 ///
 /// Expects bytes in format: `[salt_len:1][salt:variable][nonce:12][ciphertext:variable]`
+///
+/// # Errors
+///
+/// Returns an error if the data is malformed, key derivation fails, or decryption fails
+/// (e.g., wrong PIN).
 pub fn decrypt(password: &[u8], encrypted: &[u8]) -> io::Result<String> {
     debug!("Decrypting data ({} bytes)...", encrypted.len());
 

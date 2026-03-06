@@ -1,4 +1,4 @@
-use super::Page;
+use super::Page as PageTrait;
 use crate::events::AppEvent;
 use crate::fonts;
 use crate::widgets::Button;
@@ -17,7 +17,7 @@ use u8g2_fonts::{
 static CONFIRMATION_PAGE_COUNTER: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
-pub struct ConfirmationPage {
+pub struct Page {
     id: u32,
     app_sender: Sender<AppEvent>,
     message: String,
@@ -30,7 +30,7 @@ pub struct ConfirmationPage {
     key_value_pairs: Option<Vec<(String, String)>>,
 }
 
-impl ConfirmationPage {
+impl Page {
     /// Calculate button width using actual font measurement
     fn measure_button_width(text: &str) -> u32 {
         let font = FontRenderer::new::<fonts::FONT_PROPORTIONAL>();
@@ -52,7 +52,7 @@ impl ConfirmationPage {
         confirm_button_text: &str,
     ) -> Self {
         let id = CONFIRMATION_PAGE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        log::info!("[ConfirmationPage] Creating new ConfirmationPage id={id}");
+        log::info!("[Page] Creating new Page id={id}");
         let button_width = Self::measure_button_width(confirm_button_text);
         Self {
             id,
@@ -78,7 +78,7 @@ impl ConfirmationPage {
         confirm_button_text: &str,
     ) -> Self {
         let id = CONFIRMATION_PAGE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        log::info!("[ConfirmationPage] Creating new ConfirmationPage with pairs id={id}");
+        log::info!("[Page] Creating new Page with pairs id={id}");
         let button_width = Self::measure_button_width(confirm_button_text);
         Self {
             id,
@@ -94,7 +94,7 @@ impl ConfirmationPage {
     }
 }
 
-impl<D: DrawTarget<Color = BinaryColor>> Page<D> for ConfirmationPage {
+impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn is_modal(&self) -> bool {
         true
     }
@@ -154,7 +154,7 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for ConfirmationPage {
             Size::new(right_width.cast_unsigned(), text_height.cast_unsigned()),
         );
         log::info!(
-            "[ConfirmationPage id={}] text_bounds={:?}, message_len={}",
+            "[Page id={}] text_bounds={:?}, message_len={}",
             self.id,
             text_bounds,
             self.message.len()
@@ -244,7 +244,7 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for ConfirmationPage {
         // Update and draw YES button
         self.yes_button.bounds.top_left = Point::new(buttons_start_x, button_top_y);
         log::info!(
-            "[ConfirmationPage id={}] draw: yes_button bounds={:?}",
+            "[Page id={}] draw: yes_button bounds={:?}",
             self.id,
             self.yes_button.bounds
         );
@@ -254,7 +254,7 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for ConfirmationPage {
         self.no_button.bounds.top_left =
             Point::new(buttons_start_x + yes_button_width + spacing, button_top_y);
         log::info!(
-            "[ConfirmationPage id={}] draw: no_button bounds={:?}",
+            "[Page id={}] draw: no_button bounds={:?}",
             self.id,
             self.no_button.bounds
         );
@@ -265,22 +265,22 @@ impl<D: DrawTarget<Color = BinaryColor>> Page<D> for ConfirmationPage {
 
     fn handle_touch(&mut self, point: Point) -> bool {
         log::info!(
-            "[ConfirmationPage id={}] handle_touch at {:?}, yes_bounds={:?}, no_bounds={:?}",
+            "[Page id={}] handle_touch at {:?}, yes_bounds={:?}, no_bounds={:?}",
             self.id,
             point,
             self.yes_button.bounds,
             self.no_button.bounds
         );
         if self.yes_button.contains(point) {
-            log::info!("[ConfirmationPage id={}] YES button pressed", self.id);
+            log::info!("[Page id={}] YES button pressed", self.id);
             let _ = self.app_sender.send(self.confirm_event.clone());
             true
         } else if self.no_button.contains(point) {
-            log::info!("[ConfirmationPage id={}] NO/Cancel button pressed", self.id);
+            log::info!("[Page id={}] NO/Cancel button pressed", self.id);
             let _ = self.app_sender.send(self.cancel_event.clone());
             true
         } else {
-            log::info!("[ConfirmationPage id={}] Touch outside buttons", self.id);
+            log::info!("[Page id={}] Touch outside buttons", self.id);
             false
         }
     }

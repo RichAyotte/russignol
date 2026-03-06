@@ -55,7 +55,7 @@ fn test_corrupt_watermark_file_rejected() {
     buf[0..4].copy_from_slice(&100u32.to_be_bytes()); // level
     buf[4..8].copy_from_slice(&5u32.to_be_bytes()); // round
     buf[8..40].fill(0xFF); // bad hash
-    std::fs::write(key_dir.join("block_watermark"), &buf).unwrap();
+    std::fs::write(key_dir.join("block_watermark"), buf).unwrap();
 
     let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
 

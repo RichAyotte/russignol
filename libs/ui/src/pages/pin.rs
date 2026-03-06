@@ -29,7 +29,7 @@ pub const MAX_PIN_LENGTH: usize = 10;
 
 /// PIN entry mode
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PinMode {
+pub enum Mode {
     /// Creating a new PIN (first entry)
     Create,
     /// Confirming the PIN (second entry during creation)
@@ -40,7 +40,7 @@ pub enum PinMode {
 
 /// Events emitted by the PIN page
 #[derive(Clone, Debug)]
-pub enum PinEvent {
+pub enum Event {
     /// PIN entered (first entry during creation)
     FirstPinEntered(Vec<u8>),
     /// PIN entered (confirmation or verification)
@@ -54,21 +54,21 @@ pub enum PinEvent {
 /// Generic PIN entry page
 ///
 /// Uses a callback to emit events, making it usable across different applications.
-pub struct PinPage<F: FnMut(PinEvent)> {
+pub struct Page<F: FnMut(Event)> {
     buttons: [Button; 13],
     pin: Vec<u8>,
     title: String,
-    mode: PinMode,
+    mode: Mode,
     on_event: F,
 }
 
-impl<F: FnMut(PinEvent)> PinPage<F> {
+impl<F: FnMut(Event)> Page<F> {
     /// Create a new PIN page
     ///
     /// - `title`: Title shown above the PIN dots (e.g., "Enter\n PIN" or "Create\nnew PIN")
     /// - `mode`: Whether this is creation, confirmation, or verification
     /// - `on_event`: Callback invoked when events occur
-    pub fn new(title: &str, mode: PinMode, on_event: F) -> Self {
+    pub fn new(title: &str, mode: Mode, on_event: F) -> Self {
         let std_size = Size::new(40, 40);
         let wide_size = Size::new(82, 40);
 
@@ -101,14 +101,14 @@ impl<F: FnMut(PinEvent)> PinPage<F> {
     }
 
     /// Get the current PIN mode
-    pub fn mode(&self) -> PinMode {
+    pub fn mode(&self) -> Mode {
         self.mode
     }
 }
 
-impl<F, D> super::Page<D> for PinPage<F>
+impl<F, D> super::Page<D> for Page<F>
 where
-    F: FnMut(PinEvent),
+    F: FnMut(Event),
     D: DrawTarget<Color = BinaryColor>,
 {
     fn draw(&mut self, display: &mut D) -> Result<(), D::Error> {
@@ -193,12 +193,12 @@ where
                     11 => {
                         // Backspace
                         self.pin.pop();
-                        (self.on_event)(PinEvent::DirtyDisplay);
+                        (self.on_event)(Event::DirtyDisplay);
                     }
                     12 => {
                         // Clear
                         self.pin.clear();
-                        (self.on_event)(PinEvent::DirtyDisplay);
+                        (self.on_event)(Event::DirtyDisplay);
                     }
                     _ => {
                         if let Some(text) = &button.text {
@@ -206,18 +206,18 @@ where
                                 "Enter" => {
                                     let is_too_short = self.pin.len() < MIN_PIN_LENGTH;
                                     let is_creation =
-                                        matches!(self.mode, PinMode::Create | PinMode::Confirm);
+                                        matches!(self.mode, Mode::Create | Mode::Confirm);
 
                                     if is_too_short && is_creation {
-                                        (self.on_event)(PinEvent::PinTooShort);
+                                        (self.on_event)(Event::PinTooShort);
                                         self.pin.clear();
                                     } else {
                                         let event = match self.mode {
-                                            PinMode::Create => {
-                                                PinEvent::FirstPinEntered(self.pin.clone())
+                                            Mode::Create => {
+                                                Event::FirstPinEntered(self.pin.clone())
                                             }
-                                            PinMode::Confirm | PinMode::Verify => {
-                                                PinEvent::PinEntered(self.pin.clone())
+                                            Mode::Confirm | Mode::Verify => {
+                                                Event::PinEntered(self.pin.clone())
                                             }
                                         };
                                         (self.on_event)(event);
@@ -229,7 +229,7 @@ where
                                         && self.pin.len() < MAX_PIN_LENGTH
                                     {
                                         self.pin.push(digit);
-                                        (self.on_event)(PinEvent::DirtyDisplay);
+                                        (self.on_event)(Event::DirtyDisplay);
                                     }
                                 }
                             }

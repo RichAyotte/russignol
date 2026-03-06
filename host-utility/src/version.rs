@@ -377,7 +377,7 @@ def456  file2
         assert!(checksum.is_none(), "Empty checksum should filter to None");
     }
 
-    /// Helper to build a GitHubRelease for testing
+    /// Helper to build a `GitHubRelease` for testing
     fn make_release(tag: &str, prerelease: bool) -> GitHubRelease {
         GitHubRelease {
             tag_name: tag.to_string(),
@@ -400,7 +400,7 @@ def456  file2
 
     #[test]
     fn test_prerelease_filtering_excludes_prerelease_by_default() {
-        let releases = vec![
+        let releases = [
             make_release("v0.20.0-beta.1", true),
             make_release("v0.19.0", false),
         ];
@@ -425,7 +425,7 @@ def456  file2
 
     #[test]
     fn test_prerelease_filtering_includes_prerelease_when_requested() {
-        let releases = vec![
+        let releases = [
             make_release("v0.20.0-beta.1", true),
             make_release("v0.19.0", false),
         ];

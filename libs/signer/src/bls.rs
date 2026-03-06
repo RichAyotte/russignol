@@ -41,7 +41,7 @@ type Blake2b20 = Blake2b<U20>;
 
 /// BLS signature errors
 #[derive(Error, Debug)]
-pub enum BlsError {
+pub enum Error {
     /// Invalid secret key error
     #[error("Invalid secret key: {0}")]
     InvalidSecretKey(String),
@@ -81,7 +81,7 @@ pub enum BlsError {
 }
 
 /// Result type for BLS operations
-pub type Result<T> = std::result::Result<T, BlsError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 // Base58Check prefixes from OCaml code
 // src/lib_crypto/base58.ml:385 - let bls12_381_public_key_hash = "\006\161\166" (* tz4(36) *)
@@ -138,9 +138,17 @@ impl SecretKey {
     ///
     /// **Security note:** Modular reduction is cryptographically safe as it preserves
     /// the equivalence class of the secret key in the scalar field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the byte slice length is not 32 or the key is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic: the BLS12-381 curve order is a hardcoded valid constant.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != Self::SIZE {
-            return Err(BlsError::InvalidKeyLength {
+            return Err(Error::InvalidKeyLength {
                 expected: Self::SIZE,
                 actual: bytes.len(),
             });
@@ -185,11 +193,11 @@ impl SecretKey {
 
                 // Now it should be in range
                 let sk = blst::min_pk::SecretKey::from_bytes(&reduced_bytes)
-                    .map_err(|e| BlsError::InvalidSecretKey(format!("After reduction: {e:?}")))?;
+                    .map_err(|e| Error::InvalidSecretKey(format!("After reduction: {e:?}")))?;
 
                 Ok(Self { sk })
             }
-            Err(e) => Err(BlsError::InvalidSecretKey(format!("{e:?}"))),
+            Err(e) => Err(Error::InvalidSecretKey(format!("{e:?}"))),
         }
     }
 
@@ -223,8 +231,12 @@ impl SecretKey {
 
     /// Decode from base58check
     /// Corresponds to: `src/lib_crypto/bls.ml:184-191` - `of_b58check`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if base58check decoding fails or the decoded bytes are invalid.
     pub fn from_b58check(s: &str) -> Result<Self> {
-        let decoded = base58check::decode(s, BLSK_PREFIX).map_err(BlsError::Base58Error)?;
+        let decoded = base58check::decode(s, BLSK_PREFIX).map_err(Error::Base58Error)?;
         Self::from_bytes(&decoded)
     }
 }
@@ -243,16 +255,20 @@ impl PublicKey {
 
     /// Create from bytes
     /// Corresponds to: `src/lib_crypto/bls.ml:60` - `of_bytes_opt`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the byte slice length is not 48 or the key is invalid.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != Self::SIZE {
-            return Err(BlsError::InvalidKeyLength {
+            return Err(Error::InvalidKeyLength {
                 expected: Self::SIZE,
                 actual: bytes.len(),
             });
         }
 
         let pk = blst::min_pk::PublicKey::from_bytes(bytes)
-            .map_err(|e| BlsError::InvalidPublicKey(format!("{e:?}")))?;
+            .map_err(|e| Error::InvalidPublicKey(format!("{e:?}")))?;
 
         Ok(Self { pk })
     }
@@ -281,8 +297,12 @@ impl PublicKey {
 
     /// Decode from base58check
     /// Corresponds to: `src/lib_crypto/bls.ml:122-126` - `of_b58check`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if base58check decoding fails or the decoded bytes are invalid.
     pub fn from_b58check(s: &str) -> Result<Self> {
-        let decoded = base58check::decode(s, BLPK_PREFIX).map_err(BlsError::Base58Error)?;
+        let decoded = base58check::decode(s, BLPK_PREFIX).map_err(Error::Base58Error)?;
         Self::from_bytes(&decoded)
     }
 }
@@ -313,9 +333,13 @@ impl PublicKeyHash {
     }
 
     /// Create from bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the byte slice length is not 20.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != Self::SIZE {
-            return Err(BlsError::InvalidKeyLength {
+            return Err(Error::InvalidKeyLength {
                 expected: Self::SIZE,
                 actual: bytes.len(),
             });
@@ -340,8 +364,12 @@ impl PublicKeyHash {
     }
 
     /// Decode from base58check
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if base58check decoding fails or the decoded bytes are invalid.
     pub fn from_b58check(s: &str) -> Result<Self> {
-        let decoded = base58check::decode(s, TZ4_PREFIX).map_err(BlsError::Base58Error)?;
+        let decoded = base58check::decode(s, TZ4_PREFIX).map_err(Error::Base58Error)?;
         Self::from_bytes(&decoded)
     }
 }
@@ -360,16 +388,20 @@ impl Signature {
 
     /// Create from bytes
     /// Corresponds to: `src/lib_crypto/bls.ml:252-255` - `of_bytes_opt`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the byte slice length is not 96 or the signature is invalid.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != Self::SIZE {
-            return Err(BlsError::InvalidKeyLength {
+            return Err(Error::InvalidKeyLength {
                 expected: Self::SIZE,
                 actual: bytes.len(),
             });
         }
 
         let sig = blst::min_pk::Signature::from_bytes(bytes)
-            .map_err(|e| BlsError::InvalidSignature(format!("{e:?}")))?;
+            .map_err(|e| Error::InvalidSignature(format!("{e:?}")))?;
 
         Ok(Self { sig })
     }
@@ -391,8 +423,12 @@ impl Signature {
 
     /// Decode from base58check
     /// Corresponds to: `src/lib_crypto/bls.ml:311-315` - `of_b58check`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if base58check decoding fails or the decoded bytes are invalid.
     pub fn from_b58check(s: &str) -> Result<Self> {
-        let decoded = base58check::decode(s, BLSIG_PREFIX).map_err(BlsError::Base58Error)?;
+        let decoded = base58check::decode(s, BLSIG_PREFIX).map_err(Error::Base58Error)?;
         Self::from_bytes(&decoded)
     }
 }
@@ -463,6 +499,10 @@ pub fn pop_verify(pk: &PublicKey, proof: &Signature, msg: Option<&[u8]>) -> bool
 ///
 /// # Arguments
 /// * `seed` - Optional 32-byte seed. If None, uses random bytes.
+///
+/// # Errors
+///
+/// Returns an error if random generation fails or the seed produces an invalid key.
 pub fn generate_key(seed: Option<&[u8; 32]>) -> Result<(PublicKeyHash, PublicKey, SecretKey)> {
     let seed_bytes = if let Some(s) = seed {
         *s
@@ -470,7 +510,7 @@ pub fn generate_key(seed: Option<&[u8; 32]>) -> Result<(PublicKeyHash, PublicKey
         // Generate random 32 bytes (same as OCaml: Hacl.Rand.gen 32)
         let mut seed = [0u8; 32];
         getrandom::fill(&mut seed)
-            .map_err(|e| BlsError::KeyGeneration(format!("Random generation failed: {e}")))?;
+            .map_err(|e| Error::KeyGeneration(format!("Random generation failed: {e}")))?;
         seed
     };
 
@@ -483,6 +523,10 @@ pub fn generate_key(seed: Option<&[u8; 32]>) -> Result<(PublicKeyHash, PublicKey
 
 /// Compute deterministic nonce using HMAC-SHA256
 /// Corresponds to: `src/lib_crypto/bls.ml:373-375` - `deterministic_nonce`
+///
+/// # Panics
+///
+/// Cannot panic: HMAC-SHA256 accepts keys of any length.
 #[must_use]
 pub fn deterministic_nonce(sk: &SecretKey, msg: &[u8]) -> [u8; 32] {
     let key = sk.to_bytes();
@@ -663,44 +707,41 @@ mod tests {
         let seed = [99u8; 32];
 
         // Generate keypair
-        let (pkh_original, pk_original, sk_original) = generate_key(Some(&seed)).unwrap();
+        let (orig_hash, orig_pubkey, orig_secret) = generate_key(Some(&seed)).unwrap();
 
         // Encode all to base58
-        let sk_b58 = sk_original.to_b58check();
-        let pk_b58 = pk_original.to_b58check();
-        let pkh_b58 = pkh_original.to_b58check();
+        let secret_b58 = orig_secret.to_b58check();
+        let pubkey_b58 = orig_pubkey.to_b58check();
+        let hash_b58 = orig_hash.to_b58check();
 
         // Decode from base58
-        let sk_decoded = SecretKey::from_b58check(&sk_b58).unwrap();
-        let pk_decoded = PublicKey::from_b58check(&pk_b58).unwrap();
-        let pkh_decoded = PublicKeyHash::from_b58check(&pkh_b58).unwrap();
+        let decoded_secret = SecretKey::from_b58check(&secret_b58).unwrap();
+        let decoded_pubkey = PublicKey::from_b58check(&pubkey_b58).unwrap();
+        let decoded_hash = PublicKeyHash::from_b58check(&hash_b58).unwrap();
 
         // Verify secret key bytes match
         assert_eq!(
-            sk_original.to_bytes(),
-            sk_decoded.to_bytes(),
+            orig_secret.to_bytes(),
+            decoded_secret.to_bytes(),
             "Secret key roundtrip failed"
         );
 
         // Verify public key matches
-        assert_eq!(pk_original, pk_decoded, "Public key roundtrip failed");
+        assert_eq!(orig_pubkey, decoded_pubkey, "Public key roundtrip failed");
 
         // Verify public key hash matches
-        assert_eq!(
-            pkh_original, pkh_decoded,
-            "Public key hash roundtrip failed"
-        );
+        assert_eq!(orig_hash, decoded_hash, "Public key hash roundtrip failed");
 
         // Verify full derivation chain: sk → pk → pkh
-        let pk_from_decoded_sk = sk_decoded.to_public_key();
+        let derived_pubkey = decoded_secret.to_public_key();
         assert_eq!(
-            pk_from_decoded_sk, pk_original,
+            derived_pubkey, orig_pubkey,
             "Public key derived from decoded secret key must match original"
         );
 
-        let pkh_from_decoded_pk = pk_from_decoded_sk.hash();
+        let derived_hash = derived_pubkey.hash();
         assert_eq!(
-            pkh_from_decoded_pk, pkh_original,
+            derived_hash, orig_hash,
             "Public key hash from derived public key must match original"
         );
     }

@@ -2,7 +2,7 @@ use crate::events::AppEvent;
 use crate::fonts;
 use russignol_signer_lib::signing_activity::{KeyType, OperationType, SigningActivity};
 
-use super::Page;
+use super::Page as PageTrait;
 use crossbeam_channel::Sender;
 use embedded_graphics::{
     pixelcolor::BinaryColor,
@@ -33,7 +33,7 @@ pub fn format_key_short(s: &str) -> String {
     }
 }
 
-pub struct SignaturesPage {
+pub struct Page {
     // Event sender for navigation
     app_sender: Sender<AppEvent>,
     // Reference to shared signing activity for reading latest state
@@ -43,7 +43,7 @@ pub struct SignaturesPage {
     companion_pkh: Option<String>,
 }
 
-impl SignaturesPage {
+impl Page {
     pub fn new(
         app_sender: Sender<AppEvent>,
         signing_activity: Arc<Mutex<SigningActivity>>,
@@ -117,7 +117,7 @@ const COL_TYPE_X: i32 = 90;
 const COL_KEY_X: i32 = 120;
 const COL_TIME_X: i32 = 228;
 
-impl<D: DrawTarget<Color = BinaryColor>> Page<D> for SignaturesPage {
+impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn handle_touch(&mut self, _point: Point) -> bool {
         // Any touch shows the status page
         let _ = self.app_sender.send(AppEvent::ShowStatus);
@@ -262,10 +262,10 @@ mod tests {
     use russignol_signer_lib::signing_activity::{KeyType, SignatureActivity, SigningEvent};
     use std::time::{Duration, SystemTime};
 
-    fn make_activity(consensus_pkh: Option<&str>, companion_pkh: Option<&str>) -> SignaturesPage {
+    fn make_activity(consensus_pkh: Option<&str>, companion_pkh: Option<&str>) -> Page {
         let shared = Arc::new(Mutex::new(SigningActivity::default()));
         let (sender, _receiver) = crossbeam_channel::unbounded();
-        SignaturesPage {
+        Page {
             app_sender: sender,
             signing_activity_shared: shared,
             consensus_pkh: consensus_pkh.map(String::from),

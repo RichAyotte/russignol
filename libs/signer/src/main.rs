@@ -4,8 +4,7 @@
 
 use clap::{Parser, Subcommand};
 use russignol_signer_lib::{
-    HighWatermark, RequestHandler, ServerKeyManager, SignerServer, UnencryptedSigner,
-    wallet::KeyManager,
+    HighWatermark, RequestHandler, ServerKeyManager, server, signer, wallet::KeyManager,
 };
 use std::fs;
 use std::net::ToSocketAddrs;
@@ -211,7 +210,7 @@ fn launch_socket_signer(
 
     for (alias, stored_key) in &keys {
         if let Some(sk_b58) = &stored_key.secret_key {
-            match UnencryptedSigner::from_b58check(sk_b58) {
+            match signer::Unencrypted::from_b58check(sk_b58) {
                 Ok(signer) => {
                     // Now that we handle little-endian correctly, the derived PKH matches OCaml
                     let derived_pkh = *signer.public_key_hash();
@@ -271,7 +270,7 @@ fn launch_socket_signer(
 
     let timeout_duration = opts.timeout.map(Duration::from_secs);
 
-    let server = SignerServer::new(addr, Arc::new(handler), timeout_duration);
+    let server = server::Server::new(addr, Arc::new(handler), timeout_duration);
 
     // Write PID file if requested
     if let Some(ref pidfile_path) = opts.pidfile {

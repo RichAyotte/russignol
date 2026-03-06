@@ -128,6 +128,7 @@ impl ParsedCommit {
 }
 
 /// Parse a commit line in format "hash|subject"
+#[must_use]
 pub fn parse_commit(line: &str) -> Option<ParsedCommit> {
     let (hash, subject) = line.split_once('|')?;
     let hash = hash.trim().to_string();
@@ -162,6 +163,10 @@ pub fn parse_commit(line: &str) -> Option<ParsedCommit> {
 }
 
 /// Get the most recent tag reachable from HEAD
+///
+/// # Errors
+///
+/// Returns an error if the git command fails.
 pub fn get_current_tag() -> Result<Option<String>> {
     let output = Command::new("git")
         .args(["describe", "--tags", "--abbrev=0", "HEAD"])
@@ -183,6 +188,10 @@ pub fn get_current_tag() -> Result<Option<String>> {
 }
 
 /// Check if HEAD is exactly at a tag (no commits after it)
+///
+/// # Errors
+///
+/// Returns an error if the git command fails.
 pub fn head_is_tagged() -> Result<bool> {
     let output = Command::new("git")
         .args(["describe", "--tags", "--exact-match", "HEAD"])
@@ -195,6 +204,10 @@ pub fn head_is_tagged() -> Result<bool> {
 }
 
 /// Check if a specific tag exists
+///
+/// # Errors
+///
+/// Returns an error if the git command fails.
 pub fn tag_exists(tag: &str) -> Result<bool> {
     let output = Command::new("git")
         .args(["rev-parse", "--verify", &format!("refs/tags/{tag}")])
@@ -207,11 +220,19 @@ pub fn tag_exists(tag: &str) -> Result<bool> {
 }
 
 /// Get the previous tag from git history (tag before HEAD)
+///
+/// # Errors
+///
+/// Returns an error if the git command fails.
 pub fn get_previous_tag() -> Result<Option<String>> {
     get_tag_before("HEAD")
 }
 
 /// Get the tag before a given reference (tag or commit)
+///
+/// # Errors
+///
+/// Returns an error if the git command fails.
 pub fn get_tag_before(reference: &str) -> Result<Option<String>> {
     let ref_parent = format!("{reference}^");
     let output = Command::new("git")
@@ -234,6 +255,10 @@ pub fn get_tag_before(reference: &str) -> Result<Option<String>> {
 }
 
 /// Get the previous tag for a specific component (e.g., "signer-v0.13.3")
+///
+/// # Errors
+///
+/// Returns an error if the git command fails.
 pub fn get_previous_component_tag(component_prefix: &str) -> Result<Option<String>> {
     // Use git tag -l with pattern to find matching tags, sorted by version
     let pattern = format!("{component_prefix}-v*");
@@ -258,11 +283,16 @@ pub fn get_previous_component_tag(component_prefix: &str) -> Result<Option<Strin
 }
 
 /// Get the current date in YYYY-MM-DD format
+#[must_use]
 pub fn get_current_date() -> String {
     Local::now().format("%Y-%m-%d").to_string()
 }
 
 /// Get the date a tag was created in YYYY-MM-DD format
+///
+/// # Errors
+///
+/// Returns an error if the git command fails.
 pub fn get_tag_date(tag: &str) -> Result<String> {
     let output = Command::new("git")
         .args(["log", "-1", "--format=%ci", tag])
@@ -286,6 +316,10 @@ pub fn get_tag_date(tag: &str) -> Result<String> {
 }
 
 /// Fetch tags from remote to ensure we have all tags for changelog generation
+///
+/// # Errors
+///
+/// Returns an error if the git fetch command fails.
 pub fn fetch_remote_tags() -> Result<()> {
     eprintln!("Fetching tags from remote...");
     let output = Command::new("git")
@@ -304,6 +338,10 @@ pub fn fetch_remote_tags() -> Result<()> {
 }
 
 /// Get full commit messages (subject + body) for a range, for Claude context
+///
+/// # Errors
+///
+/// Returns an error if the git log command fails.
 pub fn get_full_commit_messages(tag: Option<&str>, end_ref: &str) -> Result<String> {
     let range = match tag {
         Some(t) => format!("{t}..{end_ref}"),
@@ -328,6 +366,10 @@ pub fn get_full_commit_messages(tag: Option<&str>, end_ref: &str) -> Result<Stri
 /// - `tag`: The starting tag (exclusive). If None, gets all commits up to `end_ref`.
 /// - `end_ref`: The ending reference (inclusive). Usually a tag or "HEAD".
 /// - `scope_filter`: Optional scope to filter commits by.
+///
+/// # Errors
+///
+/// Returns an error if the git log command fails.
 pub fn get_commits_since(
     tag: Option<&str>,
     end_ref: &str,
@@ -380,6 +422,7 @@ pub fn get_commits_since(
 /// - Any breaking change (!) → Major
 /// - Any `feat` commit → Minor
 /// - Otherwise → Patch
+#[must_use]
 pub fn determine_bump_type(commits: &[ParsedCommit]) -> BumpType {
     let has_breaking = commits.iter().any(|c| c.breaking);
     if has_breaking {
@@ -404,6 +447,10 @@ fn is_release_commit(commit: &ParsedCommit) -> bool {
 }
 
 /// Determine bump type from commits since the last tag for a component
+///
+/// # Errors
+///
+/// Returns an error if HEAD is already tagged, no commits are found, or git commands fail.
 pub fn get_bump_type_for_component(
     component_prefix: Option<&str>,
     scope_filter: Option<&str>,
@@ -445,6 +492,10 @@ pub fn get_bump_type_for_component(
 /// Parse a semantic version string into (major, minor, patch)
 ///
 /// Strips any pre-release suffix before parsing (e.g., "1.2.3-beta.1" → (1, 2, 3)).
+///
+/// # Errors
+///
+/// Returns an error if the version string is not in `MAJOR.MINOR.PATCH` format.
 pub fn parse_version(version: &str) -> Result<(u32, u32, u32)> {
     let base = base_version(version);
     let parts: Vec<&str> = base.split('.').collect();
@@ -466,6 +517,10 @@ pub fn parse_version(version: &str) -> Result<(u32, u32, u32)> {
 }
 
 /// Bump a version according to the bump type
+///
+/// # Errors
+///
+/// Returns an error if the version string cannot be parsed.
 pub fn bump_version(version: &str, bump_type: BumpType) -> Result<String> {
     let (major, minor, patch) = parse_version(version)?;
 
@@ -481,6 +536,7 @@ pub fn bump_version(version: &str, bump_type: BumpType) -> Result<String> {
 /// Extract the base version (without pre-release suffix) from a version string
 ///
 /// "1.2.3" → "1.2.3", "1.2.3-beta.1" → "1.2.3"
+#[must_use]
 pub fn base_version(version: &str) -> &str {
     version.split_once('-').map_or(version, |(base, _)| base)
 }
@@ -488,6 +544,7 @@ pub fn base_version(version: &str) -> &str {
 /// Extract the pre-release suffix from a version string
 ///
 /// "1.2.3" → None, "1.2.3-beta.1" → Some("beta.1")
+#[must_use]
 pub fn pre_release(version: &str) -> Option<&str> {
     version.split_once('-').map(|(_, suffix)| suffix)
 }
@@ -496,6 +553,10 @@ pub fn pre_release(version: &str) -> Option<&str> {
 ///
 /// Searches for tags matching `v{base}-beta.*` (or `{prefix}-v{base}-beta.*`)
 /// and returns max+1 (or 1 if none exist).
+///
+/// # Errors
+///
+/// Returns an error if the git tag command fails.
 pub fn next_beta_number(tag_prefix: Option<&str>, base_ver: &str) -> Result<u32> {
     let pattern = if let Some(prefix) = tag_prefix {
         format!("{prefix}-v{base_ver}-beta.*")
@@ -530,7 +591,8 @@ pub fn next_beta_number(tag_prefix: Option<&str>, base_ver: &str) -> Result<u32>
 /// - `date`: The release date in YYYY-MM-DD format
 /// - `previous_tag`: The previous version tag for the compare link (e.g., "v1.2.2")
 /// - `commits`: The parsed commits to include
-pub fn generate_changelog(
+#[must_use]
+pub fn generate(
     version: &str,
     date: &str,
     previous_tag: Option<&str>,
@@ -669,6 +731,10 @@ fn format_commit(commit: &ParsedCommit) -> String {
 ///
 /// - `component_prefix`: The tag prefix (e.g., "signer") for finding previous tag
 /// - `scope_filter`: The commit scope to filter by (e.g., "signer")
+///
+/// # Errors
+///
+/// Returns an error if git commands fail or the changelog file cannot be written.
 pub fn create_changelog_file_for_component(
     version: &str,
     component_prefix: Option<&str>,
@@ -724,7 +790,7 @@ pub fn create_changelog_file_for_component(
     let changelog = generate_with_claude(version, &date, tag.as_deref(), &full_messages)
         .unwrap_or_else(|e| {
             eprintln!("  Note: Claude generation skipped ({e}), using raw commit messages");
-            generate_changelog(version, &date, tag.as_deref(), &commits)
+            generate(version, &date, tag.as_deref(), &commits)
         });
 
     // Include component prefix in filename if present
@@ -823,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_changelog_groups_by_type() {
+    fn test_generate_groups_by_type() {
         let commits = vec![
             ParsedCommit {
                 commit_type: CommitType::Docs,
@@ -848,7 +914,7 @@ mod tests {
             },
         ];
 
-        let changelog = generate_changelog("1.0.0", "2024-01-15", Some("v0.9.0"), &commits);
+        let changelog = generate("1.0.0", "2024-01-15", Some("v0.9.0"), &commits);
 
         // Added should come before Fixed, which should come before Documentation
         let feat_pos = changelog.find("### Added").unwrap();
@@ -860,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_changelog_breaking_changes_first() {
+    fn test_generate_breaking_changes_first() {
         let commits = vec![
             ParsedCommit {
                 commit_type: CommitType::Feat,
@@ -878,7 +944,7 @@ mod tests {
             },
         ];
 
-        let changelog = generate_changelog("1.0.0", "2024-01-15", Some("v0.9.0"), &commits);
+        let changelog = generate("1.0.0", "2024-01-15", Some("v0.9.0"), &commits);
 
         let breaking_pos = changelog.find("### Breaking Changes").unwrap();
         let feat_pos = changelog.find("### Added").unwrap();
@@ -890,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_changelog_header_and_compare_link() {
+    fn test_generate_header_and_compare_link() {
         let commits = vec![ParsedCommit {
             commit_type: CommitType::Feat,
             scope: None,
@@ -899,7 +965,7 @@ mod tests {
             breaking: false,
         }];
 
-        let changelog = generate_changelog("1.2.0", "2024-03-15", Some("v1.1.0"), &commits);
+        let changelog = generate("1.2.0", "2024-03-15", Some("v1.1.0"), &commits);
 
         // Check version header format: ## [version] - YYYY-MM-DD
         assert!(
@@ -915,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_changelog_no_previous_tag() {
+    fn test_generate_no_previous_tag() {
         let commits = vec![ParsedCommit {
             commit_type: CommitType::Feat,
             scope: None,
@@ -924,7 +990,7 @@ mod tests {
             breaking: false,
         }];
 
-        let changelog = generate_changelog("0.1.0", "2024-01-01", None, &commits);
+        let changelog = generate("0.1.0", "2024-01-01", None, &commits);
 
         // Header should still be present
         assert!(changelog.contains("## [0.1.0] - 2024-01-01"));

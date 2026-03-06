@@ -30,6 +30,9 @@ impl Button {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if `bmp_data` is not valid BMP. All callers use `include_bytes!` with known-good assets.
     #[must_use]
     pub fn new_bmp(size: Size, bmp_data: &'static [u8]) -> Self {
         let bmp = Bmp::from_slice(bmp_data).unwrap();

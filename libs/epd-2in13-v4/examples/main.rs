@@ -8,7 +8,7 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
-use epd_2in13_v4::{Device, DeviceConfig};
+use epd_2in13_v4::{Device, device};
 
 const TIME_TEXT_POS: Point = Point::new(20, 95);
 const EXIT_BUTTON_RECT: Rectangle = Rectangle::new(Point::new(11, 10), Size::new(100, 50));
@@ -22,13 +22,13 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
     env_logger::init();
     log::info!("EPD_2in13_V4_test Demo");
 
-    let (mut device, touch_events) = Device::new(DeviceConfig::default())?;
+    let (mut device, touch_events) = Device::new(device::Config::default())?;
     initialize_display(&mut device)?;
 
     let rx = setup_event_channels(touch_events);
 
     log::info!("Application started. Touch the screen to draw or press the exit button.");
-    run_event_loop(&mut device, rx)?;
+    run_event_loop(&mut device, &rx)?;
 
     device.sleep()?;
     Ok(())
@@ -93,7 +93,7 @@ fn setup_event_channels(touch_events: Receiver<Point>) -> Receiver<AppEvent> {
     rx
 }
 
-fn run_event_loop(device: &mut Device, rx: Receiver<AppEvent>) -> epd_2in13_v4::EpdResult<()> {
+fn run_event_loop(device: &mut Device, rx: &Receiver<AppEvent>) -> epd_2in13_v4::EpdResult<()> {
     loop {
         match rx.recv() {
             Ok(first_event) => {

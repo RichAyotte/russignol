@@ -13,18 +13,18 @@ use u8g2_fonts::{
     types::{FontColor, HorizontalAlignment as U8gHAlign, VerticalPosition},
 };
 
-use super::Page;
+use super::Page as PageTrait;
 
 /// Static logo BMP loaded at compile time
 const LOGO_DATA: &[u8] = include_bytes!("../../assets/russignol-61h.bmp");
 
 /// Greeting page with logo and "Begin" button for first-boot setup
-pub struct GreetingPage {
+pub struct Page {
     app_sender: Sender<AppEvent>,
     button: Button,
 }
 
-impl GreetingPage {
+impl Page {
     /// Create a new greeting page
     pub fn new(app_sender: Sender<AppEvent>) -> Self {
         Self {
@@ -35,7 +35,7 @@ impl GreetingPage {
     }
 }
 
-impl<D: DrawTarget<Color = BinaryColor>> Page<D> for GreetingPage {
+impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn draw(&mut self, display: &mut D) -> Result<(), D::Error> {
         let display_bounds = display.bounding_box();
         let display_width = display_bounds.size.width.cast_signed();

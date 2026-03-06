@@ -22,14 +22,14 @@
 //! # Example Usage
 //!
 //! ```rust
-//! use russignol_signer_lib::{UnencryptedSigner, SignerHandler};
+//! use russignol_signer_lib::signer::{Unencrypted, Handler};
 //!
 //! // Generate a new signer with a deterministic seed
 //! let seed = [42u8; 32];
-//! let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
+//! let signer = Unencrypted::generate(Some(&seed)).unwrap();
 //!
 //! // Create handler with Tenderbake-only magic bytes
-//! let handler = SignerHandler::new_tenderbake_only(signer);
+//! let handler = Handler::new_tenderbake_only(signer);
 //!
 //! // Sign Tenderbake block data
 //! let block_data = b"\x11\x00\x00\x00\x01..."; // Magic byte 0x11 + block data
@@ -56,12 +56,12 @@ pub mod test_utils;
 pub mod wallet;
 
 // Re-export commonly used types
-pub use bls::{BlsError, PublicKey, PublicKeyHash, SecretKey, Signature};
+pub use bls::{PublicKey, PublicKeyHash, SecretKey, Signature};
 pub use high_watermark::{ChainId, HighWatermark, WatermarkError};
 pub use magic_bytes::{MagicByte, MagicByteError};
-pub use protocol::{ProtocolError, SignerRequest, SignerResponse};
-pub use server::{KeyManager as ServerKeyManager, RequestHandler, ServerError, SignerServer};
-pub use signer::{SignatureVersion, SignerError, SignerHandler, UnencryptedSigner};
+pub use protocol::{SignerRequest, SignerResponse};
+pub use server::{KeyManager as ServerKeyManager, RequestHandler};
+pub use signer::SignatureVersion;
 pub use signing_activity::{
     KeyType, OperationType, SignatureActivity, SigningActivity, SigningEvent, SigningEventRing,
 };

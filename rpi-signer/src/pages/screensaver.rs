@@ -1,4 +1,4 @@
-use super::Page;
+use super::Page as PageTrait;
 use crate::fonts;
 use embedded_graphics::{image::Image, pixelcolor::BinaryColor, prelude::*};
 use tinybmp::Bmp;
@@ -6,15 +6,15 @@ use u8g2_fonts::FontRenderer;
 
 const RUSSIGNOL_LOGO: &[u8] = include_bytes!("../../assets/sleeping-russignol-61h.bmp");
 
-pub struct ScreensaverPage;
+pub struct Page;
 
-impl ScreensaverPage {
+impl Page {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl<D: DrawTarget<Color = BinaryColor>> Page<D> for ScreensaverPage {
+impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn draw(&mut self, display: &mut D) -> Result<(), D::Error> {
         let display_bounds = display.bounding_box();
         let display_width = display_bounds.size.width.cast_signed();

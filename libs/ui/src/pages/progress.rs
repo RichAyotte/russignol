@@ -1,4 +1,4 @@
-use super::Page;
+use super::Page as PageTrait;
 use crate::fonts;
 use embedded_graphics::{
     Drawable,
@@ -30,19 +30,19 @@ enum ProgressMode {
     },
 }
 
-/// `ProgressPage` displays a message with a progress bar.
+/// `Page` displays a message with a progress bar.
 ///
 /// Supports two modes:
 /// - **Manual mode** (`new()`): Call `set_progress()` to update the percentage
 /// - **Timed mode** (`new_timed()`): Progress auto-advances based on elapsed time
-pub struct ProgressPage {
+pub struct Page {
     message: String,
     percent: u8,
     mode: ProgressMode,
     is_modal: bool,
 }
 
-impl ProgressPage {
+impl Page {
     /// Create a manually-controlled progress bar
     ///
     /// Use `set_progress()` to update the message and percentage.
@@ -121,7 +121,7 @@ impl ProgressPage {
     }
 }
 
-impl<D: DrawTarget<Color = BinaryColor>> Page<D> for ProgressPage {
+impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn is_modal(&self) -> bool {
         self.is_modal
     }

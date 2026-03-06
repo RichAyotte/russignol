@@ -8,7 +8,7 @@
 //! - Base58check encoding/decoding overhead
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use russignol_signer_lib::{SignerHandler, UnencryptedSigner};
+use russignol_signer_lib::signer;
 use std::hint::black_box;
 
 /// Benchmark BLS12-381 signing performance
@@ -17,8 +17,8 @@ fn bench_signing(c: &mut Criterion) {
 
     // Create test signer
     let seed = [42u8; 32];
-    let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
-    let handler = SignerHandler::new_tenderbake_only(signer);
+    let signer = signer::Unencrypted::generate(Some(&seed)).unwrap();
+    let handler = signer::Handler::new_tenderbake_only(signer);
 
     // Benchmark different message sizes
     for size in &[32, 64, 128, 256, 512, 1024, 2048] {
@@ -38,8 +38,8 @@ fn bench_verification(c: &mut Criterion) {
     let mut group = c.benchmark_group("BLS12-381 Verification");
 
     let seed = [42u8; 32];
-    let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
-    let handler = SignerHandler::new_tenderbake_only(signer);
+    let signer = signer::Unencrypted::generate(Some(&seed)).unwrap();
+    let handler = signer::Handler::new_tenderbake_only(signer);
 
     for size in &[32, 64, 128, 256, 512, 1024, 2048] {
         let mut data = vec![0x11u8; *size];
@@ -66,15 +66,15 @@ fn bench_verification(c: &mut Criterion) {
 /// Benchmark key generation
 fn bench_key_generation(c: &mut Criterion) {
     c.bench_function("BLS12-381 key generation", |b| {
-        b.iter(|| UnencryptedSigner::generate(black_box(None)).unwrap());
+        b.iter(|| signer::Unencrypted::generate(black_box(None)).unwrap());
     });
 }
 
 /// Benchmark proof of possession generation
 fn bench_proof_of_possession(c: &mut Criterion) {
     let seed = [42u8; 32];
-    let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
-    let handler = SignerHandler::new_tenderbake_only(signer);
+    let signer = signer::Unencrypted::generate(Some(&seed)).unwrap();
+    let handler = signer::Handler::new_tenderbake_only(signer);
 
     c.bench_function("BLS12-381 proof of possession", |b| {
         b.iter(|| handler.bls_prove_possession(black_box(None)).unwrap());
@@ -84,8 +84,8 @@ fn bench_proof_of_possession(c: &mut Criterion) {
 /// Benchmark deterministic nonce computation
 fn bench_deterministic_nonce(c: &mut Criterion) {
     let seed = [42u8; 32];
-    let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
-    let handler = SignerHandler::new_tenderbake_only(signer);
+    let signer = signer::Unencrypted::generate(Some(&seed)).unwrap();
+    let handler = signer::Handler::new_tenderbake_only(signer);
 
     let mut group = c.benchmark_group("Deterministic Nonce");
 
@@ -111,8 +111,8 @@ fn bench_deterministic_nonce(c: &mut Criterion) {
 /// Benchmark base58check encoding/decoding
 fn bench_base58check(c: &mut Criterion) {
     let seed = [42u8; 32];
-    let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
-    let bench_handler = SignerHandler::new_tenderbake_only(signer);
+    let signer = signer::Unencrypted::generate(Some(&seed)).unwrap();
+    let bench_handler = signer::Handler::new_tenderbake_only(signer);
 
     let mut group = c.benchmark_group("Base58Check Encoding");
 

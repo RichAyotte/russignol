@@ -155,6 +155,10 @@ pub fn ghostnet_chain_id() -> ChainId {
 /// * `base_dir` - Base watermark directory
 /// * `pkh` - Public key hash (determines the per-key subdirectory)
 /// * `level` - The initial watermark level (signing will only succeed above this level)
+///
+/// # Panics
+///
+/// Panics on I/O failure. Intended for test use only.
 pub fn preinit_watermarks(base_dir: &Path, pkh: &PublicKeyHash, level: u32) {
     let key_dir = base_dir.join(pkh.to_b58check());
     fs::create_dir_all(&key_dir).unwrap();

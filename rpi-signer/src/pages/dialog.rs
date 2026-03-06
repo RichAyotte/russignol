@@ -1,4 +1,4 @@
-use super::Page;
+use super::Page as PageTrait;
 use crate::events::AppEvent;
 use crate::fonts;
 use crate::widgets::Button;
@@ -11,14 +11,14 @@ use embedded_text::{
 };
 use u8g2_fonts::U8g2TextStyle;
 
-pub struct DialogPage {
+pub struct Page {
     app_sender: Sender<AppEvent>,
     message: String,
     button: Button,
     dismiss_event: AppEvent,
 }
 
-impl DialogPage {
+impl Page {
     pub fn new(app_sender: Sender<AppEvent>, message: &str, dismiss_event: AppEvent) -> Self {
         Self {
             app_sender,
@@ -29,7 +29,7 @@ impl DialogPage {
     }
 }
 
-impl<D: DrawTarget<Color = BinaryColor>> Page<D> for DialogPage {
+impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn is_modal(&self) -> bool {
         true
     }

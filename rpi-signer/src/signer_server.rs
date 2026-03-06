@@ -1,7 +1,7 @@
 use log::{error, info};
 use russignol_signer_lib::{
-    ChainId, HighWatermark, RequestHandler, ServerKeyManager, SignerServer, SigningActivity,
-    UnencryptedSigner, wallet::OcamlKeyEntry,
+    ChainId, HighWatermark, RequestHandler, ServerKeyManager, SigningActivity, server, signer,
+    wallet::OcamlKeyEntry,
 };
 use std::fs;
 use std::net::SocketAddr;
@@ -53,7 +53,7 @@ fn parse_secret_keys(secret_keys_json: &str) -> Result<ServerKeyManager, String>
             &entry.value
         };
 
-        match UnencryptedSigner::from_b58check(sk_b58) {
+        match signer::Unencrypted::from_b58check(sk_b58) {
             Ok(signer) => {
                 let pkh = *signer.public_key_hash();
                 key_manager.add_signer(pkh, signer, entry.name.clone());
@@ -198,7 +198,7 @@ fn run_signer_once(
 
     // Create server with 30-second connection timeout to prevent stale threads
     // on USB disconnect events
-    let server = SignerServer::new(addr, Arc::new(handler), Some(Duration::from_secs(30)));
+    let server = server::Server::new(addr, Arc::new(handler), Some(Duration::from_secs(30)));
 
     info!("🚀 Signer server listening on {addr}");
     info!("📡 Waiting for connections...");

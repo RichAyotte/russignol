@@ -43,6 +43,11 @@ impl Display {
         }
     }
 
+    /// Send the framebuffer to the display, choosing full or partial mode automatically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the display driver fails to update.
     pub fn update(&mut self) -> EpdResult<()> {
         if self.partial_update_count >= self.max_partial_updates {
             self.partial_update_count = 0;
@@ -62,6 +67,10 @@ impl Display {
     }
 
     /// Force a full display update (not partial)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the display driver fails to update.
     pub fn update_full(&mut self) -> EpdResult<()> {
         self.partial_update_count = 0;
         self.update()

@@ -43,6 +43,7 @@ impl fmt::Display for InsufficientSpace {
 /// Round `value` up to the next multiple of `alignment`.
 ///
 /// Returns 0 when `value` is 0.
+#[must_use]
 pub fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
 }
@@ -52,6 +53,10 @@ pub fn align_up(value: u64, alignment: u64) -> u64 {
 /// Given the byte offset where partition 2 (rootfs) ends, the alignment
 /// to use, and the total disk size in bytes, computes sector-based start
 /// and size values for two 64 MB F2FS partitions.
+///
+/// # Errors
+///
+/// Returns an error if the disk is too small to fit both partitions.
 pub fn calculate_partition_layout(
     p2_end_bytes: u64,
     alignment: u64,
@@ -83,6 +88,7 @@ pub fn calculate_partition_layout(
 /// Generate an sfdisk `--append` script for the given partition layout.
 ///
 /// Produces two lines that create Linux (type 83) partitions for keys and data.
+#[must_use]
 pub fn generate_sfdisk_script(layout: &PartitionLayout) -> String {
     format!(
         "start={}, size={}, type=83\nstart={}, size={}, type=83\n",
@@ -140,10 +146,10 @@ mod tests {
     #[test]
     fn test_generate_sfdisk_script() {
         let layout = PartitionLayout {
-            keys_start_sector: 4751360,
-            keys_size_sectors: 131072,
-            data_start_sector: 4882432,
-            data_size_sectors: 131072,
+            keys_start_sector: 4_751_360,
+            keys_size_sectors: 131_072,
+            data_start_sector: 4_882_432,
+            data_size_sectors: 131_072,
         };
 
         let script = generate_sfdisk_script(&layout);

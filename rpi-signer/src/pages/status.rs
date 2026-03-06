@@ -8,7 +8,7 @@ use crate::fonts;
 use crate::network_status::NetworkStatus;
 use crate::tezos_signer;
 
-use super::Page;
+use super::Page as PageTrait;
 use crossbeam_channel::Sender;
 use embedded_graphics::{
     Drawable,
@@ -33,7 +33,7 @@ fn truncate_key(key: &str) -> String {
     }
 }
 
-pub struct StatusPage {
+pub struct Page {
     app_sender: Sender<AppEvent>,
     network_status: Arc<Mutex<Option<NetworkStatus>>>,
     // Cached values
@@ -43,7 +43,7 @@ pub struct StatusPage {
     companion_pkh: Option<String>,
 }
 
-impl StatusPage {
+impl Page {
     pub fn new(
         app_sender: Sender<AppEvent>,
         signing_activity: Arc<Mutex<SigningActivity>>,
@@ -73,7 +73,7 @@ impl StatusPage {
         let network_status: Arc<Mutex<Option<NetworkStatus>>> = Arc::new(Mutex::new(None));
 
         // Spawn background thread to check network status periodically.
-        // The thread holds a Weak ref to network_status — when StatusPage drops
+        // The thread holds a Weak ref to network_status — when Page drops
         // (page navigation, dialog overlay, etc.), the Weak fails to upgrade
         // and the thread exits on its own.
         let ns_weak = Arc::downgrade(&network_status);
@@ -99,7 +99,7 @@ impl StatusPage {
                 if let Ok(mut guard) = ns.lock() {
                     *guard = Some(status);
                 }
-                // Drop the strong ref before sleeping so StatusPage can be dropped mid-sleep
+                // Drop the strong ref before sleeping so Page can be dropped mid-sleep
                 drop(ns);
 
                 if prev_status.as_ref() != Some(&status) {
@@ -132,7 +132,7 @@ const CONTENT_ROW_3: i32 = 87;
 const CONTENT_ROW_4: i32 = 109;
 const ICON_GAP: i32 = 8;
 
-impl<D: DrawTarget<Color = BinaryColor>> Page<D> for StatusPage {
+impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn handle_touch(&mut self, _point: Point) -> bool {
         let _ = self.app_sender.send(AppEvent::ShowSignatures);
         false // Whole-page listener, not a specific button

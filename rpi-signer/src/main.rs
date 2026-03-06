@@ -30,13 +30,10 @@ use embedded_graphics::geometry::Dimensions;
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::{DrawTarget, Point};
 use epd_2in13_v4::display::Display;
-use epd_2in13_v4::{Device, DeviceConfig};
+use epd_2in13_v4::{Device, device};
 use events::AppEvent;
-use pages::{
-    GreetingPage, Page, PinMode, confirmation::ConfirmationPage, dialog::DialogPage, pin::PinPage,
-    screensaver::ScreensaverPage, signatures::SignaturesPage, status::StatusPage,
-};
-use russignol_ui::pages::{ErrorPage, ProgressPage};
+use pages::{Page, confirmation, dialog, greeting, pin, screensaver, signatures, status};
+use russignol_ui::pages::{error, progress};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -47,7 +44,7 @@ use constants::KEYS_DIR;
 /// Show a fatal error on the display and exit (never returns)
 fn fatal_error(device: &mut Device, title: &str, message: &str) -> ! {
     log::error!("FATAL: {title} - {message}");
-    let mut error_page = ErrorPage::new(title, message);
+    let mut error_page = error::Page::new(title, message);
     let _ = error_page.show(&mut device.display);
     let _ = device.display.update();
     std::process::exit(1)
@@ -199,7 +196,7 @@ fn run_ui_loop(
 ) -> epd_2in13_v4::EpdResult<()> {
     const SCREENSAVER_TIMEOUT: Duration = Duration::from_secs(180);
 
-    let (mut device, touch_events) = Device::new(DeviceConfig {
+    let (mut device, touch_events) = Device::new(device::Config {
         ..Default::default()
     })?;
 
@@ -232,10 +229,10 @@ fn run_ui_loop(
 
     let mut current_page: Box<dyn Page<Display>> = if is_first_boot {
         log::info!("First boot detected - starting setup flow");
-        Box::new(GreetingPage::new(tx.clone()))
+        Box::new(greeting::Page::new(tx.clone()))
     } else {
         log::info!("Normal boot - showing PIN verification");
-        Box::new(PinPage::new(tx.clone(), "Enter\n PIN", PinMode::Verify))
+        Box::new(pin::Page::new(tx.clone(), "Enter\n PIN", pin::Mode::Verify))
     };
     current_page.show(&mut device.display)?;
     device.display.update()?;
@@ -371,7 +368,7 @@ fn handle_touch(
                 *screensaver_active = false;
             }
             *shutdown_saved_page = saved_page.take();
-            *current_page = Box::new(ConfirmationPage::new(
+            *current_page = Box::new(confirmation::Page::new(
                 app.tx.clone(),
                 "Shutdown the device?",
                 AppEvent::Shutdown,
@@ -404,7 +401,7 @@ fn handle_touch(
             app.pending_tap = None;
             let old_page = std::mem::replace(
                 current_page,
-                Box::new(ConfirmationPage::new(
+                Box::new(confirmation::Page::new(
                     app.tx.clone(),
                     "Shutdown the device?",
                     AppEvent::Shutdown,
@@ -438,27 +435,35 @@ fn construct_page(
     signing_activity: &Arc<Mutex<signing_activity::SigningActivity>>,
 ) -> Box<dyn Page<Display>> {
     match spec {
-        PageSpec::PinCreate => {
-            Box::new(PinPage::new(tx.clone(), "Create\nnew PIN", PinMode::Create))
+        PageSpec::PinCreate => Box::new(pin::Page::new(
+            tx.clone(),
+            "Create\nnew PIN",
+            pin::Mode::Create,
+        )),
+        PageSpec::PinConfirm => Box::new(pin::Page::new(
+            tx.clone(),
+            "Confirm\nPIN",
+            pin::Mode::Confirm,
+        )),
+        PageSpec::PinVerify => {
+            Box::new(pin::Page::new(tx.clone(), "Enter\nPIN", pin::Mode::Verify))
         }
-        PageSpec::PinConfirm => {
-            Box::new(PinPage::new(tx.clone(), "Confirm\nPIN", PinMode::Confirm))
+        PageSpec::Status => Box::new(status::Page::new(tx.clone(), signing_activity.clone())),
+        PageSpec::Signatures => {
+            Box::new(signatures::Page::new(tx.clone(), signing_activity.clone()))
         }
-        PageSpec::PinVerify => Box::new(PinPage::new(tx.clone(), "Enter\nPIN", PinMode::Verify)),
-        PageSpec::Status => Box::new(StatusPage::new(tx.clone(), signing_activity.clone())),
-        PageSpec::Signatures => Box::new(SignaturesPage::new(tx.clone(), signing_activity.clone())),
-        PageSpec::Screensaver => Box::new(ScreensaverPage::new()),
+        PageSpec::Screensaver => Box::new(screensaver::Page::new()),
         PageSpec::Dialog {
             message,
             on_dismiss,
-        } => Box::new(DialogPage::new(tx.clone(), &message, on_dismiss)),
+        } => Box::new(dialog::Page::new(tx.clone(), &message, on_dismiss)),
         PageSpec::Confirmation {
             message,
             on_confirm,
             on_cancel,
             warning,
             button_text,
-        } => Box::new(ConfirmationPage::new(
+        } => Box::new(confirmation::Page::new(
             tx.clone(),
             &message,
             on_confirm,
@@ -473,7 +478,7 @@ fn construct_page(
             on_cancel,
             warning,
             button_text,
-        } => Box::new(ConfirmationPage::new_with_pairs(
+        } => Box::new(confirmation::Page::new_with_pairs(
             tx.clone(),
             &title,
             pairs,
@@ -482,7 +487,7 @@ fn construct_page(
             warning,
             &button_text,
         )),
-        PageSpec::Error { title, message } => Box::new(ErrorPage::new(&title, &message)),
+        PageSpec::Error { title, message } => Box::new(error::Page::new(&title, &message)),
         PageSpec::DeviceLocked => unreachable!("DeviceLocked handled directly in apply_effects"),
     }
 }
@@ -575,7 +580,7 @@ fn apply_effects(
             Effect::SaveCurrentPage => {
                 *saved_page = Some(std::mem::replace(
                     current_page,
-                    Box::new(ScreensaverPage::new()),
+                    Box::new(screensaver::Page::new()),
                 ));
             }
             Effect::RestoreSavedPage => {
@@ -636,13 +641,13 @@ fn apply_show_progress(
     percent: u8,
 ) -> epd_2in13_v4::EpdResult<()> {
     if let Some(duration) = estimated_duration {
-        let progress = ProgressPage::new_timed(message, duration).with_modal(modal);
+        let progress = progress::Page::new_timed(message, duration).with_modal(modal);
         app.animation_interval = progress.animation_interval();
         app.needs_animation = true;
         app.current_page_modal = modal;
         *current_page = Box::new(progress);
     } else {
-        let mut progress = ProgressPage::new(message);
+        let mut progress = progress::Page::new(message);
         progress.set_progress(message, percent);
         app.current_page_modal = false;
         app.needs_animation = false;
@@ -770,7 +775,7 @@ fn apply_restore_shutdown(
     if let Some(page) = shutdown_saved_page.take() {
         *current_page = page;
     } else {
-        *current_page = Box::new(StatusPage::new(
+        *current_page = Box::new(status::Page::new(
             app.tx.clone(),
             app.signing_activity.clone(),
         ));
@@ -826,7 +831,7 @@ fn apply_watermark_update(
     };
 
     if let Some(msg) = error_msg {
-        let page = Box::new(DialogPage::new(
+        let page = Box::new(dialog::Page::new(
             app.tx.clone(),
             &msg,
             AppEvent::DialogDismissed,

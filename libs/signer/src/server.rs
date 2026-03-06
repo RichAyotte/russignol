@@ -10,7 +10,7 @@ use crate::high_watermark::{ChainId, HighWatermark};
 use crate::magic_bytes;
 use crate::protocol::encoding::{decode_request, encode_response};
 use crate::protocol::{SignerRequest, SignerResponse};
-use crate::signer::{SignerHandler, UnencryptedSigner};
+use crate::signer::{Handler, Unencrypted};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -81,18 +81,18 @@ impl Drop for RequestGuard {
 
 /// Server error
 #[derive(Debug, thiserror::Error)]
-pub enum ServerError {
+pub enum Error {
     /// IO error
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 
     /// Protocol error
     #[error("Protocol error: {0}")]
-    Protocol(#[from] crate::protocol::ProtocolError),
+    Protocol(#[from] crate::protocol::Error),
 
     /// Signer error
     #[error("Signer error: {0}")]
-    Signer(#[from] crate::signer::SignerError),
+    Signer(#[from] crate::signer::Error),
 
     /// Watermark error
     #[error("Watermark error: {0}")]
@@ -128,19 +128,19 @@ pub enum ServerError {
 }
 
 /// Result type for server operations
-pub type Result<T> = std::result::Result<T, ServerError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 // Implement From for PoisonError to enable ? operator on lock operations
-impl<T> From<std::sync::PoisonError<T>> for ServerError {
+impl<T> From<std::sync::PoisonError<T>> for Error {
     fn from(e: std::sync::PoisonError<T>) -> Self {
-        ServerError::Internal(format!("Lock poisoned: {e}"))
+        Error::Internal(format!("Lock poisoned: {e}"))
     }
 }
 
 /// Key manager for storing and retrieving signers
 pub struct KeyManager {
     /// Map of public key hash to signer
-    signers: HashMap<PublicKeyHash, UnencryptedSigner>,
+    signers: HashMap<PublicKeyHash, Unencrypted>,
     /// Map of public key hash to key name
     key_names: HashMap<PublicKeyHash, String>,
 }
@@ -156,16 +156,20 @@ impl KeyManager {
     }
 
     /// Add a signer with its name
-    pub fn add_signer(&mut self, pkh: PublicKeyHash, signer: UnencryptedSigner, name: String) {
+    pub fn add_signer(&mut self, pkh: PublicKeyHash, signer: Unencrypted, name: String) {
         self.signers.insert(pkh, signer);
         self.key_names.insert(pkh, name);
     }
 
     /// Get a signer by public key hash
-    pub fn get_signer(&self, pkh: &PublicKeyHash) -> Result<&UnencryptedSigner> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no signer is registered for the given public key hash.
+    pub fn get_signer(&self, pkh: &PublicKeyHash) -> Result<&Unencrypted> {
         self.signers
             .get(pkh)
-            .ok_or_else(|| ServerError::KeyNotFound(pkh.to_b58check()))
+            .ok_or_else(|| Error::KeyNotFound(pkh.to_b58check()))
     }
 
     /// Get the name of a key by public key hash
@@ -299,6 +303,11 @@ impl RequestHandler {
     }
 
     /// Handle a signer request
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requested key is not found, signing fails, or a watermark
+    /// violation is detected.
     pub fn handle_request(&self, req: SignerRequest) -> Result<(SignerResponse, Option<ChainId>)> {
         match req {
             SignerRequest::Sign {
@@ -411,7 +420,7 @@ impl RequestHandler {
                         drop(wm);
                         callback(pkh, chain_id, current_level, requested_level);
                         let cycles = gap / blocks_per_cycle;
-                        return Err(ServerError::Watermark(
+                        return Err(Error::Watermark(
                             crate::high_watermark::WatermarkError::LargeLevelGap {
                                 current_level,
                                 requested_level,
@@ -436,9 +445,9 @@ impl RequestHandler {
 
         // Create handler with same magic byte restrictions
         let handler = if let Some(ref allowed) = self.allowed_magic_bytes {
-            SignerHandler::new(signer.clone(), Some(allowed.clone()))
+            Handler::new(signer.clone(), Some(allowed.clone()))
         } else {
-            SignerHandler::new(signer.clone(), None)
+            Handler::new(signer.clone(), None)
         };
 
         // Extract key name before dropping keys lock
@@ -470,7 +479,7 @@ impl RequestHandler {
                     if let Some(ref callback) = self.watermark_error_callback {
                         callback(pkh, chain_id, &e);
                     }
-                    return Err(ServerError::Watermark(e));
+                    return Err(Error::Watermark(e));
                 }
             };
 
@@ -512,7 +521,7 @@ impl RequestHandler {
                     log::error!(
                         "CRITICAL: Watermark write failed, refusing to return signature: {e}"
                     );
-                    return Err(ServerError::Watermark(e));
+                    return Err(Error::Watermark(e));
                 }
 
                 let signature = sign_result?;
@@ -635,7 +644,7 @@ impl RequestHandler {
         let keys = self.keys.read()?;
         let signer = keys.get_signer(&pkh)?;
 
-        let handler = SignerHandler::new(signer.clone(), None);
+        let handler = Handler::new(signer.clone(), None);
 
         // Generate nonce directly (requests are serial)
         let nonce = handler.deterministic_nonce(data);
@@ -652,7 +661,7 @@ impl RequestHandler {
         let keys = self.keys.read()?;
         let signer = keys.get_signer(&pkh)?;
 
-        let handler = SignerHandler::new(signer.clone(), None);
+        let handler = Handler::new(signer.clone(), None);
 
         // Generate nonce hash directly (requests are serial)
         let nonce_hash = handler.deterministic_nonce_hash(data);
@@ -665,7 +674,7 @@ impl RequestHandler {
         let keys = self
             .keys
             .read()
-            .map_err(|e| ServerError::Internal(format!("Lock poisoned: {e}")))?;
+            .map_err(|e| Error::Internal(format!("Lock poisoned: {e}")))?;
         // Check if key exists
         let _ = keys.get_signer(&pkh)?;
 
@@ -676,7 +685,7 @@ impl RequestHandler {
     /// Handle known keys request
     fn handle_known_keys(&self) -> Result<SignerResponse> {
         if !self.allow_list_known_keys {
-            return Err(ServerError::NotAuthorized(
+            return Err(Error::NotAuthorized(
                 "Listing known keys is not authorized. Use --allow-list-known-keys to enable."
                     .to_string(),
             ));
@@ -693,7 +702,7 @@ impl RequestHandler {
         override_pk: Option<&PublicKey>,
     ) -> Result<SignerResponse> {
         if !self.allow_prove_possession {
-            return Err(ServerError::NotAuthorized(
+            return Err(Error::NotAuthorized(
                 "Proof of possession is not authorized. Use --allow-to-prove-possession to enable."
                     .to_string(),
             ));
@@ -701,7 +710,7 @@ impl RequestHandler {
         let keys = self.keys.read()?;
         let signer = keys.get_signer(&pkh)?;
 
-        let handler = SignerHandler::new(signer.clone(), None);
+        let handler = Handler::new(signer.clone(), None);
         let proof = handler.bls_prove_possession(override_pk)?;
 
         Ok(SignerResponse::Signature(proof))
@@ -798,7 +807,7 @@ fn read_message_length(
         }
         if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
             log::debug!("Timeout reading from {addr}: {e}");
-            return Err(ServerError::Timeout);
+            return Err(Error::Timeout);
         }
         log::debug!("Read error from {addr}: {e}");
         return Err(e.into());
@@ -811,7 +820,7 @@ fn read_message_length(
     Ok(Some(msg_len))
 }
 
-fn check_http_and_size_error(len_buf: [u8; 2], addr: SocketAddr, msg_len: usize) -> ServerError {
+fn check_http_and_size_error(len_buf: [u8; 2], addr: SocketAddr, msg_len: usize) -> Error {
     let possible_http = String::from_utf8_lossy(&len_buf);
     if possible_http.starts_with("GET ")
         || possible_http.starts_with("POST")
@@ -824,12 +833,12 @@ fn check_http_and_size_error(len_buf: [u8; 2], addr: SocketAddr, msg_len: usize)
         eprintln!(
             "   SOLUTION: Change baker config from 'http://...' to 'tcp://...' or just the address"
         );
-        ServerError::Io(std::io::Error::new(
+        Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "HTTP protocol not supported - use raw TCP (tcp://... or just address)",
         ))
     } else {
-        ServerError::MessageTooLarge(msg_len)
+        Error::MessageTooLarge(msg_len)
     }
 }
 
@@ -901,7 +910,7 @@ fn process_request(
 /// TCP signer server
 ///
 /// Corresponds to: `src/bin_signer/socket_daemon.ml`
-pub struct SignerServer {
+pub struct Server {
     /// Listen address
     address: SocketAddr,
     /// Handler for signing requests
@@ -916,7 +925,7 @@ pub struct SignerServer {
     connection_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
-impl SignerServer {
+impl Server {
     /// Create new signer server
     #[must_use]
     pub fn new(
@@ -964,6 +973,11 @@ impl SignerServer {
     /// by the calling application. Call `shutdown()` for graceful shutdown.
     ///
     /// Corresponds to: src/bin_signer/socket_daemon.ml:195-281
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding to the address fails or the accept loop encounters
+    /// an unrecoverable I/O error.
     pub fn run(&self) -> Result<()> {
         let listener = TcpListener::bind(self.address)?;
 
@@ -1026,7 +1040,7 @@ mod tests {
         let mut mgr = KeyManager::new();
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
-        let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
 
         mgr.add_signer(pkh, signer, "test_key".to_string());
 
@@ -1047,7 +1061,7 @@ mod tests {
     fn test_request_handler_public_key() {
         let seed = [42u8; 32];
         let (pkh, pk, _sk) = generate_key(Some(&seed)).unwrap();
-        let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
 
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh, signer, "test_key".to_string());
@@ -1079,8 +1093,8 @@ mod tests {
         let (pkh1, _pk1, _sk1) = generate_key(Some(&seed1)).unwrap();
         let (pkh2, _pk2, _sk2) = generate_key(Some(&seed2)).unwrap();
 
-        let signer1 = UnencryptedSigner::generate(Some(&seed1)).unwrap();
-        let signer2 = UnencryptedSigner::generate(Some(&seed2)).unwrap();
+        let signer1 = Unencrypted::generate(Some(&seed1)).unwrap();
+        let signer2 = Unencrypted::generate(Some(&seed2)).unwrap();
 
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh1, signer1, "key1".to_string());
@@ -1111,7 +1125,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
-        let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
 
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh, signer, "test_key".to_string());
@@ -1173,7 +1187,7 @@ mod tests {
         });
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ServerError::Watermark(_)));
+        assert!(matches!(result.unwrap_err(), Error::Watermark(_)));
     }
 
     #[test]
@@ -1181,7 +1195,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
-        let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
 
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh, signer, "test_key".to_string());
@@ -1246,7 +1260,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
-        let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
 
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh, signer, "test_key".to_string());
@@ -1306,7 +1320,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ServerError::Watermark(crate::high_watermark::WatermarkError::LargeLevelGap { .. })
+                Error::Watermark(crate::high_watermark::WatermarkError::LargeLevelGap { .. })
             ),
             "Expected LargeLevelGap error, got: {err:?}"
         );
@@ -1323,7 +1337,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
-        let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
 
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh, signer, "test_key".to_string());
@@ -1387,7 +1401,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let seed = [42u8; 32];
         let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
-        let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
 
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh, signer, "test_key".to_string());

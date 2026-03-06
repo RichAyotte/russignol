@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::UnencryptedSigner;
+use crate::signer::Unencrypted;
 
 // OCaml-compatible format structures
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,6 +59,7 @@ pub struct KeyManager {
 
 impl KeyManager {
     /// Create a new key manager with all files in the same directory
+    #[must_use]
     pub fn new(base_dir: Option<PathBuf>) -> Self {
         let base_dir = base_dir.unwrap_or_else(|| {
             ProjectDirs::from("org", "tezos", "signer").map_or_else(
@@ -80,6 +81,7 @@ impl KeyManager {
     ///
     /// - `base_dir`: Directory for `public_keys` and `public_key_hashs`
     /// - `secret_keys_dir`: Separate directory for `secret_keys` (e.g., tmpfs for decrypted keys)
+    #[must_use]
     pub fn new_with_secret_keys_path(
         base_dir: Option<PathBuf>,
         secret_keys_dir: Option<PathBuf>,
@@ -101,6 +103,7 @@ impl KeyManager {
     }
 
     /// Get the base directory path
+    #[must_use]
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
     }
@@ -131,6 +134,7 @@ impl KeyManager {
     }
 
     /// Load all keys from OCaml-compatible files
+    #[must_use]
     pub fn load_keys(&self) -> HashMap<String, StoredKey> {
         let mut result = HashMap::new();
 
@@ -224,6 +228,11 @@ impl KeyManager {
     /// 2. Calling `save_public_keys_only()` to persist public keys
     ///
     /// **SECURITY**: Secret keys must NEVER be written to disk unencrypted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a key with the given name already exists (and `force` is false)
+    /// or if key generation fails.
     pub fn gen_keys_in_memory(&self, name: &str, force: bool) -> Result<StoredKey, String> {
         let keys = self.load_keys();
 
@@ -233,8 +242,8 @@ impl KeyManager {
             ));
         }
 
-        let signer = UnencryptedSigner::generate(None)
-            .map_err(|e| format!("Failed to generate keypair: {e}"))?;
+        let signer =
+            Unencrypted::generate(None).map_err(|e| format!("Failed to generate keypair: {e}"))?;
 
         let pkh = signer.public_key_hash().to_b58check();
         let pk = signer.public_key().to_b58check();
@@ -252,6 +261,10 @@ impl KeyManager {
     ///
     /// **SECURITY**: This method intentionally does NOT write `secret_keys`.
     /// Secret keys must be encrypted before writing to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if directory creation, JSON serialization, or file I/O fails.
     pub fn save_public_keys_only(&self, keys: &[StoredKey]) -> Result<(), String> {
         self.ensure_dirs()
             .map_err(|e| format!("Failed to create directories: {e}"))?;

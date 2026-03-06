@@ -230,7 +230,7 @@ fn test_stress_concurrent_watermarks() {
 
 /// TOCTOU test: two threads race at the same level
 ///
-/// With `&mut self` behind RwLock, double-signing is impossible by construction.
+/// With `&mut self` behind `RwLock`, double-signing is impossible by construction.
 #[test]
 fn test_toctou_exploit_attempt() {
     let temp_dir = TempDir::new().unwrap();
@@ -307,7 +307,7 @@ fn test_toctou_exploit_attempt() {
 /// Test: concurrent sign requests at same level, different rounds.
 ///
 /// Verifies that disk always has the highest round after concurrent requests.
-/// With write lock held through write_watermark, requests are serialized and
+/// With write lock held through `write_watermark`, requests are serialized and
 /// the disk file must reflect the latest accepted round.
 #[test]
 fn test_concurrent_same_level_different_rounds_disk_consistency() {
@@ -387,9 +387,9 @@ fn test_concurrent_same_level_different_rounds_disk_consistency() {
     println!("Good: Disk always consistent after {iterations} concurrent round iterations");
 }
 
-/// Test: rollback_disk_watermark restores previous state after BLS failure.
+/// Test: `rollback_disk_watermark` restores previous state after BLS failure.
 ///
-/// Simulates the scenario where BLS signing fails after write_watermark
+/// Simulates the scenario where BLS signing fails after `write_watermark`
 /// has already persisted. Verifies both in-memory and disk are rolled back.
 #[test]
 fn test_rollback_disk_watermark_after_sign_failure() {
@@ -458,9 +458,9 @@ fn test_rollback_disk_watermark_after_sign_failure() {
     }
 }
 
-/// Test: .prev backup file is written after write_watermark
+/// Test: `.prev` backup file is written after `write_watermark`
 ///
-/// Verifies that the .prev file has valid data after write_watermark.
+/// Verifies that the `.prev` file has valid data after `write_watermark`.
 /// Note: .prev is best-effort (no fsync) — it reaches disk via OS writeback.
 #[test]
 fn test_prev_file_is_written() {

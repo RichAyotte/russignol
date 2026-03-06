@@ -37,9 +37,9 @@ async fn handle_sign(&self, pkh: PublicKeyHash, data: Vec<u8>) -> Result<SignerR
 
     // Create handler with same magic byte restrictions
     let handler = if let Some(ref allowed) = self.allowed_magic_bytes {
-        SignerHandler::new(signer.clone(), Some(allowed.clone()))
+        signer::Handler::new(signer.clone(), Some(allowed.clone()))
     } else {
-        SignerHandler::new(signer.clone(), None)
+        signer::Handler::new(signer.clone(), None)
     };
 
     #[cfg(feature = "perf-trace")]

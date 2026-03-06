@@ -7,13 +7,15 @@ pub mod error;
 pub mod pin;
 pub mod progress;
 
-pub use error::ErrorPage;
-pub use pin::{MAX_PIN_LENGTH, MIN_PIN_LENGTH, PinEvent, PinMode, PinPage};
-pub use progress::ProgressPage;
+pub use pin::{MAX_PIN_LENGTH, MIN_PIN_LENGTH};
 
 /// Trait for UI pages that can be drawn on a display
 pub trait Page<D: DrawTarget<Color = BinaryColor>> {
     /// Draw the page content to the display
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if drawing to the display fails.
     fn draw(&mut self, display: &mut D) -> Result<(), D::Error>;
 
     /// Handle a touch event at the given point.
@@ -24,6 +26,10 @@ pub trait Page<D: DrawTarget<Color = BinaryColor>> {
     }
 
     /// Clear the display and draw the page (convenience method)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if clearing or drawing to the display fails.
     fn show(&mut self, display: &mut D) -> Result<(), D::Error> {
         display.clear(BinaryColor::On)?;
         self.draw(display)

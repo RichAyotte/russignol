@@ -4,8 +4,7 @@
 //! Run with: cargo run --example `tcp_server_demo`
 
 use russignol_signer_lib::{
-    HighWatermark, RequestHandler, ServerKeyManager, SignerServer, UnencryptedSigner,
-    bls::generate_key,
+    HighWatermark, RequestHandler, ServerKeyManager, bls::generate_key, server, signer,
 };
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
@@ -23,8 +22,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (pkh1, _pk1, _sk1) = generate_key(Some(&seed1))?;
     let (pkh2, _pk2, _sk2) = generate_key(Some(&seed2))?;
 
-    let signer1 = UnencryptedSigner::generate(Some(&seed1))?;
-    let signer2 = UnencryptedSigner::generate(Some(&seed2))?;
+    let signer1 = signer::Unencrypted::generate(Some(&seed1))?;
+    let signer2 = signer::Unencrypted::generate(Some(&seed2))?;
 
     println!("  ✓ Key 1: {}", pkh1.to_b58check());
     println!("  ✓ Key 2: {}", pkh2.to_b58check());
@@ -52,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Start TCP server
     let addr: SocketAddr = "127.0.0.1:8080".parse()?;
-    let server = SignerServer::new(addr, Arc::new(handler), Some(Duration::from_secs(30)));
+    let server = server::Server::new(addr, Arc::new(handler), Some(Duration::from_secs(30)));
 
     println!("🌐 Starting TCP server on {addr}");
     println!("📡 Waiting for connections...\n");

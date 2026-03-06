@@ -3,10 +3,11 @@
 //! These tests verify the TCP server works correctly with real network connections.
 
 use russignol_signer_lib::{
-    HighWatermark, RequestHandler, ServerKeyManager, SignerServer, UnencryptedSigner,
+    HighWatermark, RequestHandler, ServerKeyManager,
     bls::generate_key,
     high_watermark::ChainId,
     protocol::{SignerRequest, SignerResponse},
+    server, signer,
     test_utils::{preinit_watermarks, send_request},
 };
 use std::net::{SocketAddr, TcpStream};
@@ -19,7 +20,7 @@ fn test_tcp_server_public_key_request() {
     // Setup
     let seed = [42u8; 32];
     let (pkh, pk, _sk) = generate_key(Some(&seed)).unwrap();
-    let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
+    let signer = signer::Unencrypted::generate(Some(&seed)).unwrap();
 
     let mut key_mgr = ServerKeyManager::new();
     key_mgr.add_signer(pkh, signer, "test_key".to_string());
@@ -33,7 +34,7 @@ fn test_tcp_server_public_key_request() {
     );
 
     let addr: SocketAddr = "127.0.0.1:18080".parse().unwrap();
-    let server = SignerServer::new(addr, Arc::new(handler), Some(Duration::from_secs(5)));
+    let server = server::Server::new(addr, Arc::new(handler), Some(Duration::from_secs(5)));
 
     // Start server in background thread
     std::thread::spawn(move || {
@@ -64,8 +65,8 @@ fn test_tcp_server_known_keys() {
     let (pkh1, _pk1, _sk1) = generate_key(Some(&seed1)).unwrap();
     let (pkh2, _pk2, _sk2) = generate_key(Some(&seed2)).unwrap();
 
-    let signer1 = UnencryptedSigner::generate(Some(&seed1)).unwrap();
-    let signer2 = UnencryptedSigner::generate(Some(&seed2)).unwrap();
+    let signer1 = signer::Unencrypted::generate(Some(&seed1)).unwrap();
+    let signer2 = signer::Unencrypted::generate(Some(&seed2)).unwrap();
 
     let mut key_mgr = ServerKeyManager::new();
     key_mgr.add_signer(pkh1, signer1, "key1".to_string());
@@ -80,7 +81,7 @@ fn test_tcp_server_known_keys() {
     );
 
     let addr: SocketAddr = "127.0.0.1:18081".parse().unwrap();
-    let server = SignerServer::new(addr, Arc::new(handler), Some(Duration::from_secs(5)));
+    let server = server::Server::new(addr, Arc::new(handler), Some(Duration::from_secs(5)));
 
     std::thread::spawn(move || {
         let _ = server.run();
@@ -107,7 +108,7 @@ fn test_tcp_server_sign_with_watermark() {
     let temp_dir = TempDir::new().unwrap();
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
-    let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
+    let signer = signer::Unencrypted::generate(Some(&seed)).unwrap();
 
     // Create chain_id matching the one used in block data ([0, 0, 0, 1])
     let mut chain_id_bytes = [0u8; 32];
@@ -131,7 +132,7 @@ fn test_tcp_server_sign_with_watermark() {
     );
 
     let addr: SocketAddr = "127.0.0.1:18082".parse().unwrap();
-    let server = SignerServer::new(addr, Arc::new(handler), Some(Duration::from_secs(5)));
+    let server = server::Server::new(addr, Arc::new(handler), Some(Duration::from_secs(5)));
 
     std::thread::spawn(move || {
         let _ = server.run();
@@ -191,7 +192,7 @@ fn test_tcp_server_sign_with_watermark() {
 fn test_tcp_server_magic_byte_filtering() {
     let seed = [42u8; 32];
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
-    let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
+    let signer = signer::Unencrypted::generate(Some(&seed)).unwrap();
 
     let mut key_mgr = ServerKeyManager::new();
     key_mgr.add_signer(pkh, signer, "test_key".to_string());
@@ -206,7 +207,7 @@ fn test_tcp_server_magic_byte_filtering() {
     );
 
     let addr: SocketAddr = "127.0.0.1:18083".parse().unwrap();
-    let server = SignerServer::new(addr, Arc::new(handler), Some(Duration::from_secs(5)));
+    let server = server::Server::new(addr, Arc::new(handler), Some(Duration::from_secs(5)));
 
     std::thread::spawn(move || {
         let _ = server.run();
@@ -237,7 +238,7 @@ fn test_tcp_server_magic_byte_filtering() {
 fn test_tcp_server_concurrent_connections() {
     let seed = [42u8; 32];
     let (public_key_hash, _public_key, _secret_key) = generate_key(Some(&seed)).unwrap();
-    let signer = UnencryptedSigner::generate(Some(&seed)).unwrap();
+    let signer = signer::Unencrypted::generate(Some(&seed)).unwrap();
 
     let mut key_mgr = ServerKeyManager::new();
     key_mgr.add_signer(public_key_hash, signer, "test_key".to_string());
@@ -251,7 +252,7 @@ fn test_tcp_server_concurrent_connections() {
     );
 
     let addr: SocketAddr = "127.0.0.1:18084".parse().unwrap();
-    let server = SignerServer::new(
+    let server = server::Server::new(
         addr,
         Arc::new(request_handler),
         Some(Duration::from_secs(5)),

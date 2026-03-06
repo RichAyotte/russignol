@@ -9,10 +9,10 @@ use thiserror::Error;
 
 /// Signer errors
 #[derive(Error, Debug)]
-pub enum SignerError {
+pub enum Error {
     /// BLS cryptographic error
     #[error("BLS error: {0}")]
-    Bls(#[from] bls::BlsError),
+    Bls(#[from] bls::Error),
 
     /// Magic byte validation error
     #[error("Magic byte error: {0}")]
@@ -28,7 +28,7 @@ pub enum SignerError {
 }
 
 /// Result type for signer operations
-pub type Result<T> = std::result::Result<T, SignerError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Signature version enumeration
 /// Corresponds to: `src/lib_crypto/signature.ml` - Version type
@@ -45,13 +45,13 @@ pub enum SignatureVersion {
 /// Unencrypted signer implementation
 /// Corresponds to: `src/lib_signer_backends/unencrypted.ml`
 #[derive(Clone)]
-pub struct UnencryptedSigner {
+pub struct Unencrypted {
     secret_key: SecretKey,
     public_key: PublicKey,
     public_key_hash: PublicKeyHash,
 }
 
-impl UnencryptedSigner {
+impl Unencrypted {
     /// Create a new unencrypted signer from a secret key
     /// Corresponds to: unencrypted.ml:43-45 - `secret_key`
     #[must_use]
@@ -67,6 +67,10 @@ impl UnencryptedSigner {
     }
 
     /// Create from base58check encoded secret key
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the base58check string is invalid or decodes to an invalid key.
     pub fn from_b58check(sk_b58: &str) -> Result<Self> {
         let secret_key = SecretKey::from_b58check(sk_b58)?;
         Ok(Self::new(secret_key))
@@ -74,6 +78,10 @@ impl UnencryptedSigner {
 
     /// Generate a new random signer
     /// Corresponds to: src/lib_crypto/bls.ml:359-371 - `generate_key`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if key generation fails.
     pub fn generate(seed: Option<&[u8; 32]>) -> Result<Self> {
         let (pkh, pk, sk) = bls::generate_key(seed)?;
         Ok(Self {
@@ -111,6 +119,10 @@ impl UnencryptedSigner {
     ///
     /// # Returns
     /// * BLS12-381 signature
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signature version does not support BLS12-381.
     pub fn sign(
         &self,
         data: &[u8],
@@ -122,13 +134,13 @@ impl UnencryptedSigner {
         match version {
             Some(SignatureVersion::V0) => {
                 // BLS not supported in V0
-                Err(SignerError::SigningFailed(
+                Err(Error::SigningFailed(
                     "BLS12-381 not supported in Signature version 0".to_string(),
                 ))
             }
             Some(SignatureVersion::V1) => {
                 // BLS not supported in V1
-                Err(SignerError::SigningFailed(
+                Err(Error::SigningFailed(
                     "BLS12-381 not supported in Signature version 1".to_string(),
                 ))
             }
@@ -147,6 +159,10 @@ impl UnencryptedSigner {
     ///
     /// # Returns
     /// * Proof of possession signature
+    ///
+    /// # Errors
+    ///
+    /// This method is infallible for BLS keys but returns `Result` for trait compatibility.
     pub fn bls_prove_possession(&self, override_pk: Option<&PublicKey>) -> Result<Signature> {
         let msg_to_sign_vec = if let Some(pk) = override_pk {
             // If override_pk is provided (for testing), use its bytes directly.
@@ -183,13 +199,13 @@ impl UnencryptedSigner {
 
 /// Signer handler with magic byte validation
 /// Corresponds to: `src/bin_signer/handler.ml`
-pub struct SignerHandler {
+pub struct Handler {
     /// The underlying unencrypted signer
-    pub signer: UnencryptedSigner,
+    pub signer: Unencrypted,
     allowed_magic_bytes: Option<Vec<u8>>,
 }
 
-impl SignerHandler {
+impl Handler {
     /// Create a new signer handler
     ///
     /// # Arguments
@@ -198,7 +214,7 @@ impl SignerHandler {
     ///   If None, all magic bytes are allowed.
     ///   Use `Some(vec![0x11, 0x12, 0x13])` for Tenderbake only.
     #[must_use]
-    pub fn new(signer: UnencryptedSigner, allowed_magic_bytes: Option<Vec<u8>>) -> Self {
+    pub fn new(signer: Unencrypted, allowed_magic_bytes: Option<Vec<u8>>) -> Self {
         Self {
             signer,
             allowed_magic_bytes,
@@ -206,14 +222,18 @@ impl SignerHandler {
     }
 
     /// Create handler from base58check encoded secret key
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the base58check string is invalid or decodes to an invalid key.
     pub fn from_b58check(sk_b58: &str, allowed_magic_bytes: Option<Vec<u8>>) -> Result<Self> {
-        let signer = UnencryptedSigner::from_b58check(sk_b58)?;
+        let signer = Unencrypted::from_b58check(sk_b58)?;
         Ok(Self::new(signer, allowed_magic_bytes))
     }
 
     /// Create handler with Tenderbake-only magic bytes (0x11, 0x12, 0x13)
     #[must_use]
-    pub fn new_tenderbake_only(signer: UnencryptedSigner) -> Self {
+    pub fn new_tenderbake_only(signer: Unencrypted) -> Self {
         Self::new(signer, Some(vec![0x11, 0x12, 0x13]))
     }
 
@@ -228,6 +248,11 @@ impl SignerHandler {
     /// # Returns
     /// * BLS12-381 signature if magic byte is valid
     /// * Error if magic byte check fails
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the magic byte is not allowed or the signature version
+    /// does not support BLS12-381.
     pub fn sign(
         &self,
         data: &[u8],
@@ -256,6 +281,10 @@ impl SignerHandler {
     }
 
     /// Prove possession of the secret key
+    ///
+    /// # Errors
+    ///
+    /// This method is infallible for BLS keys but returns `Result` for trait compatibility.
     pub fn bls_prove_possession(&self, override_pk: Option<&PublicKey>) -> Result<Signature> {
         self.signer.bls_prove_possession(override_pk)
     }
@@ -283,9 +312,9 @@ impl SignerHandler {
 mod tests {
     use super::*;
 
-    fn create_test_signer() -> UnencryptedSigner {
+    fn create_test_signer() -> Unencrypted {
         let seed = [42u8; 32];
-        UnencryptedSigner::generate(Some(&seed)).unwrap()
+        Unencrypted::generate(Some(&seed)).unwrap()
     }
 
     #[test]
@@ -322,7 +351,7 @@ mod tests {
     #[test]
     fn test_handler_no_magic_byte_restriction() {
         let signer = create_test_signer();
-        let handler = SignerHandler::new(signer, None);
+        let handler = Handler::new(signer, None);
 
         // Any data should be signable without magic byte restriction
         let data = b"\xFFtest";
@@ -335,7 +364,7 @@ mod tests {
     #[test]
     fn test_handler_tenderbake_only() {
         let signer = create_test_signer();
-        let handler = SignerHandler::new_tenderbake_only(signer);
+        let handler = Handler::new_tenderbake_only(signer);
 
         // Tenderbake block should work
         let data = b"\x11block_data";
@@ -365,7 +394,7 @@ mod tests {
     #[test]
     fn test_bls_prove_possession() {
         let signer = create_test_signer();
-        let handler = SignerHandler::new(signer, None);
+        let handler = Handler::new(signer, None);
 
         let proof = handler.bls_prove_possession(None).unwrap();
 
@@ -380,7 +409,7 @@ mod tests {
     #[test]
     fn test_bls_prove_possession_with_override() {
         let signer = create_test_signer();
-        let handler = SignerHandler::new(signer, None);
+        let handler = Handler::new(signer, None);
 
         let pk = handler.public_key().clone();
         let proof = handler.bls_prove_possession(Some(&pk)).unwrap();
@@ -392,7 +421,7 @@ mod tests {
     #[test]
     fn test_deterministic_nonce() {
         let signer = create_test_signer();
-        let handler = SignerHandler::new(signer, None);
+        let handler = Handler::new(signer, None);
 
         let data = b"Test message";
         let nonce1 = handler.deterministic_nonce(data);
@@ -409,7 +438,7 @@ mod tests {
     #[test]
     fn test_deterministic_nonce_hash() {
         let signer = create_test_signer();
-        let handler = SignerHandler::new(signer, None);
+        let handler = Handler::new(signer, None);
 
         let data = b"Test message";
         let hash1 = handler.deterministic_nonce_hash(data);

@@ -228,6 +228,10 @@ impl HighWatermark {
     /// Create new high watermark tracker
     ///
     /// Loads existing per-key watermark state for the given public key hashes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if creating the base directory or loading watermark files fails.
     pub fn new<P: AsRef<Path>>(base_dir: P, pkhs: &[PublicKeyHash]) -> io::Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
         fs::create_dir_all(&base_dir)?;
@@ -274,6 +278,15 @@ impl HighWatermark {
     /// Returns `Ok(Some(update))` with a [`WatermarkUpdate`] that must be passed
     /// to [`write_watermark`](Self::write_watermark) before returning the signature.
     /// Returns `Ok(None)` for non-watermarked operations (magic byte not 0x11/0x12/0x13).
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic: `ensure_key()` guarantees the key exists before the `.unwrap()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data is invalid, the key is not initialized, or signing
+    /// would violate the high watermark (double-signing protection).
     pub fn check_and_update(
         &mut self,
         chain_id: ChainId,
@@ -375,6 +388,10 @@ impl HighWatermark {
     /// Call this after [`rollback_update`](Self::rollback_update) when BLS signing
     /// fails but `write_watermark` already persisted the advanced value.
     /// Restores disk state to match the rolled-back in-memory state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is not initialized or disk I/O fails.
     pub fn rollback_disk_watermark(&mut self, update: &WatermarkUpdate) -> Result<()> {
         if let Some(prev) = update.prev {
             let per_key = self.per_key_mut(&update.pkh)?;
@@ -392,6 +409,10 @@ impl HighWatermark {
     /// Only called when no ceiling covers the update (slow path).
     /// When a ceiling covers, the caller skips this entirely — no disk I/O
     /// in the signing critical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is not initialized or disk I/O fails.
     pub fn write_watermark(&mut self, update: &WatermarkUpdate) -> Result<()> {
         let per_key = self.per_key_mut(&update.pkh)?;
         let idx = update.idx;
@@ -445,6 +466,10 @@ impl HighWatermark {
     ///
     /// Skips the write if the watermark already advanced past `ceiling_level`
     /// or if an existing ceiling already covers it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is not initialized or disk I/O fails.
     pub fn write_ceiling(
         &mut self,
         pkh: PublicKeyHash,
@@ -491,6 +516,10 @@ impl HighWatermark {
     /// Get current watermark levels for display purposes.
     ///
     /// Returns (`block_level`, `preattest_level`, `attest_level`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key has no watermark state initialized.
     pub fn get_current_levels(
         &self,
         chain_id: ChainId,
@@ -517,6 +546,14 @@ impl HighWatermark {
     /// Update all watermarks to a specific level (round 0).
     ///
     /// Used when a large level gap is detected and the user confirms the update.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic: `ensure_key()` guarantees the key exists before the `.unwrap()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is not initialized or disk I/O fails.
     pub fn update_to_level(
         &mut self,
         _chain_id: ChainId,
@@ -636,6 +673,7 @@ fn load_per_key_watermark(key_dir: &Path) -> io::Result<PerKeyWatermark> {
 }
 
 /// Encode a watermark entry as 40 bytes: level (4B BE) + round (4B BE) + blake3 (32B)
+#[must_use]
 pub fn encode_entry(level: u32, round: u32) -> [u8; WATERMARK_FILE_SIZE] {
     russignol_storage::watermark::encode(level, round)
 }
@@ -1023,7 +1061,7 @@ mod tests {
         let key_dir = temp_dir.path().join(pkh.to_b58check());
         fs::create_dir_all(&key_dir).unwrap();
         // Write 8 bytes instead of 40
-        fs::write(key_dir.join("block_watermark"), &[0u8; 8]).unwrap();
+        fs::write(key_dir.join("block_watermark"), [0u8; 8]).unwrap();
 
         let hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
         assert_eq!(
