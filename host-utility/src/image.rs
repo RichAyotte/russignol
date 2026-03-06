@@ -29,6 +29,114 @@ struct DownloadInfo {
     checksum: Option<String>,
     compressed_size: Option<u64>,
     uncompressed_size: Option<u64>,
+    version: Option<String>,
+    channel: Option<String>,
+}
+
+/// Image provenance metadata threaded through flash pipelines
+pub struct FlashMetadata {
+    pub image_sha256: String,
+    pub image_version: Option<String>,
+    pub channel: Option<String>,
+}
+
+/// Flash manifest written to the boot partition (p1) as `flash-manifest.json`
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct FlashManifest {
+    pub card_id: String,
+    pub flashed_at: String,
+    pub host_version: String,
+    pub image_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+}
+
+/// Manifest filename on boot partition
+pub const MANIFEST_FILENAME: &str = "flash-manifest.json";
+
+/// Generate a 128-bit random card ID as a 32-character hex string
+pub fn generate_card_id() -> Result<String> {
+    let mut buf = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| {
+            use std::io::Read as _;
+            f.read_exact(&mut buf)
+        })
+        .context("Failed to read /dev/urandom")?;
+    Ok(buf.iter().fold(String::with_capacity(32), |mut s, b| {
+        let _ = std::fmt::Write::write_fmt(&mut s, format_args!("{b:02x}"));
+        s
+    }))
+}
+
+/// Compute SHA-256 hash of a file, returning the hex digest
+pub fn compute_file_sha256(path: &Path) -> Result<String> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut reader, &mut hasher).context("Failed to read file for hashing")?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Write a flash manifest to the boot partition (p1, FAT32)
+///
+/// Generates a unique `card_id`, builds the manifest with current timestamp
+/// and host version, writes it as JSON, and returns the `card_id`.
+pub fn write_flash_manifest(device: &Path, metadata: &FlashMetadata) -> Result<String> {
+    let boot_partition = utils::get_partition_path(device, 1);
+    let mount_point = utils::mount_partition(&boot_partition, "vfat", false)?;
+
+    let card_id = generate_card_id()?;
+    let manifest = FlashManifest {
+        card_id: card_id.clone(),
+        flashed_at: chrono::Utc::now().to_rfc3339(),
+        host_version: version::VERSION.to_string(),
+        image_sha256: metadata.image_sha256.clone(),
+        image_version: metadata.image_version.clone(),
+        channel: metadata.channel.clone(),
+    };
+
+    let json =
+        serde_json::to_string_pretty(&manifest).context("Failed to serialize flash manifest")?;
+    let manifest_path = mount_point.join(MANIFEST_FILENAME);
+
+    if let Err(e) = std::fs::write(&manifest_path, &json) {
+        let _ = utils::unmount_partition(&mount_point, &boot_partition);
+        return Err(anyhow::anyhow!(
+            "Failed to write {}: {e}",
+            manifest_path.display()
+        ));
+    }
+
+    utils::unmount_partition(&mount_point, &boot_partition)?;
+    Ok(card_id)
+}
+
+/// Read the `card_id` from a flash manifest on the boot partition
+///
+/// Returns `None` on any failure (missing partition, mount error, parse error,
+/// missing field) — failure means "different card" for same-card detection.
+pub fn read_card_id(device: &Path) -> Option<String> {
+    let boot_partition = utils::get_partition_path(device, 1);
+    if !boot_partition.exists() {
+        return None;
+    }
+
+    let Ok(mount_point) = utils::mount_partition(&boot_partition, "vfat", true) else {
+        return None;
+    };
+
+    let manifest_path = mount_point.join(MANIFEST_FILENAME);
+    let result = std::fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<FlashManifest>(&content).ok())
+        .map(|m| m.card_id);
+
+    let _ = utils::unmount_partition(&mount_point, &boot_partition);
+    result
 }
 
 /// Image subcommands
@@ -416,6 +524,7 @@ fn run_restore_flash(
     device: Option<PathBuf>,
     yes: bool,
     uncompressed_size: Option<u64>,
+    metadata: &FlashMetadata,
 ) -> Result<()> {
     use crate::restore_keys;
 
@@ -431,6 +540,7 @@ fn run_restore_flash(
             image,
             yes,
             uncompressed_size,
+            metadata,
         );
     }
 
@@ -456,7 +566,7 @@ fn run_restore_flash(
     check_device_not_mounted(&target.path)?;
     check_device_has_media(&target.path)?;
 
-    restore_keys::run_dual_reader_restore(&target, image, yes, uncompressed_size, &backup)
+    restore_keys::run_dual_reader_restore(&target, image, yes, uncompressed_size, &backup, metadata)
 }
 
 fn cmd_flash(
@@ -478,12 +588,21 @@ fn cmd_flash(
     {
         bail!("Device not found: {}", dev.display());
     }
+    // Compute image hash for manifest
+    utils::info("Computing image hash...");
+    let image_sha256 = compute_file_sha256(image)?;
+
     // Restore-keys path
     if let Some(restore_keys_arg) = restore_keys {
         println!();
         print_title_bar("💾 Flash SD Card (with key restore)");
         let restore_source = crate::restore_keys::resolve_restore_source(restore_keys_arg)?;
-        return run_restore_flash(&restore_source, image, device, yes, None);
+        let metadata = FlashMetadata {
+            image_sha256,
+            image_version: None,
+            channel: None,
+        };
+        return run_restore_flash(&restore_source, image, device, yes, None, &metadata);
     }
 
     // Normal path
@@ -529,17 +648,28 @@ fn cmd_flash(
     // Re-read partition table so kernel sees new partitions
     reread_partition_table(&target_device.path);
 
-    // Write and verify watermark config
+    // Write flash manifest
+    let metadata = FlashMetadata {
+        image_sha256,
+        image_version: None,
+        channel: None,
+    };
+    write_flash_manifest(&target_device.path, &metadata)
+        .context("Failed to write flash manifest")?;
+
+    finalize_flash(&target_device.path, chain_info.as_ref())
+}
+
+/// Write watermark config (if available), verify it, and print flash success message
+fn finalize_flash(device: &Path, chain_info: Option<&watermark::ChainInfo>) -> Result<()> {
     println!();
-    if let Some(ref info) = chain_info {
-        watermark::write_watermark_config(&target_device.path, info)
+    if let Some(info) = chain_info {
+        watermark::write_watermark_config(device, info)
             .context("Failed to write watermark config")?;
 
-        // Read back to verify and display actual written values
-        let written = watermark::read_watermark_config(&target_device.path)
+        let written = watermark::read_watermark_config(device)
             .context("Failed to read back watermark config")?;
 
-        // Validate chain info
         if written.chain.name.is_empty() || written.chain.id.is_empty() {
             bail!(
                 "Invalid chain info written to SD card:\n  \
@@ -550,7 +680,6 @@ fn cmd_flash(
             );
         }
 
-        // Display verified values
         utils::success("Flash complete!");
         println!(
             "  Chain:       {} ({})",
@@ -583,6 +712,8 @@ fn resolve_download_info(url: Option<String>, include_prerelease: bool) -> Resul
             checksum: None,
             compressed_size: None,
             uncompressed_size: None,
+            version: None,
+            channel: None,
         })
     } else {
         utils::info("Fetching latest version info...");
@@ -601,11 +732,19 @@ fn resolve_download_info(url: Option<String>, include_prerelease: bool) -> Resul
             format_bytes(image_info.compressed_size_bytes)
         ));
 
+        let channel = if version_info.version.contains('-') {
+            "beta"
+        } else {
+            "stable"
+        };
+
         Ok(DownloadInfo {
             url,
             checksum: Some(image_info.sha256.clone()),
             compressed_size: Some(image_info.compressed_size_bytes),
             uncompressed_size: Some(image_info.size_bytes),
+            version: Some(version_info.version.clone()),
+            channel: Some(channel.to_string()),
         })
     }
 }
@@ -641,12 +780,28 @@ fn cmd_download_and_flash(
         )?;
         let image_path = download_with_cache(&dl.url, Some(checksum), dl.compressed_size)?;
 
+        // Compute hash from the downloaded file and verify against release checksum
+        utils::info("Computing image hash...");
+        let image_sha256 = compute_file_sha256(&image_path)?;
+        if image_sha256 != checksum {
+            bail!(
+                "Image hash mismatch after download!\n  Expected: {checksum}\n  Got:      {image_sha256}"
+            );
+        }
+
+        let metadata = FlashMetadata {
+            image_sha256,
+            image_version: dl.version,
+            channel: dl.channel,
+        };
+
         return run_restore_flash(
             &restore_source,
             &image_path,
             device,
             yes,
             dl.uncompressed_size,
+            &metadata,
         );
     }
 
@@ -695,55 +850,31 @@ fn cmd_download_and_flash(
     )?;
     let image_path = download_with_cache(&dl.url, Some(checksum), dl.compressed_size)?;
 
+    // Compute hash from the downloaded file and verify against release checksum
+    utils::info("Computing image hash...");
+    let image_sha256 = compute_file_sha256(&image_path)?;
+    if image_sha256 != checksum {
+        bail!(
+            "Image hash mismatch after download!\n  Expected: {checksum}\n  Got:      {image_sha256}"
+        );
+    }
+
     // Flash the downloaded image
     flash_image_to_device(&image_path, &target_device.path, dl.uncompressed_size)?;
 
     // Re-read partition table so kernel sees new partitions
     reread_partition_table(&target_device.path);
 
-    // Write and verify watermark config
-    println!();
-    if let Some(ref info) = chain_info {
-        watermark::write_watermark_config(&target_device.path, info)
-            .context("Failed to write watermark config")?;
+    // Write flash manifest
+    let metadata = FlashMetadata {
+        image_sha256,
+        image_version: dl.version,
+        channel: dl.channel,
+    };
+    write_flash_manifest(&target_device.path, &metadata)
+        .context("Failed to write flash manifest")?;
 
-        // Read back to verify and display actual written values
-        let written = watermark::read_watermark_config(&target_device.path)
-            .context("Failed to read back watermark config")?;
-
-        // Validate chain info
-        if written.chain.name.is_empty() || written.chain.id.is_empty() {
-            bail!(
-                "Invalid chain info written to SD card:\n  \
-                 Name: '{}'\n  ID: '{}'\n\n\
-                 The watermark config is corrupted. Please reflash the SD card.",
-                written.chain.name,
-                written.chain.id
-            );
-        }
-
-        // Display verified values
-        utils::success("Flash complete!");
-        println!(
-            "  Chain:       {} ({})",
-            written.chain.name.cyan(),
-            written.chain.id.cyan()
-        );
-        println!(
-            "  Head Level:  {}",
-            format_with_separators(written.chain.level).cyan()
-        );
-        println!();
-        println!("  You can now insert the SD card into your Raspberry Pi Zero 2W.");
-    } else {
-        utils::success(
-            "Flash complete! (no watermark config - run 'russignol watermark init' later)",
-        );
-        println!();
-        println!("  You can now insert the SD card into your Raspberry Pi Zero 2W.");
-    }
-
-    Ok(())
+    finalize_flash(&target_device.path, chain_info.as_ref())
 }
 
 fn cmd_list(include_prerelease: bool) -> Result<()> {
@@ -1900,5 +2031,65 @@ mod tests {
         assert_eq!(parse_size_string("32G"), 32 * 1024 * 1024 * 1024);
         assert_eq!(parse_size_string("16M"), 16 * 1024 * 1024);
         assert_eq!(parse_size_string("0B"), 0);
+    }
+
+    #[test]
+    fn test_generate_card_id_format() {
+        let id = generate_card_id().unwrap();
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_generate_card_id_unique() {
+        let id1 = generate_card_id().unwrap();
+        let id2 = generate_card_id().unwrap();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_compute_file_sha256() {
+        use std::io::Write as _;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"hello world").unwrap();
+        tmp.flush().unwrap();
+
+        let hash = compute_file_sha256(tmp.path()).unwrap();
+        // sha256("hello world") = b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[test]
+    fn test_flash_manifest_serialization() {
+        let manifest = FlashManifest {
+            card_id: "a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8".to_string(),
+            flashed_at: "2026-03-06T12:34:56Z".to_string(),
+            host_version: "0.20.0-beta.1".to_string(),
+            image_sha256: "abc123".to_string(),
+            image_version: Some("0.20.0-beta.1".to_string()),
+            channel: Some("beta".to_string()),
+        };
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        assert!(json.contains("\"card_id\""));
+        assert!(json.contains("\"image_version\""));
+        assert!(json.contains("\"channel\""));
+    }
+
+    #[test]
+    fn test_flash_manifest_serialization_skips_none() {
+        let manifest = FlashManifest {
+            card_id: "a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8".to_string(),
+            flashed_at: "2026-03-06T12:34:56Z".to_string(),
+            host_version: "0.20.0-beta.1".to_string(),
+            image_sha256: "abc123".to_string(),
+            image_version: None,
+            channel: None,
+        };
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        assert!(!json.contains("image_version"));
+        assert!(!json.contains("channel"));
     }
 }

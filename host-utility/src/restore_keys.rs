@@ -40,6 +40,8 @@ pub struct SourceBackup {
     pub public_key_hashs: Vec<u8>,
     pub chain_info: Vec<u8>,
     watermarks: Vec<PerKeyWatermarkBackup>,
+    /// Card ID from flash manifest (None for pre-manifest cards)
+    pub source_card_id: Option<String>,
 }
 
 /// Calculate restore partition layout from sfdisk JSON output.
@@ -282,12 +284,16 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
     // p4 reads use .ok() so they can't fail, but unmount consistently
     utils::unmount_partition(&p4_mount, &p4_path)?;
 
+    // Read card_id from flash manifest (None for pre-manifest cards)
+    let source_card_id = image::read_card_id(source_device);
+
     Ok(SourceBackup {
         secret_keys_enc,
         public_keys,
         public_key_hashs,
         chain_info,
         watermarks,
+        source_card_id,
     })
 }
 
@@ -525,38 +531,21 @@ pub fn print_restore_success() {
     println!("  You can now insert the SD card into your Raspberry Pi Zero 2W.");
 }
 
-/// Verify the inserted card is not the source card (user forgot to swap).
+/// Check whether the inserted card is the source card (user forgot to swap).
 ///
-/// Checks whether the device's keys partition (p3) contains the same
-/// `public_key_hashs` as the source backup. If it does, the user likely
-/// forgot to swap cards and would overwrite their source.
-fn verify_not_source_card(device: &Path, backup: &SourceBackup) -> Result<()> {
-    let p3_path = get_partition_path(device, 3);
-    if !p3_path.exists() {
-        // No p3 partition — fresh or non-russignol card, safe to proceed
-        return Ok(());
-    }
+/// Returns `true` if the card is the source card (same `card_id`).
+/// Returns `false` (safe to proceed) if: card IDs differ, target has no
+/// manifest, or source had no manifest (pre-manifest card).
+fn is_source_card(device: &Path, backup: &SourceBackup) -> bool {
+    let target_id = image::read_card_id(device);
+    card_ids_match(&backup.source_card_id, &target_id)
+}
 
-    // Try to mount and read public_key_hashs; if anything fails the card
-    // is clearly different from the source (corrupted, different FS, etc.)
-    let Ok(mount) = utils::mount_partition(&p3_path, "f2fs", true) else {
-        return Ok(());
-    };
-
-    let target_pkh = fs::read(mount.join("public_key_hashs")).ok();
-    let _ = utils::unmount_partition(&mount, &p3_path);
-
-    if let Some(target_pkh) = target_pkh
-        && target_pkh == backup.public_key_hashs
-    {
-        bail!(
-            "This card contains the same keys as the source card!\n  \
-             You may have forgotten to swap cards.\n  \
-             Please remove this card, insert the TARGET card, and try again."
-        );
-    }
-
-    Ok(())
+/// Pure comparison: do the source and target card IDs indicate the same card?
+///
+/// Returns `true` only when both IDs are `Some` and equal.
+fn card_ids_match(source: &Option<String>, target: &Option<String>) -> bool {
+    matches!((source, target), (Some(s), Some(t)) if s == t)
 }
 
 /// Show a destructive operation warning with key/chain details and require
@@ -766,6 +755,13 @@ fn describe_card(device: &Path) -> String {
     )
 }
 
+/// Wait for a card swap in a USB card reader, expecting the **target** card.
+///
+/// Equivalent to `wait_for_card_swap_labeled(device, "target")`.
+fn wait_for_card_swap(device: &Path) -> Result<()> {
+    wait_for_card_swap_labeled(device, "target")
+}
+
 /// Wait for a card swap in a USB card reader.
 ///
 /// A USB card reader keeps its `/dev/sdX` block device even when no card is
@@ -774,8 +770,8 @@ fn describe_card(device: &Path) -> String {
 /// 2. Waits for the new card to be **inserted** (media sectors > 0)
 /// 3. Runs `udevadm settle` to let the kernel finish initializing the device
 ///
-/// Shows live status so the user knows exactly what the utility sees.
-fn wait_for_card_swap(device: &Path) -> Result<()> {
+/// `label` is shown in spinners (e.g. "source" or "target").
+fn wait_for_card_swap_labeled(device: &Path, label: &str) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
 
     // Phase 1: wait for card removal (media disappears)
@@ -800,8 +796,16 @@ fn wait_for_card_swap(device: &Path) -> Result<()> {
         }
     }
 
-    // Phase 2: wait for new card insertion (media appears)
-    let spinner = progress::create_spinner("No card — insert target card");
+    wait_for_card_insert(device, deadline, label)?;
+
+    Ok(())
+}
+
+/// Wait for a card to be inserted and udev to settle.
+///
+/// `label` is shown in the spinner (e.g. "source" or "target").
+fn wait_for_card_insert(device: &Path, deadline: std::time::Instant, label: &str) -> Result<()> {
+    let spinner = progress::create_spinner(&format!("No card — insert {label} card"));
     loop {
         if device.exists() && device_media_sectors(device) > 0 {
             spinner.finish_and_clear();
@@ -811,14 +815,13 @@ fn wait_for_card_swap(device: &Path) -> Result<()> {
             spinner.finish_and_clear();
             bail!(
                 "Timed out waiting for new card in {}.\n  \
-                 Insert the target SD card into the reader.",
+                 Insert the {label} SD card into the reader.",
                 device.display()
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
-    // Phase 3: let udev fully settle (partition nodes, automounter, etc.)
     let spinner = progress::create_spinner("Card detected — waiting for kernel to initialize");
     let _ = Command::new("udevadm")
         .args(["settle", "--timeout=5"])
@@ -826,9 +829,21 @@ fn wait_for_card_swap(device: &Path) -> Result<()> {
     spinner.finish_and_clear();
 
     let desc = describe_card(device);
-    utils::success(&format!("Target card ready ({desc})"));
+    utils::success(&format!(
+        "{} card ready ({desc})",
+        uppercase_first(label)
+    ));
 
     Ok(())
+}
+
+/// Capitalize the first character of a string.
+fn uppercase_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Ensure partition device nodes are visible for the source card.
@@ -878,24 +893,45 @@ pub fn run_single_reader_restore(
     image: &Path,
     yes: bool,
     uncompressed_size: Option<u64>,
+    metadata: &image::FlashMetadata,
 ) -> Result<()> {
-    // Step 1: Read source card (prompt only if not already inserted)
+    // Step 1: Read source card, prompting for swap if the inserted card isn't valid
     if !restore_from.exists() {
         prompt_enter("Insert SOURCE card and press Enter...")?;
         wait_for_device_reappear(restore_from)?;
     }
 
-    ensure_source_partitions_visible(restore_from)?;
-    let spinner = progress::create_spinner("Reading source card...");
-    let backup = read_source_card(restore_from)?;
-    spinner.finish_and_clear();
+    let backup = loop {
+        ensure_source_partitions_visible(restore_from)?;
+        let spinner = progress::create_spinner("Reading source card...");
+        match read_source_card(restore_from) {
+            Ok(backup) => {
+                spinner.finish_and_clear();
+                break backup;
+            }
+            Err(e) => {
+                spinner.finish_and_clear();
+                utils::warning(&format!(
+                    "Could not read source card: {e:#}\n  \
+                     Please insert the SOURCE card (a configured russignol device)."
+                ));
+                wait_for_card_swap_labeled(restore_from, "source")?;
+            }
+        }
+    };
 
     // Step 2: Swap to target card — auto-detect via media presence
     utils::info("Remove SOURCE card from the reader, then insert TARGET card");
     wait_for_card_swap(restore_from)?;
 
-    // Verify the user actually swapped cards
-    verify_not_source_card(restore_from, &backup)?;
+    // Verify the user actually swapped cards, looping until they do
+    while is_source_card(restore_from, &backup) {
+        utils::warning(
+            "This is the same card that was just read (source card).\n  \
+             Please swap it for the TARGET card.",
+        );
+        wait_for_card_swap(restore_from)?;
+    }
 
     // Look up device info for the warning box
     let target = image::lookup_block_device(restore_from)
@@ -915,6 +951,9 @@ pub fn run_single_reader_restore(
     create_and_format_partitions(restore_from)?;
     write_backup_to_target(restore_from, &backup)?;
 
+    image::write_flash_manifest(restore_from, metadata)
+        .context("Failed to write flash manifest")?;
+
     print_restore_success();
     Ok(())
 }
@@ -926,6 +965,7 @@ pub fn run_dual_reader_restore(
     yes: bool,
     uncompressed_size: Option<u64>,
     backup: &SourceBackup,
+    metadata: &image::FlashMetadata,
 ) -> Result<()> {
     // Confirm before flashing
     if !confirm_restore_operation(target, backup, yes)? {
@@ -941,6 +981,9 @@ pub fn run_dual_reader_restore(
     // Step 2: Create partitions and write backup
     create_and_format_partitions(&target.path)?;
     write_backup_to_target(&target.path, backup)?;
+
+    image::write_flash_manifest(&target.path, metadata)
+        .context("Failed to write flash manifest")?;
 
     print_restore_success();
     Ok(())
@@ -963,6 +1006,7 @@ mod tests {
                 preattestation: Some(vec![15, 16]),
                 attestation: Some(vec![17, 18]),
             }],
+            source_card_id: Some("a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8".into()),
         };
 
         backup.zeroize();
@@ -972,6 +1016,38 @@ mod tests {
         assert!(backup.public_key_hashs.is_empty());
         assert!(backup.chain_info.is_empty());
         assert!(backup.watermarks.is_empty());
+        assert_eq!(backup.source_card_id, None);
+    }
+
+    #[test]
+    fn test_card_ids_match_both_same() {
+        let source = Some("aabbccdd".to_string());
+        let target = Some("aabbccdd".to_string());
+        assert!(card_ids_match(&source, &target));
+    }
+
+    #[test]
+    fn test_card_ids_match_both_different() {
+        let source = Some("aabbccdd".to_string());
+        let target = Some("11223344".to_string());
+        assert!(!card_ids_match(&source, &target));
+    }
+
+    #[test]
+    fn test_card_ids_match_source_none() {
+        let target = Some("aabbccdd".to_string());
+        assert!(!card_ids_match(&None, &target));
+    }
+
+    #[test]
+    fn test_card_ids_match_target_none() {
+        let source = Some("aabbccdd".to_string());
+        assert!(!card_ids_match(&source, &None));
+    }
+
+    #[test]
+    fn test_card_ids_match_both_none() {
+        assert!(!card_ids_match(&None, &None));
     }
 
     #[test]
