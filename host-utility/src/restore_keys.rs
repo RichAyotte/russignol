@@ -21,41 +21,18 @@ use crate::utils::{self, get_partition_path};
 /// Re-export for callers and tests.
 pub type RestorePartitionLayout = russignol_storage::PartitionLayout;
 
-/// Watermark data for a single key, held in memory only.
-#[derive(Zeroize, ZeroizeOnDrop)]
-struct PerKeyWatermarkBackup {
-    pkh: String,
-    block: Option<Vec<u8>>,
-    preattestation: Option<Vec<u8>>,
-    attestation: Option<Vec<u8>>,
-}
-
 /// Key data read from a source card, held in memory only.
 ///
 /// Derives `ZeroizeOnDrop` so fields are overwritten when the struct is dropped.
+/// Chain info and watermarks are NOT read from the source card — they come from
+/// the Tezos node to ensure correctness even when restoring from old cards.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SourceBackup {
     pub secret_keys_enc: Vec<u8>,
     pub public_keys: Vec<u8>,
     pub public_key_hashs: Vec<u8>,
-    pub chain_info: Vec<u8>,
-    watermarks: Vec<PerKeyWatermarkBackup>,
     /// Card ID from flash manifest (None for pre-manifest cards)
     pub source_card_id: Option<String>,
-}
-
-impl SourceBackup {
-    /// Return the maximum block watermark level across all keys.
-    pub fn max_watermark_level(&self) -> Option<u32> {
-        self.watermarks
-            .iter()
-            .filter_map(|pk| pk.block.as_deref())
-            .filter_map(|data| {
-                let buf: &[u8; watermark::FILE_SIZE] = data.try_into().ok()?;
-                watermark::decode(buf).map(|(level, _)| level)
-            })
-            .max()
-    }
 }
 
 /// Calculate restore partition layout from sfdisk JSON output.
@@ -232,17 +209,18 @@ pub fn resolve_restore_source(arg: &Path) -> Result<PathBuf> {
     Ok(selected.path)
 }
 
-/// Read key and watermark data from a source card into memory
+/// Read key data from a source card into memory
+///
+/// Only reads key files (`secret_keys.enc`, `public_keys`, `public_key_hashs`).
+/// Chain info and watermarks are derived from the Tezos node, not the source card.
 pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
     let p3_path = get_partition_path(source_device, 3);
-    let p4_path = get_partition_path(source_device, 4);
 
-    if !p3_path.exists() || !p4_path.exists() {
+    if !p3_path.exists() {
         bail!(
             "Source card does not appear to be a configured russignol device\n  \
-             (partitions {} and/or {} not found)",
-            p3_path.display(),
-            p4_path.display()
+             (partition {} not found)",
+            p3_path.display()
         );
     }
 
@@ -257,13 +235,11 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
             fs::read(p3_mount.join("public_keys")).context("Missing public_keys on source card")?;
         let public_key_hashs = fs::read(p3_mount.join("public_key_hashs"))
             .context("Missing public_key_hashs on source card")?;
-        let chain_info = fs::read(p3_mount.join("chain_info.json"))
-            .context("Missing chain_info.json on source card")?;
-        Ok((secret_keys_enc, public_keys, public_key_hashs, chain_info))
+        Ok((secret_keys_enc, public_keys, public_key_hashs))
     })();
 
     // Always unmount p3, even on read error
-    let (secret_keys_enc, public_keys, public_key_hashs, chain_info) = match p3_result {
+    let (secret_keys_enc, public_keys, public_key_hashs) = match p3_result {
         Ok(data) => {
             utils::unmount_partition(&p3_mount, &p3_path)?;
             data
@@ -274,30 +250,6 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
         }
     };
 
-    // Mount data partition (p4) read-only
-    let p4_mount = utils::mount_partition(&p4_path, "f2fs", true)
-        .context("Failed to mount source data partition")?;
-
-    let watermarks_dir = p4_mount.join("watermarks");
-    let mut watermarks = Vec::new();
-    if let Ok(entries) = fs::read_dir(&watermarks_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let pkh = entry.file_name().to_string_lossy().into_owned();
-                watermarks.push(PerKeyWatermarkBackup {
-                    block: fs::read(path.join(watermark::FILENAMES[0])).ok(),
-                    preattestation: fs::read(path.join(watermark::FILENAMES[1])).ok(),
-                    attestation: fs::read(path.join(watermark::FILENAMES[2])).ok(),
-                    pkh,
-                });
-            }
-        }
-    }
-
-    // p4 reads use .ok() so they can't fail, but unmount consistently
-    utils::unmount_partition(&p4_mount, &p4_path)?;
-
     // Read card_id from flash manifest (None for pre-manifest cards)
     let source_card_id = image::read_card_id(source_device);
 
@@ -305,8 +257,6 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
         secret_keys_enc,
         public_keys,
         public_key_hashs,
-        chain_info,
-        watermarks,
         source_card_id,
     })
 }
@@ -404,10 +354,13 @@ pub fn create_and_format_partitions(device: &Path) -> Result<()> {
 }
 
 /// Write backup data to target device partitions
+///
+/// Chain info and watermarks are derived from the node, not the source card.
+/// Watermark directories are created for each key found in `public_key_hashs`.
 pub fn write_backup_to_target(
     device: &Path,
     backup: &SourceBackup,
-    min_watermark_level: Option<u32>,
+    chain_info: &crate::watermark::ChainInfo,
 ) -> Result<()> {
     let p3_path = get_partition_path(device, 3);
     let p4_path = get_partition_path(device, 4);
@@ -424,8 +377,18 @@ pub fn write_backup_to_target(
             .context("Failed to write public_keys")?;
         fs::write(p3_mount.join("public_key_hashs"), &backup.public_key_hashs)
             .context("Failed to write public_key_hashs")?;
-        fs::write(p3_mount.join("chain_info.json"), &backup.chain_info)
-            .context("Failed to write chain_info.json")?;
+        // Generate chain_info.json from node data
+        let chain_info_json = serde_json::json!({
+            "id": chain_info.id,
+            "name": chain_info.name,
+            "blocks_per_cycle": chain_info.blocks_per_cycle,
+        });
+        fs::write(
+            p3_mount.join("chain_info.json"),
+            serde_json::to_string_pretty(&chain_info_json)
+                .context("Failed to serialize chain_info.json")?,
+        )
+        .context("Failed to write chain_info.json")?;
         // Write setup marker so signer skips first-boot setup
         fs::write(p3_mount.join(".setup_complete"), "1")
             .context("Failed to write .setup_complete marker")?;
@@ -447,21 +410,14 @@ pub fn write_backup_to_target(
 
     let p4_result = (|| {
         let watermarks_dir = p4_mount.join("watermarks");
-        for per_key in &backup.watermarks {
-            let key_dir = watermarks_dir.join(&per_key.pkh);
+        let wm_data = watermark::encode(chain_info.level, 0);
+        for key in extract_named_keys(&backup.public_key_hashs) {
+            let key_dir = watermarks_dir.join(&key.address);
             fs::create_dir_all(&key_dir)
-                .with_context(|| format!("Failed to create watermark dir for {}", per_key.pkh))?;
-            for (slot, filename) in [
-                (&per_key.block, watermark::FILENAMES[0]),
-                (&per_key.preattestation, watermark::FILENAMES[1]),
-                (&per_key.attestation, watermark::FILENAMES[2]),
-            ] {
-                if let Some(ref data) =
-                    watermark::effective_watermark(slot.as_deref(), min_watermark_level)
-                {
-                    fs::write(key_dir.join(filename), data)
-                        .with_context(|| format!("Failed to write {filename}"))?;
-                }
+                .with_context(|| format!("Failed to create watermark dir for {}", key.address))?;
+            for filename in &watermark::FILENAMES {
+                fs::write(key_dir.join(filename), wm_data)
+                    .with_context(|| format!("Failed to write {filename}"))?;
             }
         }
         Ok(())
@@ -516,14 +472,6 @@ fn extract_tz4_addresses(public_key_hashs: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Parse chain name and id from `chain_info.json` bytes
-fn parse_chain_info(chain_info: &[u8]) -> Option<(String, String)> {
-    let json: serde_json::Value = serde_json::from_slice(chain_info).ok()?;
-    let name = json.get("name").and_then(|v| v.as_str())?.to_string();
-    let id = json.get("id").and_then(|v| v.as_str())?.to_string();
-    Some((name, id))
-}
-
 /// Map a key alias to a user-friendly label
 fn friendly_key_label(alias: &str) -> &str {
     use crate::constants;
@@ -568,6 +516,7 @@ fn card_ids_match(source: Option<&str>, target: Option<&str>) -> bool {
 pub fn confirm_restore_operation(
     target: &image::BlockDevice,
     backup: &SourceBackup,
+    chain_info: &crate::watermark::ChainInfo,
     yes: bool,
 ) -> Result<bool> {
     let warning_msg = "ALL DATA ON THIS DEVICE WILL BE PERMANENTLY ERASED!";
@@ -585,16 +534,11 @@ pub fn confirm_restore_operation(
         lines.push(format!("{label}: {}", key.address));
     }
 
-    if let Some((name, id)) = parse_chain_info(&backup.chain_info) {
-        lines.push(format!("Chain: {name} ({id})"));
-    }
-
-    if let Some(level) = backup.max_watermark_level() {
-        lines.push(format!(
-            "Head Level: {}",
-            utils::format_with_separators(level)
-        ));
-    }
+    lines.push(format!("Chain: {} ({})", chain_info.name, chain_info.id));
+    lines.push(format!(
+        "Head Level: {}",
+        utils::format_with_separators(chain_info.level)
+    ));
 
     println!();
     println!(
@@ -898,7 +842,7 @@ pub fn run_single_reader_restore(
     yes: bool,
     uncompressed_size: Option<u64>,
     metadata: &image::FlashMetadata,
-    min_watermark_level: Option<u32>,
+    chain_info: &crate::watermark::ChainInfo,
 ) -> Result<()> {
     // Step 1: Read source card, prompting for swap if the inserted card isn't valid
     if !restore_from.exists() {
@@ -943,7 +887,7 @@ pub fn run_single_reader_restore(
         .unwrap_or_else(|_| image::BlockDevice::from_path(restore_from));
 
     // Confirm before flashing
-    if !confirm_restore_operation(&target, &backup, yes)? {
+    if !confirm_restore_operation(&target, &backup, chain_info, yes)? {
         utils::info("Restore cancelled");
         println!();
         return Ok(());
@@ -954,7 +898,7 @@ pub fn run_single_reader_restore(
     image::reread_partition_table(restore_from);
 
     create_and_format_partitions(restore_from)?;
-    write_backup_to_target(restore_from, &backup, min_watermark_level)?;
+    write_backup_to_target(restore_from, &backup, chain_info)?;
 
     image::write_flash_manifest(restore_from, metadata)
         .context("Failed to write flash manifest")?;
@@ -971,10 +915,10 @@ pub fn run_dual_reader_restore(
     uncompressed_size: Option<u64>,
     backup: &SourceBackup,
     metadata: &image::FlashMetadata,
-    min_watermark_level: Option<u32>,
+    chain_info: &crate::watermark::ChainInfo,
 ) -> Result<()> {
     // Confirm before flashing
-    if !confirm_restore_operation(target, backup, yes)? {
+    if !confirm_restore_operation(target, backup, chain_info, yes)? {
         utils::info("Restore cancelled");
         println!();
         return Ok(());
@@ -986,7 +930,7 @@ pub fn run_dual_reader_restore(
 
     // Step 2: Create partitions and write backup
     create_and_format_partitions(&target.path)?;
-    write_backup_to_target(&target.path, backup, min_watermark_level)?;
+    write_backup_to_target(&target.path, backup, chain_info)?;
 
     image::write_flash_manifest(&target.path, metadata)
         .context("Failed to write flash manifest")?;
@@ -1005,13 +949,6 @@ mod tests {
             secret_keys_enc: vec![1, 2, 3, 4],
             public_keys: vec![5, 6, 7],
             public_key_hashs: vec![8, 9],
-            chain_info: vec![10, 11, 12],
-            watermarks: vec![PerKeyWatermarkBackup {
-                pkh: "tz4test".into(),
-                block: Some(vec![13, 14]),
-                preattestation: Some(vec![15, 16]),
-                attestation: Some(vec![17, 18]),
-            }],
             source_card_id: Some("a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8".into()),
         };
 
@@ -1020,8 +957,6 @@ mod tests {
         assert!(backup.secret_keys_enc.is_empty());
         assert!(backup.public_keys.is_empty());
         assert!(backup.public_key_hashs.is_empty());
-        assert!(backup.chain_info.is_empty());
-        assert!(backup.watermarks.is_empty());
         assert_eq!(backup.source_card_id, None);
     }
 
@@ -1190,44 +1125,5 @@ mod tests {
             },
         ];
         assert!(!is_single_reader_mode(restore_from, None, &devices));
-    }
-
-    #[test]
-    fn test_max_watermark_level() {
-        let backup = SourceBackup {
-            secret_keys_enc: vec![],
-            public_keys: vec![],
-            public_key_hashs: vec![],
-            chain_info: vec![],
-            watermarks: vec![
-                PerKeyWatermarkBackup {
-                    pkh: "tz4key1".into(),
-                    block: Some(watermark::encode(100_000, 0).to_vec()),
-                    preattestation: None,
-                    attestation: None,
-                },
-                PerKeyWatermarkBackup {
-                    pkh: "tz4key2".into(),
-                    block: Some(watermark::encode(200_000, 0).to_vec()),
-                    preattestation: None,
-                    attestation: None,
-                },
-            ],
-            source_card_id: None,
-        };
-        assert_eq!(backup.max_watermark_level(), Some(200_000));
-    }
-
-    #[test]
-    fn test_max_watermark_level_no_watermarks() {
-        let backup = SourceBackup {
-            secret_keys_enc: vec![],
-            public_keys: vec![],
-            public_key_hashs: vec![],
-            chain_info: vec![],
-            watermarks: vec![],
-            source_card_id: None,
-        };
-        assert_eq!(backup.max_watermark_level(), None);
     }
 }

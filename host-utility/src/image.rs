@@ -525,7 +525,7 @@ fn run_restore_flash(
     yes: bool,
     uncompressed_size: Option<u64>,
     metadata: &FlashMetadata,
-    min_watermark_level: Option<u32>,
+    chain_info: &watermark::ChainInfo,
 ) -> Result<()> {
     use crate::restore_keys;
 
@@ -542,7 +542,7 @@ fn run_restore_flash(
             yes,
             uncompressed_size,
             metadata,
-            min_watermark_level,
+            chain_info,
         );
     }
 
@@ -575,7 +575,7 @@ fn run_restore_flash(
         uncompressed_size,
         &backup,
         metadata,
-        min_watermark_level,
+        chain_info,
     )
 }
 
@@ -615,6 +615,10 @@ fn cmd_flash(
             image_version: None,
             channel: None,
         };
+        let chain_info = chain_info.as_ref().context(
+            "Node check required for key restore but no configuration found.\n  \
+             Run 'russignol config' first, or use --endpoint to specify your node.",
+        )?;
         return run_restore_flash(
             &restore_source,
             image,
@@ -622,7 +626,7 @@ fn cmd_flash(
             yes,
             None,
             &metadata,
-            chain_info.as_ref().map(|info| info.level),
+            chain_info,
         );
     }
 
@@ -816,6 +820,10 @@ fn cmd_download_and_flash(
             channel: dl.channel,
         };
 
+        let chain_info = chain_info.as_ref().context(
+            "Node check required for key restore but no configuration found.\n  \
+             Run 'russignol config' first, or use --endpoint to specify your node.",
+        )?;
         return run_restore_flash(
             &restore_source,
             &image_path,
@@ -823,7 +831,7 @@ fn cmd_download_and_flash(
             yes,
             dl.uncompressed_size,
             &metadata,
-            chain_info.as_ref().map(|info| info.level),
+            chain_info,
         );
     }
 
