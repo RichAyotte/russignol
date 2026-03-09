@@ -4,7 +4,7 @@
 //! invalid or corrupt files and only accepts valid 40-byte binary entries.
 
 use russignol_signer_lib::bls::generate_key;
-use russignol_signer_lib::high_watermark::{ChainId, HighWatermark, WatermarkError};
+use russignol_signer_lib::high_watermark::{ChainId, HighWatermark};
 use russignol_signer_lib::test_utils::{create_block_data, preinit_watermarks};
 use tempfile::TempDir;
 
@@ -14,7 +14,7 @@ fn chain_id_from_index(n: u32) -> ChainId {
     ChainId::from_bytes(&bytes)
 }
 
-/// Verify that oversized watermark files are rejected
+/// Verify that oversized watermark files are rejected at load time
 #[test]
 fn test_large_watermark_file_rejected() {
     let temp_dir = TempDir::new().unwrap();
@@ -27,21 +27,15 @@ fn test_large_watermark_file_rejected() {
     let large_content = "x".repeat(70 * 1024); // 70KB
     std::fs::write(key_dir.join("block_watermark"), large_content).unwrap();
 
-    // HighWatermark should handle large file gracefully (entry will be None)
-    let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
-
-    let chain_id = chain_id_from_index(1);
-    let data = create_block_data(100, 0);
-    let result = hwm.check_and_update(chain_id, &pkh, &data);
-
-    assert!(
-        matches!(result.unwrap_err(), WatermarkError::NotInitialized { .. }),
-        "Should return NotInitialized when watermark file is invalid"
-    );
-    println!("✓ Oversized watermark file rejected, signing blocked correctly");
+    // Corrupt watermark file must cause a load failure
+    let Err(err) = HighWatermark::new(temp_dir.path(), &[pkh]) else {
+        panic!("expected error for oversized watermark file");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    println!("✓ Oversized watermark file rejected at load time");
 }
 
-/// Verify corrupt data (bad hash) is rejected
+/// Verify corrupt data (bad hash) is rejected at load time
 #[test]
 fn test_corrupt_watermark_file_rejected() {
     let temp_dir = TempDir::new().unwrap();
@@ -57,17 +51,12 @@ fn test_corrupt_watermark_file_rejected() {
     buf[8..40].fill(0xFF); // bad hash
     std::fs::write(key_dir.join("block_watermark"), buf).unwrap();
 
-    let mut hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
-
-    let chain_id = chain_id_from_index(1);
-    let data = create_block_data(100, 0);
-    let result = hwm.check_and_update(chain_id, &pkh, &data);
-
-    assert!(
-        matches!(result.unwrap_err(), WatermarkError::NotInitialized { .. }),
-        "Should return NotInitialized when hash is invalid"
-    );
-    println!("✓ Corrupt hash rejected correctly");
+    // Corrupt watermark file must cause a load failure
+    let Err(err) = HighWatermark::new(temp_dir.path(), &[pkh]) else {
+        panic!("expected error for corrupt watermark file");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    println!("✓ Corrupt hash rejected at load time");
 }
 
 /// Verify valid watermark files work correctly
