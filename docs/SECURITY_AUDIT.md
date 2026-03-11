@@ -171,7 +171,7 @@ The device runs at stock clock speeds for maximum reliability.
 
 Keys are encrypted at rest using:
 - **Algorithm:** AES-256-GCM (authenticated encryption)
-- **KDF:** Scrypt (log_n=18, 256MB memory-hard)
+- **KDF:** Scrypt (log_n=18, r=8, p=4, 256MB memory-hard)
 - **Salt:** Random per encryption
 - **Nonce:** 12-byte random
 
@@ -289,7 +289,7 @@ Protection against stale watermarks that could indicate misconfiguration:
 
 ### 9.2 Disk
 
-Keys at rest are protected by AES-256-GCM with Scrypt KDF (log_n=18, 256MB memory-hard). Brute-force attacks are slowed by Scrypt's memory-hardness, which limits GPU parallelization.
+Keys at rest are protected by AES-256-GCM with Scrypt KDF (log_n=18, r=8, p=4, 256MB memory-hard). Brute-force attacks are slowed by Scrypt's memory-hardness and `p=4` sequential passes, which limit GPU parallelization.
 
 ## 10. Supply Chain Security
 
@@ -388,24 +388,75 @@ The following security measures are in place:
 
 ### Encryption Parameters
 
-Keys are protected by AES-256-GCM with Scrypt KDF (log_n=18, 256MB memory-hard). The 256MB memory requirement severely limits GPU parallelization and makes ASICs impractical.
+Keys are protected by AES-256-GCM with Scrypt KDF (log_n=18, r=8, p=4, 256MB memory-hard). The `p=4` parallelism parameter means scrypt runs 4 sequential passes, increasing compute cost ~4× over `p=1`. The 256MB memory requirement severely limits GPU parallelization and makes ASICs impractical.
+
+### Benchmarks
+
+Measured March 2026 on AMD Ryzen 7 7700X (8C/16T, 4.5 GHz) + AMD Radeon RX 6700 XT (12 GB VRAM):
+
+| Method | Our scrypt (N=2^18, r=8, p=4) | Default scrypt (N=2^14, r=1, p=1) |
+|--------|-------------------------------|-------------------------------------|
+| CPU single-core (Rust `scrypt` 0.11, release) | 1.34 s/hash | — |
+| CPU 16 threads (Rust `scrypt` 0.11, release) | 6.84 H/s | — |
+| GPU OpenCL (hashcat v7.1.2) | **3 H/s** | 54,712 H/s |
+
+<details>
+<summary>Reproducing benchmarks</summary>
+
+**CPU** (single-core): `cargo test --release -p russignol-crypto test_scrypt_timing -- --nocapture`
+
+**CPU** (multi-threaded): run a standalone harness that spawns 16 threads each calling `scrypt::scrypt()` with `Params::new(18, 8, 4, 32)`.
+
+**GPU** (hashcat): `--speed-only` and `-b` report 0 H/s for non-default scrypt parameters due to a hashcat autotune limitation. You must run an actual crack attempt with a wordlist:
+
+```sh
+# Generate test hash and wordlist
+echo 'SCRYPT:262144:8:4:dGVzdHNhbHQ=:dGVzdGhhc2hoYXNodGVzdGhhc2hoYXNodGVzdGhhc2ho' > /tmp/hash.txt
+seq -w 00000 01000 > /tmp/wordlist.txt
+
+# GPU benchmark (our params) — read Speed line from output
+hashcat -m 8900 --backend-devices 1 -w 3 --self-test-disable --force \
+  -a 0 --runtime 120 /tmp/hash.txt /tmp/wordlist.txt
+
+# GPU benchmark (default params) — for comparison
+echo 'SCRYPT:16384:1:1:dGVzdHNhbHQ=:dGVzdGhhc2hoYXNodGVzdGhhc2hoYXNodGVzdGhhc2ho' > /tmp/hash_default.txt
+seq -w 000000 100000 > /tmp/wordlist_large.txt
+hashcat -m 8900 --backend-devices 1 -w 3 --self-test-disable --force \
+  -a 0 --runtime 60 /tmp/hash_default.txt /tmp/wordlist_large.txt
+```
+
+Use `hashcat -I` to list backend devices and adjust `--backend-devices` accordingly.
+
+</details>
 
 ### Time to Crack
 
-Assuming ~1 second per Scrypt hash on a single modern CPU:
+Exhaustive search times assuming 6.84 H/s per machine (AMD Ryzen 7 7700X, 16 threads):
 
 | PIN Length | Keyspace | Single Machine | 100 Machines | 1000 Machines |
 |------------|----------|----------------|--------------|---------------|
-| 5 digits | 10^5 | ~1.2 days | ~17 min | ~2 min |
-| 6 digits | 10^6 | ~12 days | ~2.8 hours | ~17 min |
-| 7 digits | 10^7 | ~116 days | ~1.2 days | ~2.8 hours |
-| 8 digits | 10^8 | ~3.2 years | ~12 days | ~1.2 days |
-| 9 digits | 10^9 | ~32 years | ~116 days | ~12 days |
-| 10 digits | 10^10 | ~317 years | ~3.2 years | ~116 days |
+| 5 digits | 10^5 | ~4 hours | ~2.4 min | ~15 sec |
+| 6 digits | 10^6 | ~1.7 days | ~24 min | ~2.4 min |
+| 7 digits | 10^7 | ~17 days | ~4 hours | ~24 min |
+| 8 digits | 10^8 | ~169 days | ~1.7 days | ~4 hours |
+| 9 digits | 10^9 | ~4.6 years | ~17 days | ~1.7 days |
+| 10 digits | 10^10 | ~46 years | ~169 days | ~17 days |
+
+GPU exhaustive search times assuming 3 H/s per GPU (RX 6700 XT):
+
+| PIN Length | Keyspace | Single GPU | 100 GPUs | 1000 GPUs |
+|------------|----------|------------|----------|-----------|
+| 5 digits | 10^5 | ~9.3 hours | ~5.6 min | ~33 sec |
+| 6 digits | 10^6 | ~3.9 days | ~56 min | ~5.6 min |
+| 7 digits | 10^7 | ~39 days | ~9.3 hours | ~56 min |
+| 8 digits | 10^8 | ~1.1 years | ~3.9 days | ~9.3 hours |
+| 9 digits | 10^9 | ~10.6 years | ~39 days | ~3.9 days |
+| 10 digits | 10^10 | ~106 years | ~1.1 years | ~39 days |
 
 ### Notes
 
-- **GPU attacks limited**: 256MB per attempt means a 24GB GPU can only run ~96 parallel operations (vs millions for weak KDFs)
+- **GPU is slower than CPU**: With our hardened parameters, the RX 6700 XT achieves only 3 H/s — **2.3× slower than the 16-thread CPU** (6.84 H/s). For comparison, the same GPU achieves 54,712 H/s with weak scrypt defaults (N=2^14, r=1, p=1). The 256 MB per-hash memory requirement limits the GPU to ~40 parallel hashes, far too few to keep its thousands of wavefronts occupied.
+- **Memory bandwidth bottleneck**: 16 CPU threads achieve only ~5.1× speedup (not 16×) because 16 × 256 MB = 4 GB of memory-hard work saturates memory bandwidth.
 - **Average case**: Expected crack time is half the maximum (attacker finds PIN midway through keyspace on average)
 - **Offline attack**: These estimates assume offline attack on extracted SD card; the 5-attempt lockout only protects against on-device attacks
 
