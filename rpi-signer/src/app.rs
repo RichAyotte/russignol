@@ -53,7 +53,6 @@ pub enum PageSpec {
     Watermarks,
     Blockchain,
     About,
-    Screensaver,
     Dialog {
         message: String,
         on_dismiss: AppEvent,
@@ -119,8 +118,8 @@ pub enum Effect {
         new_level: u32,
     },
     ResetActivity,
-    SaveCurrentPage,
-    RestoreSavedPage,
+    DropCurrentPage,
+    RebuildSavedPage,
     FatalError {
         title: String,
         message: String,
@@ -133,6 +132,7 @@ pub enum Effect {
 pub struct App {
     pub state: AppState,
     pub current_page_modal: bool,
+    pub current_page_spec: Option<PageSpec>,
     pub tx: Sender<AppEvent>,
     pub signing_activity: Arc<Mutex<signing_activity::SigningActivity>>,
     pub start_signer_tx: Sender<String>,
@@ -160,6 +160,7 @@ impl App {
         Self {
             state,
             current_page_modal: false,
+            current_page_spec: None,
             tx,
             signing_activity,
             start_signer_tx,
@@ -195,7 +196,7 @@ impl App {
     fn wake_from_screensaver_effects(&mut self) -> Vec<Effect> {
         if self.is_screensaver_active() {
             self.set_screensaver(false);
-            return vec![Effect::WakeDisplay];
+            return vec![Effect::WakeDisplay, Effect::RebuildSavedPage];
         }
         vec![]
     }
@@ -443,11 +444,7 @@ impl App {
                     return (LoopAction::Continue, vec![]);
                 }
                 self.set_screensaver(true);
-                effects.extend([
-                    Effect::SaveCurrentPage,
-                    Effect::ShowPage(PageSpec::Screensaver),
-                    Effect::SleepDisplay,
-                ]);
+                effects.extend([Effect::DropCurrentPage, Effect::SleepDisplay]);
             }
             AppEvent::DeactivateScreensaver => {
                 if self.is_screensaver_active() {
@@ -455,7 +452,7 @@ impl App {
                     self.set_screensaver(false);
                     effects.extend([
                         Effect::WakeDisplay,
-                        Effect::RestoreSavedPage,
+                        Effect::RebuildSavedPage,
                         Effect::ResetActivity,
                     ]);
                 }
@@ -882,8 +879,17 @@ mod tests {
         let mut app = active_screensaver_app();
         let (_action, effects) = app.handle_event(AppEvent::DeactivateScreensaver);
         assert!(has_effect(&effects, &Effect::WakeDisplay));
-        assert!(has_effect(&effects, &Effect::RestoreSavedPage));
+        assert!(has_effect(&effects, &Effect::RebuildSavedPage));
         assert!(has_effect(&effects, &Effect::ResetActivity));
+        assert!(!app.is_screensaver_active());
+    }
+
+    #[test]
+    fn wake_from_screensaver_rebuilds_page() {
+        let mut app = active_screensaver_app();
+        let effects = app.wake_from_screensaver_effects();
+        assert!(has_effect(&effects, &Effect::WakeDisplay));
+        assert!(has_effect(&effects, &Effect::RebuildSavedPage));
         assert!(!app.is_screensaver_active());
     }
 
@@ -971,16 +977,12 @@ mod tests {
     }
 
     #[test]
-    fn activate_screensaver_saves_page_and_sleeps() {
+    fn activate_screensaver_drops_page_and_sleeps() {
         let mut app = active_app();
         let (_action, effects) = app.handle_event(AppEvent::ActivateScreensaver);
         assert_eq!(
             effects,
-            vec![
-                Effect::SaveCurrentPage,
-                Effect::ShowPage(PageSpec::Screensaver),
-                Effect::SleepDisplay,
-            ]
+            vec![Effect::DropCurrentPage, Effect::SleepDisplay,]
         );
         assert!(app.is_screensaver_active());
     }

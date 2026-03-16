@@ -241,9 +241,6 @@ fn run_ui_loop(
     current_page.show(&mut device.display)?;
     device.display.update()?;
 
-    // Page save slot for screensaver restore
-    let mut saved_page: Option<Box<dyn Page<Display>>> = None;
-
     loop {
         let timeout = app.recv_timeout();
 
@@ -285,14 +282,7 @@ fn run_ui_loop(
         let (action, effects) = app.handle_event(event);
 
         if action != LoopAction::Continue {
-            apply_effects(
-                &mut app,
-                effects,
-                &mut device,
-                &mut current_page,
-                &mut saved_page,
-                cpu_boost,
-            )?;
+            apply_effects(&mut app, effects, &mut device, &mut current_page, cpu_boost)?;
             if action == LoopAction::Break {
                 break;
             }
@@ -369,7 +359,6 @@ fn construct_page(
         PageSpec::Watermarks => Box::new(watermarks::Page::new(tx.clone(), watermark.clone())),
         PageSpec::Blockchain => Box::new(blockchain::Page::new(tx.clone())),
         PageSpec::About => Box::new(about::Page::new(tx.clone())),
-        PageSpec::Screensaver => Box::new(screensaver::Page::new()),
         PageSpec::Dialog {
             message,
             on_dismiss,
@@ -414,7 +403,6 @@ fn apply_effects(
     effects: Vec<Effect>,
     device: &mut Device,
     current_page: &mut Box<dyn Page<Display>>,
-    saved_page: &mut Option<Box<dyn Page<Display>>>,
     cpu_boost: Option<&cpu_freq::CpuBoost>,
 ) -> epd_2in13_v4::EpdResult<()> {
     for effect in effects {
@@ -492,18 +480,18 @@ fn apply_effects(
                     *last_activity = Instant::now();
                 }
             }
-            Effect::SaveCurrentPage => {
-                *saved_page = Some(std::mem::replace(
-                    current_page,
-                    Box::new(screensaver::Page::new()),
-                ));
+            Effect::DropCurrentPage => {
+                *current_page = Box::new(screensaver::Page::new());
             }
-            Effect::RestoreSavedPage => {
-                if let Some(page) = saved_page.take() {
+            Effect::RebuildSavedPage => {
+                if let Some(spec) = app.current_page_spec.clone() {
+                    let page = construct_page(spec, &app.tx, &app.signing_activity, &app.watermark);
+                    app.current_page_modal = page.is_modal();
+                    app.needs_animation = false;
                     *current_page = page;
+                    current_page.show(&mut device.display)?;
+                    device.display.update()?;
                 }
-                current_page.show(&mut device.display)?;
-                device.display.update()?;
             }
             Effect::FatalError { title, message } => fatal_error(device, &title, &message),
             Effect::Exit(code) => std::process::exit(code),
@@ -533,6 +521,7 @@ fn apply_show_page(
         );
         device.display.update()?;
     } else {
+        app.current_page_spec = Some(spec.clone());
         let page = construct_page(spec, &app.tx, &app.signing_activity, &app.watermark);
         app.current_page_modal = page.is_modal();
         app.needs_animation = false;
