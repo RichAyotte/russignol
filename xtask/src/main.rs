@@ -1367,7 +1367,7 @@ fn cmd_test(fuzz: bool) -> Result<()> {
     // Check for unused dependencies with cargo-machete
     println!("\n{}", "Checking for unused dependencies...".cyan());
     if which::which("cargo-machete").is_ok() {
-        run_cmd("cargo", &["machete"], "Unused dependencies found")?;
+        run_cmd("cargo-machete", &[], "Unused dependencies found")?;
         println!("{}", "✓ No unused dependencies".green());
     } else {
         println!(
