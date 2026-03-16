@@ -221,6 +221,9 @@ enum Commands {
         no_fuzz: bool,
     },
 
+    /// Check for unused dependencies
+    Deps,
+
     /// Clean build artifacts
     Clean {
         /// Also clean buildroot output
@@ -411,6 +414,7 @@ fn try_main() -> Result<()> {
             publish,
         }),
         Commands::Test { no_fuzz } => cmd_test(!no_fuzz),
+        Commands::Deps => cmd_deps(),
         Commands::Clean { buildroot, deep } => do_clean(buildroot, deep),
         Commands::Validate => cmd_validate(),
         Commands::Publish { component, publish } => cmd_publish(component, &publish),
@@ -1363,20 +1367,17 @@ fn cmd_test(fuzz: bool) -> Result<()> {
         )?;
         println!("{}", "✓ Proptest fuzzing complete".green());
     }
+    Ok(())
+}
 
-    // Check for unused dependencies with cargo-machete
-    println!("\n{}", "Checking for unused dependencies...".cyan());
+fn cmd_deps() -> Result<()> {
+    println!("{}", "Checking for unused dependencies...".cyan());
     if which::which("cargo-machete").is_ok() {
         run_cmd("cargo-machete", &[], "Unused dependencies found")?;
         println!("{}", "✓ No unused dependencies".green());
     } else {
-        println!(
-            "  {} cargo-machete not installed, skipping. Install with: {}",
-            "⚠".yellow(),
-            "cargo install cargo-machete".cyan()
-        );
+        bail!("cargo-machete not installed. Install with: cargo install cargo-machete");
     }
-
     Ok(())
 }
 
