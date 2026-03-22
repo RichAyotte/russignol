@@ -500,6 +500,8 @@ fn apply_effects(
             }
             Effect::DropCurrentPage => {
                 *current_page = Box::new(screensaver::Page::new());
+                current_page.show(&mut device.display)?;
+                device.display.update()?;
             }
             Effect::RebuildSavedPage => {
                 if let Some(spec) = app.current_page_spec.clone() {
