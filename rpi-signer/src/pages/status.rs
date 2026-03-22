@@ -35,7 +35,6 @@ impl Page {
         let tx = app_sender.clone();
         let signing_activity_bg = signing_activity.clone();
         std::thread::spawn(move || {
-            let mut prev_status: Option<NetworkStatus> = None;
             loop {
                 let Some(ns) = ns_weak.upgrade() else {
                     return;
@@ -57,10 +56,7 @@ impl Page {
                 }
                 drop(ns);
 
-                if prev_status.as_ref() != Some(&status) {
-                    let _ = tx.send(AppEvent::DirtyDisplay);
-                    prev_status = Some(status);
-                }
+                let _ = tx.send(AppEvent::DirtyDisplay);
                 std::thread::sleep(Duration::from_secs(1));
             }
         });

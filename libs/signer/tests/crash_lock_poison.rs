@@ -150,11 +150,11 @@ fn test_recommended_fix_pattern() {
 // RequestHandler integration test with poisoned lock
 // ============================================================================
 
-/// Test that RequestHandler returns Error::Internal (not a panic) when the
-/// KeyManager lock is poisoned.
+/// Test that `RequestHandler` returns `Error::Internal` (not a panic) when the
+/// `KeyManager` lock is poisoned.
 ///
 /// This exercises the real server code path, unlike the unit tests above
-/// that only test raw RwLock recovery patterns.
+/// that only test raw `RwLock` recovery patterns.
 #[test]
 fn test_request_handler_returns_error_on_poisoned_lock() {
     use russignol_signer_lib::SignerRequest;
