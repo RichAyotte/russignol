@@ -34,7 +34,7 @@ ctrlc = "3.5"
 russignol-storage = { version = "0.1.0", path = "../libs/storage" }
 
 [dev-dependencies]
-tempfile = "3.26.0"
+tempfile = "3.27.0"
 
 # Note: [profile.release] settings moved to workspace Cargo.toml
 # All optimization settings are now applied workspace-wide

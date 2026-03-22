@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.102"
 chrono = "0.4.44"
-clap = { version = "4.5.60", features = ["derive"] }
+clap = { version = "4.6.0", features = ["derive"] }
 clap_complete = "4"
 colored = "3.1.1"
 dirs = "6.0"
@@ -28,10 +28,10 @@ nix = { version = "0.31.2", features = ["user", "process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 shellexpand = "3.1"
-ureq = "3.2"
+ureq = "3.3"
 semver = "1.0"
 sha2 = "0.10"
-tempfile = "3.26"
+tempfile = "3.27"
 lzma-rs = "0.3"
 unicode-width = "0.2"
 zeroize = { version = "1.8.2", features = ["derive"] }
