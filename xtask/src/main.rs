@@ -14,6 +14,7 @@ mod clean;
 mod config;
 mod deploy;
 mod image;
+mod upgrade;
 mod utils;
 mod watermark_test;
 
@@ -221,6 +222,9 @@ enum Commands {
         no_fuzz: bool,
     },
 
+    /// Check for and apply dependency upgrades
+    Upgrade,
+
     /// Check for unused dependencies
     Deps,
 
@@ -413,6 +417,7 @@ fn try_main() -> Result<()> {
             clean,
             publish,
         }),
+        Commands::Upgrade => upgrade::cmd_upgrade(),
         Commands::Test { no_fuzz } => cmd_test(!no_fuzz),
         Commands::Deps => cmd_deps(),
         Commands::Clean { buildroot, deep } => do_clean(buildroot, deep),
