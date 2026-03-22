@@ -17,7 +17,7 @@ mod util;
 mod watermark_setup;
 mod widgets;
 
-use app::{App, AppState, Effect, LoopAction, PageSpec};
+use app::{App, Effect, LoopAction, PageSpec};
 use crossbeam_channel::Sender;
 use russignol_signer_lib::{
     ChainId, HighWatermark,
@@ -41,7 +41,7 @@ use russignol_ui::pages::{error, progress};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use constants::{KEYS_DIR, LOG_DIR, LOG_FILE};
 
@@ -216,7 +216,13 @@ fn run_ui_loop(
     watermark: &Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>>,
     cpu_boost: Option<&cpu_freq::CpuBoost>,
 ) -> epd_2in13_v4::EpdResult<()> {
-    const SCREENSAVER_TIMEOUT: Duration = Duration::from_secs(180);
+    const SCREENSAVER_TIMEOUT: Duration = Duration::from_secs(60);
+
+    let (screensaver_reset_tx, screensaver_reset_rx) = crossbeam_channel::unbounded::<()>();
+    let tx_screensaver = tx.clone();
+    std::thread::spawn(move || {
+        screensaver_timer(&screensaver_reset_rx, &tx_screensaver, SCREENSAVER_TIMEOUT);
+    });
 
     let (mut device, touch_events) = Device::new(device::Config {
         ..Default::default()
@@ -265,13 +271,7 @@ fn run_ui_loop(
         let event = match rx.recv_timeout(timeout) {
             Ok(event) => event,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                handle_timeout(
-                    &mut app,
-                    &mut device,
-                    &mut current_page,
-                    tx,
-                    SCREENSAVER_TIMEOUT,
-                )?;
+                handle_timeout(&mut app, &mut device, &mut current_page)?;
                 continue;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -283,7 +283,12 @@ fn run_ui_loop(
         // Handle Touch and DirtyDisplay directly in the runtime
         match event {
             AppEvent::Touch(touch_point) => {
-                handle_touch(&mut app, &mut current_page, touch_point);
+                handle_touch(
+                    &mut app,
+                    &mut current_page,
+                    touch_point,
+                    &screensaver_reset_tx,
+                );
                 continue;
             }
             AppEvent::DirtyDisplay => {
@@ -300,7 +305,14 @@ fn run_ui_loop(
         let (action, effects) = app.handle_event(event);
 
         if action != LoopAction::Continue {
-            apply_effects(&mut app, effects, &mut device, &mut current_page, cpu_boost)?;
+            apply_effects(
+                &mut app,
+                effects,
+                &mut device,
+                &mut current_page,
+                cpu_boost,
+                &screensaver_reset_tx,
+            )?;
             if action == LoopAction::Break {
                 break;
             }
@@ -314,23 +326,7 @@ fn handle_timeout(
     app: &mut App,
     device: &mut Device,
     current_page: &mut Box<dyn Page<Display>>,
-    tx: &crossbeam_channel::Sender<AppEvent>,
-    screensaver_timeout: Duration,
 ) -> epd_2in13_v4::EpdResult<()> {
-    // Check for inactivity timeout (screensaver)
-    if let AppState::Active {
-        screensaver_active,
-        last_activity,
-    } = &app.state
-        && !screensaver_active
-        && !current_page.is_modal()
-        && last_activity.elapsed() >= screensaver_timeout
-    {
-        log::debug!("Inactivity timer expired, activating screensaver");
-        let _ = tx.send(AppEvent::ActivateScreensaver);
-    }
-
-    // Animation tick
     if app.needs_animation && !app.is_screensaver_active() {
         current_page.show(&mut device.display)?;
         device.display.update()?;
@@ -338,13 +334,37 @@ fn handle_timeout(
     Ok(())
 }
 
-fn handle_touch(app: &mut App, current_page: &mut Box<dyn Page<Display>>, touch_point: Point) {
+fn handle_touch(
+    app: &mut App,
+    current_page: &mut Box<dyn Page<Display>>,
+    touch_point: Point,
+    screensaver_reset_tx: &Sender<()>,
+) {
     if app.is_screensaver_active() {
         let _ = app.tx.send(AppEvent::DeactivateScreensaver);
     } else {
         current_page.handle_touch(touch_point);
-        if let AppState::Active { last_activity, .. } = &mut app.state {
-            *last_activity = Instant::now();
+        let _ = screensaver_reset_tx.send(());
+    }
+}
+
+fn screensaver_timer(
+    reset_rx: &crossbeam_channel::Receiver<()>,
+    event_tx: &Sender<AppEvent>,
+    timeout: Duration,
+) {
+    loop {
+        match reset_rx.recv_timeout(timeout) {
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                log::debug!("Inactivity timer expired, activating screensaver");
+                let _ = event_tx.send(AppEvent::ActivateScreensaver);
+                // Block until reset to avoid re-firing while screensaver is active
+                if reset_rx.recv().is_err() {
+                    return;
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            Ok(()) => {}
         }
     }
 }
@@ -422,6 +442,7 @@ fn apply_effects(
     device: &mut Device,
     current_page: &mut Box<dyn Page<Display>>,
     cpu_boost: Option<&cpu_freq::CpuBoost>,
+    screensaver_reset_tx: &Sender<()>,
 ) -> epd_2in13_v4::EpdResult<()> {
     for effect in effects {
         match effect {
@@ -494,9 +515,7 @@ fn apply_effects(
                 apply_watermark_update(app, device, current_page, &pkh, chain_id, new_level)?;
             }
             Effect::ResetActivity => {
-                if let AppState::Active { last_activity, .. } = &mut app.state {
-                    *last_activity = Instant::now();
-                }
+                let _ = screensaver_reset_tx.send(());
             }
             Effect::DropCurrentPage => {
                 *current_page = Box::new(screensaver::Page::new());

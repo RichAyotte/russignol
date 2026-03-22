@@ -22,10 +22,7 @@ pub enum AppState {
         lockout_until: Option<Instant>,
     },
     /// Keys decrypted, signer running
-    Active {
-        screensaver_active: bool,
-        last_activity: Instant,
-    },
+    Active { screensaver_active: bool },
     /// Terminal: too many failed PIN attempts
     Locked,
 }
@@ -302,7 +299,6 @@ impl App {
                 ]);
                 self.state = AppState::Active {
                     screensaver_active: false,
-                    last_activity: Instant::now(),
                 };
                 effects.push(Effect::Emit(AppEvent::KeysDecrypted(secret_keys_json)));
             }
@@ -372,7 +368,6 @@ impl App {
                 log::info!("PIN verified successfully, secret keys decrypted");
                 self.state = AppState::Active {
                     screensaver_active: false,
-                    last_activity: Instant::now(),
                 };
                 effects.push(Effect::InitWatermark {
                     context: "PIN entry".into(),
@@ -627,7 +622,6 @@ mod tests {
         let mut app = test_app(false);
         app.state = AppState::Active {
             screensaver_active: false,
-            last_activity: Instant::now(),
         };
         app
     }
