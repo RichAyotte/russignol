@@ -15,6 +15,7 @@
 PID_FILE="/var/run/russignol.pid"
 USER="russignol"
 COMMAND="/bin/russignol-signer"
+export RUST_LOG=info
 
 # Partition layout (created at first boot by signer):
 # - p3 (keys): Holds encrypted keys, becomes RO after setup
@@ -71,65 +72,66 @@ mount_data_partition() {
 }
 
 case "$1" in
-start)
-    # Disable activity LED (~1mA / 5mW saving)
-    echo 0 >/sys/class/leds/ACT/brightness 2>/dev/null
+    start)
+        # Disable activity LED (~1mA / 5mW saving)
+        echo 0 >/sys/class/leds/ACT/brightness 2>/dev/null
 
-    echo "Starting Russignol"
+        echo "Starting Russignol"
 
-    # Mount partitions (if they exist)
-    mount_keys_partition
-    mount_data_partition
+        # Mount partitions (if they exist)
+        mount_keys_partition
+        mount_data_partition
 
-    # First boot (no partitions): run as root for storage setup
-    #   - Signer will drop privileges to russignol after storage completes
-    # After setup: run as unprivileged russignol user
-    # Grant russignol write access to CPU freq control (sysfs resets to root each boot)
-    chown russignol /sys/devices/system/cpu/cpufreq/policy0/scaling_setspeed 2>/dev/null
-    chown russignol /sys/class/leds/ACT/brightness 2>/dev/null
+        # First boot (no partitions): run as root for storage setup
+        #   - Signer will drop privileges to russignol after storage completes
+        # After setup: run as unprivileged russignol user
+        # Grant russignol write access to CPU freq control (sysfs resets to root each boot)
+        chown russignol /sys/devices/system/cpu/cpufreq/policy0/scaling_setspeed 2>/dev/null
+        chown russignol /sys/class/leds/ACT/brightness 2>/dev/null
 
-    if ! partition_exists 3 || ! partition_exists 4; then
-        echo "First boot detected - running as root for storage setup"
-        echo "Signer will drop privileges after partition creation"
-        start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
-            --chdir /home/russignol \
-            --background --startas /bin/sh -- -c "$COMMAND"
-    else
-        echo "Normal boot - running as $USER"
-        mkdir -p /data/logs
-        chown "$USER" /data/logs
-        # Truncate panic log if it exceeds 1MB
-        if [ -f /data/logs/panic.log ] && [ "$(wc -c </data/logs/panic.log)" -gt 1048576 ]; then
-            : >/data/logs/panic.log
+        if ! partition_exists 3 || ! partition_exists 4; then
+            echo "First boot detected - running as root for storage setup"
+            echo "Signer will drop privileges after partition creation"
+            if ! start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
+                --chdir /home/russignol \
+                --background --startas /bin/sh -- -c "$COMMAND"; then
+                echo "Failed to start Russignol" >&2
+                exit 1
+            fi
+        else
+            echo "Normal boot - running as $USER"
+            mkdir -p /data/logs
+            chown "$USER" /data/logs
+            # Truncate panic log if it exceeds 1MB
+            if [ -f /data/logs/panic.log ] && [ "$(wc -c </data/logs/panic.log)" -gt 1048576 ]; then
+                : >/data/logs/panic.log
+            fi
+            # Binary manages its own log file via RotatingWriter; init only captures panics
+            if ! start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
+                --chuid "$USER" \
+                --chdir /home/russignol \
+                --background --startas /bin/sh -- -c "$COMMAND >/dev/null 2>>/data/logs/panic.log"; then
+                echo "Failed to start Russignol" >&2
+                exit 1
+            fi
         fi
-        # Binary manages its own log file via RotatingWriter; init only captures panics
-        start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
-            --chuid "$USER" \
-            --chdir /home/russignol \
-            --background --startas /bin/sh -- -c "$COMMAND >/dev/null 2>>/data/logs/panic.log"
-    fi
-    if [ $? -ne 0 ]; then
-        echo "Failed to start Russignol" >&2
+        ;;
+    stop)
+        echo "Stopping Russignol the Tezos Signer"
+        if ! start-stop-daemon --stop --oknodo --pidfile "$PID_FILE" --retry 5; then
+            echo "Failed to stop Russignol" >&2
+            exit 1
+        fi
+        ;;
+    restart)
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
         exit 1
-    fi
-    ;;
-stop)
-    echo "Stopping Russignol the Tezos Signer"
-    start-stop-daemon --stop --oknodo --pidfile "$PID_FILE" --retry 5
-    if [ $? -ne 0 ]; then
-        echo "Failed to stop Russignol" >&2
-        exit 1
-    fi
-    ;;
-restart)
-    "$0" stop
-    sleep 1
-    "$0" start
-    ;;
-*)
-    echo "Usage: $0 {start|stop|restart}"
-    exit 1
-    ;;
+        ;;
 esac
 
 exit 0
