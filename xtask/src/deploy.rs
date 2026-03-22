@@ -10,15 +10,16 @@ const DEVICE_PASS: &str = "russignol";
 const DEVICE_HOST: &str = "169.254.1.1";
 const REMOTE_BINARY: &str = "/data/russignol-signer";
 
-pub fn deploy(skip_build: bool) -> Result<()> {
+pub fn deploy(skip_build: bool, dev: bool) -> Result<()> {
     check_command("sshpass", "Install with: sudo apt-get install sshpass")?;
 
     if !skip_build {
-        println!("{}", "Building release binary...".cyan());
-        build_rpi_signer(false)?;
+        let mode = if dev { "development" } else { "release" };
+        println!("{}", format!("Building {mode} binary...").cyan());
+        build_rpi_signer(dev)?;
     }
 
-    let binary_path = get_signer_binary_path(false)?;
+    let binary_path = get_signer_binary_path(dev)?;
 
     println!("{}", "Stopping signer on device...".cyan());
     // Character class [r] prevents pkill from matching its own command line

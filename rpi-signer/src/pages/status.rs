@@ -91,16 +91,18 @@ fn read_uptime() -> Option<String> {
     let field = raw.split_whitespace().next()?;
     // /proc/uptime is "seconds.fractional ...", parse integer part
     let secs: u64 = field.split('.').next()?.parse().ok()?;
-    let total_minutes = secs / 60;
-    let minutes = total_minutes % 60;
-    let hours = (total_minutes / 60) % 24;
-    let days = total_minutes / 60 / 24;
+    let seconds = secs % 60;
+    let minutes = (secs / 60) % 60;
+    let hours = (secs / 3600) % 24;
+    let days = secs / 86400;
     if days > 0 {
-        Some(format!("{days}d {hours}h {minutes}m"))
+        Some(format!("{days}d {hours}h {minutes}m {seconds}s"))
     } else if hours > 0 {
-        Some(format!("{hours}h {minutes}m"))
+        Some(format!("{hours}h {minutes}m {seconds}s"))
+    } else if minutes > 0 {
+        Some(format!("{minutes}m {seconds}s"))
     } else {
-        Some(format!("{minutes}m"))
+        Some(format!("{seconds}s"))
     }
 }
 

@@ -19,6 +19,7 @@ cargo xtask release --github  # Release and publish to GitHub
 cargo xtask publish --github  # Publish existing build to GitHub (no rebuild)
 cargo xtask publish --website # Publish website to Cloudflare Pages
 cargo xtask deploy            # Build, deploy, and restart signer on device
+cargo xtask deploy --dev      # Build and deploy debug binary
 cargo xtask deploy --skip-build  # Deploy previously built binary
 cargo xtask validate          # Validate build environment
 cargo xtask clean             # Clean build artifacts

@@ -268,6 +268,10 @@ enum Commands {
         /// Skip build step (deploy previously built binary)
         #[arg(long)]
         skip_build: bool,
+
+        /// Build in development mode (debug symbols, faster compilation)
+        #[arg(long)]
+        dev: bool,
     },
 
     /// Run watermark protection E2E tests on a physical device
@@ -424,7 +428,7 @@ fn try_main() -> Result<()> {
         Commands::Validate => cmd_validate(),
         Commands::Publish { component, publish } => cmd_publish(component, &publish),
         Commands::Coverage { open, lcov } => cmd_coverage(open, lcov),
-        Commands::Deploy { skip_build } => deploy::deploy(skip_build),
+        Commands::Deploy { skip_build, dev } => deploy::deploy(skip_build, dev),
         Commands::WatermarkTest {
             device,
             port,

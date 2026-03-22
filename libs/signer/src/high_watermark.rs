@@ -714,6 +714,7 @@ fn decode_entry(buf: &[u8; WATERMARK_FILE_SIZE]) -> Option<WatermarkEntry> {
 }
 
 /// Load a watermark entry from an open file handle (pread at offset 0).
+#[cfg(any(debug_assertions, test))]
 fn load_entry_from_file(file: &File) -> Option<WatermarkEntry> {
     let meta = file.metadata().ok()?;
     if meta.len() != WATERMARK_FILE_SIZE as u64 {
