@@ -98,12 +98,15 @@ start)
         echo "Normal boot - running as $USER"
         mkdir -p /data/logs
         chown "$USER" /data/logs
-        # Rotate log: keep one previous boot's log
-        [ -f /data/logs/signer.log ] && mv /data/logs/signer.log /data/logs/signer.log.old
+        # Truncate panic log if it exceeds 1MB
+        if [ -f /data/logs/panic.log ] && [ "$(wc -c </data/logs/panic.log)" -gt 1048576 ]; then
+            : >/data/logs/panic.log
+        fi
+        # Binary manages its own log file via RotatingWriter; init only captures panics
         start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
             --chuid "$USER" \
             --chdir /home/russignol \
-            --background --startas /bin/sh -- -c "$COMMAND >>/data/logs/signer.log 2>&1"
+            --background --startas /bin/sh -- -c "$COMMAND >/dev/null 2>>/data/logs/panic.log"
     fi
     if [ $? -ne 0 ]; then
         echo "Failed to start Russignol" >&2

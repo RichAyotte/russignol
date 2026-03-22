@@ -325,8 +325,7 @@ start_watchdog() {
 # as the russignol user.
 #
 R_CMD="/bin/russignol-signer"
-LOG_FILE="/data/logs/watchdog.log"
-LOG_MAX_LINES=10000
+PANIC_LOG="/data/logs/panic.log"
 
 run_supervisor() {
     cd /home/russignol || return 1
@@ -347,16 +346,13 @@ run_supervisor() {
         # Normal boot: ensure log directory exists
         mkdir -p "${DATA_MOUNT}/logs"
 
-        # Log rotation - keep only last LOG_MAX_LINES
-        if [ -f "$LOG_FILE" ]; then
-            LOG_SIZE=$(wc -l <"$LOG_FILE" 2>/dev/null || echo 0)
-            if [ "$LOG_SIZE" -gt "$LOG_MAX_LINES" ]; then
-                tail -n "$LOG_MAX_LINES" "$LOG_FILE" >"$LOG_FILE.tmp"
-                mv "$LOG_FILE.tmp" "$LOG_FILE"
-            fi
+        # Truncate panic log if it exceeds 1MB
+        if [ -f "$PANIC_LOG" ] && [ "$(wc -c <"$PANIC_LOG")" -gt 1048576 ]; then
+            : >"$PANIC_LOG"
         fi
 
-        su -s /bin/sh -c "$R_CMD" "$R_USER" >>"$LOG_FILE" 2>&1
+        # Binary manages its own log file via RotatingWriter; init only captures panics
+        su -s /bin/sh -c "$R_CMD" "$R_USER" >/dev/null 2>>"$PANIC_LOG"
     fi
 
     # Don't restart - error should remain visible on display

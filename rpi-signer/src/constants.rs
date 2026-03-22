@@ -15,6 +15,12 @@ pub const WATERMARK_DIR: &str = "/data/watermarks";
 /// Boot partition device path (first partition on SD card)
 pub const BOOT_PARTITION: &str = "/dev/mmcblk0p1";
 
+/// Log directory on the data partition
+pub const LOG_DIR: &str = "/data/logs";
+
+/// Log file path for the rotating log writer
+pub const LOG_FILE: &str = "/data/logs/signer.log";
+
 /// Boot partition mount point
 ///
 /// This is intentionally a fixed path rather than using mktemp because:

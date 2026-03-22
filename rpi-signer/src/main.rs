@@ -5,6 +5,7 @@ mod cpu_freq;
 mod events;
 mod fonts;
 mod led;
+mod log_writer;
 mod network_status;
 mod pages;
 mod setup;
@@ -42,7 +43,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use constants::KEYS_DIR;
+use constants::{KEYS_DIR, LOG_DIR, LOG_FILE};
 
 /// Show a fatal error on the display and exit (never returns)
 fn fatal_error(device: &mut Device, title: &str, message: &str) -> ! {
@@ -53,8 +54,25 @@ fn fatal_error(device: &mut Device, title: &str, message: &str) -> ! {
     std::process::exit(1)
 }
 
+fn init_logging() {
+    if std::path::Path::new(LOG_DIR).exists() {
+        // Normal boot: route logs through a size-capped rotating writer
+        if let Ok(writer) = log_writer::RotatingWriter::new(std::path::Path::new(LOG_FILE)) {
+            env_logger::Builder::from_default_env()
+                .target(env_logger::Target::Pipe(Box::new(writer)))
+                .init();
+        } else {
+            // Fall back to stderr if we can't open the log file
+            env_logger::init();
+        }
+    } else {
+        // First boot: /data/logs doesn't exist yet, use stderr
+        env_logger::init();
+    }
+}
+
 fn main() -> epd_2in13_v4::EpdResult<()> {
-    env_logger::init();
+    init_logging();
 
     // Shared signing activity tracker
     let signing_activity = Arc::new(Mutex::new(signing_activity::SigningActivity::default()));

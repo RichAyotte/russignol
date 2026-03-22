@@ -57,7 +57,7 @@ struct RequestGuard {
 impl RequestGuard {
     fn new(addr: SocketAddr) -> Self {
         let prev_count = ACTIVE_REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!(
+        log::info!(
             "[CONCURRENCY] Request started (from {addr}), {} active (was {})",
             prev_count + 1,
             prev_count
@@ -70,7 +70,7 @@ impl RequestGuard {
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         let prev_count = ACTIVE_REQUEST_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!(
+        log::info!(
             "[CONCURRENCY] Request completed (from {}), {} still active (was {})",
             self.addr,
             prev_count - 1,
@@ -403,8 +403,8 @@ impl RequestHandler {
         data: &[u8],
     ) -> Result<(SignerResponse, Option<ChainId>)> {
         let (pkh, version) = pkh_and_version;
-        log::info!(
-            "📝 Signature request for key: {} (version {})",
+        log::debug!(
+            "Signature request for key: {} (version {})",
             pkh.to_b58check(),
             version
         );
@@ -421,7 +421,7 @@ impl RequestHandler {
         }
 
         #[cfg(feature = "perf-trace")]
-        eprintln!("[PERF] Magic byte check: {:?}", t.elapsed());
+        log::info!("[PERF] Magic byte check: {:?}", t.elapsed());
 
         // 2. Check high watermark
         #[cfg(feature = "perf-trace")]
@@ -476,7 +476,7 @@ impl RequestHandler {
         }
 
         #[cfg(feature = "perf-trace")]
-        eprintln!("[PERF] Watermark check: {:?}", t.elapsed());
+        log::info!("[PERF] Watermark check: {:?}", t.elapsed());
 
         // 3. Get key and prepare signer
         #[cfg(feature = "perf-trace")]
@@ -497,7 +497,7 @@ impl RequestHandler {
         drop(keys);
 
         #[cfg(feature = "perf-trace")]
-        eprintln!("[PERF] Get signer: {:?}", t.elapsed());
+        log::info!("[PERF] Get signer: {:?}", t.elapsed());
 
         // 2b+4. Check watermark, then BLS sign + watermark persist in parallel.
         //    Write lock is held from check_and_update through write_watermark to
@@ -609,7 +609,7 @@ impl RequestHandler {
         };
 
         #[cfg(feature = "perf-trace")]
-        eprintln!("[PERF] BLS sign + watermark write: {:?}", t.elapsed());
+        log::info!("[PERF] BLS sign + watermark write: {:?}", t.elapsed());
 
         // Update signing activity with metrics
         if let Some(ref activity_tracker) = self.signing_activity
@@ -662,8 +662,8 @@ impl RequestHandler {
         }
 
         #[cfg(feature = "perf-trace")]
-        eprintln!(
-            "[PERF] ===== TOTAL SIGN REQUEST: {:?} =====\n",
+        log::info!(
+            "[PERF] ===== TOTAL SIGN REQUEST: {:?} =====",
             request_start.elapsed()
         );
 
@@ -838,8 +838,8 @@ fn handle_connection_inner(
         process_request(socket, addr, msg_len, handler)?;
 
         #[cfg(feature = "perf-trace")]
-        eprintln!(
-            "[PERF] ===== TOTAL REQUEST (including TCP): {:?} =====\n",
+        log::info!(
+            "[PERF] ===== TOTAL REQUEST (including TCP): {:?} =====",
             request_start.elapsed()
         );
     }
@@ -892,11 +892,9 @@ fn check_http_and_size_error(len_buf: [u8; 2], addr: SocketAddr, msg_len: usize)
         || possible_http.starts_with("POST")
         || possible_http.starts_with("HEAD")
     {
-        eprintln!(
-            "⚠️  ERROR: Client {addr} sent HTTP request, but this server expects raw TCP protocol"
-        );
-        eprintln!("   HTTP request starts with: {possible_http}");
-        eprintln!(
+        log::warn!("Client {addr} sent HTTP request, but this server expects raw TCP protocol");
+        log::warn!("   HTTP request starts with: {possible_http}");
+        log::warn!(
             "   SOLUTION: Change baker config from 'http://...' to 'tcp://...' or just the address"
         );
         Error::Io(std::io::Error::new(
@@ -922,7 +920,7 @@ fn process_request(
     socket.read_exact(&mut msg_buf)?;
 
     #[cfg(feature = "perf-trace")]
-    eprintln!("[PERF] TCP read: {:?}", t.elapsed());
+    log::info!("[PERF] TCP read: {:?}", t.elapsed());
 
     #[cfg(feature = "perf-trace")]
     let t = std::time::Instant::now();
@@ -931,7 +929,7 @@ fn process_request(
     log::debug!("<= RECV request from {addr}: {request:?}");
 
     #[cfg(feature = "perf-trace")]
-    eprintln!("[PERF] Decode request: {:?}", t.elapsed());
+    log::info!("[PERF] Decode request: {:?}", t.elapsed());
 
     #[cfg(feature = "perf-trace")]
     let t = std::time::Instant::now();
@@ -942,7 +940,7 @@ fn process_request(
     };
 
     #[cfg(feature = "perf-trace")]
-    eprintln!("[PERF] Handle request: {:?}", t.elapsed());
+    log::info!("[PERF] Handle request: {:?}", t.elapsed());
 
     #[cfg(feature = "perf-trace")]
     let t = std::time::Instant::now();
@@ -950,7 +948,7 @@ fn process_request(
     let response_data = encode_response(&response)?;
 
     #[cfg(feature = "perf-trace")]
-    eprintln!("[PERF] Encode response: {:?}", t.elapsed());
+    log::info!("[PERF] Encode response: {:?}", t.elapsed());
 
     #[cfg(feature = "perf-trace")]
     let t = std::time::Instant::now();
@@ -968,7 +966,7 @@ fn process_request(
     socket.flush()?;
 
     #[cfg(feature = "perf-trace")]
-    eprintln!("[PERF] TCP write: {:?}", t.elapsed());
+    log::info!("[PERF] TCP write: {:?}", t.elapsed());
 
     Ok(())
 }
@@ -1047,7 +1045,7 @@ impl Server {
     pub fn run(&self) -> Result<()> {
         let listener = TcpListener::bind(self.address)?;
 
-        eprintln!("Listening on {}", self.address);
+        log::info!("Listening on {}", self.address);
 
         self.accept_loop(&listener)
     }
@@ -1087,7 +1085,7 @@ impl Server {
 
                 if let Err(e) = handle_connection(socket, addr, &handler, timeout, max_message_size)
                 {
-                    eprintln!("Connection error from {addr}: {e}");
+                    log::error!("Connection error from {addr}: {e}");
                 }
             });
         }
