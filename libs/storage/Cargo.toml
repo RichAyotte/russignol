@@ -9,4 +9,4 @@ description = "Shared storage constants and utilities for Russignol"
 workspace = true
 
 [dependencies]
-blake3 = "1.8.4"
+blake3 = "1.8.5"
