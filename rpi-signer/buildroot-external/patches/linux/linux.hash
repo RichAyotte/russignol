@@ -2,6 +2,6 @@
 # From: https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc
 sha256  9106a4605da9e31ff17659d958782b815f9591ab308d03b0ee21aad6c7dced4b  linux-6.18.tar.xz
 
-# Raspberry Pi kernel (rpi-6.18.y branch, commit 779766586d23eb88e48b30d1a30665005afba6e8)
-# Downloaded from: https://github.com/raspberrypi/linux/archive/779766586d23eb88e48b30d1a30665005afba6e8.tar.gz
-sha256  5f26ac5a6a96f4196d99bc9f63d80ec9159d5aabe108649affc6355152ee373f  779766586d23eb88e48b30d1a30665005afba6e8.tar.gz
+# Raspberry Pi kernel (rpi-6.18.y branch, commit 3d3dd5921d317d84208d1efe45d76abcda82eb98)
+# Downloaded from: https://github.com/raspberrypi/linux/archive/3d3dd5921d317d84208d1efe45d76abcda82eb98.tar.gz
+sha256  61fa4179cf975d26b172b0fdd1c9d1210aa3f201f8c76415fcf9c92a303c564c  3d3dd5921d317d84208d1efe45d76abcda82eb98.tar.gz
