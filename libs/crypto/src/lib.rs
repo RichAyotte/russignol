@@ -195,6 +195,35 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    const FIXTURE_PIN: &[u8] = b"123456";
+    const FIXTURE_PLAINTEXT: &str = r#"{"consensus":"edsk_fixture"}"#;
+
+    /// Captures a legacy v1 encrypted blob to disk so the next code generation
+    /// can prove its decrypt path still works against bytes produced by the
+    /// pre-upgrade implementation. Run on the legacy code path before bumping
+    /// scrypt:
+    /// `cargo test -p russignol-crypto -- --ignored capture_legacy_fixture`.
+    #[test]
+    #[ignore]
+    fn capture_legacy_fixture() {
+        let bytes = encrypt(FIXTURE_PIN, FIXTURE_PLAINTEXT).unwrap();
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy_v1.bin");
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            bytes[0], 22,
+            "legacy v1 first byte must be 22 (b64 salt length)"
+        );
+        assert_eq!(
+            bytes.len(),
+            1 + 22 + 12 + FIXTURE_PLAINTEXT.len() + 16,
+            "unexpected v1 blob length"
+        );
+    }
+
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
         let password = b"123456";
