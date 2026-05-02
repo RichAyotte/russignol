@@ -614,12 +614,21 @@ fn build_for_target_with_dir(target: &str, dev: bool, target_dir: &str) -> Resul
 
 /// Compute SHA256 hash of a file
 fn compute_sha256(path: &Path) -> Result<String> {
-    let mut hasher = Sha256::new();
+    use std::io::Read;
     let mut file =
         File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
-    std::io::copy(&mut file, &mut hasher)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    Ok(format!("{:x}", hasher.finalize()))
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Move release assets to target/ with canonical names and generate checksums

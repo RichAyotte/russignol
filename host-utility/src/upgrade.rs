@@ -175,12 +175,20 @@ fn download_with_progress(
 
 /// Verify downloaded file checksum
 fn verify_checksum(file: &Path, expected: &str) -> Result<()> {
-    let mut hasher = Sha256::new();
+    use std::io::Read;
     let mut f = std::fs::File::open(file).context("Failed to open file for checksum")?;
-
-    std::io::copy(&mut f, &mut hasher).context("Failed to read file for checksum")?;
-
-    let hash = format!("{:x}", hasher.finalize());
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .context("Failed to read file for checksum")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let hash = hex::encode(hasher.finalize());
 
     if hash != expected {
         anyhow::bail!("Checksum verification failed!\nExpected: {expected}\nGot:      {hash}");

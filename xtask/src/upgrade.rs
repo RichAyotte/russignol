@@ -432,7 +432,7 @@ fn compute_file_sha256(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn download_tarball(url: &str, filename: &str) -> Result<PathBuf> {

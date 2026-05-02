@@ -73,12 +73,22 @@ pub fn generate_card_id() -> Result<String> {
 
 /// Compute SHA-256 hash of a file, returning the hex digest
 pub fn compute_file_sha256(path: &Path) -> Result<String> {
+    use std::io::Read;
     let file =
         std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
-    std::io::copy(&mut reader, &mut hasher).context("Failed to read file for hashing")?;
-    Ok(format!("{:x}", hasher.finalize()))
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .context("Failed to read file for hashing")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Write a flash manifest to the boot partition (p1, FAT32)
@@ -1490,17 +1500,7 @@ fn download_with_cache(
 
 /// Verify checksum without printing errors (for cache checking)
 fn verify_checksum_silent(file: &Path, expected: &str) -> bool {
-    let Ok(mut f) = std::fs::File::open(file) else {
-        return false;
-    };
-
-    let mut hasher = Sha256::new();
-    if std::io::copy(&mut f, &mut hasher).is_err() {
-        return false;
-    }
-
-    let hash = format!("{:x}", hasher.finalize());
-    hash == expected
+    compute_file_sha256(file).is_ok_and(|hash| hash == expected)
 }
 
 /// Download file with retry support
@@ -1589,12 +1589,7 @@ fn do_download(
 
 /// Verify file checksum
 fn verify_checksum(file: &Path, expected: &str) -> Result<()> {
-    let mut hasher = Sha256::new();
-    let mut f = std::fs::File::open(file).context("Failed to open file for checksum")?;
-
-    std::io::copy(&mut f, &mut hasher).context("Failed to read file for checksum")?;
-
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = compute_file_sha256(file).context("Failed to read file for checksum")?;
 
     if hash != expected {
         bail!(

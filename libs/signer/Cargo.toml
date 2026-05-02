@@ -27,7 +27,7 @@ insecure-disk-keys = []
 
 [dependencies]
 blake2 = "0.10.6"
-blake3 = "1.8.3"
+blake3 = "1.8.4"
 blst = "0.3.16"
 bs58 = { version = "0.5.1", features = ["check"] }
 bson = "3.1.0"
@@ -35,13 +35,13 @@ clap = { version = "4.6.0", features = ["derive"] }
 directories = "6.0.0"
 getrandom = "0.4.2"
 hex = "0.4.3"
-hmac = "0.12.1"
+hmac = "0.13.0"
 log = "0.4.29"
 num-bigint = "0.4"
 russignol-storage = { version = "0.1.0", path = "../storage" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 thiserror = "2.0.18"
 
 # Note: [profile.release] settings moved to workspace Cargo.toml
@@ -52,7 +52,7 @@ thiserror = "2.0.18"
 criterion = "0.8.2"
 tempfile = "3.27.0"
 colored = "3.1"
-proptest = "1.10"
+proptest = "1.11"
 
 [[bench]]
 name = "signing_benchmark"
