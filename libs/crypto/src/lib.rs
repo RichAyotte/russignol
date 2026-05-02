@@ -225,7 +225,7 @@ mod tests {
 
         // Should complete within 60s even on slow hardware
         assert!(
-            elapsed < Duration::from_secs(60),
+            elapsed < Duration::from_mins(1),
             "Scrypt took too long: {elapsed:?}"
         );
         println!("Scrypt completed in {elapsed:?}");

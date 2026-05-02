@@ -69,9 +69,7 @@ fn get_install_dir() -> Result<PathBuf> {
 
 /// Check if directory is in PATH
 fn is_in_path(dir: &Path) -> bool {
-    std::env::var("PATH")
-        .map(|path| path.split(':').any(|p| Path::new(p) == dir))
-        .unwrap_or(false)
+    std::env::var("PATH").is_ok_and(|path| path.split(':').any(|p| Path::new(p) == dir))
 }
 
 /// Copy binary to target location

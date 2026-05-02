@@ -37,8 +37,7 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         let logo_result: Result<Bmp<BinaryColor>, _> = Bmp::from_slice(LOGO_DATA);
         let logo_size = logo_result
             .as_ref()
-            .map(|l| l.bounding_box().size)
-            .unwrap_or(Size::new(64, 64));
+            .map_or(Size::new(64, 64), |l| l.bounding_box().size);
         let logo_x = (half_width - logo_size.width.cast_signed()) / 2;
         let logo_y = (DISPLAY_HEIGHT - logo_size.height.cast_signed()) / 2;
         if let Ok(logo) = logo_result {

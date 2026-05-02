@@ -34,7 +34,7 @@ impl RotatingWriter {
     /// its current size on disk.
     pub fn new(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let bytes_written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let bytes_written = file.metadata().map_or(0, |m| m.len());
         let old_path = path.with_extension("log.old");
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -49,7 +49,7 @@ impl RotatingWriter {
     #[cfg(test)]
     fn with_max_size(path: &Path, max_size: u64) -> io::Result<RotatingWriterTest> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let bytes_written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let bytes_written = file.metadata().map_or(0, |m| m.len());
         let old_path = path.with_extension("log.old");
         Ok(RotatingWriterTest {
             inner: Mutex::new(Inner {

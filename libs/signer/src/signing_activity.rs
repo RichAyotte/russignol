@@ -277,7 +277,7 @@ mod tests {
             consensus: Some(SignatureActivity {
                 level: Some(100),
                 // 120 seconds ago
-                timestamp: SystemTime::now() - Duration::from_secs(120),
+                timestamp: SystemTime::now() - Duration::from_mins(2),
                 duration: None,
                 operation_type: Some(OperationType::Block),
                 data_size: None,

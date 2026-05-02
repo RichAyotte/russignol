@@ -810,7 +810,7 @@ fn wait_for_card_swap(device: &Path) -> Result<()> {
 ///
 /// `label` is shown in spinners (e.g. "source" or "target").
 fn wait_for_card_swap_labeled(device: &Path, label: &str) -> Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
 
     // Phase 1: wait for card removal (media disappears)
     if device_media_sectors(device) > 0 {

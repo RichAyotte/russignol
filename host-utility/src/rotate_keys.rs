@@ -994,10 +994,7 @@ fn wait_for_device(expectation: &DeviceExpectation, config: &RussignolConfig) ->
             match expectation {
                 DeviceExpectation::New => {
                     // For NEW device, just check that signer responds with at least 2 keys
-                    if keys::discover_remote_keys(config)
-                        .map(|k| k.len() >= 2)
-                        .unwrap_or(false)
-                    {
+                    if keys::discover_remote_keys(config).is_ok_and(|k| k.len() >= 2) {
                         spinner.finish_and_clear();
                         success("Device connected and signer responding");
                         return Ok(());
@@ -1047,8 +1044,7 @@ fn wait_for_device(expectation: &DeviceExpectation, config: &RussignolConfig) ->
 fn signer_has_expected_consensus_key(config: &RussignolConfig) -> bool {
     // Query the existing alias - this will contact the signer
     run_octez_client_command(&["show", "address", CONSENSUS_KEY_ALIAS], config)
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 /// Discover key hashes from the remote signer
@@ -1804,8 +1800,7 @@ fn resume_from_keys_imported(
     } else {
         inquire::Select::new("How would you like to proceed?", options)
             .prompt()
-            .map(|s| i32::from(!s.contains("retry")))
-            .unwrap_or(1)
+            .map_or(1, |s| i32::from(!s.contains("retry")))
     };
 
     if selection == 1 {

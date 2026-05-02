@@ -99,13 +99,11 @@ fn mount_boot_partition() -> Result<(), String> {
 
 /// Check if a path is a mount point by reading /proc/mounts
 fn is_mounted(path: &str) -> bool {
-    fs::read_to_string("/proc/mounts")
-        .map(|contents| {
-            contents
-                .lines()
-                .any(|line| line.split(' ').nth(1) == Some(path))
-        })
-        .unwrap_or(false)
+    fs::read_to_string("/proc/mounts").is_ok_and(|contents| {
+        contents
+            .lines()
+            .any(|line| line.split(' ').nth(1) == Some(path))
+    })
 }
 
 fn unmount_boot_partition() -> Result<(), String> {

@@ -9,7 +9,7 @@ use crate::setup;
 /// Maximum failed PIN attempts before lockout
 const MAX_FAILED_ATTEMPTS: u32 = 5;
 /// Lockout duration after max failed attempts (5 minutes)
-const LOCKOUT_DURATION: Duration = Duration::from_secs(300);
+const LOCKOUT_DURATION: Duration = Duration::from_mins(5);
 
 /// Application lifecycle state — scopes mutable variables to their lifecycle phase
 #[derive(Debug)]
@@ -441,16 +441,14 @@ impl App {
                 self.set_screensaver(true);
                 effects.extend([Effect::DropCurrentPage, Effect::SleepDisplay]);
             }
-            AppEvent::DeactivateScreensaver => {
-                if self.is_screensaver_active() {
-                    log::info!("Deactivating screensaver");
-                    self.set_screensaver(false);
-                    effects.extend([
-                        Effect::WakeDisplay,
-                        Effect::RebuildSavedPage,
-                        Effect::ResetActivity,
-                    ]);
-                }
+            AppEvent::DeactivateScreensaver if self.is_screensaver_active() => {
+                log::info!("Deactivating screensaver");
+                self.set_screensaver(false);
+                effects.extend([
+                    Effect::WakeDisplay,
+                    Effect::RebuildSavedPage,
+                    Effect::ResetActivity,
+                ]);
             }
             AppEvent::WatermarkError {
                 pkh,
