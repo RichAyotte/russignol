@@ -5,9 +5,30 @@
 //! - **AES-256-GCM** for authenticated encryption
 //!
 //! # File Format
+//!
+//! Encrypted blobs carry a 1-byte version tag as their first byte. Two layouts
+//! are recognized:
+//!
 //! ```text
-//! [salt_len:1][salt:variable][nonce:12][ciphertext:variable]
+//! v2 (current write target):
+//!   [version=0x02 : 1][salt : 16 raw bytes][nonce : 12][ciphertext : variable]
+//!
+//! v1 (legacy, decrypt-only):
+//!   [salt_len=22 : 1][salt : 22 b64-ASCII bytes][nonce : 12][ciphertext : variable]
 //! ```
+//!
+//! Dispatch is by the first byte: `0x02` selects v2, `22` (`0x16`) selects v1,
+//! anything else is rejected. v1 always starts with `22` because the legacy
+//! writer used `password-hash`'s `SaltString::generate`, which produces 16
+//! random bytes encoded to a fixed 22-character base64 string and then stored
+//! those 22 ASCII bytes as the salt. This makes `0x02` an unambiguous v2
+//! discriminator and reserves `0x03..=0xFF` (excluding `0x16`) for future
+//! formats.
+//!
+//! v1 stays decryptable because devices already in the field hold blobs whose
+//! KDF input is the 22-byte b64-ASCII slice; any change to that input derives
+//! a different key for the same PIN. v2 fixes the layout (raw 16-byte salts)
+//! so the crate no longer depends on `password-hash`.
 //!
 //! # Security Properties
 //! - 256 MB memory-hard key derivation (safe for 512 MB device)
@@ -16,14 +37,33 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
-    aead::{Aead, AeadCore, OsRng},
+    aead::{Aead, AeadCore, OsRng, rand_core::RngCore},
 };
 use log::debug;
-use scrypt::password_hash::SaltString;
 use std::io::{self, Write};
 
 /// Path to encrypted secret keys file
 pub const SECRET_KEYS_ENC_PATH: &str = "/keys/secret_keys.enc";
+
+/// v2 blob version byte. v1 is implicit through `LEGACY_SALT_LEN`.
+const FORMAT_V2: u8 = 0x02;
+
+/// First byte of every legacy v1 blob: the b64-encoded length of a 16-byte
+/// salt is invariably 22.
+const LEGACY_SALT_LEN: u8 = 22;
+
+/// Raw salt size used by v2.
+const V2_SALT_LEN: usize = 16;
+
+/// AES-GCM nonce size in bytes.
+const NONCE_LEN: usize = 12;
+
+/// Identifies which on-disk layout a blob used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobFormat {
+    V1Legacy,
+    V2,
+}
 
 /// Hardened scrypt parameters: `log_n=18`, r=8, p=4 (256 MB, ~8s on `RPi` Zero 2W @ 1.3 GHz)
 /// - `log_n=18` provides 256 MB memory-hardness (safe for 512 MB device)
@@ -34,31 +74,36 @@ pub const SECRET_KEYS_ENC_PATH: &str = "/keys/secret_keys.enc";
 /// Cannot panic: scrypt parameters are hardcoded valid constants.
 #[must_use]
 pub fn scrypt_params() -> scrypt::Params {
-    scrypt::Params::new(18, 8, 4, 32).expect("valid scrypt params")
+    scrypt::Params::new(18, 8, 4).expect("valid scrypt params")
 }
 
-/// Derive a 32-byte encryption key from password and salt using scrypt
+/// Derive a 32-byte encryption key from a password and an opaque salt slice.
+///
+/// Both v1 and v2 funnel through this single call: v1 hands in the 22-byte
+/// b64-ASCII slice the legacy writer persisted, v2 hands in the 16 raw bytes.
+/// `scrypt::scrypt` does not interpret the salt, so feeding it the bytes the
+/// writer stored verbatim keeps key derivation byte-identical to the writer's.
 ///
 /// # Errors
 ///
 /// Returns an error if scrypt key derivation fails.
-pub fn derive_key(password: &[u8], salt: &SaltString) -> io::Result<[u8; 32]> {
+pub fn derive_key(password: &[u8], salt: &[u8]) -> io::Result<[u8; 32]> {
     let mut key = [0u8; 32];
     let params = scrypt_params();
 
     debug!("Deriving key using scrypt (log_n=18, r=8, p=4, 256 MB memory)...");
     let start = std::time::Instant::now();
 
-    scrypt::scrypt(password, salt.as_str().as_bytes(), &params, &mut key)
+    scrypt::scrypt(password, salt, &params, &mut key)
         .map_err(|e| io::Error::other(format!("Scrypt key derivation failed: {e}")))?;
 
     debug!("Key derived in {:?}", start.elapsed());
     Ok(key)
 }
 
-/// Encrypt secret keys JSON, returning the encrypted blob
+/// Encrypt secret keys JSON, returning a v2 encrypted blob.
 ///
-/// Returns bytes in format: `[salt_len:1][salt:variable][nonce:12][ciphertext:variable]`
+/// Output bytes: `[0x02 : 1][salt : 16 raw bytes][nonce : 12][ciphertext : variable]`.
 ///
 /// # Errors
 ///
@@ -66,11 +111,10 @@ pub fn derive_key(password: &[u8], salt: &SaltString) -> io::Result<[u8; 32]> {
 pub fn encrypt(password: &[u8], plaintext: &str) -> io::Result<Vec<u8>> {
     debug!("Encrypting data...");
 
-    // Generate salt and derive key
-    let salt = SaltString::generate(&mut OsRng);
+    let mut salt = [0u8; V2_SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
     let key = derive_key(password, &salt)?;
 
-    // Encrypt with AES-256-GCM
     debug!("Encrypting with AES-256-GCM");
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| {
         io::Error::new(
@@ -87,14 +131,9 @@ pub fn encrypt(password: &[u8], plaintext: &str) -> io::Result<Vec<u8>> {
         )
     })?;
 
-    // Pack into file format: [salt_len][salt][nonce][ciphertext]
-    let mut output = Vec::new();
-    let salt_bytes = salt.as_str().as_bytes();
-    // Salt strings are base64-encoded and always fit in a u8 (max ~22 bytes)
-    let salt_len = u8::try_from(salt_bytes.len())
-        .map_err(|_| io::Error::other("Salt length exceeds 255 bytes"))?;
-    output.write_all(&[salt_len])?;
-    output.write_all(salt_bytes)?;
+    let mut output = Vec::with_capacity(1 + V2_SALT_LEN + NONCE_LEN + ciphertext.len());
+    output.write_all(&[FORMAT_V2])?;
+    output.write_all(&salt)?;
     output.write_all(nonce.as_ref())?;
     output.write_all(&ciphertext)?;
 
@@ -102,71 +141,80 @@ pub fn encrypt(password: &[u8], plaintext: &str) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
-/// Decrypt secret keys from encrypted blob
+/// Decrypt a blob and report which layout produced it.
 ///
-/// Expects bytes in format: `[salt_len:1][salt:variable][nonce:12][ciphertext:variable]`
+/// Callers that need to act on the format (e.g. stage a v2 rewrite when they
+/// see a v1) consume the returned `BlobFormat`. Callers that just want the
+/// plaintext can use `decrypt`, which discards it.
 ///
 /// # Errors
 ///
-/// Returns an error if the data is malformed, key derivation fails, or decryption fails
-/// (e.g., wrong PIN).
-pub fn decrypt(password: &[u8], encrypted: &[u8]) -> io::Result<String> {
+/// Returns an error if the version byte is unknown, the data is malformed,
+/// the salt slice is the wrong size, key derivation fails, or AES-GCM
+/// authentication fails (e.g., wrong PIN).
+pub fn decrypt_with_format(password: &[u8], encrypted: &[u8]) -> io::Result<(String, BlobFormat)> {
     debug!("Decrypting data ({} bytes)...", encrypted.len());
 
-    // Parse salt length
-    if encrypted.is_empty() {
+    let Some(&version_byte) = encrypted.first() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Encrypted data is empty",
         ));
-    }
-    let salt_len = encrypted[0] as usize;
-    let mut offset = 1;
+    };
 
-    // Parse salt
-    if encrypted.len() < offset + salt_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Encrypted data too short for salt",
-        ));
-    }
-    let salt_bytes = &encrypted[offset..offset + salt_len];
-    let salt_str = std::str::from_utf8(salt_bytes).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Salt is not valid UTF-8: {e}"),
-        )
-    })?;
-    let salt = SaltString::from_b64(salt_str).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Failed to decode salt: {e}"),
-        )
-    })?;
-    offset += salt_len;
+    let (salt, format, after_salt) = match version_byte {
+        LEGACY_SALT_LEN => {
+            let salt_end = 1 + LEGACY_SALT_LEN as usize;
+            if encrypted.len() < salt_end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Encrypted data too short for legacy salt",
+                ));
+            }
+            (
+                &encrypted[1..salt_end],
+                BlobFormat::V1Legacy,
+                &encrypted[salt_end..],
+            )
+        }
+        FORMAT_V2 => {
+            let salt_end = 1 + V2_SALT_LEN;
+            if encrypted.len() < salt_end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Encrypted data too short for v2 salt",
+                ));
+            }
+            (
+                &encrypted[1..salt_end],
+                BlobFormat::V2,
+                &encrypted[salt_end..],
+            )
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown format version",
+            ));
+        }
+    };
 
-    // Parse nonce (12 bytes for AES-GCM)
-    if encrypted.len() < offset + 12 {
+    if after_salt.len() < NONCE_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Encrypted data too short for nonce",
         ));
     }
-    let nonce = Nonce::from_slice(&encrypted[offset..offset + 12]);
-    offset += 12;
-
-    // Remaining bytes are ciphertext
-    let ciphertext = &encrypted[offset..];
+    let nonce = Nonce::from_slice(&after_salt[..NONCE_LEN]);
+    let ciphertext = &after_salt[NONCE_LEN..];
     debug!(
-        "Parsed: salt={} bytes, ciphertext={} bytes",
-        salt_len,
+        "Parsed: format={format:?}, salt={} bytes, ciphertext={} bytes",
+        salt.len(),
         ciphertext.len()
     );
 
-    // Derive key
-    let key = derive_key(password, &salt)?;
+    let key = derive_key(password, salt)?;
 
-    // Decrypt with AES-256-GCM
     debug!("Decrypting with AES-256-GCM");
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| {
         io::Error::new(
@@ -182,12 +230,26 @@ pub fn decrypt(password: &[u8], encrypted: &[u8]) -> io::Result<String> {
         )
     })?;
 
-    String::from_utf8(plaintext).map_err(|e| {
+    let plaintext = String::from_utf8(plaintext).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Decrypted data is not valid UTF-8: {e}"),
         )
-    })
+    })?;
+
+    Ok((plaintext, format))
+}
+
+/// Decrypt a blob and return only the plaintext.
+///
+/// Thin wrapper around `decrypt_with_format` for callers that don't care which
+/// layout produced the blob.
+///
+/// # Errors
+///
+/// Same conditions as `decrypt_with_format`.
+pub fn decrypt(password: &[u8], encrypted: &[u8]) -> io::Result<String> {
+    decrypt_with_format(password, encrypted).map(|(plaintext, _)| plaintext)
 }
 
 #[cfg(test)]
@@ -197,62 +259,85 @@ mod tests {
 
     const FIXTURE_PIN: &[u8] = b"123456";
     const FIXTURE_PLAINTEXT: &str = r#"{"consensus":"edsk_fixture"}"#;
+    const LEGACY_V1_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/legacy_v1.bin");
 
-    /// Captures a legacy v1 encrypted blob to disk so the next code generation
-    /// can prove its decrypt path still works against bytes produced by the
-    /// pre-upgrade implementation. Run on the legacy code path before bumping
-    /// scrypt:
-    /// `cargo test -p russignol-crypto -- --ignored capture_legacy_fixture`.
     #[test]
-    #[ignore]
-    fn capture_legacy_fixture() {
-        let bytes = encrypt(FIXTURE_PIN, FIXTURE_PLAINTEXT).unwrap();
-
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("legacy_v1.bin");
-        std::fs::write(&path, &bytes).unwrap();
-
-        assert_eq!(
-            bytes[0], 22,
-            "legacy v1 first byte must be 22 (b64 salt length)"
-        );
-        assert_eq!(
-            bytes.len(),
-            1 + 22 + 12 + FIXTURE_PLAINTEXT.len() + 16,
-            "unexpected v1 blob length"
-        );
+    fn test_decrypt_legacy_fixture() {
+        let plaintext = decrypt(FIXTURE_PIN, LEGACY_V1_FIXTURE).unwrap();
+        assert_eq!(plaintext, FIXTURE_PLAINTEXT);
     }
 
     #[test]
-    fn test_encrypt_decrypt_roundtrip() {
-        let password = b"123456";
-        let plaintext = r#"{"consensus": "edsk..."}"#;
-
-        let encrypted = encrypt(password, plaintext).unwrap();
-        let decrypted = decrypt(password, &encrypted).unwrap();
-
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn test_wrong_password_fails() {
-        let plaintext = "secret data";
-        let encrypted = encrypt(b"correct", plaintext).unwrap();
-        let result = decrypt(b"wrong", &encrypted);
-
+    fn test_legacy_fixture_wrong_pin_fails() {
+        let result = decrypt(b"wrong-pin", LEGACY_V1_FIXTURE);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("wrong PIN"));
     }
 
     #[test]
+    fn test_decrypt_with_format_returns_v1_for_fixture() {
+        let (_, format) = decrypt_with_format(FIXTURE_PIN, LEGACY_V1_FIXTURE).unwrap();
+        assert_eq!(format, BlobFormat::V1Legacy);
+    }
+
+    #[test]
+    fn test_decrypt_with_format_returns_v2_for_fresh_blob() {
+        let pin = b"123456";
+        let plaintext = "secret";
+        let bytes = encrypt(pin, plaintext).unwrap();
+        let (_, format) = decrypt_with_format(pin, &bytes).unwrap();
+        assert_eq!(format, BlobFormat::V2);
+    }
+
+    #[test]
+    fn test_v2_roundtrip() {
+        let pin = b"123456";
+        let plaintext = r#"{"consensus": "edsk..."}"#;
+        let bytes = encrypt(pin, plaintext).unwrap();
+        assert_eq!(decrypt(pin, &bytes).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_v2_format_invariants() {
+        let plaintext = "hello";
+        let bytes = encrypt(b"pin", plaintext).unwrap();
+        assert_eq!(bytes[0], FORMAT_V2);
+        assert_eq!(
+            bytes.len(),
+            1 + V2_SALT_LEN + NONCE_LEN + plaintext.len() + 16,
+            "v2 blob length must be header + ciphertext + 16-byte GCM tag"
+        );
+    }
+
+    #[test]
+    fn test_v2_wrong_pin_fails() {
+        let bytes = encrypt(b"correct", "secret data").unwrap();
+        let result = decrypt(b"wrong", &bytes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("wrong PIN"));
+    }
+
+    #[test]
+    fn test_unknown_version_byte_fails() {
+        let mut blob = vec![0xFF];
+        blob.extend(std::iter::repeat_n(0u8, 64));
+        let err = decrypt(b"any", &blob).unwrap_err();
+        assert!(err.to_string().contains("unknown format version"));
+    }
+
+    #[test]
+    fn test_truncated_v2_data_error() {
+        let result = decrypt(b"any", &[FORMAT_V2]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_scrypt_timing() {
-        let salt = SaltString::generate(&mut OsRng);
+        let salt = [0u8; V2_SALT_LEN];
         let start = std::time::Instant::now();
         let _ = derive_key(b"123456", &salt).unwrap();
         let elapsed = start.elapsed();
 
-        // Should complete within 60s even on slow hardware
         assert!(
             elapsed < Duration::from_mins(1),
             "Scrypt took too long: {elapsed:?}"
@@ -263,7 +348,7 @@ mod tests {
     #[test]
     fn test_key_derivation_deterministic() {
         let password = b"test_pin";
-        let salt = SaltString::generate(&mut OsRng);
+        let salt = [7u8; V2_SALT_LEN];
 
         let key1 = derive_key(password, &salt).unwrap();
         let key2 = derive_key(password, &salt).unwrap();
@@ -279,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_truncated_data_error() {
-        let result = decrypt(b"password", &[22]); // salt_len=22 but no salt data
+        let result = decrypt(b"password", &[LEGACY_SALT_LEN]);
         assert!(result.is_err());
     }
 }
