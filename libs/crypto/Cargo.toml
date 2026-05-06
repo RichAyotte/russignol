@@ -12,3 +12,6 @@ workspace = true
 scrypt = "0.12"
 aes-gcm = "0.10"
 log = { workspace = true }
+
+[dev-dependencies]
+toml = "1.1.2"
