@@ -705,13 +705,9 @@ fn import_and_set_key(
 
         // Check if already set on-chain (pass pkh in the correct slot)
         let already_set = if kind == "consensus" {
-            check_individual_keys_on_chain(baker_key, &pkh, "", config)
-                .map(|(c, _)| c)
-                .unwrap_or(false)
+            check_individual_keys_on_chain(baker_key, &pkh, "", config).is_ok_and(|(c, _)| c)
         } else {
-            check_individual_keys_on_chain(baker_key, "", &pkh, config)
-                .map(|(_, c)| c)
-                .unwrap_or(false)
+            check_individual_keys_on_chain(baker_key, "", &pkh, config).is_ok_and(|(_, c)| c)
         };
 
         if !already_set {

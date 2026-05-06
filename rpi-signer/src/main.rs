@@ -216,7 +216,7 @@ fn run_ui_loop(
     watermark: &Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>>,
     cpu_boost: Option<&cpu_freq::CpuBoost>,
 ) -> epd_2in13_v4::EpdResult<()> {
-    const SCREENSAVER_TIMEOUT: Duration = Duration::from_secs(60);
+    const SCREENSAVER_TIMEOUT: Duration = Duration::from_mins(1);
 
     let (screensaver_reset_tx, screensaver_reset_rx) = crossbeam_channel::unbounded::<()>();
     let tx_screensaver = tx.clone();

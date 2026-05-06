@@ -25,8 +25,6 @@ log = { version = "0.4", features = ["max_level_info", "release_max_level_info"]
 # Dev profile - enable optimizations for usable debug builds
 [profile.dev]
 opt-level = 1             # Basic optimizations, better debuggability
-
-# Optimize heavy dependencies even in dev builds
 [profile.dev.package.scrypt]
 opt-level = 3
 [profile.dev.package.aes-gcm]

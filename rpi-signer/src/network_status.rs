@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 const INTERFACE_NAME: &str = "usb0";
 const HOST_IP: &str = "169.254.1.2";
-const BAKER_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(60); // Consider baker idle after 60s
+const BAKER_ACTIVITY_TIMEOUT: Duration = Duration::from_mins(1); // Consider baker idle after 60s
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NetworkStatus {

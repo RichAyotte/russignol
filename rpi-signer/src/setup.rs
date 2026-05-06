@@ -60,8 +60,7 @@ pub fn verify_partitions_early() -> Result<(), String> {
 
 fn is_partition_mounted(partition: &str) -> bool {
     std::fs::read_to_string("/proc/mounts")
-        .map(|mounts| mounts.lines().any(|line| line.starts_with(partition)))
-        .unwrap_or(false)
+        .is_ok_and(|mounts| mounts.lines().any(|line| line.starts_with(partition)))
 }
 
 /// Verify partitions are ready for setup

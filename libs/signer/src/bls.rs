@@ -31,7 +31,7 @@
 use crate::base58check;
 use blake2::digest::consts::U20;
 use blake2::{Blake2b, Digest};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use num_bigint::BigUint;
 use sha2::Sha256;
 use thiserror::Error;

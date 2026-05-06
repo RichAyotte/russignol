@@ -122,8 +122,7 @@ pub fn is_service_active(service: &str) -> bool {
         return false;
     }
     run_command("systemctl", &["is-active", service])
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "active")
-        .unwrap_or(false)
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "active")
 }
 
 /// Check if a command exists in PATH
@@ -133,8 +132,7 @@ pub fn command_exists(program: &str) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 /// Check if a file exists

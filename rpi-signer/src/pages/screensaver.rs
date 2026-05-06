@@ -23,8 +23,7 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         let logo_result: Result<Bmp<BinaryColor>, _> = Bmp::from_slice(RUSSIGNOL_LOGO);
         let logo_size = logo_result
             .as_ref()
-            .map(|l| l.bounding_box().size)
-            .unwrap_or(Size::new(64, 64)); // Fallback size if BMP fails
+            .map_or(Size::new(64, 64), |l| l.bounding_box().size); // Fallback size if BMP fails
 
         // Calculate total height of logo + spacing + text, then center vertically
         let text_height = 12;
