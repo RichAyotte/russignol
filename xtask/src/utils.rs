@@ -15,11 +15,20 @@ pub fn clear_host_compiler_flags() {
     }
 }
 
-/// Set ARM-specific RUSTFLAGS for Cortex-A53 (`RPi` Zero 2W)
+/// Set ARM-specific RUSTFLAGS for Cortex-A53 (`RPi` Zero 2W).
+///
+/// The `sha2_256_backend = "soft"` cfg forces sha2 0.11 to skip its
+/// cpufeatures-gated runtime dispatch, which hangs first-boot keygen on the
+/// Pi Zero 2W's Cortex-A53 (BCM2710A1) under release LTO. The CPU lacks the
+/// `ARMv8` SHA-2 crypto extensions, so the soft backend is what would run at
+/// runtime regardless.
 pub fn set_arm_rustflags() {
     // Safe in our single-threaded build context
     unsafe {
-        env::set_var("RUSTFLAGS", "-C target-cpu=cortex-a53");
+        env::set_var(
+            "RUSTFLAGS",
+            "-C target-cpu=cortex-a53 --cfg sha2_256_backend=\"soft\"",
+        );
     }
 }
 
