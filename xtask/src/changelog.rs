@@ -719,32 +719,40 @@ fn generate_with_claude(
         .unwrap_or_default();
 
     let prompt = format!(
-        "Russignol is a Tezos blockchain signer that runs on a Raspberry Pi Zero 2W. \
-         It signs consensus operations (blocks and attestations) using BLS12-381 keys. \
-         The device runs 24/7 in a home environment, so power consumption, temperature, \
-         reliability, and security are key concerns for users. The host utility runs on \
-         the user's desktop to manage the device (flashing SD cards, backing up keys, \
-         upgrading firmware).\n\n\
-         Generate a changelog from these git commits. Group entries under these markdown \
-         sections in order: Added, Fixed, Changed, Chores. Only include sections that \
-         have entries. Each entry should be a bullet point: `- **scope:** description (hash)` \
-         or `- description (hash)` if no scope. Descriptions should emphasize user-facing \
-         benefits (reliability, power efficiency, temperature, performance, security, \
-         usability) instead of implementation details. Be concise — each description \
-         should be a single short sentence.\n\n\
-         Skip commits with type docs, refactor, test, style, ci, or scope website or xtask. \
-         Skip release meta-commits (chore(release)).\n\n\
-         When a fix commit is a follow-up correction to a new feature introduced in the \
-         same release, fold its details into the parent feature's description instead of \
-         listing it as a separate fix. Only list a commit under Fixed if it fixes a bug \
-         that existed in a previous release.\n\n\
-         Start with this exact header line:\n\
+        "Russignol is a Tezos signer running 24/7 on a Pi Zero 2W. Users are bakers; \
+         they care about uptime, security, power, heat, and the host CLI that flashes \
+         and backs up the device.\n\n\
+         Write release notes for the commits below. Each bullet leads with what changes \
+         for the user — a new capability, a bug they no longer hit, a property they can \
+         now rely on. Mention mechanism (how it works internally) only when it changes \
+         what the user can do.\n\n\
+         Format each bullet as `- **scope:** <one short sentence> (hash)`, dropping the \
+         bold when there is no scope. Group under `### Added`, `### Fixed`, `### Changed`, \
+         `### Chores` in that order; omit empty sections.\n\n\
+         Words like \"polling\", \"event-based\", \"two-boot\", \"verify-then-promote\", \
+         \"fdatasync\", \"wrapper\", \"refactored\", \"switched to\", \"rewrote\", \
+         \"promoted\" describe how, not what — do not write a bullet about them.\n\n\
+         Bad:  - **rpi-signer:** Two-boot verify-then-promote migration to v2 preserves \
+         v1 until the next boot confirms it. (abc1234)\n\
+         Good: - **rpi-signer:** Encrypted keys upgrade to a stronger format on next \
+         unlock; the old file is kept until the new one is verified, so an interrupted \
+         upgrade cannot brick the device. (abc1234)\n\n\
+         Bad:  - **screensaver:** Event-based activation timer eliminates idle CPU \
+         wakeups from polling. (def5678)\n\
+         Good: - **screensaver:** Idle CPU wakeups drop, lowering temperature and power \
+         on long-running devices. (def5678)\n\n\
+         Skip: types `docs`, `refactor`, `test`, `style`, `ci`; scopes `website`, `xtask`; \
+         release meta (`chore(release)`); and `fix` commits that only correct work \
+         introduced in this same release.\n\n\
+         When several commits ship one user-visible feature (a new format plus its \
+         migration, for example), write one bullet listing every contributing hash: \
+         `(hash1, hash2)`.\n\n\
+         Begin with exactly:\n\
          ## [{version}] - {date}\n\n\
-         End with this exact line:\n\
+         End with exactly:\n\
          {compare_link}\n\
-         Format as GitHub Flavored Markdown. \
-         Output only the changelog with no surrounding commentary.\n\n\
-         Here are the full commit messages:\n\n{full_messages}"
+         Output only the changelog — no preamble, no commentary.\n\n\
+         Commits:\n\n{full_messages}"
     );
 
     let output = Command::new("claude")
