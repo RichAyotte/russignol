@@ -769,7 +769,23 @@ fn generate_with_claude(
         bail!("claude returned empty output");
     }
 
+    validate_claude_changelog(&rewritten, version, date)?;
+
     Ok(rewritten)
+}
+
+/// Verify Claude's output is a real changelog and not refusal/meta commentary.
+///
+/// The required header `## [{version}] - {date}` is dictated by the prompt and
+/// is a stable anchor: if it is missing, the response is not the changelog the
+/// release pipeline expects and must be rejected so the caller can fall back
+/// to the deterministic generator.
+fn validate_claude_changelog(output: &str, version: &str, date: &str) -> Result<()> {
+    let header = format!("## [{version}] - {date}");
+    if !output.lines().any(|line| line.trim() == header) {
+        bail!("claude output missing required header `{header}`");
+    }
+    Ok(())
 }
 
 fn format_commit(commit: &ParsedCommit) -> String {
@@ -1094,6 +1110,46 @@ mod tests {
         };
         let formatted = format_commit(&commit);
         assert_eq!(formatted, "- fix bug (def5678)\n");
+    }
+
+    #[test]
+    fn test_validate_claude_changelog_accepts_well_formed_output() {
+        let body = "\
+## [0.23.0] - 2026-05-06
+
+### Added
+- **signer:** something useful (abc1234)
+
+**Full Changelog**: https://github.com/RichAyotte/russignol/compare/v0.22.0...v0.23.0
+";
+        validate_claude_changelog(body, "0.23.0", "2026-05-06").unwrap();
+    }
+
+    #[test]
+    fn test_validate_claude_changelog_rejects_meta_commentary() {
+        // Verbatim text Claude returned during the v0.23.0 release that ended up
+        // as the GitHub release notes — must not pass validation.
+        let body = "The changelog is complete in my response above — no code changes \
+                    are needed for this task, so there's nothing to implement or approve.";
+        let err = validate_claude_changelog(body, "0.23.0", "2026-05-06").unwrap_err();
+        assert!(err.to_string().contains("missing required header"));
+    }
+
+    #[test]
+    fn test_validate_claude_changelog_rejects_wrong_version() {
+        let body = "## [0.22.0] - 2026-05-06\n\n### Added\n- something (abc1234)\n";
+        assert!(validate_claude_changelog(body, "0.23.0", "2026-05-06").is_err());
+    }
+
+    #[test]
+    fn test_validate_claude_changelog_rejects_wrong_date() {
+        let body = "## [0.23.0] - 2026-04-01\n\n### Added\n- something (abc1234)\n";
+        assert!(validate_claude_changelog(body, "0.23.0", "2026-05-06").is_err());
+    }
+
+    #[test]
+    fn test_validate_claude_changelog_rejects_empty() {
+        assert!(validate_claude_changelog("", "0.23.0", "2026-05-06").is_err());
     }
 
     #[test]
