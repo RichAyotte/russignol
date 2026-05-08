@@ -24,8 +24,14 @@ pub const DATA_MOUNT: &str = "/data";
 // Setup marker lives on keys partition (survives data partition corruption)
 pub const SETUP_MARKER: &str = "/keys/.setup_complete";
 
-// Path to check for existing keys (CRITICAL: never overwrite if this exists)
-const SECRET_KEYS_ENC: &str = "/keys/secret_keys.enc";
+// Returns true if any encrypted secret keys file exists. Either path
+// presence is a "do not overwrite" signal: a v1-named blob predates the
+// migration; a v2-named blob is current. Setup must refuse if either is
+// present.
+fn encrypted_keys_exist() -> bool {
+    Path::new(russignol_crypto::SECRET_KEYS_ENC_PATH).exists()
+        || Path::new(russignol_crypto::SECRET_KEYS_ENC_V2_PATH).exists()
+}
 
 /// Check if storage partitions need to be created (first boot on fresh image)
 pub fn needs_storage_setup() -> bool {
@@ -49,7 +55,7 @@ pub fn is_first_boot() -> bool {
 /// case as it would destroy existing keys.
 pub fn verify_partitions_early() -> Result<(), String> {
     // CRITICAL: If keys exist but marker doesn't, refuse to proceed
-    if Path::new(SECRET_KEYS_ENC).exists() {
+    if encrypted_keys_exist() {
         return Err("ABORT: Existing keys detected but setup marker missing! \
              Setup cannot proceed - this would destroy your keys. \
              If you need to reset, reflash the device."
@@ -72,7 +78,7 @@ pub fn verify_partitions() -> Result<(), String> {
     log::info!("Keys partition mounted at {KEYS_MOUNT}");
 
     // CRITICAL: Check if keys already exist - if so, REFUSE to proceed
-    if Path::new(SECRET_KEYS_ENC).exists() {
+    if encrypted_keys_exist() {
         return Err("ABORT: Existing keys detected on keys partition! \
              Setup cannot proceed - this would risk data loss. \
              If you need to reset, reflash the device."

@@ -17,6 +17,13 @@ USER="russignol"
 COMMAND="/bin/russignol-signer"
 export RUST_LOG=info
 
+# Signer exits with this code to request a clean reboot from the init
+# supervisor (used to land each PIN-blob migration step on a fresh boot).
+# Must stay in sync with the matching constants in
+# `rpi-signer/src/app.rs` (`EXIT_CODE_REBOOT`) and
+# `rpi-signer/buildroot-external/rootfs-overlay-hardened/init`.
+EXIT_CODE_REBOOT=42
+
 # Partition layout (created at first boot by signer):
 # - p3 (keys): Holds encrypted keys, becomes RO after setup
 # - p4 (data): Holds watermarks and logs
@@ -38,6 +45,13 @@ is_mounted() {
     grep -q "^$1 " /proc/mounts
 }
 
+# Returns success when the keys partition needs to stay rw so the signer can
+# run the v1->v2 PIN-blob migration. Presence of the v1-named blob is the
+# whole signal: it means either staging or verify-and-promote is pending.
+needs_migration() {
+    [ -f "${KEYS_MOUNT}/secret_keys.enc" ]
+}
+
 mount_keys_partition() {
     # Check if p3 exists - if not, first boot hasn't created it yet
     if ! partition_exists 3; then
@@ -50,8 +64,12 @@ mount_keys_partition() {
         # Mount read-write first to check for setup marker
         if mount -t f2fs -o rw "${KEYS_PART}" "${KEYS_MOUNT}" 2>/dev/null; then
             if [ -f "${SETUP_MARKER}" ]; then
-                # After setup: remount read-only for security
-                mount -o remount,ro "${KEYS_MOUNT}"
+                if needs_migration; then
+                    echo "Keys partition kept rw for PIN migration"
+                else
+                    # After setup: remount read-only for security
+                    mount -o remount,ro "${KEYS_MOUNT}"
+                fi
             fi
             # First boot: leave mounted read-write for key generation
         fi
@@ -94,25 +112,48 @@ case "$1" in
             echo "Signer will drop privileges after partition creation"
             if ! start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
                 --chdir /home/russignol \
-                --background --startas /bin/sh -- -c "$COMMAND"; then
+                --background --startas /bin/sh -- -c \
+                "$COMMAND; ec=\$?; [ \$ec = $EXIT_CODE_REBOOT ] && reboot -f; exit \$ec"; then
                 echo "Failed to start Russignol" >&2
                 exit 1
             fi
         else
-            echo "Normal boot - running as $USER"
             mkdir -p /data/logs
             chown "$USER" /data/logs
+            # Migration boots run the wrapper as root, which leaves
+            # panic.log and signer.log owned root:root. The next normal
+            # boot starts the wrapper via --chuid russignol, and its
+            # `2>>panic.log` redirect would then fail with EACCES before
+            # $COMMAND runs. Reclaim ownership unconditionally.
+            chown "$USER" /data/logs/*.log 2>/dev/null
             # Truncate panic log if it exceeds 1MB
             if [ -f /data/logs/panic.log ] && [ "$(wc -c </data/logs/panic.log)" -gt 1048576 ]; then
                 : >/data/logs/panic.log
             fi
-            # Binary manages its own log file via RotatingWriter; init only captures panics
-            if ! start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
-                --chuid "$USER" \
-                --chdir /home/russignol \
-                --background --startas /bin/sh -- -c "$COMMAND >/dev/null 2>>/data/logs/panic.log"; then
-                echo "Failed to start Russignol" >&2
-                exit 1
+            # Migration boots run as root so the signer can chown/chmod the
+            # promoted v2 canonical and remount /keys ro before demoting
+            # to russignol in-process.
+            if needs_migration; then
+                echo "Migration boot - running as root; signer demotes in-process"
+                # Binary manages its own log file via RotatingWriter; init only captures panics
+                if ! start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
+                    --chdir /home/russignol \
+                    --background --startas /bin/sh -- -c \
+                    "$COMMAND >/dev/null 2>>/data/logs/panic.log; ec=\$?; if [ \$ec = $EXIT_CODE_REBOOT ]; then echo \"signer requested reboot at \$(date)\" >>/data/logs/panic.log; reboot -f; fi; exit \$ec"; then
+                    echo "Failed to start Russignol" >&2
+                    exit 1
+                fi
+            else
+                echo "Normal boot - running as $USER"
+                # Binary manages its own log file via RotatingWriter; init only captures panics
+                if ! start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
+                    --chuid "$USER" \
+                    --chdir /home/russignol \
+                    --background --startas /bin/sh -- -c \
+                    "$COMMAND >/dev/null 2>>/data/logs/panic.log; ec=\$?; if [ \$ec = $EXIT_CODE_REBOOT ]; then echo \"signer requested reboot at \$(date)\" >>/data/logs/panic.log; reboot -f; fi; exit \$ec"; then
+                    echo "Failed to start Russignol" >&2
+                    exit 1
+                fi
             fi
         fi
         ;;

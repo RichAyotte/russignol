@@ -42,8 +42,15 @@ use aes_gcm::{
 use log::debug;
 use std::io::{self, Write};
 
-/// Path to encrypted secret keys file
+/// Path to a v1-format encrypted secret keys file. New devices never write
+/// here; the path remains canonical for legacy blobs that pre-date the v2
+/// layout and for any blob mid-migration to v2.
 pub const SECRET_KEYS_ENC_PATH: &str = "/keys/secret_keys.enc";
+
+/// Path to a v2-format encrypted secret keys file. Fresh setups write here
+/// directly; a v1→v2 migration writes here after re-encryption (or moves the
+/// blob here unchanged when the v1-named file is already v2 format).
+pub const SECRET_KEYS_ENC_V2_PATH: &str = "/keys/secret_keys.enc.v2";
 
 /// v2 blob version byte. v1 is implicit through `LEGACY_SALT_LEN`.
 const FORMAT_V2: u8 = 0x02;

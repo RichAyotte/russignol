@@ -4,6 +4,7 @@ pub mod confirmation;
 pub mod dialog;
 pub mod greeting;
 pub mod menu;
+pub mod notice;
 pub mod pin;
 pub mod screensaver;
 pub mod signatures;

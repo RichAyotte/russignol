@@ -1,5 +1,8 @@
 use embedded_graphics::prelude::Point;
 use russignol_signer_lib::ChainId;
+use std::time::Duration;
+
+use crate::tezos_encrypt::MigrationEvent;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEvent {
@@ -19,9 +22,24 @@ pub enum AppEvent {
     // === Normal operation events ===
     EnterPin,
     InvalidPinEntered,
-    PinVerified(String), // PIN verified successfully, carries decrypted secret_keys JSON
+    PinVerified {
+        json: String,
+        migration: Option<MigrationEvent>,
+    }, // PIN verified successfully, carries decrypted secret_keys JSON + migration outcome
+    /// Fired by the PIN-verify thread between the v1 unlock and the v2
+    /// re-encrypt so the UI can swap in a fresh progress page (the
+    /// "Verifying PIN..." bar has already capped at 100% by this point).
+    PinVerifyProgress {
+        message: String,
+        estimated_duration: Duration,
+    },
+    /// Fired by the migration error notice's OK button; carries the
+    /// already-decrypted secret keys forward to the normal unlock path.
+    AcknowledgeMigrationNotice {
+        json: String,
+    },
     PinVerificationFailed, // PIN verification failed (wrong PIN)
-    DeviceLocked,        // Too many failed PIN attempts, device locked
+    DeviceLocked,          // Too many failed PIN attempts, device locked
     KeysDecrypted(String), // Keys decrypted, carries secret_keys JSON for signer
     DirtyDisplay,
     Touch(Point),

@@ -34,8 +34,8 @@ use epd_2in13_v4::display::Display;
 use epd_2in13_v4::{Device, device};
 use events::AppEvent;
 use pages::{
-    Page, about, blockchain, confirmation, dialog, greeting, menu, pin, screensaver, signatures,
-    status, watermarks,
+    Page, about, blockchain, confirmation, dialog, greeting, menu, notice, pin, screensaver,
+    signatures, status, watermarks,
 };
 use russignol_ui::pages::{error, progress};
 use std::path::PathBuf;
@@ -334,6 +334,37 @@ fn handle_timeout(
     Ok(())
 }
 
+/// Block for `duration`, redrawing the current page each
+/// `app.animation_interval` if it's animated. Without this the progress
+/// bar shown before a migration reboot would freeze at 0% for the entire
+/// countdown — `std::thread::sleep` blocks the event loop, so the
+/// timed-progress page never gets a chance to refresh from `handle_timeout`.
+fn sleep_with_animation(
+    app: &mut App,
+    device: &mut Device,
+    current_page: &mut Box<dyn Page<Display>>,
+    duration: Duration,
+) -> epd_2in13_v4::EpdResult<()> {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        if app.needs_animation && !app.is_screensaver_active() {
+            if let Err(e) = current_page.show(&mut device.display) {
+                log::warn!("display update during sleep: {e}");
+            }
+            if let Err(e) = device.display.update() {
+                log::warn!("display update during sleep: {e}");
+            }
+            std::thread::sleep(app.animation_interval.min(remaining));
+        } else {
+            std::thread::sleep(remaining);
+        }
+    }
+}
+
 fn handle_touch(
     app: &mut App,
     current_page: &mut Box<dyn Page<Display>>,
@@ -432,6 +463,11 @@ fn construct_page(
             &button_text,
         )),
         PageSpec::Error { title, message } => Box::new(error::Page::new(&title, &message)),
+        PageSpec::Notice {
+            title,
+            message,
+            on_dismiss,
+        } => Box::new(notice::Page::new(tx.clone(), &title, &message, on_dismiss)),
         PageSpec::DeviceLocked => unreachable!("DeviceLocked handled directly in apply_effects"),
     }
 }
@@ -533,8 +569,11 @@ fn apply_effects(
                 }
             }
             Effect::FatalError { title, message } => fatal_error(device, &title, &message),
-            Effect::Exit(code) => std::process::exit(code),
-            Effect::Sleep(duration) => std::thread::sleep(duration),
+            Effect::Exit(code) => {
+                log::info!("Exiting with code {code}");
+                std::process::exit(code);
+            }
+            Effect::Sleep(duration) => sleep_with_animation(app, device, current_page, duration)?,
         }
     }
     Ok(())
@@ -650,14 +689,25 @@ fn spawn_pin_verify(tx: Sender<AppEvent>, pin: Vec<u8>, cpu_boost: Option<&cpu_f
             b.boost();
         }
         let start = std::time::Instant::now();
-        let result = tezos_encrypt::decrypt_secret_keys(&pin);
+        let result = tezos_encrypt::decrypt_secret_keys(&pin, {
+            let tx = tx.clone();
+            move || {
+                let _ = tx.send(AppEvent::PinVerifyProgress {
+                    message: "Upgrading PIN...".into(),
+                    estimated_duration: Duration::from_secs(12),
+                });
+            }
+        });
         if let Some(ref b) = boost {
             b.restore();
         }
         match result {
-            Ok(json) => {
+            Ok(outcome) => {
                 log::info!("Decrypting time: {:?}", start.elapsed());
-                let _ = tx.send(AppEvent::PinVerified(json));
+                let _ = tx.send(AppEvent::PinVerified {
+                    json: outcome.plaintext,
+                    migration: outcome.migration,
+                });
             }
             Err(e) => {
                 log::error!("PIN verification failed: {e}");

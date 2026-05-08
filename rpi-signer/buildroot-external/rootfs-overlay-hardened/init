@@ -89,6 +89,13 @@ partition_exists() {
     [ -e "/sys/block/mmcblk0/mmcblk0p$1" ]
 }
 
+# Returns success when the keys partition needs to stay rw so the signer can
+# run the v1->v2 PIN-blob migration. Presence of the v1-named blob is the
+# whole signal: it means either staging or verify-and-promote is pending.
+needs_migration() {
+    [ -f "${KEYS_MOUNT}/secret_keys.enc" ]
+}
+
 init_keys_partition() {
     log_debug "Setting up keys partition..."
 
@@ -104,9 +111,13 @@ init_keys_partition() {
     # Mount read-write first to check for setup marker
     if mount -t f2fs -o rw "${KEYS_PART}" "${KEYS_MOUNT}" 2>/dev/null; then
         if [ -f "${SETUP_MARKER}" ]; then
-            # After setup: remount read-only for security
-            mount -o remount,ro "${KEYS_MOUNT}"
-            log_debug "Setup complete, keys partition remounted read-only"
+            if needs_migration; then
+                log_debug "Setup complete, keys partition kept rw for PIN migration"
+            else
+                # After setup: remount read-only for security
+                mount -o remount,ro "${KEYS_MOUNT}"
+                log_debug "Setup complete, keys partition remounted read-only"
+            fi
         else
             # First boot: keep read-write for key generation
             log_debug "First boot, keys partition kept read-write"
@@ -327,6 +338,13 @@ start_watchdog() {
 R_CMD="/bin/russignol-signer"
 PANIC_LOG="/data/logs/panic.log"
 
+# Signer exits with this code to request a clean reboot from the supervisor
+# (used to land each PIN-blob migration step on a fresh boot).
+# Must stay in sync with the matching constants in
+# `rpi-signer/src/app.rs` (`EXIT_CODE_REBOOT`) and
+# `rpi-signer/buildroot-external/rootfs-overlay-dev/etc/init.d/S20russignol`.
+EXIT_CODE_REBOOT=42
+
 run_supervisor() {
     cd /home/russignol || return 1
 
@@ -342,17 +360,39 @@ run_supervisor() {
     if ! partition_exists 3 || ! partition_exists 4; then
         # First boot: run as root, no log redirection (would fail anyway)
         $R_CMD
+        ec=$?
     else
-        # Normal boot: ensure log directory exists
+        # Ensure log directory exists
         mkdir -p "${DATA_MOUNT}/logs"
+        # Migration boots run the signer as root, which leaves
+        # signer.log (and panic.log) owned root:root. The next normal
+        # boot runs the signer as russignol via su; RotatingWriter
+        # would then fail to append to a root-owned signer.log.
+        # Reclaim ownership unconditionally.
+        chown "$R_USER" "${DATA_MOUNT}/logs/"*.log 2>/dev/null
 
         # Truncate panic log if it exceeds 1MB
         if [ -f "$PANIC_LOG" ] && [ "$(wc -c <"$PANIC_LOG")" -gt 1048576 ]; then
             : >"$PANIC_LOG"
         fi
 
-        # Binary manages its own log file via RotatingWriter; init only captures panics
-        su -s /bin/sh -c "$R_CMD" "$R_USER" >/dev/null 2>>"$PANIC_LOG"
+        # Migration boots run as root so the signer can chown/chmod the
+        # promoted v2 canonical and remount /keys ro before demoting
+        # to russignol in-process.
+        if needs_migration; then
+            log_debug "Migration boot - running as root; signer demotes in-process"
+            $R_CMD >/dev/null 2>>"$PANIC_LOG"
+            ec=$?
+        else
+            # Binary manages its own log file via RotatingWriter; init only captures panics
+            su -s /bin/sh -c "$R_CMD" "$R_USER" >/dev/null 2>>"$PANIC_LOG"
+            ec=$?
+        fi
+    fi
+
+    if [ "$ec" = "$EXIT_CODE_REBOOT" ]; then
+        log_debug "Signer requested reboot (exit $ec)"
+        reboot -f
     fi
 
     # Don't restart - error should remain visible on display

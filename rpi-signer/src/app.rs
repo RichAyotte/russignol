@@ -5,6 +5,38 @@ use std::time::{Duration, Instant};
 
 use crate::events::AppEvent;
 use crate::setup;
+use crate::tezos_encrypt::MigrationEvent;
+
+/// Visible duration for the migration progress page before the device reboots.
+const MIGRATION_REBOOT_COUNTDOWN: Duration = Duration::from_secs(5);
+
+/// Exit code that the init script supervisor interprets as "reboot the device".
+/// Must stay in sync with the matching constants in
+/// `rpi-signer/buildroot-external/rootfs-overlay-dev/etc/init.d/S20russignol`
+/// and `rpi-signer/buildroot-external/rootfs-overlay-hardened/init`.
+const EXIT_CODE_REBOOT: i32 = 42;
+
+fn push_reboot_progress(message: &str, effects: &mut Vec<Effect>) {
+    effects.push(Effect::ShowProgress {
+        message: message.into(),
+        estimated_duration: Some(MIGRATION_REBOOT_COUNTDOWN),
+        modal: true,
+        percent: 0,
+    });
+    effects.push(Effect::Sleep(MIGRATION_REBOOT_COUNTDOWN));
+    effects.push(Effect::Exit(EXIT_CODE_REBOOT));
+}
+
+/// Show a modal migration-error notice that the user must acknowledge.
+/// Nothing else is queued — the dismiss event drives the next step so
+/// the renderer never paints the menu over an unread error.
+fn push_migration_notice(title: &str, message: &str, json: String, effects: &mut Vec<Effect>) {
+    effects.push(Effect::ShowPage(PageSpec::Notice {
+        title: title.into(),
+        message: message.into(),
+        on_dismiss: AppEvent::AcknowledgeMigrationNotice { json },
+    }));
+}
 
 /// Maximum failed PIN attempts before lockout
 const MAX_FAILED_ATTEMPTS: u32 = 5;
@@ -72,6 +104,11 @@ pub enum PageSpec {
     Error {
         title: String,
         message: String,
+    },
+    Notice {
+        title: String,
+        message: String,
+        on_dismiss: AppEvent,
     },
     DeviceLocked,
 }
@@ -364,15 +401,24 @@ impl App {
                 });
                 effects.push(Effect::SpawnPinVerify { pin });
             }
-            AppEvent::PinVerified(secret_keys_json) => {
+            AppEvent::PinVerified { json, migration } => {
                 log::info!("PIN verified successfully, secret keys decrypted");
-                self.state = AppState::Active {
-                    screensaver_active: false,
-                };
-                effects.push(Effect::InitWatermark {
-                    context: "PIN entry".into(),
+                self.dispatch_pin_verified(json, migration, &mut effects);
+            }
+            AppEvent::PinVerifyProgress {
+                message,
+                estimated_duration,
+            } => {
+                effects.push(Effect::ShowProgress {
+                    message,
+                    estimated_duration: Some(estimated_duration),
+                    modal: true,
+                    percent: 0,
                 });
-                effects.push(Effect::Emit(AppEvent::KeysDecrypted(secret_keys_json)));
+            }
+            AppEvent::AcknowledgeMigrationNotice { json } => {
+                log::info!("Migration notice acknowledged; demoting and proceeding to active");
+                self.proceed_to_active(json, true, &mut effects);
             }
             AppEvent::PinVerificationFailed => {
                 log::info!("PinVerificationFailed, delegating to InvalidPinEntered");
@@ -422,6 +468,80 @@ impl App {
             _ => {}
         }
         (LoopAction::Proceed, effects)
+    }
+
+    fn dispatch_pin_verified(
+        &mut self,
+        json: String,
+        migration: Option<MigrationEvent>,
+        effects: &mut Vec<Effect>,
+    ) {
+        match migration {
+            None => self.proceed_to_active(json, false, effects),
+            Some(MigrationEvent::StagedV2) => {
+                log::info!("PIN upgrade staged; rebooting to verify-and-promote");
+                effects.push(Effect::SetKeyPermissions);
+                effects.push(Effect::SyncDisk);
+                push_reboot_progress("Upgrade staged, rebooting...", effects);
+            }
+            Some(MigrationEvent::PromotedV2) => {
+                log::info!("PIN upgrade complete; demoting to russignol in-process");
+                self.proceed_to_active(json, true, effects);
+            }
+            Some(MigrationEvent::RevertedFromCorruptV2 { reason }) => {
+                log::warn!("PIN upgrade reverted from corrupt v2: {reason}");
+                push_migration_notice(
+                    "PIN UPGRADE FAILED",
+                    &format!("Reverted to legacy format.\n{reason}"),
+                    json,
+                    effects,
+                );
+            }
+            Some(MigrationEvent::StagingFailed { reason }) => {
+                log::warn!("PIN upgrade staging failed: {reason}");
+                push_migration_notice(
+                    "PIN UPGRADE FAILED",
+                    &format!("Could not stage v2 blob.\n{reason}"),
+                    json,
+                    effects,
+                );
+            }
+            Some(MigrationEvent::MigrationDisabled { attempts }) => {
+                log::error!(
+                    "Migration disabled after {attempts} attempts; device unlocked on legacy format"
+                );
+                push_migration_notice(
+                    "MIGRATION DISABLED",
+                    &format!("{attempts} attempts; re-image device.\nUnlocking on legacy format."),
+                    json,
+                    effects,
+                );
+            }
+        }
+    }
+
+    /// Transition to Active and queue the unlock effects. When `demote` is
+    /// true the signer is currently running as root (migration boot ack
+    /// path) and must hand off privileges before going active: chown/chmod
+    /// the canonical, sync, remount /keys ro, drop to russignol. Steady-
+    /// state unlocks (no migration) come up as russignol already and skip
+    /// the demote sequence.
+    fn proceed_to_active(&mut self, json: String, demote: bool, effects: &mut Vec<Effect>) {
+        self.state = AppState::Active {
+            screensaver_active: false,
+        };
+        if demote {
+            effects.extend([
+                Effect::SetKeyPermissions,
+                Effect::SyncDisk,
+                Effect::RemountKeysReadonly,
+                Effect::DropPrivileges,
+            ]);
+        }
+        effects.push(Effect::InitWatermark {
+            context: "PIN entry".into(),
+        });
+        effects.push(Effect::Emit(AppEvent::KeysDecrypted(json)));
     }
 
     fn handle_active(&mut self, event: AppEvent) -> (LoopAction, Vec<Effect>) {
@@ -634,6 +754,23 @@ mod tests {
         effects.iter().any(|e| e == expected)
     }
 
+    /// Lookup wrapper so ordering assertions read like `set_perms < drop_priv`
+    /// instead of unwrapping `.iter().position(...)` at every call site.
+    struct EffectPositions<'a>(&'a [Effect]);
+
+    impl EffectPositions<'_> {
+        fn position_of(&self, expected: &Effect) -> usize {
+            self.0
+                .iter()
+                .position(|e| e == expected)
+                .unwrap_or_else(|| panic!("effect {expected:?} not present in {:?}", self.0))
+        }
+    }
+
+    fn effect_positions(effects: &[Effect]) -> EffectPositions<'_> {
+        EffectPositions(effects)
+    }
+
     fn has_show_page(effects: &[Effect], spec: &PageSpec) -> bool {
         effects
             .iter()
@@ -658,10 +795,235 @@ mod tests {
     }
 
     #[test]
-    fn pin_verified_transitions_pin_entry_to_active() {
+    fn pin_verified_no_migration_transitions_pin_entry_to_active() {
         let mut app = normal_boot_app();
-        let (_action, _effects) = app.handle_event(AppEvent::PinVerified("{}".into()));
+        let (_action, effects) = app.handle_event(AppEvent::PinVerified {
+            json: "{}".into(),
+            migration: None,
+        });
         assert!(matches!(app.state, AppState::Active { .. }));
+        assert!(
+            !has_effect(&effects, &Effect::SetKeyPermissions),
+            "steady-state unlock must not re-chmod keys (boot came up as russignol)"
+        );
+        assert!(
+            !has_effect(&effects, &Effect::DropPrivileges),
+            "steady-state unlock must not drop privileges (boot came up as russignol)"
+        );
+        assert!(
+            !has_effect(&effects, &Effect::RemountKeysReadonly),
+            "steady-state unlock must not remount /keys (init already remounted ro)"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::InitWatermark { .. }))
+        );
+        assert!(has_effect(
+            &effects,
+            &Effect::Emit(AppEvent::KeysDecrypted("{}".into()))
+        ));
+    }
+
+    #[test]
+    fn pin_verified_staged_v2_shows_progress_and_exits_for_reboot() {
+        let mut app = normal_boot_app();
+        let (_action, effects) = app.handle_event(AppEvent::PinVerified {
+            json: "{}".into(),
+            migration: Some(MigrationEvent::StagedV2),
+        });
+        let positions = effect_positions(&effects);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ShowProgress { .. })),
+            "expected ShowProgress for STAGED"
+        );
+        assert!(
+            has_effect(&effects, &Effect::Sleep(MIGRATION_REBOOT_COUNTDOWN)),
+            "expected Sleep before exit"
+        );
+        assert!(
+            has_effect(&effects, &Effect::Exit(EXIT_CODE_REBOOT)),
+            "expected Exit(42) for reboot"
+        );
+        let set_perms = positions.position_of(&Effect::SetKeyPermissions);
+        let sync = positions.position_of(&Effect::SyncDisk);
+        let exit = positions.position_of(&Effect::Exit(EXIT_CODE_REBOOT));
+        assert!(
+            set_perms < sync && sync < exit,
+            "expected SetKeyPermissions, SyncDisk before reboot (got {set_perms} < {sync} < {exit})"
+        );
+        assert!(
+            !matches!(app.state, AppState::Active { .. }),
+            "state should not transition to Active before reboot"
+        );
+    }
+
+    #[test]
+    fn pin_verified_promoted_v2_proceeds_active_with_demote() {
+        let mut app = normal_boot_app();
+        let (_action, effects) = app.handle_event(AppEvent::PinVerified {
+            json: "secrets".into(),
+            migration: Some(MigrationEvent::PromotedV2),
+        });
+        let positions = effect_positions(&effects);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::ShowProgress { .. })),
+            "PromotedV2 must not show a reboot progress page"
+        );
+        assert!(
+            !has_effect(&effects, &Effect::Sleep(MIGRATION_REBOOT_COUNTDOWN)),
+            "PromotedV2 must not sleep for a reboot countdown"
+        );
+        assert!(
+            !has_effect(&effects, &Effect::Exit(EXIT_CODE_REBOOT)),
+            "PromotedV2 must not exit for reboot — demote happens in-process"
+        );
+        let set_perms = positions.position_of(&Effect::SetKeyPermissions);
+        let sync = positions.position_of(&Effect::SyncDisk);
+        let remount = positions.position_of(&Effect::RemountKeysReadonly);
+        let drop_priv = positions.position_of(&Effect::DropPrivileges);
+        assert!(
+            set_perms < sync && sync < remount && remount < drop_priv,
+            "expected SetKeyPermissions < SyncDisk < RemountKeysReadonly < DropPrivileges (got {set_perms} < {sync} < {remount} < {drop_priv})"
+        );
+        assert!(
+            matches!(
+                app.state,
+                AppState::Active {
+                    screensaver_active: false
+                }
+            ),
+            "PromotedV2 transitions directly to Active"
+        );
+        assert!(
+            has_effect(
+                &effects,
+                &Effect::Emit(AppEvent::KeysDecrypted("secrets".into()))
+            ),
+            "expected KeysDecrypted carrying the plaintext"
+        );
+    }
+
+    #[test]
+    fn pin_verified_reverted_shows_notice_and_waits_for_ack() {
+        let mut app = normal_boot_app();
+        let (_action, effects) = app.handle_event(AppEvent::PinVerified {
+            json: "secrets".into(),
+            migration: Some(MigrationEvent::RevertedFromCorruptV2 {
+                reason: "test".into(),
+            }),
+        });
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::ShowPage(PageSpec::Notice { title, on_dismiss, .. })
+                    if title == "PIN UPGRADE FAILED"
+                        && matches!(
+                            on_dismiss,
+                            AppEvent::AcknowledgeMigrationNotice { json } if json == "secrets"
+                        )
+            )),
+            "expected Notice page titled PIN UPGRADE FAILED with ack carrier"
+        );
+        assert!(
+            !has_effect(&effects, &Effect::Exit(EXIT_CODE_REBOOT)),
+            "no reboot for revert"
+        );
+        assert!(
+            !matches!(app.state, AppState::Active { .. }),
+            "must stay in PinEntry until notice is acknowledged"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Emit(AppEvent::KeysDecrypted(_)))),
+            "KeysDecrypted must not fire before acknowledgment"
+        );
+        assert!(
+            !has_effect(&effects, &Effect::DropPrivileges),
+            "DropPrivileges must wait until acknowledgment so the notice renders as root"
+        );
+        assert!(
+            !has_effect(&effects, &Effect::RemountKeysReadonly),
+            "RemountKeysReadonly must wait until acknowledgment"
+        );
+    }
+
+    #[test]
+    fn pin_verified_staging_failed_shows_notice_and_waits_for_ack() {
+        let mut app = normal_boot_app();
+        let (_action, effects) = app.handle_event(AppEvent::PinVerified {
+            json: "secrets".into(),
+            migration: Some(MigrationEvent::StagingFailed {
+                reason: "EROFS".into(),
+            }),
+        });
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::ShowPage(PageSpec::Notice { title, .. }) if title == "PIN UPGRADE FAILED"
+        )));
+        assert!(!has_effect(&effects, &Effect::Exit(EXIT_CODE_REBOOT)));
+        assert!(!matches!(app.state, AppState::Active { .. }));
+        assert!(!has_effect(&effects, &Effect::DropPrivileges));
+        assert!(!has_effect(&effects, &Effect::RemountKeysReadonly));
+    }
+
+    #[test]
+    fn pin_verified_migration_disabled_shows_notice_and_waits_for_ack() {
+        let mut app = normal_boot_app();
+        let (_action, effects) = app.handle_event(AppEvent::PinVerified {
+            json: "secrets".into(),
+            migration: Some(MigrationEvent::MigrationDisabled { attempts: 4 }),
+        });
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::ShowPage(PageSpec::Notice { title, .. }) if title == "MIGRATION DISABLED"
+        )));
+        assert!(!has_effect(&effects, &Effect::Exit(EXIT_CODE_REBOOT)));
+        assert!(!matches!(app.state, AppState::Active { .. }));
+        assert!(!has_effect(&effects, &Effect::DropPrivileges));
+        assert!(!has_effect(&effects, &Effect::RemountKeysReadonly));
+    }
+
+    #[test]
+    fn acknowledge_migration_notice_proceeds_to_active() {
+        let mut app = normal_boot_app();
+        let (_action, effects) = app.handle_event(AppEvent::AcknowledgeMigrationNotice {
+            json: "secrets".into(),
+        });
+        assert!(matches!(app.state, AppState::Active { .. }));
+        assert!(has_effect(
+            &effects,
+            &Effect::Emit(AppEvent::KeysDecrypted("secrets".into()))
+        ));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::InitWatermark { .. }))
+        );
+        let positions = effect_positions(&effects);
+        let set_perms = positions.position_of(&Effect::SetKeyPermissions);
+        let sync = positions.position_of(&Effect::SyncDisk);
+        let remount = positions.position_of(&Effect::RemountKeysReadonly);
+        let drop_priv = positions.position_of(&Effect::DropPrivileges);
+        let init_wm = effects
+            .iter()
+            .position(|e| matches!(e, Effect::InitWatermark { .. }))
+            .expect("InitWatermark present");
+        let keys_decrypted =
+            positions.position_of(&Effect::Emit(AppEvent::KeysDecrypted("secrets".into())));
+        assert!(
+            set_perms < sync
+                && sync < remount
+                && remount < drop_priv
+                && drop_priv < init_wm
+                && init_wm < keys_decrypted,
+            "expected SetKeyPermissions < SyncDisk < RemountKeysReadonly < DropPrivileges < InitWatermark < KeysDecrypted (got {set_perms} < {sync} < {remount} < {drop_priv} < {init_wm} < {keys_decrypted})"
+        );
     }
 
     #[test]

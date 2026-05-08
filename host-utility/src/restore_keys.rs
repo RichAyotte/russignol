@@ -29,7 +29,11 @@ pub type RestorePartitionLayout = russignol_storage::PartitionLayout;
 /// The source chain ID/name are read only to detect network mismatches.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SourceBackup {
-    pub secret_keys_enc: Vec<u8>,
+    /// All `secret_keys.enc*` files copied verbatim by filename, with no
+    /// interpretation of the suffix. The host utility treats each entry as
+    /// an opaque PIN-encrypted payload so backup/restore is agnostic to
+    /// however many on-disk versions exist.
+    pub pin_blobs: Vec<(String, Vec<u8>)>,
     pub public_keys: Vec<u8>,
     pub public_key_hashs: Vec<u8>,
     /// Card ID from flash manifest (None for pre-manifest cards)
@@ -214,10 +218,51 @@ pub fn resolve_restore_source(arg: &Path) -> Result<PathBuf> {
     Ok(selected.path)
 }
 
+/// Read every `secret_keys.enc*` file from a mounted keys partition.
+///
+/// Returns the entries sorted by filename for determinism. Treats each file
+/// as an opaque payload — no interpretation of the suffix. Returns the
+/// configured-setup error when no matching files exist so the caller-facing
+/// failure mode is unchanged from the v1-only era.
+fn read_pin_blobs(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
+    let entries =
+        fs::read_dir(dir).with_context(|| format!("Failed to read directory {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.context("Failed to read directory entry")?;
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with("secret_keys.enc") {
+            continue;
+        }
+        let bytes = fs::read(entry.path())
+            .with_context(|| format!("Failed to read {}", entry.path().display()))?;
+        blobs.push((name_str.to_string(), bytes));
+    }
+    if blobs.is_empty() {
+        bail!("No keys found on source card -- has this device completed setup?");
+    }
+    blobs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(blobs)
+}
+
+/// Write every PIN-blob entry to the target keys partition.
+///
+/// Each `(filename, bytes)` pair is written to `dir.join(filename)` verbatim.
+fn write_pin_blobs(dir: &Path, pin_blobs: &[(String, Vec<u8>)]) -> Result<()> {
+    for (name, bytes) in pin_blobs {
+        fs::write(dir.join(name), bytes).with_context(|| format!("Failed to write {name}"))?;
+    }
+    Ok(())
+}
+
 /// Read key data from a source card into memory
 ///
-/// Only reads key files (`secret_keys.enc`, `public_keys`, `public_key_hashs`).
-/// Chain info and watermarks are derived from the Tezos node, not the source card.
+/// Reads every `secret_keys.enc*` PIN-blob file verbatim along with
+/// `public_keys` and `public_key_hashs`. Chain info and watermarks are
+/// derived from the Tezos node, not the source card.
 pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
     let p3_path = get_partition_path(source_device, 3);
 
@@ -234,8 +279,7 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
         .context("Failed to mount source keys partition")?;
 
     let p3_result = (|| {
-        let secret_keys_enc = fs::read(p3_mount.join("secret_keys.enc"))
-            .context("No keys found on source card -- has this device completed setup?")?;
+        let pin_blobs = read_pin_blobs(&p3_mount)?;
         let public_keys =
             fs::read(p3_mount.join("public_keys")).context("Missing public_keys on source card")?;
         let public_key_hashs = fs::read(p3_mount.join("public_key_hashs"))
@@ -259,7 +303,7 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
             };
 
         Ok((
-            secret_keys_enc,
+            pin_blobs,
             public_keys,
             public_key_hashs,
             source_chain_id,
@@ -268,7 +312,7 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
     })();
 
     // Always unmount p3, even on read error
-    let (secret_keys_enc, public_keys, public_key_hashs, source_chain_id, source_chain_name) =
+    let (pin_blobs, public_keys, public_key_hashs, source_chain_id, source_chain_name) =
         match p3_result {
             Ok(data) => {
                 utils::unmount_partition(&p3_mount, &p3_path)?;
@@ -284,7 +328,7 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
     let source_card_id = image::read_card_id(source_device);
 
     Ok(SourceBackup {
-        secret_keys_enc,
+        pin_blobs,
         public_keys,
         public_key_hashs,
         source_card_id,
@@ -403,8 +447,7 @@ pub fn write_backup_to_target(
         .context("Failed to mount target keys partition")?;
 
     let p3_result = (|| {
-        fs::write(p3_mount.join("secret_keys.enc"), &backup.secret_keys_enc)
-            .context("Failed to write secret_keys.enc")?;
+        write_pin_blobs(&p3_mount, &backup.pin_blobs).context("Failed to write PIN blobs")?;
         fs::write(p3_mount.join("public_keys"), &backup.public_keys)
             .context("Failed to write public_keys")?;
         fs::write(p3_mount.join("public_key_hashs"), &backup.public_key_hashs)
@@ -1048,7 +1091,10 @@ mod tests {
     #[test]
     fn test_source_backup_zeroize() {
         let mut backup = SourceBackup {
-            secret_keys_enc: vec![1, 2, 3, 4],
+            pin_blobs: vec![
+                ("secret_keys.enc".into(), vec![1, 2, 3, 4]),
+                ("secret_keys.enc.v2".into(), vec![10, 11, 12]),
+            ],
             public_keys: vec![5, 6, 7],
             public_key_hashs: vec![8, 9],
             source_card_id: Some("a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8".into()),
@@ -1058,7 +1104,7 @@ mod tests {
 
         backup.zeroize();
 
-        assert!(backup.secret_keys_enc.is_empty());
+        assert!(backup.pin_blobs.is_empty());
         assert!(backup.public_keys.is_empty());
         assert!(backup.public_key_hashs.is_empty());
         assert_eq!(backup.source_card_id, None);
@@ -1252,5 +1298,78 @@ mod tests {
             },
         ];
         assert!(!is_single_reader_mode(restore_from, None, &devices));
+    }
+
+    #[test]
+    fn read_pin_blobs_v1_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("secret_keys.enc"), b"v1-payload").unwrap();
+        // Sibling files must be ignored
+        fs::write(dir.path().join("public_keys"), b"pk").unwrap();
+
+        let blobs = read_pin_blobs(dir.path()).unwrap();
+
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].0, "secret_keys.enc");
+        assert_eq!(blobs[0].1, b"v1-payload");
+    }
+
+    #[test]
+    fn read_pin_blobs_v2_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("secret_keys.enc.v2"), b"v2-payload").unwrap();
+
+        let blobs = read_pin_blobs(dir.path()).unwrap();
+
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].0, "secret_keys.enc.v2");
+        assert_eq!(blobs[0].1, b"v2-payload");
+    }
+
+    #[test]
+    fn read_pin_blobs_both_present_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("secret_keys.enc.v2"), b"v2-payload").unwrap();
+        fs::write(dir.path().join("secret_keys.enc"), b"v1-payload").unwrap();
+
+        let blobs = read_pin_blobs(dir.path()).unwrap();
+
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(blobs[0].0, "secret_keys.enc");
+        assert_eq!(blobs[0].1, b"v1-payload");
+        assert_eq!(blobs[1].0, "secret_keys.enc.v2");
+        assert_eq!(blobs[1].1, b"v2-payload");
+    }
+
+    #[test]
+    fn read_pin_blobs_no_blob_returns_setup_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("public_keys"), b"pk").unwrap();
+
+        let err = read_pin_blobs(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("has this device completed setup?"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn write_pin_blobs_round_trip_two_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin_blobs = vec![
+            ("secret_keys.enc".to_string(), b"v1-payload".to_vec()),
+            ("secret_keys.enc.v2".to_string(), b"v2-payload".to_vec()),
+        ];
+
+        write_pin_blobs(dir.path(), &pin_blobs).unwrap();
+
+        assert_eq!(
+            fs::read(dir.path().join("secret_keys.enc")).unwrap(),
+            b"v1-payload"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("secret_keys.enc.v2")).unwrap(),
+            b"v2-payload"
+        );
     }
 }
