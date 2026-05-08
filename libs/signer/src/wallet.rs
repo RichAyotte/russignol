@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 use crate::signer::Unencrypted;
 
@@ -40,7 +41,7 @@ pub struct StoredKey {
     /// Base58-encoded public key
     pub public_key: String,
     /// Optional base58-encoded secret key
-    pub secret_key: Option<String>,
+    pub secret_key: Option<Zeroizing<String>>,
 }
 
 /// Manages keys in OCaml-compatible format
@@ -197,12 +198,12 @@ impl KeyManager {
                 .and_then(|e| {
                     // Extract the actual key from "unencrypted:edsk..." or "encrypted:edesk..."
                     if let Some(unenc) = e.value.strip_prefix("unencrypted:") {
-                        Some(unenc.to_string())
+                        Some(Zeroizing::new(unenc.to_string()))
                     } else if let Some(_enc) = e.value.strip_prefix("encrypted:") {
                         // Skip encrypted keys for now
                         None
                     } else {
-                        Some(e.value.clone())
+                        Some(Zeroizing::new(e.value.clone()))
                     }
                 });
 
@@ -247,7 +248,7 @@ impl KeyManager {
 
         let pkh = signer.public_key_hash().to_b58check();
         let pk = signer.public_key().to_b58check();
-        let sk = signer.secret_key().to_b58check();
+        let sk = Zeroizing::new(signer.secret_key().to_b58check());
 
         Ok(StoredKey {
             alias: name.to_string(),
@@ -389,7 +390,10 @@ mod tests {
 
         let keys = manager.load_keys();
         let key = keys.get("test_key").unwrap();
-        assert_eq!(key.secret_key, Some("BLsk1secret".to_string()));
+        assert_eq!(
+            key.secret_key,
+            Some(Zeroizing::new("BLsk1secret".to_string()))
+        );
     }
 
     #[test]
@@ -471,7 +475,7 @@ mod tests {
             alias: "test".to_string(),
             public_key_hash: "tz4test".to_string(),
             public_key: "BLpk1test".to_string(),
-            secret_key: Some("BLsk1secret".to_string()),
+            secret_key: Some(Zeroizing::new("BLsk1secret".to_string())),
         };
 
         manager.save_public_keys_only(&[key]).unwrap();

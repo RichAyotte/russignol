@@ -2001,6 +2001,7 @@ dependencies = [
  "log",
  "scrypt",
  "toml",
+ "zeroize",
 ]
 
 [[package]]
@@ -2054,6 +2055,7 @@ dependencies = [
  "tempfile",
  "tinybmp",
  "u8g2-fonts",
+ "zeroize",
 ]
 
 [[package]]
@@ -2081,6 +2083,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

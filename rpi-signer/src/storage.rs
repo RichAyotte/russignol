@@ -517,13 +517,15 @@ pub fn drop_privileges() -> Result<bool, String> {
         ));
     }
 
-    // Drop supplementary groups
+    // Drop supplementary groups. Treat failure as fatal: if we silently
+    // continued, the russignol-uid signer would inherit whatever
+    // supplementary groups root carried (typically `root` itself), which
+    // turns any future `chmod g+r` on a sensitive file into a quiet hole.
     if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
-        log::warn!(
+        return Err(format!(
             "Failed to clear supplementary groups: {}",
             std::io::Error::last_os_error()
-        );
-        // Non-fatal, continue
+        ));
     }
 
     // Drop user privileges (point of no return)

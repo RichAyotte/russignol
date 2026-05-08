@@ -218,6 +218,18 @@ pub fn resolve_restore_source(arg: &Path) -> Result<PathBuf> {
     Ok(selected.path)
 }
 
+/// Defends `dir.join(name)` against a hostile source card whose directory
+/// entries embed `/`, `\`, NUL, or ASCII control bytes. Requires the
+/// `secret_keys.enc` prefix.
+fn is_safe_pin_blob_filename(name: &str) -> bool {
+    if !name.starts_with("secret_keys.enc") {
+        return false;
+    }
+    !name
+        .bytes()
+        .any(|b| b == b'/' || b == b'\\' || b == 0 || b.is_ascii_control())
+}
+
 /// Read every `secret_keys.enc*` file from a mounted keys partition.
 ///
 /// Returns the entries sorted by filename for determinism. Treats each file
@@ -234,7 +246,7 @@ fn read_pin_blobs(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        if !name_str.starts_with("secret_keys.enc") {
+        if !is_safe_pin_blob_filename(name_str) {
             continue;
         }
         let bytes = fs::read(entry.path())
@@ -1130,6 +1142,38 @@ mod tests {
     #[test]
     fn test_card_ids_match_target_none() {
         assert!(!card_ids_match(Some("aabbccdd"), None));
+    }
+
+    #[test]
+    fn safe_pin_blob_filename_accepts_canonical_names() {
+        assert!(is_safe_pin_blob_filename("secret_keys.enc"));
+        assert!(is_safe_pin_blob_filename("secret_keys.enc.v2"));
+        assert!(is_safe_pin_blob_filename("secret_keys.enc.tmp"));
+    }
+
+    #[test]
+    fn safe_pin_blob_filename_rejects_path_traversal() {
+        assert!(!is_safe_pin_blob_filename("../etc/shadow"));
+        assert!(!is_safe_pin_blob_filename(".."));
+        assert!(!is_safe_pin_blob_filename("."));
+        assert!(!is_safe_pin_blob_filename(
+            "secret_keys.enc/../../etc/passwd"
+        ));
+        assert!(!is_safe_pin_blob_filename("secret_keys.enc\\bad"));
+    }
+
+    #[test]
+    fn safe_pin_blob_filename_rejects_control_bytes() {
+        assert!(!is_safe_pin_blob_filename("secret_keys.enc\x01"));
+        assert!(!is_safe_pin_blob_filename("secret_keys.enc\n"));
+        assert!(!is_safe_pin_blob_filename("secret_keys.enc\0"));
+    }
+
+    #[test]
+    fn safe_pin_blob_filename_rejects_wrong_prefix() {
+        assert!(!is_safe_pin_blob_filename(""));
+        assert!(!is_safe_pin_blob_filename("public_keys"));
+        assert!(!is_safe_pin_blob_filename("secret_keys.en"));
     }
 
     #[test]

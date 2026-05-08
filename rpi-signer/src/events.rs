@@ -2,6 +2,7 @@ use embedded_graphics::prelude::Point;
 use russignol_signer_lib::ChainId;
 use std::time::Duration;
 
+use crate::secret::Secret;
 use crate::tezos_encrypt::MigrationEvent;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,16 +15,16 @@ pub enum AppEvent {
         message: String,
         percent: u8,
     }, // Progress update during storage setup
-    FirstPinEntered(Vec<u8>),   // First PIN entered during creation
+    FirstPinEntered(Secret<Vec<u8>>), // First PIN entered during creation
     PinMismatch,                // PINs don't match during confirmation
-    KeyGenSuccess(String),      // Key generation completed, carries secret_keys JSON
+    KeyGenSuccess(Secret<String>), // Key generation completed, carries secret_keys JSON
     KeyGenFailed(String),       // Key generation failed with error message
 
     // === Normal operation events ===
     EnterPin,
     InvalidPinEntered,
     PinVerified {
-        json: String,
+        json: Secret<String>,
         migration: Option<MigrationEvent>,
     }, // PIN verified successfully, carries decrypted secret_keys JSON + migration outcome
     /// Fired by the PIN-verify thread between the v1 unlock and the v2
@@ -36,14 +37,14 @@ pub enum AppEvent {
     /// Fired by the migration error notice's OK button; carries the
     /// already-decrypted secret keys forward to the normal unlock path.
     AcknowledgeMigrationNotice {
-        json: String,
+        json: Secret<String>,
     },
-    PinVerificationFailed, // PIN verification failed (wrong PIN)
-    DeviceLocked,          // Too many failed PIN attempts, device locked
-    KeysDecrypted(String), // Keys decrypted, carries secret_keys JSON for signer
+    PinVerificationFailed,         // PIN verification failed (wrong PIN)
+    DeviceLocked,                  // Too many failed PIN attempts, device locked
+    KeysDecrypted(Secret<String>), // Keys decrypted, carries secret_keys JSON for signer
     DirtyDisplay,
     Touch(Point),
-    PinEntered(Vec<u8>),
+    PinEntered(Secret<Vec<u8>>),
     ActivateScreensaver,   // Trigger screensaver after inactivity
     DeactivateScreensaver, // Wake from screensaver on touch
     Shutdown,              // Signal to exit the application
@@ -80,4 +81,36 @@ pub enum AppEvent {
         title: String,
         message: String,
     }, // Fatal error - show error page and halt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `AppEvent`'s derived `Debug` must not surface the inner PIN bytes
+    /// or decrypted JSON — `Secret<T>` provides the redaction; the derive
+    /// only forwards.
+    #[test]
+    fn debug_redacts_pin_and_plaintext_payloads() {
+        let dbg = format!("{:?}", AppEvent::PinEntered(Secret::new(vec![1, 2, 3, 4])));
+        assert_eq!(
+            dbg, "PinEntered(<redacted>)",
+            "PIN payload not fully redacted: {dbg}"
+        );
+        for digit in ['1', '2', '3', '4'] {
+            assert!(
+                !dbg.contains(digit),
+                "PIN digit {digit} leaked through Debug: {dbg}"
+            );
+        }
+
+        let dbg = format!(
+            "{:?}",
+            AppEvent::KeysDecrypted(Secret::new(String::from("super-secret-json")))
+        );
+        assert_eq!(
+            dbg, "KeysDecrypted(<redacted>)",
+            "JSON payload not fully redacted: {dbg}"
+        );
+    }
 }

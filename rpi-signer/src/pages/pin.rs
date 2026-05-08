@@ -15,6 +15,9 @@ use u8g2_fonts::{
     FontRenderer,
     types::{FontColor, HorizontalAlignment, VerticalPosition},
 };
+use zeroize::Zeroize;
+
+use crate::secret::Secret;
 
 const BACKSPACE_ICON: &[u8] = include_bytes!("../../assets/backspace.bmp");
 const CLEAR_ICON: &[u8] = include_bytes!("../../assets/clear.bmp");
@@ -38,7 +41,7 @@ pub enum Mode {
 
 pub struct Page {
     buttons: [Button; 13],
-    pin: Vec<u8>,
+    pin: Secret<Vec<u8>>,
     title: String,
     mode: Mode,
     app_sender: Sender<AppEvent>,
@@ -70,7 +73,7 @@ impl Page {
 
         Self {
             buttons,
-            pin: Vec::new(),
+            pin: Secret::new(Vec::with_capacity(MAX_PIN_LENGTH)),
             title: title.to_string(),
             mode,
             app_sender,
@@ -162,15 +165,22 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
             if button.contains(point) {
                 match i {
                     11 => {
-                        // Backspace
+                        // Backspace: zero the trailing byte before truncating
+                        // so the digit doesn't linger in the backing allocation
+                        // (Vec::pop alone leaves the byte in place).
+                        if let Some(b) = self.pin.last_mut() {
+                            *b = 0;
+                        }
                         self.pin.pop();
                         if self.app_sender.send(AppEvent::DirtyDisplay).is_err() {
                             log::error!("Could not send AppEvent::DirtyDisplay");
                         }
                     }
                     12 => {
-                        // Clear
-                        self.pin.clear();
+                        // Clear: zeroize() overwrites the live bytes and
+                        // truncates length to 0; Vec::clear alone would leave
+                        // the digits in the backing allocation.
+                        self.pin.zeroize();
                         if self.app_sender.send(AppEvent::DirtyDisplay).is_err() {
                             log::error!("Could not send AppEvent::DirtyDisplay");
                         }
@@ -200,7 +210,7 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
                                                     "PIN too short (min {MIN_PIN_LENGTH} digits)"
                                                 );
                                             }
-                                            self.pin.clear();
+                                            self.pin.zeroize();
                                         }
                                         Mode::Confirm | Mode::Verify => {
                                             // During confirm/verify, let short PINs fail
@@ -212,7 +222,7 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
                                             {
                                                 log::error!("Could not send PIN event");
                                             }
-                                            self.pin.clear();
+                                            self.pin.zeroize();
                                         }
                                     }
                                 }
@@ -239,5 +249,38 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+
+    #[test]
+    fn pin_buffer_preallocated_to_max_length() {
+        let (tx, _rx) = unbounded::<AppEvent>();
+        let page = Page::new(tx, "title", Mode::Create);
+        assert!(
+            page.pin.capacity() >= MAX_PIN_LENGTH,
+            "PIN buffer capacity {} is below MAX_PIN_LENGTH {}",
+            page.pin.capacity(),
+            MAX_PIN_LENGTH,
+        );
+    }
+
+    #[test]
+    fn pin_buffer_does_not_reallocate_at_max_length() {
+        let (tx, _rx) = unbounded::<AppEvent>();
+        let mut page = Page::new(tx, "title", Mode::Create);
+        let cap_before = page.pin.capacity();
+        for digit in 0..u8::try_from(MAX_PIN_LENGTH).unwrap() {
+            page.pin.push(digit);
+        }
+        assert_eq!(
+            page.pin.capacity(),
+            cap_before,
+            "PIN buffer reallocated while filling to MAX_PIN_LENGTH",
+        );
     }
 }

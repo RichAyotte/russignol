@@ -25,6 +25,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::secret::Secret;
+
 pub use russignol_crypto::{SECRET_KEYS_ENC_PATH, SECRET_KEYS_ENC_V2_PATH};
 
 pub const KEYS_MOUNT: &str = "/keys";
@@ -63,10 +65,20 @@ pub enum MigrationEvent {
 
 /// Plaintext plus an optional migration event the app event loop dispatches
 /// on (countdown page + reboot, error page, or normal unlock).
+///
+/// `plaintext` is private so a stray `{:?}` cannot widen redaction:
+/// `Secret<String>` zeroizes on drop and renders as `<redacted>`, but the
+/// outer struct's derived `Debug` only forwards through that wrapper.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecryptOutcome {
-    pub plaintext: String,
+    plaintext: Secret<String>,
     pub migration: Option<MigrationEvent>,
+}
+
+impl DecryptOutcome {
+    pub fn into_parts(self) -> (Secret<String>, Option<MigrationEvent>) {
+        (self.plaintext, self.migration)
+    }
 }
 
 /// Decrypt secret keys, transparently driving the v1→v2 migration state
@@ -130,7 +142,7 @@ fn migrate_and_decrypt(
 
         (false, true) => {
             let v2 = fs::read(v2_path)?;
-            let plaintext = russignol_crypto::decrypt(password, &v2)?;
+            let plaintext = Secret::from_zeroizing(russignol_crypto::decrypt(password, &v2)?);
             let _ = clear_counter(counter_path);
             Ok(DecryptOutcome {
                 plaintext,
@@ -156,6 +168,7 @@ fn stage_v1_to_v2(
 
     if attempts >= MIGRATION_ATTEMPT_THRESHOLD {
         let (plaintext, _) = russignol_crypto::decrypt_with_format(password, &v1)?;
+        let plaintext = Secret::from_zeroizing(plaintext);
         warn!(
             "Migration disabled after {attempts} attempts; v1 decrypted natively, no further migration this boot"
         );
@@ -166,6 +179,7 @@ fn stage_v1_to_v2(
     }
 
     let (plaintext, format) = russignol_crypto::decrypt_with_format(password, &v1)?;
+    let plaintext = Secret::from_zeroizing(plaintext);
 
     if !matches!(format, BlobFormat::V1Legacy) {
         return Err(io::Error::other("v1-named file contains non-v1 format"));
@@ -217,6 +231,7 @@ fn verify_v2_or_revert(
     if attempts >= MIGRATION_ATTEMPT_THRESHOLD {
         let v1 = fs::read(v1_path)?;
         let (plaintext, _) = russignol_crypto::decrypt_with_format(password, &v1)?;
+        let plaintext = Secret::from_zeroizing(plaintext);
         warn!(
             "Migration disabled after {attempts} attempts; v1 decrypted natively, v2 left in place"
         );
@@ -229,6 +244,7 @@ fn verify_v2_or_revert(
     let v2 = fs::read(v2_path)?;
     match russignol_crypto::decrypt(password, &v2) {
         Ok(plaintext) => {
+            let plaintext = Secret::from_zeroizing(plaintext);
             fs::remove_file(v1_path)?;
             let _ = clear_counter(counter_path);
             info!(
@@ -244,6 +260,7 @@ fn verify_v2_or_revert(
             let v1 = fs::read(v1_path)?;
             match russignol_crypto::decrypt_with_format(password, &v1) {
                 Ok((plaintext, _)) => {
+                    let plaintext = Secret::from_zeroizing(plaintext);
                     let _ = fs::remove_file(v2_path);
                     let reason = format!("{v2_err}");
                     warn!(
@@ -461,7 +478,7 @@ mod tests {
 
         let outcome = l.run(LEGACY_V1_PIN).unwrap();
 
-        assert_eq!(outcome.plaintext, plaintext);
+        assert_eq!(outcome.plaintext.as_str(), plaintext);
         assert_eq!(outcome.migration, None);
         assert_eq!(fs::read(&l.v2_path).unwrap(), v2);
         assert!(!l.v1_path.exists());
@@ -478,7 +495,7 @@ mod tests {
 
         let outcome = l.run(LEGACY_V1_PIN).unwrap();
 
-        assert_eq!(outcome.plaintext, LEGACY_V1_PLAINTEXT);
+        assert_eq!(outcome.plaintext.as_str(), LEGACY_V1_PLAINTEXT);
         assert_eq!(outcome.migration, Some(MigrationEvent::StagedV2));
         assert_eq!(
             fs::read(&l.v1_path).unwrap(),
@@ -514,7 +531,7 @@ mod tests {
 
         let outcome = l.run(LEGACY_V1_PIN).unwrap();
 
-        assert_eq!(outcome.plaintext, LEGACY_V1_PLAINTEXT);
+        assert_eq!(outcome.plaintext.as_str(), LEGACY_V1_PLAINTEXT);
         assert_eq!(outcome.migration, Some(MigrationEvent::PromotedV2));
         assert!(!l.v1_path.exists(), "v1 unlinked after verify");
         assert_eq!(fs::read(&l.v2_path).unwrap(), v2, "v2 unchanged");
@@ -531,7 +548,7 @@ mod tests {
 
         let outcome = l.run(LEGACY_V1_PIN).unwrap();
 
-        assert_eq!(outcome.plaintext, LEGACY_V1_PLAINTEXT);
+        assert_eq!(outcome.plaintext.as_str(), LEGACY_V1_PLAINTEXT);
         assert!(matches!(
             outcome.migration,
             Some(MigrationEvent::RevertedFromCorruptV2 { .. })
@@ -581,7 +598,7 @@ mod tests {
             migrate_and_decrypt(LEGACY_V1_PIN, &l.v1_path, &unwritable_v2, &l.counter, || {})
                 .unwrap();
 
-        assert_eq!(outcome.plaintext, LEGACY_V1_PLAINTEXT);
+        assert_eq!(outcome.plaintext.as_str(), LEGACY_V1_PLAINTEXT);
         assert!(matches!(
             outcome.migration,
             Some(MigrationEvent::StagingFailed { .. })
@@ -605,7 +622,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.plaintext, LEGACY_V1_PLAINTEXT);
+        assert_eq!(outcome.plaintext.as_str(), LEGACY_V1_PLAINTEXT);
         assert!(matches!(
             outcome.migration,
             Some(MigrationEvent::StagingFailed { .. })
@@ -627,7 +644,7 @@ mod tests {
 
         let outcome = l.run(LEGACY_V1_PIN).unwrap();
 
-        assert_eq!(outcome.plaintext, LEGACY_V1_PLAINTEXT);
+        assert_eq!(outcome.plaintext.as_str(), LEGACY_V1_PLAINTEXT);
         assert_eq!(
             outcome.migration,
             Some(MigrationEvent::MigrationDisabled {
@@ -649,7 +666,7 @@ mod tests {
 
         let outcome = l.run(LEGACY_V1_PIN).unwrap();
 
-        assert_eq!(outcome.plaintext, LEGACY_V1_PLAINTEXT);
+        assert_eq!(outcome.plaintext.as_str(), LEGACY_V1_PLAINTEXT);
         assert_eq!(
             outcome.migration,
             Some(MigrationEvent::MigrationDisabled {

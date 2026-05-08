@@ -41,6 +41,7 @@ use aes_gcm::{
 };
 use log::debug;
 use std::io::{self, Write};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Path to a v1-format encrypted secret keys file. New devices never write
 /// here; the path remains canonical for legacy blobs that pre-date the v2
@@ -159,7 +160,10 @@ pub fn encrypt(password: &[u8], plaintext: &str) -> io::Result<Vec<u8>> {
 /// Returns an error if the version byte is unknown, the data is malformed,
 /// the salt slice is the wrong size, key derivation fails, or AES-GCM
 /// authentication fails (e.g., wrong PIN).
-pub fn decrypt_with_format(password: &[u8], encrypted: &[u8]) -> io::Result<(String, BlobFormat)> {
+pub fn decrypt_with_format(
+    password: &[u8],
+    encrypted: &[u8],
+) -> io::Result<(Zeroizing<String>, BlobFormat)> {
     debug!("Decrypting data ({} bytes)...", encrypted.len());
 
     let Some(&version_byte) = encrypted.first() else {
@@ -237,14 +241,19 @@ pub fn decrypt_with_format(password: &[u8], encrypted: &[u8]) -> io::Result<(Str
         )
     })?;
 
+    // UTF-8 validation may reject the bytes; if it does, zeroize the rejected
+    // buffer before returning so plaintext never drops through a non-zeroizing
+    // path.
     let plaintext = String::from_utf8(plaintext).map_err(|e| {
+        let mut bytes = e.into_bytes();
+        bytes.zeroize();
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Decrypted data is not valid UTF-8: {e}"),
+            "Decrypted data is not valid UTF-8",
         )
     })?;
 
-    Ok((plaintext, format))
+    Ok((Zeroizing::new(plaintext), format))
 }
 
 /// Decrypt a blob and return only the plaintext.
@@ -255,7 +264,7 @@ pub fn decrypt_with_format(password: &[u8], encrypted: &[u8]) -> io::Result<(Str
 /// # Errors
 ///
 /// Same conditions as `decrypt_with_format`.
-pub fn decrypt(password: &[u8], encrypted: &[u8]) -> io::Result<String> {
+pub fn decrypt(password: &[u8], encrypted: &[u8]) -> io::Result<Zeroizing<String>> {
     decrypt_with_format(password, encrypted).map(|(plaintext, _)| plaintext)
 }
 
@@ -271,7 +280,7 @@ mod tests {
     #[test]
     fn test_decrypt_legacy_fixture() {
         let plaintext = decrypt(FIXTURE_PIN, LEGACY_V1_FIXTURE).unwrap();
-        assert_eq!(plaintext, FIXTURE_PLAINTEXT);
+        assert_eq!(plaintext.as_str(), FIXTURE_PLAINTEXT);
     }
 
     #[test]
@@ -301,7 +310,7 @@ mod tests {
         let pin = b"123456";
         let plaintext = r#"{"consensus": "edsk..."}"#;
         let bytes = encrypt(pin, plaintext).unwrap();
-        assert_eq!(decrypt(pin, &bytes).unwrap(), plaintext);
+        assert_eq!(decrypt(pin, &bytes).unwrap().as_str(), plaintext);
     }
 
     #[test]
@@ -374,4 +383,12 @@ mod tests {
         let result = decrypt(b"password", &[LEGACY_SALT_LEN]);
         assert!(result.is_err());
     }
+
+    /// Compile-time guarantee that decrypted plaintext zeros its backing
+    /// storage on drop. If a future change drops the `Zeroizing` wrapper
+    /// from the return type, this assertion fails to compile.
+    const _: fn() = || {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Zeroizing<String>>();
+    };
 }

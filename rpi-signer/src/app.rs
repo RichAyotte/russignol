@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::events::AppEvent;
+use crate::secret::Secret;
 use crate::setup;
 use crate::tezos_encrypt::MigrationEvent;
 
@@ -30,7 +31,12 @@ fn push_reboot_progress(message: &str, effects: &mut Vec<Effect>) {
 /// Show a modal migration-error notice that the user must acknowledge.
 /// Nothing else is queued — the dismiss event drives the next step so
 /// the renderer never paints the menu over an unread error.
-fn push_migration_notice(title: &str, message: &str, json: String, effects: &mut Vec<Effect>) {
+fn push_migration_notice(
+    title: &str,
+    message: &str,
+    json: Secret<String>,
+    effects: &mut Vec<Effect>,
+) {
     effects.push(Effect::ShowPage(PageSpec::Notice {
         title: title.into(),
         message: message.into(),
@@ -47,7 +53,7 @@ const LOCKOUT_DURATION: Duration = Duration::from_mins(5);
 #[derive(Debug)]
 pub enum AppState {
     /// First boot: key generation flow
-    Setup { first_pin: Option<Vec<u8>> },
+    Setup { first_pin: Option<Secret<Vec<u8>>> },
     /// Normal boot: PIN verification
     PinEntry {
         failed_attempts: u32,
@@ -128,15 +134,15 @@ pub enum Effect {
     SleepDevice,
     ClearDisplay,
     Emit(AppEvent),
-    SendKeys(String),
+    SendKeys(Secret<String>),
     InitWatermark {
         context: String,
     },
     SpawnKeygen {
-        pin: Vec<u8>,
+        pin: Secret<Vec<u8>>,
     },
     SpawnPinVerify {
-        pin: Vec<u8>,
+        pin: Secret<Vec<u8>>,
     },
     SpawnStorageSetup,
     SyncDisk,
@@ -169,7 +175,7 @@ pub struct App {
     pub current_page_spec: Option<PageSpec>,
     pub tx: Sender<AppEvent>,
     pub signing_activity: Arc<Mutex<signing_activity::SigningActivity>>,
-    pub start_signer_tx: Sender<String>,
+    pub start_signer_tx: Sender<Secret<String>>,
     pub watermark: Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>>,
     pub needs_animation: bool,
     pub animation_interval: Duration,
@@ -180,7 +186,7 @@ impl App {
         is_first_boot: bool,
         tx: Sender<AppEvent>,
         signing_activity: Arc<Mutex<signing_activity::SigningActivity>>,
-        start_signer_tx: Sender<String>,
+        start_signer_tx: Sender<Secret<String>>,
         watermark: Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>>,
     ) -> Self {
         let state = if is_first_boot {
@@ -350,7 +356,7 @@ impl App {
         (LoopAction::Proceed, effects)
     }
 
-    fn handle_setup_pin_confirm(&mut self, pin: Vec<u8>) -> Vec<Effect> {
+    fn handle_setup_pin_confirm(&mut self, pin: Secret<Vec<u8>>) -> Vec<Effect> {
         let AppState::Setup { first_pin } = &mut self.state else {
             return vec![];
         };
@@ -472,7 +478,7 @@ impl App {
 
     fn dispatch_pin_verified(
         &mut self,
-        json: String,
+        json: Secret<String>,
         migration: Option<MigrationEvent>,
         effects: &mut Vec<Effect>,
     ) {
@@ -480,8 +486,12 @@ impl App {
             None => self.proceed_to_active(json, false, effects),
             Some(MigrationEvent::StagedV2) => {
                 log::info!("PIN upgrade staged; rebooting to verify-and-promote");
-                effects.push(Effect::SetKeyPermissions);
-                effects.push(Effect::SyncDisk);
+                effects.extend([
+                    Effect::SetKeyPermissions,
+                    Effect::SyncDisk,
+                    Effect::RemountKeysReadonly,
+                    Effect::DropPrivileges,
+                ]);
                 push_reboot_progress("Upgrade staged, rebooting...", effects);
             }
             Some(MigrationEvent::PromotedV2) => {
@@ -526,7 +536,7 @@ impl App {
     /// the canonical, sync, remount /keys ro, drop to russignol. Steady-
     /// state unlocks (no migration) come up as russignol already and skip
     /// the demote sequence.
-    fn proceed_to_active(&mut self, json: String, demote: bool, effects: &mut Vec<Effect>) {
+    fn proceed_to_active(&mut self, json: Secret<String>, demote: bool, effects: &mut Vec<Effect>) {
         self.state = AppState::Active {
             screensaver_active: false,
         };
@@ -777,6 +787,14 @@ mod tests {
             .any(|e| matches!(e, Effect::ShowPage(s) if s == spec))
     }
 
+    fn pin(bytes: &[u8]) -> Secret<Vec<u8>> {
+        Secret::new(bytes.to_vec())
+    }
+
+    fn json(s: &str) -> Secret<String> {
+        Secret::new(s.to_string())
+    }
+
     // === State transition tests ===
 
     #[test]
@@ -790,7 +808,7 @@ mod tests {
     #[test]
     fn keygen_success_transitions_setup_to_active() {
         let mut app = first_boot_app();
-        let (_action, _effects) = app.handle_event(AppEvent::KeyGenSuccess("{}".into()));
+        let (_action, _effects) = app.handle_event(AppEvent::KeyGenSuccess(json("{}")));
         assert!(matches!(app.state, AppState::Active { .. }));
     }
 
@@ -798,7 +816,7 @@ mod tests {
     fn pin_verified_no_migration_transitions_pin_entry_to_active() {
         let mut app = normal_boot_app();
         let (_action, effects) = app.handle_event(AppEvent::PinVerified {
-            json: "{}".into(),
+            json: json("{}"),
             migration: None,
         });
         assert!(matches!(app.state, AppState::Active { .. }));
@@ -821,7 +839,7 @@ mod tests {
         );
         assert!(has_effect(
             &effects,
-            &Effect::Emit(AppEvent::KeysDecrypted("{}".into()))
+            &Effect::Emit(AppEvent::KeysDecrypted(json("{}")))
         ));
     }
 
@@ -829,7 +847,7 @@ mod tests {
     fn pin_verified_staged_v2_shows_progress_and_exits_for_reboot() {
         let mut app = normal_boot_app();
         let (_action, effects) = app.handle_event(AppEvent::PinVerified {
-            json: "{}".into(),
+            json: json("{}"),
             migration: Some(MigrationEvent::StagedV2),
         });
         let positions = effect_positions(&effects);
@@ -849,10 +867,22 @@ mod tests {
         );
         let set_perms = positions.position_of(&Effect::SetKeyPermissions);
         let sync = positions.position_of(&Effect::SyncDisk);
+        let remount = positions.position_of(&Effect::RemountKeysReadonly);
+        let drop_priv = positions.position_of(&Effect::DropPrivileges);
+        let progress = effects
+            .iter()
+            .position(|e| matches!(e, Effect::ShowProgress { .. }))
+            .expect("ShowProgress present");
+        let sleep = positions.position_of(&Effect::Sleep(MIGRATION_REBOOT_COUNTDOWN));
         let exit = positions.position_of(&Effect::Exit(EXIT_CODE_REBOOT));
         assert!(
-            set_perms < sync && sync < exit,
-            "expected SetKeyPermissions, SyncDisk before reboot (got {set_perms} < {sync} < {exit})"
+            set_perms < sync
+                && sync < remount
+                && remount < drop_priv
+                && drop_priv < progress
+                && progress < sleep
+                && sleep < exit,
+            "expected SetKeyPermissions < SyncDisk < RemountKeysReadonly < DropPrivileges < ShowProgress < Sleep < Exit(42), got {set_perms} < {sync} < {remount} < {drop_priv} < {progress} < {sleep} < {exit}"
         );
         assert!(
             !matches!(app.state, AppState::Active { .. }),
@@ -864,7 +894,7 @@ mod tests {
     fn pin_verified_promoted_v2_proceeds_active_with_demote() {
         let mut app = normal_boot_app();
         let (_action, effects) = app.handle_event(AppEvent::PinVerified {
-            json: "secrets".into(),
+            json: json("secrets"),
             migration: Some(MigrationEvent::PromotedV2),
         });
         let positions = effect_positions(&effects);
@@ -902,7 +932,7 @@ mod tests {
         assert!(
             has_effect(
                 &effects,
-                &Effect::Emit(AppEvent::KeysDecrypted("secrets".into()))
+                &Effect::Emit(AppEvent::KeysDecrypted(json("secrets")))
             ),
             "expected KeysDecrypted carrying the plaintext"
         );
@@ -912,7 +942,7 @@ mod tests {
     fn pin_verified_reverted_shows_notice_and_waits_for_ack() {
         let mut app = normal_boot_app();
         let (_action, effects) = app.handle_event(AppEvent::PinVerified {
-            json: "secrets".into(),
+            json: json("secrets"),
             migration: Some(MigrationEvent::RevertedFromCorruptV2 {
                 reason: "test".into(),
             }),
@@ -924,7 +954,7 @@ mod tests {
                     if title == "PIN UPGRADE FAILED"
                         && matches!(
                             on_dismiss,
-                            AppEvent::AcknowledgeMigrationNotice { json } if json == "secrets"
+                            AppEvent::AcknowledgeMigrationNotice { json } if json.as_str() == "secrets"
                         )
             )),
             "expected Notice page titled PIN UPGRADE FAILED with ack carrier"
@@ -957,7 +987,7 @@ mod tests {
     fn pin_verified_staging_failed_shows_notice_and_waits_for_ack() {
         let mut app = normal_boot_app();
         let (_action, effects) = app.handle_event(AppEvent::PinVerified {
-            json: "secrets".into(),
+            json: json("secrets"),
             migration: Some(MigrationEvent::StagingFailed {
                 reason: "EROFS".into(),
             }),
@@ -976,7 +1006,7 @@ mod tests {
     fn pin_verified_migration_disabled_shows_notice_and_waits_for_ack() {
         let mut app = normal_boot_app();
         let (_action, effects) = app.handle_event(AppEvent::PinVerified {
-            json: "secrets".into(),
+            json: json("secrets"),
             migration: Some(MigrationEvent::MigrationDisabled { attempts: 4 }),
         });
         assert!(effects.iter().any(|e| matches!(
@@ -993,12 +1023,12 @@ mod tests {
     fn acknowledge_migration_notice_proceeds_to_active() {
         let mut app = normal_boot_app();
         let (_action, effects) = app.handle_event(AppEvent::AcknowledgeMigrationNotice {
-            json: "secrets".into(),
+            json: json("secrets"),
         });
         assert!(matches!(app.state, AppState::Active { .. }));
         assert!(has_effect(
             &effects,
-            &Effect::Emit(AppEvent::KeysDecrypted("secrets".into()))
+            &Effect::Emit(AppEvent::KeysDecrypted(json("secrets")))
         ));
         assert!(
             effects
@@ -1015,7 +1045,7 @@ mod tests {
             .position(|e| matches!(e, Effect::InitWatermark { .. }))
             .expect("InitWatermark present");
         let keys_decrypted =
-            positions.position_of(&Effect::Emit(AppEvent::KeysDecrypted("secrets".into())));
+            positions.position_of(&Effect::Emit(AppEvent::KeysDecrypted(json("secrets"))));
         assert!(
             set_perms < sync
                 && sync < remount
@@ -1047,13 +1077,13 @@ mod tests {
     fn pin_entered_in_setup_with_first_pin_confirms() {
         let mut app = first_boot_app();
         // Set first_pin
-        app.handle_event(AppEvent::FirstPinEntered(vec![1, 2, 3, 4]));
+        app.handle_event(AppEvent::FirstPinEntered(pin(&[1, 2, 3, 4])));
         // Now confirm with same PIN
-        let (_action, effects) = app.handle_event(AppEvent::PinEntered(vec![1, 2, 3, 4]));
+        let (_action, effects) = app.handle_event(AppEvent::PinEntered(pin(&[1, 2, 3, 4])));
         assert!(has_effect(
             &effects,
             &Effect::SpawnKeygen {
-                pin: vec![1, 2, 3, 4]
+                pin: pin(&[1, 2, 3, 4])
             }
         ));
     }
@@ -1061,19 +1091,19 @@ mod tests {
     #[test]
     fn pin_entered_in_setup_with_mismatch_emits_pin_mismatch() {
         let mut app = first_boot_app();
-        app.handle_event(AppEvent::FirstPinEntered(vec![1, 2, 3, 4]));
-        let (_action, effects) = app.handle_event(AppEvent::PinEntered(vec![5, 6, 7, 8]));
+        app.handle_event(AppEvent::FirstPinEntered(pin(&[1, 2, 3, 4])));
+        let (_action, effects) = app.handle_event(AppEvent::PinEntered(pin(&[5, 6, 7, 8])));
         assert!(has_effect(&effects, &Effect::Emit(AppEvent::PinMismatch)));
     }
 
     #[test]
     fn pin_entered_in_pin_entry_verifies() {
         let mut app = normal_boot_app();
-        let (_action, effects) = app.handle_event(AppEvent::PinEntered(vec![1, 2, 3, 4]));
+        let (_action, effects) = app.handle_event(AppEvent::PinEntered(pin(&[1, 2, 3, 4])));
         assert!(has_effect(
             &effects,
             &Effect::SpawnPinVerify {
-                pin: vec![1, 2, 3, 4]
+                pin: pin(&[1, 2, 3, 4])
             }
         ));
     }
@@ -1252,7 +1282,7 @@ mod tests {
     #[test]
     fn keygen_success_produces_correct_effect_order() {
         let mut app = first_boot_app();
-        let (_action, effects) = app.handle_event(AppEvent::KeyGenSuccess("{}".into()));
+        let (_action, effects) = app.handle_event(AppEvent::KeyGenSuccess(json("{}")));
         let expected_order = [
             Effect::ProcessWatermarkConfig,
             Effect::WriteSetupMarker,
@@ -1263,7 +1293,7 @@ mod tests {
             Effect::InitWatermark {
                 context: "first boot setup".into(),
             },
-            Effect::Emit(AppEvent::KeysDecrypted("{}".into())),
+            Effect::Emit(AppEvent::KeysDecrypted(json("{}"))),
         ];
         assert_eq!(effects, expected_order);
     }
@@ -1289,11 +1319,11 @@ mod tests {
     #[test]
     fn keys_decrypted_sends_keys_and_shows_menu() {
         let mut app = active_app();
-        let (_action, effects) = app.handle_event(AppEvent::KeysDecrypted("keys".into()));
+        let (_action, effects) = app.handle_event(AppEvent::KeysDecrypted(json("keys")));
         assert_eq!(
             effects,
             vec![
-                Effect::SendKeys("keys".into()),
+                Effect::SendKeys(json("keys")),
                 Effect::ShowPage(PageSpec::Menu),
                 Effect::ResetActivity,
             ]
@@ -1311,7 +1341,7 @@ mod tests {
     #[test]
     fn pin_mismatch_resets_first_pin_and_shows_error() {
         let mut app = first_boot_app();
-        app.handle_event(AppEvent::FirstPinEntered(vec![1, 2, 3, 4]));
+        app.handle_event(AppEvent::FirstPinEntered(pin(&[1, 2, 3, 4])));
         let (_action, effects) = app.handle_event(AppEvent::PinMismatch);
         // Should show error then PIN create
         assert!(has_show_page(

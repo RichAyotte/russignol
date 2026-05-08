@@ -8,6 +8,7 @@ mod led;
 mod log_writer;
 mod network_status;
 mod pages;
+mod secret;
 mod setup;
 mod signer_server;
 mod storage;
@@ -23,7 +24,7 @@ use russignol_signer_lib::{
     ChainId, HighWatermark,
     bls::PublicKeyHash,
     signing_activity,
-    wallet::{KeyManager, OcamlKeyEntry, StoredKey},
+    wallet::{KeyManager, StoredKey},
 };
 use std::sync::RwLock;
 
@@ -38,6 +39,7 @@ use pages::{
     signatures, status, watermarks,
 };
 use russignol_ui::pages::{error, progress};
+use secret::Secret;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -81,7 +83,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
     let (app_tx, app_rx) = crossbeam_channel::unbounded();
 
     // Create channel to pass decrypted secret keys to signer (in memory, never written to disk)
-    let (start_signer_tx, start_signer_rx) = crossbeam_channel::bounded::<String>(1);
+    let (start_signer_tx, start_signer_rx) = crossbeam_channel::bounded::<Secret<String>>(1);
 
     // Watermark will be created after PIN entry and encryption unlock
     let watermark: Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>> = Arc::new(RwLock::new(None));
@@ -210,7 +212,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
 
 fn run_ui_loop(
     signing_activity: &Arc<Mutex<signing_activity::SigningActivity>>,
-    start_signer_tx: &crossbeam_channel::Sender<String>,
+    start_signer_tx: &crossbeam_channel::Sender<Secret<String>>,
     tx: &crossbeam_channel::Sender<AppEvent>,
     rx: &crossbeam_channel::Receiver<AppEvent>,
     watermark: &Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>>,
@@ -661,7 +663,11 @@ fn apply_init_watermark(
     Ok(())
 }
 
-fn spawn_keygen(tx: Sender<AppEvent>, pin: Vec<u8>, cpu_boost: Option<&cpu_freq::CpuBoost>) {
+fn spawn_keygen(
+    tx: Sender<AppEvent>,
+    pin: Secret<Vec<u8>>,
+    cpu_boost: Option<&cpu_freq::CpuBoost>,
+) {
     let boost = cpu_boost.cloned();
     std::thread::spawn(move || {
         if let Some(ref b) = boost {
@@ -682,7 +688,11 @@ fn spawn_keygen(tx: Sender<AppEvent>, pin: Vec<u8>, cpu_boost: Option<&cpu_freq:
     });
 }
 
-fn spawn_pin_verify(tx: Sender<AppEvent>, pin: Vec<u8>, cpu_boost: Option<&cpu_freq::CpuBoost>) {
+fn spawn_pin_verify(
+    tx: Sender<AppEvent>,
+    pin: Secret<Vec<u8>>,
+    cpu_boost: Option<&cpu_freq::CpuBoost>,
+) {
     let boost = cpu_boost.cloned();
     std::thread::spawn(move || {
         if let Some(ref b) = boost {
@@ -704,10 +714,8 @@ fn spawn_pin_verify(tx: Sender<AppEvent>, pin: Vec<u8>, cpu_boost: Option<&cpu_f
         match result {
             Ok(outcome) => {
                 log::info!("Decrypting time: {:?}", start.elapsed());
-                let _ = tx.send(AppEvent::PinVerified {
-                    json: outcome.plaintext,
-                    migration: outcome.migration,
-                });
+                let (json, migration) = outcome.into_parts();
+                let _ = tx.send(AppEvent::PinVerified { json, migration });
             }
             Err(e) => {
                 log::error!("PIN verification failed: {e}");
@@ -827,7 +835,7 @@ fn apply_watermark_update(
 /// is written to disk. Plaintext secret keys NEVER touch the filesystem.
 ///
 /// Returns the secret keys JSON (for immediate use in signing mode).
-fn generate_and_encrypt_keys(pin: &[u8]) -> Result<String, String> {
+fn generate_and_encrypt_keys(pin: &[u8]) -> Result<Secret<String>, String> {
     let key_manager = KeyManager::new(Some(PathBuf::from(KEYS_DIR)));
 
     // Generate keys IN MEMORY ONLY - no disk writes yet
@@ -846,7 +854,7 @@ fn generate_and_encrypt_keys(pin: &[u8]) -> Result<String, String> {
     let keys = [&consensus_key, &companion_key];
 
     // Build secret_keys JSON in memory (OCaml-compatible format)
-    let secret_keys_json = build_secret_keys_json(&keys)?;
+    let secret_keys_json = build_secret_keys_json(&keys);
 
     // Encrypt secret keys and write ONLY the encrypted form to disk
     log::info!("Encrypting secret keys...");
@@ -937,18 +945,138 @@ fn connection_callbacks(
     }
 }
 
-/// Build OCaml-compatible `secret_keys` JSON from in-memory keys
-fn build_secret_keys_json(keys: &[&StoredKey]) -> Result<String, String> {
-    let entries: Vec<OcamlKeyEntry<String>> = keys
-        .iter()
-        .filter_map(|key| {
-            key.secret_key.as_ref().map(|sk| OcamlKeyEntry {
-                name: key.alias.clone(),
-                value: format!("unencrypted:{sk}"),
-            })
-        })
-        .collect();
+/// Build OCaml-compatible `secret_keys` JSON from in-memory keys.
+///
+/// Pre-sizes the output `Secret<String>` so `String::push_str` never
+/// reallocates, which would copy the plaintext into a new heap block and
+/// leave the old block un-zeroed. The single returned buffer is the only
+/// place plaintext lives.
+fn build_secret_keys_json(keys: &[&StoredKey]) -> Secret<String> {
+    let n: usize = keys.iter().filter(|k| k.secret_key.is_some()).count();
+    // 2 bytes for `[]`, plus a per-entry budget covering the skeleton, an
+    // alias headroom, and a 64-byte upper bound on the base58 secret
+    // (BLS12-381 BLsk is 54 chars, libs/signer/src/bls.rs:93).
+    let cap = 2 + n.saturating_mul(192);
 
-    serde_json::to_string_pretty(&entries)
-        .map_err(|e| format!("Failed to serialize secret_keys: {e}"))
+    let mut secret: Secret<String> = Secret::new(String::with_capacity(cap));
+    let buf: &mut String = &mut secret;
+    buf.push('[');
+    let mut first = true;
+    for key in keys {
+        let Some(sk) = key.secret_key.as_ref() else {
+            continue;
+        };
+        if !first {
+            buf.push(',');
+        }
+        first = false;
+        buf.push_str(r#"{"name":""#);
+        write_escaped(buf, &key.alias);
+        buf.push_str(r#"","value":"unencrypted:"#);
+        // Base58 alphabet contains no `"`, `\`, or control bytes — write raw.
+        buf.push_str(sk);
+        buf.push_str(r#""}"#);
+    }
+    buf.push(']');
+    secret
+}
+
+/// Escape a JSON string body: `"`, `\`, and ASCII control bytes as
+/// `\u00XX`. No other escapes are needed because non-ASCII UTF-8 is valid
+/// inside a JSON string.
+fn write_escaped(out: &mut String, s: &str) {
+    use core::fmt::Write;
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => {
+                write!(out, "\\u{:04x}", c as u32).expect("write to String is infallible");
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use russignol_signer_lib::wallet::OcamlKeyEntry;
+    use zeroize::Zeroizing;
+
+    const SAMPLE_SK: &str = "BLsk2snGqdSb7qBDhKbc62AxbZXJycDvA5QmeYYhB7Nb3wFuMMbq9x";
+
+    fn make_key(alias: &str, sk: Option<&str>) -> StoredKey {
+        StoredKey {
+            alias: alias.to_string(),
+            public_key_hash: format!("tz4{alias}"),
+            public_key: format!("BLpk{alias}"),
+            secret_key: sk.map(|s| Zeroizing::new(s.to_string())),
+        }
+    }
+
+    #[test]
+    fn emit_round_trip() {
+        let k1 = make_key("consensus", Some(SAMPLE_SK));
+        let k2 = make_key("companion", Some(SAMPLE_SK));
+        let keys = [&k1, &k2];
+
+        let secret = build_secret_keys_json(&keys);
+        let parsed: Vec<OcamlKeyEntry<String>> =
+            serde_json::from_str(&secret).expect("emitter must produce valid JSON");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "consensus");
+        assert_eq!(parsed[0].value, format!("unencrypted:{SAMPLE_SK}"));
+        assert_eq!(parsed[1].name, "companion");
+        assert_eq!(parsed[1].value, format!("unencrypted:{SAMPLE_SK}"));
+    }
+
+    #[test]
+    fn emit_no_realloc() {
+        let k1 = make_key("consensus", Some(SAMPLE_SK));
+        let k2 = make_key("companion", Some(SAMPLE_SK));
+        let keys = [&k1, &k2];
+        let n: usize = keys.iter().filter(|k| k.secret_key.is_some()).count();
+        let expected_cap = 2 + n.saturating_mul(192);
+
+        let secret = build_secret_keys_json(&keys);
+
+        assert_eq!(
+            secret.capacity(),
+            expected_cap,
+            "build_secret_keys_json reallocated its output buffer (capacity grew during emit)",
+        );
+        assert!(
+            secret.len() <= expected_cap,
+            "emitted output {len} exceeded preallocated capacity {expected_cap}",
+            len = secret.len(),
+        );
+    }
+
+    #[test]
+    fn emit_escapes_alias() {
+        let alias = "a\"b\\c";
+        let k = make_key(alias, Some(SAMPLE_SK));
+        let secret = build_secret_keys_json(&[&k]);
+
+        let parsed: Vec<OcamlKeyEntry<String>> = serde_json::from_str(&secret)
+            .expect("escaped alias must produce valid JSON parseable by serde_json");
+        assert_eq!(parsed[0].name, alias);
+    }
+
+    #[test]
+    fn emit_empty_input() {
+        let secret = build_secret_keys_json(&[]);
+        assert_eq!(&*secret, "[]");
+    }
+
+    #[test]
+    fn emit_prefix_present() {
+        let k = make_key("consensus", Some(SAMPLE_SK));
+        let secret = build_secret_keys_json(&[&k]);
+        assert!(
+            secret.contains("unencrypted:"),
+            "emitter dropped the `unencrypted:` prefix",
+        );
+    }
 }

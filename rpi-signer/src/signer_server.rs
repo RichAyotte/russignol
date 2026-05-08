@@ -1,13 +1,29 @@
 use log::{error, info};
 use russignol_signer_lib::{
     ChainId, HighWatermark, RequestHandler, ServerKeyManager, SigningActivity, server, signer,
-    wallet::OcamlKeyEntry,
 };
+use serde::Deserialize;
+use std::borrow::Cow;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+
+/// Borrowing view over a secret-keys JSON entry.
+///
+/// `value: &str` makes `serde_json` slice each secret out of the input
+/// buffer rather than allocate a fresh owned `String` per entry; an owned
+/// `String` would drop without zeroizing and leave plaintext in the heap.
+/// The input itself is a `Secret<String>` and zeroizes on drop, so the
+/// borrowed slice inherits that lifetime. Base58 secrets contain no `"`,
+/// `\`, or control bytes, so the borrow always succeeds.
+#[derive(Deserialize)]
+struct BorrowedKeyEntry<'a> {
+    #[serde(borrow)]
+    name: Cow<'a, str>,
+    value: &'a str,
+}
 
 /// Configuration for the integrated signer
 pub struct SignerConfig {
@@ -31,36 +47,36 @@ impl Default for SignerConfig {
     }
 }
 
-/// Parse secret keys JSON and create a `KeyManager`
+/// Parse secret keys JSON and create a `KeyManager`.
 ///
-/// Keys are passed directly in memory after PIN decryption - never written to disk.
+/// Keys are passed in memory after PIN decryption — never written to disk.
 fn parse_secret_keys(secret_keys_json: &str) -> Result<ServerKeyManager, String> {
-    let mut key_manager = ServerKeyManager::new();
-
-    let sk_entries: Vec<OcamlKeyEntry<String>> = serde_json::from_str(secret_keys_json)
+    let entries: Vec<BorrowedKeyEntry<'_>> = serde_json::from_str(secret_keys_json)
         .map_err(|e| format!("Failed to parse secret_keys JSON: {e}"))?;
 
-    if sk_entries.is_empty() {
+    if entries.is_empty() {
         return Err("No keys found in secret_keys".to_string());
     }
 
-    info!("Loading {} key(s)...", sk_entries.len());
+    info!("Loading {} key(s)...", entries.len());
 
-    for entry in sk_entries {
-        let sk_b58 = if let Some(unenc) = entry.value.strip_prefix("unencrypted:") {
-            unenc
-        } else {
-            &entry.value
-        };
+    let mut key_manager = ServerKeyManager::new();
+    for entry in entries {
+        let sk_b58 = entry
+            .value
+            .strip_prefix("unencrypted:")
+            .unwrap_or(entry.value);
+        let alias = entry.name;
 
         match signer::Unencrypted::from_b58check(sk_b58) {
             Ok(signer) => {
                 let pkh = *signer.public_key_hash();
-                key_manager.add_signer(pkh, signer, entry.name.clone());
-                info!("  ✓ Loaded key: {} ({})", entry.name, pkh.to_b58check());
+                let alias_owned = alias.into_owned();
+                info!("  ✓ Loaded key: {alias_owned} ({})", pkh.to_b58check());
+                key_manager.add_signer(pkh, signer, alias_owned);
             }
             Err(e) => {
-                error!("  ✗ Failed to load key '{}': {}", entry.name, e);
+                error!("  ✗ Failed to load key '{alias}': {e}");
             }
         }
     }
@@ -209,4 +225,88 @@ fn run_signer_once(
     info!("📡 Waiting for connections...");
 
     server.run().map_err(|e| format!("Server error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use russignol_signer_lib::wallet::OcamlKeyEntry;
+
+    const SAMPLE_SK: &str = "BLsk2snGqdSb7qBDhKbc62AxbZXJycDvA5QmeYYhB7Nb3wFuMMbq9x";
+
+    fn parse(input: &str) -> Result<Vec<BorrowedKeyEntry<'_>>, serde_json::Error> {
+        serde_json::from_str(input)
+    }
+
+    #[test]
+    fn parse_compact() {
+        let input = format!(
+            r#"[{{"name":"alice","value":"unencrypted:{SAMPLE_SK}"}},{{"name":"bob","value":"unencrypted:{SAMPLE_SK}"}}]"#,
+        );
+        let entries = parse(&input).expect("compact parses");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name.as_ref(), "alice");
+        assert_eq!(entries[0].value, format!("unencrypted:{SAMPLE_SK}"));
+        assert_eq!(entries[1].name.as_ref(), "bob");
+        assert_eq!(entries[1].value, format!("unencrypted:{SAMPLE_SK}"));
+    }
+
+    /// Backwards-compat: existing v2 (and v1) blobs in the field hold
+    /// plaintext produced by `serde_json::to_string_pretty`. The reader
+    /// must continue to accept that whitespace-rich form unchanged.
+    #[test]
+    fn parse_pretty_legacy() {
+        let legacy = vec![
+            OcamlKeyEntry {
+                name: "consensus".to_string(),
+                value: format!("unencrypted:{SAMPLE_SK}"),
+            },
+            OcamlKeyEntry {
+                name: "companion".to_string(),
+                value: format!("unencrypted:{SAMPLE_SK}"),
+            },
+        ];
+        let pretty = serde_json::to_string_pretty(&legacy).expect("legacy emitter");
+
+        let entries = parse(&pretty).expect("pretty-legacy parses");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name.as_ref(), "consensus");
+        assert_eq!(entries[0].value, format!("unencrypted:{SAMPLE_SK}"));
+        assert_eq!(entries[1].name.as_ref(), "companion");
+        assert_eq!(entries[1].value, format!("unencrypted:{SAMPLE_SK}"));
+    }
+
+    #[test]
+    fn parse_with_escapes_in_alias() {
+        let input = r#"[{"name":"a\"b\\c","value":"unencrypted:abc"}]"#;
+        let entries = parse(input).expect("escaped alias parses");
+        assert_eq!(entries[0].name.as_ref(), "a\"b\\c");
+        assert_eq!(entries[0].value, "unencrypted:abc");
+    }
+
+    #[test]
+    fn parse_rejects_malformed() {
+        assert!(parse(r#"{"name":"k","value":"v"}"#).is_err()); // not an array
+        assert!(parse(r#"[{"name":"k","value":"v"}"#).is_err()); // unterminated array
+        assert!(parse(r#"[{"name":"k","value":"v"}]xx"#).is_err()); // trailing garbage
+        assert!(parse("").is_err()); // empty
+    }
+
+    /// Load-bearing for the leak fix: `value: &'a str` forces `serde_json`
+    /// to slice into the input rather than allocate a fresh `String` per
+    /// entry. If a future refactor changes `value`'s type to one that
+    /// owns its bytes, this test catches it via a pointer-range check.
+    #[test]
+    fn parse_borrows_value_from_input() {
+        let input: String = format!(r#"[{{"name":"k","value":"unencrypted:{SAMPLE_SK}"}}]"#);
+        let entries = parse(&input).expect("parses");
+        let value: &str = entries[0].value;
+        let input_start = input.as_ptr() as usize;
+        let input_end = input_start + input.len();
+        let value_start = value.as_ptr() as usize;
+        assert!(
+            (input_start..input_end).contains(&value_start),
+            "value slice does not point into the input buffer (parser allocated)",
+        );
+    }
 }
