@@ -76,7 +76,8 @@ sudo eject /dev/sdX
 ```bash
 diskutil list
 diskutil unmountDisk /dev/diskN
-xzcat russignol-pi-zero.img.xz | sudo dd of=/dev/rdiskN bs=4m conv=fsync
+xzcat russignol-pi-zero.img.xz | sudo dd of=/dev/rdiskN bs=4m
+sync
 diskutil eject /dev/diskN
 ```
 
