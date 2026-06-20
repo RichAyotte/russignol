@@ -29,6 +29,15 @@ sudo apt install curl xz-utils eject iproute2 usbutils
 brew install xz
 ```
 
+> **Note:** macOS is operate-only. This guide gets a Mac through flashing,
+> network configuration, key import, and baking — all via `octez-client` and
+> `octez-baker`, which are cross-platform. But **watermark initialization
+> (Step 1) and key rotation are performed by the
+> [host utility](INSTALL_HOST_UTILITY.md), which runs only on Linux.** A Mac on
+> its own cannot seed the high-watermark floor on a freshly flashed card or
+> drive a key rotation; use a Linux host — a VM or container with USB
+> passthrough works — for those steps.
+
 ## Step 1: Download and Flash SD Card
 
 > **Warning: Manual flashing skips critical security provisioning.**
