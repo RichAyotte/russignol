@@ -93,7 +93,14 @@ diskutil eject /dev/diskN
 
 ## Step 3: Configure Network
 
-### Create udev Rule
+Network configuration is OS-specific: Linux uses a udev rule plus
+`systemd-networkd`; macOS configures the interface directly with
+`networksetup`. Both ends share the same link-local subnet — the signer is
+`169.254.1.1` and the host must be `169.254.1.2/30`.
+
+### Linux
+
+#### Create udev Rule
 
 Create a persistent device name:
 
@@ -106,7 +113,7 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=net
 ```
 
-### Configure Link-Local Address
+#### Configure Link-Local Address
 
 The signer runs on `169.254.1.1`. Configure your host to reach it:
 
@@ -129,7 +136,7 @@ EOF
 sudo systemctl restart systemd-networkd
 ```
 
-### Exclude from NetworkManager
+#### Exclude from NetworkManager
 
 If NetworkManager is running, prevent it from managing the russignol interface:
 
@@ -145,7 +152,7 @@ sudo systemctl restart NetworkManager
 
 Skip this step if NetworkManager is not installed or not running (`systemctl is-active NetworkManager`).
 
-### Manual Configuration (Alternative)
+#### Manual Configuration (Alternative)
 
 Alternatively, configure manually each boot:
 
@@ -153,6 +160,40 @@ Alternatively, configure manually each boot:
 sudo ip addr add 169.254.1.2/30 dev russignol
 sudo ip link set russignol up
 ```
+
+### macOS
+
+> **Warning:** macOS support has not been tested.
+
+The signer presents a standard USB CDC-ECM ethernet interface, which macOS
+recognizes without extra drivers. Identify the interface it created:
+
+```bash
+networksetup -listallhardwareports
+```
+
+Look for the hardware port backed by a newly added `enN` device; the signer
+reports its product as `Russignol Ethernet`. Note both the hardware port name
+and the `enN` device.
+
+Assign the static address `169.254.1.2/30` (netmask `255.255.255.252`).
+Persistent, by hardware port name:
+
+```bash
+sudo networksetup -setmanual "Russignol Ethernet" 169.254.1.2 255.255.255.252
+```
+
+Temporary (cleared on replug or reboot), by device name:
+
+```bash
+sudo ifconfig en5 169.254.1.2 255.255.255.252
+```
+
+> **Note:** The host address must be exactly `169.254.1.2`. The device pings
+> the host and power-cycles the USB gadget after ~30 seconds of failed pings,
+> so the automatic link-local address macOS would otherwise self-assign (a
+> random `169.254.x.x`) makes the link flap. Confirm `ifconfig enN` shows
+> `169.254.1.2` and no second self-assigned address.
 
 ### Verify Connectivity
 
