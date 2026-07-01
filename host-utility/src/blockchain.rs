@@ -517,3 +517,65 @@ pub fn format_time_estimate(blocks_away: i64, minimal_block_delay: Option<i64>) 
         }
     }
 }
+
+/// Parse `octez-client list known addresses` output into `(alias, address)`
+/// pairs, keeping only `tz`-prefixed addresses. Each line has the shape
+/// `<alias>: <tz…> (<sk/pk info>)`.
+pub fn parse_known_addresses(stdout: &str) -> Vec<(String, String)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (alias, rest) = line.split_once(':')?;
+            let address = rest.split_whitespace().next()?;
+            address
+                .starts_with("tz")
+                .then(|| (alias.trim().to_string(), address.to_string()))
+        })
+        .collect()
+}
+
+/// List the wallet's known addresses as `(alias, address)` pairs by running
+/// `octez-client list known addresses` (a local wallet read — no per-address
+/// network probing).
+pub fn list_known_addresses(config: &RussignolConfig) -> Result<Vec<(String, String)>> {
+    let output = run_octez_client_command(&["list", "known", "addresses"], config)?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "octez-client list known addresses failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(parse_known_addresses(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_alias_address_pairs_and_skips_non_tz_lines() {
+        let out = "\
+russignol-consensus: tz4RArZgeJEszVVsThhkLR3qay6YpNxph5zG (tcp sk known)
+capture-delegator-1: tz1WufWRKzsBg3aA6oZNndoAgyd46uUnqJDa (unencrypted sk known)
+noise line without a colon
+label:    not-an-address here
+spaced : tz2ABCdef (unencrypted sk known)
+";
+        assert_eq!(
+            parse_known_addresses(out),
+            vec![
+                (
+                    "russignol-consensus".to_string(),
+                    "tz4RArZgeJEszVVsThhkLR3qay6YpNxph5zG".to_string()
+                ),
+                (
+                    "capture-delegator-1".to_string(),
+                    "tz1WufWRKzsBg3aA6oZNndoAgyd46uUnqJDa".to_string()
+                ),
+                ("spaced".to_string(), "tz2ABCdef".to_string()),
+            ]
+        );
+    }
+}

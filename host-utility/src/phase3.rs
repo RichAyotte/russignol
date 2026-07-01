@@ -41,48 +41,22 @@ fn select_baker(
     // If auto_confirm is enabled and a baker key was provided, use it directly
     if auto_confirm {
         if let Some(key) = provided_baker_key {
-            let list_output = run_octez_client_command(&["list", "known", "addresses"], config)?;
-            if list_output.status.success() {
-                let stdout = String::from_utf8_lossy(&list_output.stdout);
-
-                for line in stdout.lines() {
-                    if let Some((alias_part, rest)) = line.split_once(':') {
-                        let alias = alias_part.trim();
-                        if let Some(addr) = rest.split_whitespace().next()
-                            && (alias == key || addr == key)
-                        {
-                            return Ok((alias.to_string(), addr.to_string()));
-                        }
-                    }
-                }
-
-                anyhow::bail!(
-                    "Provided baker key '{key}' not found in octez-client known addresses"
-                );
+            if let Some((alias, addr)) = blockchain::list_known_addresses(config)?
+                .into_iter()
+                .find(|(alias, addr)| alias == key || addr == key)
+            {
+                return Ok((alias, addr));
             }
+            anyhow::bail!("Provided baker key '{key}' not found in octez-client known addresses");
         }
         anyhow::bail!("--yes flag requires --baker-key to be specified");
     }
 
-    // List known addresses and parse them
-    let list_output = run_octez_client_command(&["list", "known", "addresses"], config)?;
-    let mut choices: Vec<(String, String, String)> = Vec::new(); // (display, alias, address)
-
-    if list_output.status.success() {
-        let stdout = String::from_utf8_lossy(&list_output.stdout);
-
-        for line in stdout.lines() {
-            if let Some((alias_part, rest)) = line.split_once(':') {
-                let alias = alias_part.trim();
-                if let Some(addr) = rest.split_whitespace().next()
-                    && addr.starts_with("tz")
-                {
-                    let display = format!("{alias} ({addr})");
-                    choices.push((display, alias.to_string(), addr.to_string()));
-                }
-            }
-        }
-    }
+    // List known addresses (local wallet read)
+    let choices: Vec<(String, String, String)> = blockchain::list_known_addresses(config)?
+        .into_iter()
+        .map(|(alias, addr)| (format!("{alias} ({addr})"), alias, addr))
+        .collect(); // (display, alias, address)
 
     if choices.is_empty() {
         anyhow::bail!(

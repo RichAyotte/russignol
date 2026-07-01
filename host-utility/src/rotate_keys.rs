@@ -858,14 +858,7 @@ fn check_sd_card_readiness(auto_confirm: bool) -> Result<bool> {
 
             // Retry loop for flash operations
             loop {
-                match image::run_image_command(image::ImageCommands::DownloadAndFlash {
-                    url: None,
-                    device: None,
-                    endpoint: None,
-                    yes: false,
-                    restore_keys: None,
-                    beta: false,
-                }) {
+                match image::run_image_command(image::ImageCommands::download_and_flash_latest()) {
                     Ok(()) => {
                         println!();
                         success("SD card flashed successfully!");

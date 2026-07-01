@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 use crate::config;
 use crate::constants::ORANGE_256;
-use crate::progress;
+use crate::restore_keys;
 use crate::utils::{
     self, JsonValueExt, create_http_agent, create_orange_theme, format_with_separators,
     print_title_bar,
@@ -192,6 +192,21 @@ pub enum ImageCommands {
         /// Optionally specify the source device, or omit to auto-detect.
         #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
         restore_keys: Option<PathBuf>,
+
+        /// Migrate keys from a Nomadic Labs tezos-rpi-bls-signer card (Linux only).
+        /// Optionally specify the source device, or omit to auto-detect.
+        #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
+        migrate_keys: Option<PathBuf>,
+
+        /// Source key alias to import as the consensus key (migration only;
+        /// default: first key)
+        #[arg(long)]
+        consensus_key: Option<String>,
+
+        /// Source key alias to import as the companion key (migration only;
+        /// default: second key)
+        #[arg(long)]
+        companion_key: Option<String>,
     },
 
     /// Download and flash in one step
@@ -217,6 +232,21 @@ pub enum ImageCommands {
         #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
         restore_keys: Option<PathBuf>,
 
+        /// Migrate keys from a Nomadic Labs tezos-rpi-bls-signer card (Linux only).
+        /// Optionally specify the source device, or omit to auto-detect.
+        #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
+        migrate_keys: Option<PathBuf>,
+
+        /// Source key alias to import as the consensus key (migration only;
+        /// default: first key)
+        #[arg(long)]
+        consensus_key: Option<String>,
+
+        /// Source key alias to import as the companion key (migration only;
+        /// default: second key)
+        #[arg(long)]
+        companion_key: Option<String>,
+
         /// Download the latest beta (pre-release) version
         #[arg(long)]
         beta: bool,
@@ -228,6 +258,24 @@ pub enum ImageCommands {
         #[arg(long)]
         beta: bool,
     },
+}
+
+impl ImageCommands {
+    /// A plain interactive `download-and-flash` of the latest stable image,
+    /// with no key-source, device, or channel overrides.
+    pub fn download_and_flash_latest() -> Self {
+        Self::DownloadAndFlash {
+            url: None,
+            device: None,
+            endpoint: None,
+            yes: false,
+            restore_keys: None,
+            migrate_keys: None,
+            consensus_key: None,
+            companion_key: None,
+            beta: false,
+        }
+    }
 }
 
 /// Represents a detected block device
@@ -286,12 +334,20 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
             endpoint,
             yes,
             restore_keys,
+            migrate_keys,
+            consensus_key,
+            companion_key,
         } => cmd_flash(
             &image,
             device,
             endpoint.as_deref(),
             yes,
-            restore_keys.as_deref(),
+            KeySourceArgs {
+                restore_keys: restore_keys.as_deref(),
+                migrate_keys: migrate_keys.as_deref(),
+                consensus_key: consensus_key.as_deref(),
+                companion_key: companion_key.as_deref(),
+            },
         ),
         ImageCommands::DownloadAndFlash {
             url,
@@ -299,13 +355,21 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
             endpoint,
             yes,
             restore_keys,
+            migrate_keys,
+            consensus_key,
+            companion_key,
             beta,
         } => cmd_download_and_flash(
             url,
             device,
             endpoint.as_deref(),
             yes,
-            restore_keys.as_deref(),
+            KeySourceArgs {
+                restore_keys: restore_keys.as_deref(),
+                migrate_keys: migrate_keys.as_deref(),
+                consensus_key: consensus_key.as_deref(),
+                companion_key: companion_key.as_deref(),
+            },
             beta,
         ),
         ImageCommands::List { beta } => cmd_list(beta),
@@ -405,6 +469,22 @@ fn check_flash_tools() -> Result<()> {
     Ok(())
 }
 
+/// The config a flash should use for node RPCs: the loaded config with an
+/// optional endpoint override, a minimal endpoint-only config when none is
+/// loaded, or `None` when neither a config nor an endpoint is available.
+fn effective_config(endpoint_override: Option<&str>) -> Option<config::RussignolConfig> {
+    let loaded_config = config::RussignolConfig::load().ok();
+    match (loaded_config, endpoint_override) {
+        (Some(mut cfg), Some(endpoint)) => {
+            cfg.rpc_endpoint = endpoint.to_string();
+            Some(cfg)
+        }
+        (Some(cfg), None) => Some(cfg),
+        (None, Some(endpoint)) => Some(config::RussignolConfig::minimal_with_endpoint(endpoint)),
+        (None, None) => None,
+    }
+}
+
 /// Check node connectivity and fetch chain info for watermark configuration
 ///
 /// Returns `Ok(Some(chain_info))` if node is available,
@@ -412,34 +492,10 @@ fn check_flash_tools() -> Result<()> {
 /// or Err if node check fails.
 ///
 /// If `endpoint_override` is provided, it will be used instead of the configured endpoint.
-/// If no config exists but endpoint is provided, creates a minimal config using the endpoint.
 fn check_node_for_watermarks(
     endpoint_override: Option<&str>,
 ) -> Result<Option<watermark::ChainInfo>> {
-    let loaded_config = config::RussignolConfig::load().ok();
-
-    // Determine effective config: use loaded config with endpoint override,
-    // or create minimal config if endpoint provided without existing config
-    let effective_config = match (&loaded_config, endpoint_override) {
-        (Some(cfg), Some(endpoint)) => {
-            // Have config, override endpoint
-            let mut cfg_clone = cfg.clone();
-            cfg_clone.rpc_endpoint = endpoint.to_string();
-            Some(cfg_clone)
-        }
-        (Some(cfg), None) => {
-            // Have config, use as-is
-            Some(cfg.clone())
-        }
-        (None, Some(endpoint)) => {
-            // No config but endpoint provided - create minimal config
-            Some(config::RussignolConfig::minimal_with_endpoint(endpoint))
-        }
-        (None, None) => {
-            // No config and no endpoint
-            None
-        }
-    };
+    let effective_config = effective_config(endpoint_override);
 
     if let Some(ref cfg) = effective_config {
         match watermark::prefetch_chain_info(cfg) {
@@ -527,18 +583,16 @@ fn cmd_download(
     Ok(())
 }
 
-/// Shared restore-flash logic used by both `cmd_flash` and `cmd_download_and_flash`
-fn run_restore_flash(
+/// Shared keyed-flash logic (restore or migrate) used by both `cmd_flash` and
+/// `cmd_download_and_flash`. The `source` selects how the key material is read
+/// and how a physical card is identified for the single-reader swap guard;
+/// everything downstream is shared.
+fn run_keyed_flash(
+    source: &dyn restore_keys::CardSource,
     restore_source: &Path,
-    image: &Path,
     device: Option<PathBuf>,
-    yes: bool,
-    uncompressed_size: Option<u64>,
-    metadata: &FlashMetadata,
-    chain_info: &watermark::ChainInfo,
+    job: restore_keys::FlashJob<'_>,
 ) -> Result<()> {
-    use crate::restore_keys;
-
     restore_keys::check_restore_tools()?;
 
     let detected = detect_removable_devices().unwrap_or_default();
@@ -546,25 +600,18 @@ fn run_restore_flash(
         restore_keys::is_single_reader_mode(restore_source, device.as_deref(), &detected);
 
     if single_reader {
-        return restore_keys::run_single_reader_restore(
-            restore_source,
-            image,
-            yes,
-            uncompressed_size,
-            metadata,
-            chain_info,
-        );
+        return restore_keys::run_single_reader_restore(source, restore_source, job);
     }
 
     // Dual reader: read source card first
-    restore_keys::ensure_source_partitions_visible(restore_source)?;
-    let spinner = progress::create_spinner("Reading source card...");
-    let backup = restore_keys::read_source_card(restore_source)?;
-    spinner.finish_and_clear();
+    let backup = source.read(restore_source)?;
 
     // Check for network mismatch before target selection
-    if !restore_keys::warn_network_mismatch(&backup, chain_info, yes)? {
-        utils::info("Restore cancelled");
+    if !restore_keys::warn_network_mismatch(&backup, job.chain_info, job.yes)? {
+        utils::info(&format!(
+            "{} cancelled",
+            restore_keys::uppercase_first(source.noun())
+        ));
         println!();
         return Ok(());
     }
@@ -585,15 +632,56 @@ fn run_restore_flash(
     check_device_not_mounted(&target.path)?;
     check_device_has_media(&target.path)?;
 
-    restore_keys::run_dual_reader_restore(
-        &target,
-        image,
-        yes,
-        uncompressed_size,
-        &backup,
-        metadata,
-        chain_info,
-    )
+    restore_keys::run_dual_reader_restore(&target, &backup, source.noun(), job)
+}
+
+/// Where a keyed flash gets its key material. Both `flash` and
+/// `download-and-flash` accept the same options; at most one of `restore_keys`
+/// / `migrate_keys` may be set.
+#[derive(Clone, Copy)]
+struct KeySourceArgs<'a> {
+    restore_keys: Option<&'a Path>,
+    migrate_keys: Option<&'a Path>,
+    consensus_key: Option<&'a str>,
+    companion_key: Option<&'a str>,
+}
+
+/// Reject `--restore-keys` and `--migrate-keys` used together: each selects a
+/// different key source for the same flash, so only one may be given.
+fn check_key_source_exclusive(
+    restore_keys: Option<&Path>,
+    migrate_keys: Option<&Path>,
+) -> Result<()> {
+    if restore_keys.is_some() && migrate_keys.is_some() {
+        bail!("--restore-keys and --migrate-keys cannot be used together; choose one source");
+    }
+    Ok(())
+}
+
+/// Resolve the requested key source to a `CardSource` plus its device path, or
+/// `None` when neither `--restore-keys` nor `--migrate-keys` was given.
+///
+/// For migration this prompts for the source/new PINs and verifies the eCryptfs
+/// toolchain, so it runs before any download or destructive work. `endpoint`
+/// selects the node used to label the migrated keys by their on-chain roles.
+fn resolve_key_source(
+    keys: KeySourceArgs<'_>,
+    endpoint: Option<&str>,
+) -> Result<Option<(Box<dyn restore_keys::CardSource>, PathBuf)>> {
+    if let Some(arg) = keys.migrate_keys {
+        let device = restore_keys::resolve_restore_source(arg)?;
+        let source = crate::migrate_keys::MigrateSource::prompt(
+            keys.consensus_key.map(str::to_string),
+            keys.companion_key.map(str::to_string),
+            effective_config(endpoint),
+        )?;
+        Ok(Some((Box::new(source), device)))
+    } else if let Some(arg) = keys.restore_keys {
+        let device = restore_keys::resolve_restore_source(arg)?;
+        Ok(Some((Box::new(restore_keys::RestoreSource), device)))
+    } else {
+        Ok(None)
+    }
 }
 
 fn cmd_flash(
@@ -601,8 +689,10 @@ fn cmd_flash(
     device: Option<PathBuf>,
     endpoint: Option<&str>,
     yes: bool,
-    restore_keys: Option<&Path>,
+    keys: KeySourceArgs<'_>,
 ) -> Result<()> {
+    check_key_source_exclusive(keys.restore_keys, keys.migrate_keys)?;
+
     // Check for required tools first
     check_flash_tools()?;
 
@@ -622,28 +712,35 @@ fn cmd_flash(
     // Check node FIRST - fail fast if node is unavailable
     let chain_info = check_node_for_watermarks(endpoint)?;
 
-    // Restore-keys path
-    if let Some(restore_keys_arg) = restore_keys {
+    // Keyed path: restore or migrate (mutually exclusive, checked above)
+    if let Some((source, source_device)) = resolve_key_source(keys, endpoint)? {
         println!();
-        print_title_bar("💾 Flash SD Card (with key restore)");
-        let restore_source = crate::restore_keys::resolve_restore_source(restore_keys_arg)?;
+        let suffix = if keys.migrate_keys.is_some() {
+            "migration"
+        } else {
+            "restore"
+        };
+        print_title_bar(&format!("💾 Flash SD Card (with key {suffix})"));
         let metadata = FlashMetadata {
             image_sha256,
             image_version: None,
             channel: None,
         };
         let chain_info = chain_info.as_ref().context(
-            "Node check required for key restore but no configuration found.\n  \
+            "Node check required to write keys but no configuration found.\n  \
              Run 'russignol config' first, or use --endpoint to specify your node.",
         )?;
-        return run_restore_flash(
-            &restore_source,
-            image,
+        return run_keyed_flash(
+            source.as_ref(),
+            &source_device,
             device,
-            yes,
-            None,
-            &metadata,
-            chain_info,
+            restore_keys::FlashJob {
+                image,
+                uncompressed_size: None,
+                yes,
+                metadata: &metadata,
+                chain_info,
+            },
         );
     }
 
@@ -793,9 +890,11 @@ fn cmd_download_and_flash(
     device: Option<PathBuf>,
     endpoint: Option<&str>,
     yes: bool,
-    restore_keys: Option<&Path>,
+    keys: KeySourceArgs<'_>,
     include_prerelease: bool,
 ) -> Result<()> {
+    check_key_source_exclusive(keys.restore_keys, keys.migrate_keys)?;
+
     // Check for required tools first
     check_flash_tools()?;
 
@@ -808,12 +907,17 @@ fn cmd_download_and_flash(
     // Check node FIRST - fail fast if node is unavailable
     let chain_info = check_node_for_watermarks(endpoint)?;
 
-    // Restore-keys path
-    if let Some(restore_keys_arg) = restore_keys {
+    // Keyed path: restore or migrate (mutually exclusive, checked above)
+    if let Some((source, source_device)) = resolve_key_source(keys, endpoint)? {
         println!();
-        print_title_bar("📥💾 Download and Flash SD Card (with key restore)");
-
-        let restore_source = crate::restore_keys::resolve_restore_source(restore_keys_arg)?;
+        let suffix = if keys.migrate_keys.is_some() {
+            "migration"
+        } else {
+            "restore"
+        };
+        print_title_bar(&format!(
+            "📥💾 Download and Flash SD Card (with key {suffix})"
+        ));
 
         // Download first (can happen before touching cards)
         let dl = resolve_download_info(url, include_prerelease)?;
@@ -838,17 +942,20 @@ fn cmd_download_and_flash(
         };
 
         let chain_info = chain_info.as_ref().context(
-            "Node check required for key restore but no configuration found.\n  \
+            "Node check required to write keys but no configuration found.\n  \
              Run 'russignol config' first, or use --endpoint to specify your node.",
         )?;
-        return run_restore_flash(
-            &restore_source,
-            &image_path,
+        return run_keyed_flash(
+            source.as_ref(),
+            &source_device,
             device,
-            yes,
-            dl.uncompressed_size,
-            &metadata,
-            chain_info,
+            restore_keys::FlashJob {
+                image: &image_path,
+                uncompressed_size: dl.uncompressed_size,
+                yes,
+                metadata: &metadata,
+                chain_info,
+            },
         );
     }
 
@@ -2044,6 +2151,18 @@ mod tests {
             .take_while(|c| c.is_ascii_digit() || *c == '.')
             .collect();
         num_str.parse::<f64>().unwrap_or(0.0) as u64 * multiplier
+    }
+
+    #[test]
+    fn key_source_flags_are_mutually_exclusive() {
+        let p = Path::new("/dev/sdx");
+        assert!(
+            check_key_source_exclusive(Some(p), Some(p)).is_err(),
+            "both --restore-keys and --migrate-keys must be rejected"
+        );
+        assert!(check_key_source_exclusive(Some(p), None).is_ok());
+        assert!(check_key_source_exclusive(None, Some(p)).is_ok());
+        assert!(check_key_source_exclusive(None, None).is_ok());
     }
 
     #[test]

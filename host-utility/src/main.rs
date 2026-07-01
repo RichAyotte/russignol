@@ -17,6 +17,7 @@ mod hardware;
 mod image;
 mod install;
 mod keys;
+mod migrate_keys;
 mod phase2;
 mod phase3;
 mod phase5;
@@ -234,105 +235,7 @@ enum ConfigCommands {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    match cli.command {
-        None => {
-            // No subcommand provided, print help
-            Cli::command().print_help()?;
-            std::process::exit(0);
-        }
-        Some(Commands::Setup {
-            dry_run,
-            verbose,
-            skip_hardware_check,
-            yes,
-            endpoint,
-            signer_endpoint,
-            network_backend,
-            baker_key,
-        }) => {
-            run_setup(&SetupConfig {
-                confirmation: confirmation::ConfirmationConfig {
-                    auto_confirm: yes,
-                    dry_run,
-                    verbose,
-                },
-                skip_hardware_check,
-                baker_key: baker_key.as_deref(),
-                endpoint: endpoint.as_deref(),
-                signer_endpoint: signer_endpoint.as_deref(),
-                network_backend,
-            })?;
-        }
-        Some(Commands::Status {
-            verbose,
-            endpoint,
-            signer_endpoint,
-        }) => {
-            handle_status_command(verbose, endpoint.as_deref(), signer_endpoint.as_deref())?;
-        }
-        Some(Commands::Purge { dry_run }) => {
-            // Load configuration
-            let config = config::RussignolConfig::load()?;
-            purge::run_purge(dry_run, &config)?;
-        }
-        Some(Commands::Install { backup }) => {
-            install::run_install(backup)?;
-        }
-        Some(Commands::Upgrade { check, yes, beta }) => {
-            upgrade::run_upgrade(check, yes, beta)?;
-        }
-        Some(Commands::Config { command }) => {
-            config::run_config_command(command)?;
-        }
-        Some(Commands::Completions { shell, print }) => {
-            handle_completions_command(shell, print)?;
-        }
-        Some(Commands::Image { command }) => {
-            image::run_image_command(command)?;
-        }
-        Some(Commands::Watermark { command }) => {
-            handle_watermark_command(command)?;
-        }
-        Some(Commands::RotateKeys {
-            monitor,
-            replace,
-            dry_run,
-            yes,
-            verbose,
-            endpoint,
-            signer_endpoint,
-            config: hardware_config,
-            restart_method,
-            baker_service,
-            stop_command,
-            start_command,
-        }) => {
-            let opts = rotate_keys::RotateKeysOptions {
-                monitor_only: monitor,
-                replace,
-                dry_run,
-                auto_confirm: yes,
-                verbose,
-            };
-            let restart_config = rotate_keys::RestartConfig {
-                method: restart_method,
-                service: baker_service,
-                stop_command,
-                start_command,
-            };
-            handle_rotate_keys_command(
-                &opts,
-                hardware_config,
-                &restart_config,
-                endpoint.as_deref(),
-                signer_endpoint.as_deref(),
-            )?;
-        }
-    }
-
-    Ok(())
+    dispatch(Cli::parse().command)
 }
 
 fn install_completions(shell: Shell) -> Result<()> {
@@ -402,6 +305,82 @@ fn handle_watermark_command(command: WatermarkCommands) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Dispatch a parsed CLI command to its handler.
+fn dispatch(command: Option<Commands>) -> Result<()> {
+    match command {
+        None => {
+            Cli::command().print_help()?;
+            std::process::exit(0);
+        }
+        Some(Commands::Setup {
+            dry_run,
+            verbose,
+            skip_hardware_check,
+            yes,
+            endpoint,
+            signer_endpoint,
+            network_backend,
+            baker_key,
+        }) => run_setup(&SetupConfig {
+            confirmation: confirmation::ConfirmationConfig {
+                auto_confirm: yes,
+                dry_run,
+                verbose,
+            },
+            skip_hardware_check,
+            baker_key: baker_key.as_deref(),
+            endpoint: endpoint.as_deref(),
+            signer_endpoint: signer_endpoint.as_deref(),
+            network_backend,
+        }),
+        Some(Commands::Status {
+            verbose,
+            endpoint,
+            signer_endpoint,
+        }) => handle_status_command(verbose, endpoint.as_deref(), signer_endpoint.as_deref()),
+        Some(Commands::Purge { dry_run }) => {
+            purge::run_purge(dry_run, &config::RussignolConfig::load()?)
+        }
+        Some(Commands::Install { backup }) => install::run_install(backup),
+        Some(Commands::Upgrade { check, yes, beta }) => upgrade::run_upgrade(check, yes, beta),
+        Some(Commands::Config { command }) => config::run_config_command(command),
+        Some(Commands::Completions { shell, print }) => handle_completions_command(shell, print),
+        Some(Commands::Image { command }) => image::run_image_command(command),
+        Some(Commands::Watermark { command }) => handle_watermark_command(command),
+        Some(Commands::RotateKeys {
+            monitor,
+            replace,
+            dry_run,
+            yes,
+            verbose,
+            endpoint,
+            signer_endpoint,
+            config: hardware_config,
+            restart_method,
+            baker_service,
+            stop_command,
+            start_command,
+        }) => handle_rotate_keys_command(
+            &rotate_keys::RotateKeysOptions {
+                monitor_only: monitor,
+                replace,
+                dry_run,
+                auto_confirm: yes,
+                verbose,
+            },
+            hardware_config,
+            &rotate_keys::RestartConfig {
+                method: restart_method,
+                service: baker_service,
+                stop_command,
+                start_command,
+            },
+            endpoint.as_deref(),
+            signer_endpoint.as_deref(),
+        ),
+    }
 }
 
 fn handle_status_command(

@@ -2021,6 +2021,8 @@ dependencies = [
  "log",
  "lzma-rs",
  "nix 0.31.2",
+ "russignol-crypto",
+ "russignol-signer-lib",
  "russignol-storage",
  "semver",
  "serde",

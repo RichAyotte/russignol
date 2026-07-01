@@ -349,6 +349,81 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
     })
 }
 
+/// Wraps a [`CardSource::read`] error the single-reader loop must treat as
+/// fatal — abort the flash — rather than prompting for a card swap.
+///
+/// A swap only helps when the wrong *card* is inserted; it can't fix a wrong
+/// PIN (re-prompted in place) or an environment failure like a missing eCryptfs
+/// kernel module. Sources return this to bypass the swap loop.
+#[derive(Debug)]
+pub(crate) struct AbortRead(pub anyhow::Error);
+
+impl std::fmt::Display for AbortRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for AbortRead {}
+
+/// A source of key material for a keyed flash.
+///
+/// Abstracts the one part of the flash pipeline that differs between restoring
+/// from a russignol card and migrating from a Nomadic Labs card: how the source
+/// is read and how a physical card is identified for the single-reader swap
+/// guard. Everything downstream (flash, partition, write, manifest) is shared.
+pub(crate) trait CardSource {
+    /// Read the source card into a backup, doing any prompting/decryption
+    /// internally.
+    fn read(&self, device: &Path) -> Result<SourceBackup>;
+
+    /// Stable identifier for the physical card currently in `device`, used by
+    /// the single-reader swap guard to detect that the source was never
+    /// removed. `None` when the card cannot be identified.
+    fn identity(&self, device: &Path) -> Option<String>;
+
+    /// User-facing verb for this operation: `"restore"` or `"migrate"`.
+    fn noun(&self) -> &'static str;
+}
+
+/// Restore from an existing russignol card: read its keys partition and
+/// identify it by the flash-manifest card ID.
+pub(crate) struct RestoreSource;
+
+impl CardSource for RestoreSource {
+    fn read(&self, device: &Path) -> Result<SourceBackup> {
+        ensure_source_partitions_visible(device)?;
+        let spinner = progress::create_spinner("Reading source card...");
+        let result = read_source_card(device);
+        spinner.finish_and_clear();
+        result
+    }
+
+    fn identity(&self, device: &Path) -> Option<String> {
+        image::read_card_id(device)
+    }
+
+    fn noun(&self) -> &'static str {
+        "restore"
+    }
+}
+
+/// The image and node-derived context shared by both reader modes of a keyed
+/// flash. Bundled so the single- and dual-reader entry points stay readable.
+#[derive(Clone, Copy)]
+pub(crate) struct FlashJob<'a> {
+    /// Base image to flash onto the target.
+    pub image: &'a Path,
+    /// Uncompressed size hint for the flash progress bar (downloads only).
+    pub uncompressed_size: Option<u64>,
+    /// Skip confirmation prompts.
+    pub yes: bool,
+    /// Provenance written to the flash manifest.
+    pub metadata: &'a image::FlashMetadata,
+    /// Chain info and watermark seed, sourced from the node.
+    pub chain_info: &'a crate::watermark::ChainInfo,
+}
+
 /// Create and format p3/p4 partitions on the target device
 pub fn create_and_format_partitions(device: &Path) -> Result<()> {
     let sfdisk = utils::resolve_tool("sfdisk").context("sfdisk not found")?;
@@ -559,33 +634,32 @@ fn extract_tz4_addresses(public_key_hashs: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Map a key alias to a user-friendly label
+/// Map a key alias to a user-friendly label.
+///
+/// Covers both russignol's own aliases and the bare `consensus`/`companion`
+/// role names a migrated card carries, so the confirmation box labels migrated
+/// keys by role too.
 fn friendly_key_label(alias: &str) -> &str {
     use crate::constants;
+    use russignol_signer_lib::server::KEY_ROLES;
     match alias {
-        s if s == constants::CONSENSUS_KEY_ALIAS => "Consensus key",
-        s if s == constants::COMPANION_KEY_ALIAS => "Companion key",
+        s if s == constants::CONSENSUS_KEY_ALIAS || s == KEY_ROLES[0] => "Consensus key",
+        s if s == constants::COMPANION_KEY_ALIAS || s == KEY_ROLES[1] => "Companion key",
         s if s == constants::CONSENSUS_KEY_PENDING_ALIAS => "Pending consensus key",
         s if s == constants::COMPANION_KEY_PENDING_ALIAS => "Pending companion key",
         _ => "Key",
     }
 }
 
-/// Print restore success message matching the normal flash output
-pub fn print_restore_success() {
+/// Print the success message shared by restore and migrate flashes.
+///
+/// `noun` ("restore"/"migrate") becomes the past-tense verb ("restored"/
+/// "migrated") in the confirmation line.
+pub fn print_restore_success(noun: &str) {
     utils::success("Flash complete!");
     println!();
+    println!("  Keys {noun}d to the new card.");
     println!("  You can now insert the SD card into your Raspberry Pi Zero 2W.");
-}
-
-/// Check whether the inserted card is the source card (user forgot to swap).
-///
-/// Returns `true` if the card is the source card (same `card_id`).
-/// Returns `false` (safe to proceed) if: card IDs differ, target has no
-/// manifest, or source had no manifest (pre-manifest card).
-fn is_source_card(device: &Path, backup: &SourceBackup) -> bool {
-    let target_id = image::read_card_id(device);
-    card_ids_match(backup.source_card_id.as_deref(), target_id.as_deref())
 }
 
 /// Pure comparison: do the source and target card IDs indicate the same card?
@@ -928,7 +1002,7 @@ fn wait_for_card_insert(device: &Path, deadline: std::time::Instant, label: &str
 }
 
 /// Capitalize the first character of a string.
-fn uppercase_first(s: &str) -> String {
+pub(crate) fn uppercase_first(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) => c.to_uppercase().to_string() + chars.as_str(),
@@ -977,14 +1051,11 @@ fn prompt_enter(message: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run the restore workflow for single-reader mode (card swap)
+/// Run the keyed-flash workflow for single-reader mode (card swap)
 pub fn run_single_reader_restore(
+    source: &dyn CardSource,
     restore_from: &Path,
-    image: &Path,
-    yes: bool,
-    uncompressed_size: Option<u64>,
-    metadata: &image::FlashMetadata,
-    chain_info: &crate::watermark::ChainInfo,
+    job: FlashJob<'_>,
 ) -> Result<()> {
     // Step 1: Read source card, prompting for swap if the inserted card isn't valid
     if !restore_from.exists() {
@@ -993,37 +1064,43 @@ pub fn run_single_reader_restore(
     }
 
     let backup = loop {
-        ensure_source_partitions_visible(restore_from)?;
-        let spinner = progress::create_spinner("Reading source card...");
-        match read_source_card(restore_from) {
-            Ok(backup) => {
-                spinner.finish_and_clear();
-                break backup;
-            }
-            Err(e) => {
-                spinner.finish_and_clear();
-                utils::warning(&format!(
-                    "Could not read source card: {e:#}\n  \
-                     Please insert the SOURCE card (a configured russignol device)."
-                ));
-                wait_for_card_swap_labeled(restore_from, "source")?;
-            }
+        match source.read(restore_from) {
+            Ok(backup) => break backup,
+            // A fatal error (e.g. missing eCryptfs module) won't be fixed by
+            // another card — abort with the underlying cause.
+            Err(e) => match e.downcast::<AbortRead>() {
+                Ok(abort) => return Err(abort.0),
+                Err(e) => {
+                    utils::warning(&format!(
+                        "Could not read source card: {e:#}\n  \
+                         Please insert the correct SOURCE card."
+                    ));
+                    wait_for_card_swap_labeled(restore_from, "source")?;
+                }
+            },
         }
     };
 
     // Check for network mismatch before asking user to swap cards
-    if !warn_network_mismatch(&backup, chain_info, yes)? {
-        utils::info("Restore cancelled");
+    if !warn_network_mismatch(&backup, job.chain_info, job.yes)? {
+        utils::info(&format!("{} cancelled", uppercase_first(source.noun())));
         println!();
         return Ok(());
     }
+
+    // Capture the source card's identity while it's still inserted, so the swap
+    // guard below can detect that it was never removed.
+    let source_id = source.identity(restore_from);
 
     // Step 2: Swap to target card — auto-detect via media presence
     utils::info("Remove SOURCE card from the reader, then insert TARGET card");
     wait_for_card_swap(restore_from)?;
 
     // Verify the user actually swapped cards, looping until they do
-    while is_source_card(restore_from, &backup) {
+    while card_ids_match(
+        source_id.as_deref(),
+        source.identity(restore_from).as_deref(),
+    ) {
         utils::warning(
             "This is the same card that was just read (source card).\n  \
              Please swap it for the TARGET card.",
@@ -1036,55 +1113,55 @@ pub fn run_single_reader_restore(
         .unwrap_or_else(|_| image::BlockDevice::from_path(restore_from));
 
     // Confirm before flashing
-    if !confirm_restore_operation(&target, &backup, chain_info, yes)? {
-        utils::info("Restore cancelled");
+    if !confirm_restore_operation(&target, &backup, job.chain_info, job.yes)? {
+        utils::info(&format!("{} cancelled", uppercase_first(source.noun())));
         println!();
         return Ok(());
     }
 
     // Step 3: Flash, partition, and write keys
-    image::flash_image_to_device(image, restore_from, uncompressed_size)?;
+    image::flash_image_to_device(job.image, restore_from, job.uncompressed_size)?;
     image::reread_partition_table(restore_from);
 
     create_and_format_partitions(restore_from)?;
-    write_backup_to_target(restore_from, &backup, chain_info)?;
+    write_backup_to_target(restore_from, &backup, job.chain_info)?;
 
-    image::write_flash_manifest(restore_from, metadata)
+    image::write_flash_manifest(restore_from, job.metadata)
         .context("Failed to write flash manifest")?;
 
-    print_restore_success();
+    print_restore_success(source.noun());
     Ok(())
 }
 
-/// Run the restore workflow for dual-reader mode (both cards accessible)
+/// Run the keyed-flash workflow for dual-reader mode (both cards accessible).
+///
+/// The source has already been read; `noun` ("restore"/"migrate") only shapes
+/// user-facing wording.
 pub fn run_dual_reader_restore(
     target: &image::BlockDevice,
-    image: &Path,
-    yes: bool,
-    uncompressed_size: Option<u64>,
     backup: &SourceBackup,
-    metadata: &image::FlashMetadata,
-    chain_info: &crate::watermark::ChainInfo,
+    noun: &str,
+    job: FlashJob<'_>,
 ) -> Result<()> {
     // Confirm before flashing
-    if !confirm_restore_operation(target, backup, chain_info, yes)? {
-        utils::info("Restore cancelled");
+    if !confirm_restore_operation(target, backup, job.chain_info, job.yes)? {
+        utils::info(&format!("{} cancelled", uppercase_first(noun)));
         println!();
         return Ok(());
     }
 
     // Step 1: Flash target card
-    image::flash_image_to_device(image, &target.path, uncompressed_size)?;
+    image::flash_image_to_device(job.image, &target.path, job.uncompressed_size)?;
     image::reread_partition_table(&target.path);
 
     // Step 2: Create partitions and write backup
     create_and_format_partitions(&target.path)?;
-    write_backup_to_target(&target.path, backup, chain_info)?;
+    write_backup_to_target(&target.path, backup, job.chain_info)?;
 
-    image::write_flash_manifest(&target.path, metadata)
+    image::write_flash_manifest(&target.path, job.metadata)
         .context("Failed to write flash manifest")?;
 
-    print_restore_success();
+    print_restore_success(noun);
     Ok(())
 }
 
