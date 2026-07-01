@@ -25,9 +25,15 @@ pub fn clear_host_compiler_flags() {
 pub fn set_arm_rustflags() {
     // Safe in our single-threaded build context
     unsafe {
+        // The Pi Zero 2W's Cortex-A53 lacks the optional ARMv8 crypto
+        // extensions, yet LLVM's cortex-a53 model enables +aes/+sha2. cpufeatures
+        // then trusts the compile-time feature and skips its runtime HWCAP probe,
+        // so RustCrypto executes AES/SHA/PMULL instructions that fault (SIGILL) on
+        // this silicon. Subtracting the features restores the runtime probe, which
+        // correctly finds no crypto and selects the software backends.
         env::set_var(
             "RUSTFLAGS",
-            "-C target-cpu=cortex-a53 --cfg sha2_256_backend=\"soft\"",
+            "-C target-cpu=cortex-a53 -C target-feature=-aes,-sha2",
         );
     }
 }

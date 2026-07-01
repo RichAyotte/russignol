@@ -37,7 +37,7 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
-    aead::{Aead, AeadCore, OsRng, rand_core::RngCore},
+    aead::{Aead, Generate},
 };
 use log::debug;
 use std::io::{self, Write};
@@ -119,8 +119,7 @@ pub fn derive_key(password: &[u8], salt: &[u8]) -> io::Result<[u8; 32]> {
 pub fn encrypt(password: &[u8], plaintext: &str) -> io::Result<Vec<u8>> {
     debug!("Encrypting data...");
 
-    let mut salt = [0u8; V2_SALT_LEN];
-    OsRng.fill_bytes(&mut salt);
+    let salt: [u8; V2_SALT_LEN] = Generate::generate();
     let key = derive_key(password, &salt)?;
 
     debug!("Encrypting with AES-256-GCM");
@@ -131,7 +130,7 @@ pub fn encrypt(password: &[u8], plaintext: &str) -> io::Result<Vec<u8>> {
         )
     })?;
 
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let nonce = Nonce::generate();
     let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes()).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -216,7 +215,8 @@ pub fn decrypt_with_format(
             "Encrypted data too short for nonce",
         ));
     }
-    let nonce = Nonce::from_slice(&after_salt[..NONCE_LEN]);
+    let nonce = Nonce::try_from(&after_salt[..NONCE_LEN])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid nonce: {e}")))?;
     let ciphertext = &after_salt[NONCE_LEN..];
     debug!(
         "Parsed: format={format:?}, salt={} bytes, ciphertext={} bytes",
@@ -234,7 +234,7 @@ pub fn decrypt_with_format(
         )
     })?;
 
-    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| {
+    let plaintext = cipher.decrypt(&nonce, ciphertext).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Decryption failed (wrong PIN?): {e}"),

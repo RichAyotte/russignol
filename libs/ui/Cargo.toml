@@ -12,6 +12,6 @@ workspace = true
 [dependencies]
 embedded-graphics = "0.8.2"
 tinybmp = "0.7.0"
-u8g2-fonts = { version = "0.7.2", features = ["embedded_graphics_textstyle"] }
+u8g2-fonts = { version = "0.8.0", features = ["embedded_graphics_textstyle"] }
 embedded-layout = "0.4.2"
 embedded-text = "0.7.3"

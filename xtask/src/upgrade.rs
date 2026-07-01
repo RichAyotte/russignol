@@ -25,11 +25,11 @@ pub fn cmd_upgrade() -> Result<()> {
     println!();
     upgrade_buildroot()?;
     println!();
-    upgrade_rpi_linux()?;
+    let kernel_changed = upgrade_rpi_linux()?;
     println!();
     update_defconfigs()?;
     println!();
-    update_kernel_config()?;
+    update_kernel_config(kernel_changed)?;
 
     println!();
     println!("{}", "Upgrade complete.".green().bold());
@@ -169,12 +169,12 @@ fn upgrade_buildroot() -> Result<()> {
 // RPI-LINUX
 // ============================================================================
 
-fn upgrade_rpi_linux() -> Result<()> {
+fn upgrade_rpi_linux() -> Result<bool> {
     println!("{}", "Linux kernel (rpi-linux)".cyan());
 
     if !Path::new(RPI_LINUX_DIR).exists() {
         println!("  {} rpi-linux directory not found, skipping", "⚠".yellow());
-        return Ok(());
+        return Ok(false);
     }
 
     let branch = get_rpi_linux_branch()?;
@@ -190,9 +190,8 @@ fn upgrade_rpi_linux() -> Result<()> {
     let new_hash = git_output(&["-C", RPI_LINUX_DIR, "rev-parse", "HEAD"])?;
     let new_version = get_kernel_version(RPI_LINUX_DIR)?;
 
-    if old_hash == new_hash {
-        println!("  {} Already up to date ({})", "✓".green(), new_version);
-    } else {
+    let changed = old_hash != new_hash;
+    if changed {
         println!(
             "  {} Updated: {} → {} ({})",
             "✓".green(),
@@ -200,11 +199,13 @@ fn upgrade_rpi_linux() -> Result<()> {
             new_version,
             &new_hash[..12]
         );
+    } else {
+        println!("  {} Already up to date ({})", "✓".green(), new_version);
     }
 
     check_newer_kernel_branches(&branch)?;
 
-    Ok(())
+    Ok(changed)
 }
 
 fn get_rpi_linux_branch() -> Result<String> {
@@ -366,23 +367,25 @@ fn update_linux_hash_file(commit: &str) -> Result<()> {
     let tarball_name = format!("{commit}.tar.gz");
 
     // Check if tarball is already in buildroot's download cache
-    let cached_path = PathBuf::from(BUILDROOT_DIR)
-        .join("dl/linux")
-        .join(&tarball_name);
+    let dl_dir = PathBuf::from(BUILDROOT_DIR).join("dl/linux");
+    let cached_path = dl_dir.join(&tarball_name);
 
     let sha256_hex = if cached_path.exists() {
         println!("  Computing hash from cached tarball...");
         compute_file_sha256(&cached_path)?
     } else {
         println!("  Downloading kernel tarball for hash verification...");
-        let tmp_path = download_tarball(&tarball_url, &tarball_name)?;
+        std::fs::create_dir_all(&dl_dir)
+            .with_context(|| format!("Failed to create {}", dl_dir.display()))?;
+        let tmp_path = download_tarball(&tarball_url, &dl_dir, &tarball_name)?;
         let hash = compute_file_sha256(&tmp_path)?;
-
-        // Move to buildroot download cache for later use
-        let dl_dir = PathBuf::from(BUILDROOT_DIR).join("dl/linux");
-        std::fs::create_dir_all(&dl_dir).ok();
-        std::fs::rename(&tmp_path, &cached_path).ok();
-
+        if let Err(e) = std::fs::rename(&tmp_path, &cached_path) {
+            println!(
+                "  {} Could not cache tarball ({e}); it will be re-downloaded at build time",
+                "⚠".yellow()
+            );
+            std::fs::remove_file(&tmp_path).ok();
+        }
         hash
     };
 
@@ -435,9 +438,12 @@ fn compute_file_sha256(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn download_tarball(url: &str, filename: &str) -> Result<PathBuf> {
-    let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(filename);
+/// Download `url` into `dest_dir` under a temporary name. Downloading into the
+/// buildroot cache dir keeps the file on the same filesystem as its final
+/// location, so the caller's move is a rename rather than a cross-device copy
+/// that would fail when `$TMPDIR` is a separate mount.
+fn download_tarball(url: &str, dest_dir: &Path, filename: &str) -> Result<PathBuf> {
+    let tmp_path = dest_dir.join(format!("{filename}.tmp"));
 
     let status = Command::new("wget")
         .args(["-q", "-O"])
@@ -447,6 +453,7 @@ fn download_tarball(url: &str, filename: &str) -> Result<PathBuf> {
         .context("Failed to run wget")?;
 
     if !status.success() {
+        std::fs::remove_file(&tmp_path).ok();
         bail!("Failed to download {url}");
     }
 
@@ -457,7 +464,7 @@ fn download_tarball(url: &str, filename: &str) -> Result<PathBuf> {
 // KERNEL CONFIG
 // ============================================================================
 
-fn update_kernel_config() -> Result<()> {
+fn update_kernel_config(kernel_changed: bool) -> Result<()> {
     println!("{}", "Kernel defconfig".cyan());
 
     let buildroot_dir = PathBuf::from(BUILDROOT_DIR);
@@ -504,6 +511,18 @@ fn update_kernel_config() -> Result<()> {
         println!(
             "    Review changes: {}",
             format!("git diff {KERNEL_DEFCONFIG}").cyan()
+        );
+    }
+
+    // A source bump leaves stale artifacts in output/build/linux-custom that
+    // buildroot's image target reuses, packing the previous kernel. Clearing the
+    // package forces the next build to recompile from the new source.
+    if kernel_changed {
+        println!("  Clearing stale kernel build...");
+        run_buildroot_make(&buildroot_dir, &external_tree, &["linux-dirclean"])?;
+        println!(
+            "  {} Kernel build cleared; next image build recompiles from new source",
+            "✓".green()
         );
     }
 

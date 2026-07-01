@@ -10,9 +10,9 @@ workspace = true
 
 [dependencies]
 scrypt = "0.12"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 log = { workspace = true }
-zeroize = "1.8"
+zeroize = "1.9"
 
 [dev-dependencies]
 toml = "1.1.2"

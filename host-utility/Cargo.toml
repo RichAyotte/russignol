@@ -14,19 +14,19 @@ name = "russignol"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.102"
-chrono = "0.4.44"
+anyhow = "1.0.103"
+chrono = "0.4.45"
 clap = { version = "4.6.1", features = ["derive"] }
 clap_complete = "4"
 colored = "3.1.1"
 dirs = "6.0"
-env_logger = "0.11.10"
-indicatif = "0.18.4"
+env_logger = "0.11.11"
+indicatif = "0.18.6"
 inquire = "0.9"
-log = "0.4.29"
-nix = { version = "0.31.2", features = ["user", "process"] }
+log = "0.4.33"
+nix = { version = "0.31.3", features = ["user", "process"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 shellexpand = "3.1"
 ureq = "3.3"
 semver = "1.0"
@@ -34,7 +34,7 @@ sha2 = "0.11"
 tempfile = "3.27"
 lzma-rs = "0.3"
 unicode-width = "0.2"
-zeroize = { version = "1.8.2", features = ["derive"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
 russignol-storage = { version = "0.1.0", path = "../libs/storage" }
 hex = "0.4.3"
 russignol-crypto = { version = "0.1.2", path = "../libs/crypto" }
