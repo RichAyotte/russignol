@@ -2183,14 +2183,14 @@ mod tests {
 
     /// Build lsblk JSON in the shape of `lsblk -d -o NAME,TYPE,TRAN,RM,SIZE,MODEL --json`
     #[cfg(target_os = "linux")]
-    fn lsblk_json(devices: serde_json::Value) -> serde_json::Value {
+    fn lsblk_json(devices: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "blockdevices": devices })
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn filter_includes_removable_usb_disk() {
-        let json = lsblk_json(serde_json::json!([
+        let json = lsblk_json(&serde_json::json!([
             {"name": "sdb", "type": "disk", "tran": "usb", "rm": true, "size": "29.7G", "model": " UHSII uSD Reader "}
         ]));
         let devices = filter_removable_devices(&json);
@@ -2205,7 +2205,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn filter_excludes_internal_sata_and_nvme_disks() {
-        let json = lsblk_json(serde_json::json!([
+        let json = lsblk_json(&serde_json::json!([
             {"name": "sda", "type": "disk", "tran": "sata", "rm": false, "size": "476.9G", "model": "Samsung SSD 860"},
             {"name": "nvme0n1", "type": "disk", "tran": "nvme", "rm": false, "size": "1.8T", "model": "WD_BLACK SN850X"}
         ]));
@@ -2215,7 +2215,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn filter_excludes_empty_usb_reader_slot() {
-        let json = lsblk_json(serde_json::json!([
+        let json = lsblk_json(&serde_json::json!([
             {"name": "sdb", "type": "disk", "tran": "usb", "rm": true, "size": "0B", "model": "UHSII uSD Reader"}
         ]));
         assert!(filter_removable_devices(&json).is_empty());
@@ -2225,7 +2225,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn filter_includes_mmcblk_with_mmc_transport() {
         // util-linux >= 2.39 reports TRAN "mmc" for mmcblk devices
-        let json = lsblk_json(serde_json::json!([
+        let json = lsblk_json(&serde_json::json!([
             {"name": "mmcblk0", "type": "disk", "tran": "mmc", "rm": true, "size": "29.7G", "model": null}
         ]));
         let devices = filter_removable_devices(&json);
@@ -2238,7 +2238,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn filter_includes_mmcblk_with_null_transport() {
         // util-linux <= 2.38 reports no TRAN for mmcblk devices
-        let json = lsblk_json(serde_json::json!([
+        let json = lsblk_json(&serde_json::json!([
             {"name": "mmcblk0", "type": "disk", "tran": null, "rm": true, "size": "29.7G", "model": null}
         ]));
         let devices = filter_removable_devices(&json);
@@ -2250,7 +2250,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn filter_excludes_soldered_emmc() {
-        let json = lsblk_json(serde_json::json!([
+        let json = lsblk_json(&serde_json::json!([
             {"name": "mmcblk1", "type": "disk", "tran": null, "rm": false, "size": "58.2G", "model": null}
         ]));
         assert!(filter_removable_devices(&json).is_empty());
@@ -2259,7 +2259,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn filter_excludes_emmc_boot_partition() {
-        let json = lsblk_json(serde_json::json!([
+        let json = lsblk_json(&serde_json::json!([
             {"name": "mmcblk1boot0", "type": "disk", "tran": null, "rm": false, "size": "4M", "model": null}
         ]));
         assert!(filter_removable_devices(&json).is_empty());
@@ -2269,7 +2269,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn filter_normalizes_mmcblk_transport_to_mmc() {
         // Both lsblk variants must store the same transport
-        let json = lsblk_json(serde_json::json!([
+        let json = lsblk_json(&serde_json::json!([
             {"name": "mmcblk0", "type": "disk", "tran": "mmc", "rm": true, "size": "29.7G", "model": null},
             {"name": "mmcblk1", "type": "disk", "tran": null, "rm": true, "size": "58.2G", "model": null}
         ]));
