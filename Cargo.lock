@@ -1994,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "russignol-setup"
-version = "0.25.0"
+version = "0.26.0-beta.1"
 dependencies = [
  "anyhow",
  "chrono",
