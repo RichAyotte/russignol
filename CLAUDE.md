@@ -28,6 +28,16 @@ cargo xtask config busybox menuconfig  # Configure busybox
 cargo xtask config kernel nconfig      # Configure Linux kernel
 ```
 
+# Flashing
+
+Always flash SD cards with the host utility, never raw `dd` or an imager:
+
+```sh
+russignol image flash buildroot/output/images/sdcard.img.xz
+```
+
+The host utility handles device auto-detection, mount/safety checks, decompression, and post-write partition re-read that a bare `dd` skips.
+
 # Pre-commit
 
 ```sh
