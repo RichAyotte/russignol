@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 /// Semantic version bump type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -698,6 +699,62 @@ pub fn generate(
     output
 }
 
+/// Run a command with piped stdout/stderr, killing it if it runs past `timeout`.
+fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output> {
+    use std::io::Read;
+
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn command")?;
+
+    // Drain the pipes on separate threads so a chatty child can't fill a pipe
+    // buffer and deadlock against our wait loop.
+    let mut stdout_pipe = child.stdout.take().context("child stdout not piped")?;
+    let mut stderr_pipe = child.stderr.take().context("child stderr not piped")?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout_pipe.read_to_end(&mut buf).map(|_| buf)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stderr_pipe.read_to_end(&mut buf).map(|_| buf)
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("Failed to poll command")? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().context("Failed to kill timed-out command")?;
+            child.wait().context("Failed to reap timed-out command")?;
+            bail!("Command timed out after {}s", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout reader thread panicked"))?
+        .context("Failed to read command stdout")?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr reader thread panicked"))?
+        .context("Failed to read command stderr")?;
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+// A real generation run measured ~4 minutes; the bound only exists to catch a
+// genuinely hung CLI, so leave generous headroom above normal latency.
+const CLAUDE_CHANGELOG_TIMEOUT: Duration = Duration::from_mins(10);
+
 /// Generate a user-facing changelog using Claude CLI
 ///
 /// Passes the full commit messages through `claude -p` which generates a formatted
@@ -755,13 +812,15 @@ fn generate_with_claude(
          Commits:\n\n{full_messages}"
     );
 
-    let output = Command::new("claude")
-        .args(["--print", "--model", "sonnet", &prompt])
-        .env_remove("CLAUDECODE")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .context("Failed to run claude CLI")?;
+    eprintln!("  Generating release notes with Claude (can take a few minutes)...");
+
+    let mut cmd = Command::new("claude");
+    cmd.args(["--print", "--model", "sonnet", &prompt])
+        .env_remove("CLAUDECODE");
+    // Bounded so a hung CLI surfaces as an error, which the caller in
+    // create_changelog_file_for_component turns into the deterministic
+    // generator fallback instead of stalling the release forever.
+    let output = run_with_timeout(&mut cmd, CLAUDE_CHANGELOG_TIMEOUT)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -905,6 +964,28 @@ pub fn create_changelog_file_for_component(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_run_with_timeout_captures_output_of_fast_command() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("hi");
+        let output = run_with_timeout(&mut cmd, Duration::from_secs(5)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi");
+    }
+
+    #[test]
+    fn test_run_with_timeout_kills_command_exceeding_timeout() {
+        let start = std::time::Instant::now();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        let err = run_with_timeout(&mut cmd, Duration::from_millis(200)).unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn test_base_version_stable() {
