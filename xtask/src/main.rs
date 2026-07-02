@@ -1104,9 +1104,10 @@ fn commit_version_bump(component: ReleaseComponent, version: &str) -> Result<()>
 
     println!("  Tagged: {}", tag.cyan());
 
-    // Push commit and tag to remote
+    // Push commit and tag to remote; --set-upstream so a release from a
+    // branch that has never been pushed does not die here mid-flow
     let status = Command::new("git")
-        .args(["push", "--follow-tags"])
+        .args(["push", "--follow-tags", "--set-upstream", "origin", "HEAD"])
         .status()
         .context("Failed to push to remote")?;
 
