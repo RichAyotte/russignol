@@ -19,6 +19,7 @@
 # ==============================================================================
 # DEBUG LOGGING
 # ==============================================================================
+# shellcheck disable=SC2034  # log target, referenced when the echo below is enabled
 DEBUG_LOG="/var/log/init.log"
 log_debug() {
     # echo "$1" >> "$DEBUG_LOG"
@@ -29,6 +30,8 @@ log_debug() {
 # 0. SIGNAL HANDLING
 # ==============================================================================
 init_signals() {
+    # As PID 1 this CHLD trap makes busybox ash prone to intermittently deadlock
+    # any pipeline (`cmd | cmd`); keep pipelines out of this process.
     trap ':' CHLD
 }
 
@@ -61,6 +64,7 @@ init_mdev() {
 # ==============================================================================
 init_rng() {
     if [ -r "/etc/default/seedrng" ]; then
+        # shellcheck source=/dev/null
         . "/etc/default/seedrng"
     fi
     seedrng "${SEEDRNG_ARGS:-}" || true
@@ -150,9 +154,21 @@ init_data_partition() {
 # ==============================================================================
 USB_CONFIGFS="/sys/kernel/config"
 
+# First UDC name, or empty. Globs sysfs instead of `ls | head` to stay pipe-free
+# (see init_signals).
+first_udc() {
+    for u in /sys/class/udc/*; do
+        [ -e "$u" ] && {
+            printf '%s\n' "${u##*/}"
+            return 0
+        }
+    done
+    return 1
+}
+
 load_usb_modules() {
     # uname not available in hardened busybox, find module dir directly
-    MODULE_DIR=$(ls -d /lib/modules/*/ 2>/dev/null | head -1)
+    for MODULE_DIR in /lib/modules/*/; do break; done
     MODULE_DIR=${MODULE_DIR%/} # remove trailing slash
     GADGET_DIR="$MODULE_DIR/kernel/drivers/usb/gadget"
     USB_DIR="$MODULE_DIR/kernel/drivers/usb"
@@ -169,8 +185,11 @@ load_usb_modules() {
     # Load configfs module first
     CONFIGFS_KO="$MODULE_DIR/kernel/fs/configfs/configfs.ko"
     log_debug "  configfs.ko exists: $([ -f "$CONFIGFS_KO" ] && echo YES || echo NO)"
+    # Do not pipe insmod here: as PID 1 (SIGCHLD trap in init_signals) this
+    # pipeline can intermittently deadlock in busybox ash, wedging USB bring-up.
     if [ -f "$CONFIGFS_KO" ]; then
-        insmod "$CONFIGFS_KO" 2>&1 | while read -r line; do log_debug "  insmod configfs: $line"; done
+        insmod "$CONFIGFS_KO"
+        log_debug "  insmod configfs ret=$?"
     fi
 
     # Mount configfs BEFORE loading libcomposite
@@ -192,8 +211,8 @@ load_usb_modules() {
         "$GADGET_DIR/function/u_ether.ko" \
         "$GADGET_DIR/function/usb_f_ecm.ko"; do
         if [ -f "$mod" ]; then
-            insmod "$mod" 2>&1
-            log_debug "  insmod $(basename "$mod") ret=$?"
+            insmod "$mod"
+            log_debug "  insmod ${mod##*/} ret=$?"
         else
             log_debug "  MISSING: $mod"
         fi
@@ -202,10 +221,10 @@ load_usb_modules() {
     # Wait for UDC
     log_debug "  Waiting for UDC..."
     for _ in $(seq 1 30); do
-        [ -n "$(ls /sys/class/udc 2>/dev/null)" ] && break
+        [ -n "$(first_udc)" ] && break
         sleep 0.1
     done
-    log_debug "  UDC contents: $(ls /sys/class/udc 2>/dev/null || echo EMPTY)"
+    log_debug "  UDC contents: $(first_udc || echo EMPTY)"
 
     # Wait for usb_gadget
     log_debug "  Waiting for usb_gadget..."
@@ -226,7 +245,30 @@ load_usb_modules() {
 # ==============================================================================
 USB_GADGET="$USB_CONFIGFS/usb_gadget/g1"
 USB_IFACE="usb0"
-setup_gadget() {
+
+# Locally-administered MAC (02:...) from five byte-pairs of the hex CPU serial,
+# starting at char offset $2 (0 = host side, 2 = device side). Pure parameter
+# expansion, no `echo | sed` (see init_signals). Outputs nothing on a short
+# serial so the callers' fallback MACs apply.
+serial_to_mac() {
+    rest=$1
+    [ "$2" = 2 ] && rest=${rest#??}
+    [ "${#rest}" -ge 10 ] || return 1
+    mac=02
+    i=0
+    while [ "$i" -lt 5 ]; do
+        pair=${rest%"${rest#??}"}
+        mac="$mac:$pair"
+        rest=${rest#??}
+        i=$((i + 1))
+    done
+    printf '%s\n' "$mac"
+}
+
+# Body is a subshell: this cds into configfs, and the supervisor calls it
+# repeatedly — the caller's cwd must never sit inside the tree a later call
+# rm -rfs.
+setup_gadget() (
     # Ensure ConfigFS is mounted
     if ! grep -q configfs /proc/mounts; then
         mount -t configfs none "$USB_CONFIGFS" 2>/dev/null
@@ -247,9 +289,9 @@ setup_gadget() {
     echo 0x0200 >bcdUSB
 
     # Deterministic identity from CPU serial (stable across reboots)
-    USB_SERIAL=$(grep Serial /proc/cpuinfo | sed 's/.*: //')
-    HOST_MAC=$(echo "$USB_SERIAL" | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/')
-    DEV_MAC=$(echo "$USB_SERIAL" | sed 's/^..\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/')
+    USB_SERIAL=$(sed -n 's/^Serial[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo)
+    HOST_MAC=$(serial_to_mac "$USB_SERIAL" 0)
+    DEV_MAC=$(serial_to_mac "$USB_SERIAL" 2)
 
     mkdir -p strings/0x409
     echo "${USB_SERIAL:-0123456789}" >strings/0x409/serialnumber
@@ -268,8 +310,7 @@ setup_gadget() {
 
     # Bind to UDC
     for _ in $(seq 1 10); do
-        UDC=$(ls /sys/class/udc 2>/dev/null | head -n1)
-        [ -n "$UDC" ] && break
+        UDC=$(first_udc) && break
         sleep 0.5
     done
 
@@ -278,50 +319,64 @@ setup_gadget() {
     else
         return 1
     fi
-}
+)
 
 # ==============================================================================
-# 7. NETWORK WATCHDOG
+# 7. GADGET SUPERVISOR
 # ==============================================================================
 HOST_IP="169.254.1.2"
 # 6 failures * 5 seconds = 30 second timeout before USB reset
 MAX_FAILURES=6
 RESET_COUNT_FILE="/tmp/usb_reset_count"
 
-start_watchdog() {
+# Owns the whole gadget lifecycle from one background process: load modules,
+# (re)create the gadget whenever usb0 is absent, keep the link addressed, and
+# rebind the UDC after sustained ping loss. Single owner means no races over
+# configfs, and a transient bring-up miss self-heals instead of leaving a
+# headless device offline until a power cycle.
+start_gadget_supervisor() {
     (
-        sleep 5
         FAIL_COUNT=0
         while true; do
-            if ip link show dev "$USB_IFACE" >/dev/null 2>&1; then
-                ip link show dev "$USB_IFACE" | grep -q "UP" || ip link set "$USB_IFACE" up 2>/dev/null
-                if ! ip addr show dev "$USB_IFACE" | grep -q "169.254.1.1"; then
+            # No usb0 yet -> load modules (early-returns once the framework is
+            # up), then (re)create and bind the gadget, then recheck.
+            if ! ip link show dev "$USB_IFACE" >/dev/null 2>&1; then
+                load_usb_modules && setup_gadget
+                FAIL_COUNT=0
+                sleep 5
+                continue
+            fi
+
+            ip link set "$USB_IFACE" up 2>/dev/null
+            case "$(ip addr show dev "$USB_IFACE" 2>/dev/null)" in
+                *169.254.1.1/30*) ;;
+                *)
                     ip addr flush dev "$USB_IFACE" 2>/dev/null
                     ip neigh flush dev "$USB_IFACE" 2>/dev/null
                     ip addr add 169.254.1.1/30 dev "$USB_IFACE" 2>/dev/null
-                fi
-                if ping -c 1 -W 1 "$HOST_IP" >/dev/null 2>&1; then
-                    FAIL_COUNT=0
-                else
-                    FAIL_COUNT=$((FAIL_COUNT + 1))
-                fi
-                if [ "$FAIL_COUNT" -ge "$MAX_FAILURES" ]; then
-                    # Track reset count for diagnostics
-                    RESET_COUNT=$(cat "$RESET_COUNT_FILE" 2>/dev/null || echo 0)
-                    RESET_COUNT=$((RESET_COUNT + 1))
-                    echo "$RESET_COUNT" >"$RESET_COUNT_FILE"
-                    logger -t usb-watchdog "USB gadget reset #$RESET_COUNT (after $MAX_FAILURES ping failures)"
+                    ;;
+            esac
 
-                    echo "" >"$USB_GADGET/UDC" 2>/dev/null
-                    sleep 1
-                    UDC=$(ls /sys/class/udc 2>/dev/null | head -n1)
-                    [ -n "$UDC" ] && echo "$UDC" >"$USB_GADGET/UDC"
-                    sleep 2
-                    FAIL_COUNT=0
-                fi
+            if ping -c 1 -W 1 "$HOST_IP" >/dev/null 2>&1; then
+                FAIL_COUNT=0
             else
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+            fi
+
+            if [ "$FAIL_COUNT" -ge "$MAX_FAILURES" ]; then
+                RESET_COUNT=$(cat "$RESET_COUNT_FILE" 2>/dev/null || echo 0)
+                RESET_COUNT=$((RESET_COUNT + 1))
+                echo "$RESET_COUNT" >"$RESET_COUNT_FILE"
+                # No logger here: the hardened image runs no syslogd.
+
+                echo "" >"$USB_GADGET/UDC" 2>/dev/null
+                sleep 1
+                UDC=$(first_udc)
+                [ -n "$UDC" ] && echo "$UDC" >"$USB_GADGET/UDC" 2>/dev/null
+                sleep 2
                 FAIL_COUNT=0
             fi
+
             sleep 5
         done
     ) &
@@ -415,7 +470,7 @@ init_mounts
 log_debug "After init_mounts"
 
 log_debug "Disabling activity LED"
-echo 0 > /sys/class/leds/ACT/brightness 2>/dev/null
+echo 0 >/sys/class/leds/ACT/brightness 2>/dev/null
 
 log_debug "Before init_mdev"
 init_mdev
@@ -433,21 +488,11 @@ log_debug "Before init_data_partition"
 init_data_partition
 log_debug "After init_data_partition"
 
-# USB gadget setup in background (don't block app startup)
-(
-    log_debug "Before load_usb_modules"
-    load_usb_modules
-    log_debug "After load_usb_modules ret=$?"
-
-    log_debug "Before setup_gadget"
-    setup_gadget
-    log_debug "After setup_gadget ret=$?"
-) &
-
-# Watchdog configures usb0 (ip link up + assigns 169.254.1.1/30) and handles reconnect recovery
-log_debug "Before start_watchdog"
-start_watchdog
-log_debug "After start_watchdog"
+# Gadget bring-up + watchdog run as one background supervisor (single owner of
+# the gadget lifecycle) so the signer's startup is never blocked on USB.
+log_debug "Before start_gadget_supervisor"
+start_gadget_supervisor
+log_debug "After start_gadget_supervisor"
 
 log_debug "Before run_supervisor"
 run_supervisor
