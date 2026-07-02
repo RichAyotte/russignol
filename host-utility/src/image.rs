@@ -528,8 +528,9 @@ fn cmd_download(
     } else {
         // Fetch version info to get image details
         utils::info("Fetching latest version info...");
-        let version_info = version::fetch_latest_version(include_prerelease)
-            .context("Failed to fetch version info from russignol.com")?;
+        let version_info =
+            version::fetch_latest_version(include_prerelease, version::RequiredAsset::Image)
+                .context("Failed to fetch version info from russignol.com")?;
 
         let image_info = version_info.images.get("pi-zero").context(
             "No pi-zero image found in version info. Use --url to specify a direct download URL.",
@@ -853,8 +854,9 @@ fn resolve_download_info(url: Option<String>, include_prerelease: bool) -> Resul
         })
     } else {
         utils::info("Fetching latest version info...");
-        let version_info = version::fetch_latest_version(include_prerelease)
-            .context("Failed to fetch version info from russignol.com")?;
+        let version_info =
+            version::fetch_latest_version(include_prerelease, version::RequiredAsset::Image)
+                .context("Failed to fetch version info from russignol.com")?;
 
         let image_info = version_info
             .images
@@ -1033,8 +1035,9 @@ fn cmd_list(include_prerelease: bool) -> Result<()> {
     print_title_bar("📋 Available Images");
 
     utils::info("Fetching version info from russignol.com...");
-    let version_info = version::fetch_latest_version(include_prerelease)
-        .context("Failed to fetch version info")?;
+    let version_info =
+        version::fetch_latest_version(include_prerelease, version::RequiredAsset::Image)
+            .context("Failed to fetch version info")?;
 
     println!();
     println!("  Version: {}", version_info.version);

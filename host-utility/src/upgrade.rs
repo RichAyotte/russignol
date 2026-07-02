@@ -75,7 +75,8 @@ pub fn run_upgrade(check_only: bool, _yes: bool, include_prerelease: bool) -> Re
 
 /// Check if update is available, returns Some(VersionInfo) if update available
 fn check_for_updates(include_prerelease: bool) -> Result<Option<version::VersionInfo>> {
-    let latest = version::fetch_latest_version(include_prerelease)?;
+    let latest =
+        version::fetch_latest_version(include_prerelease, version::RequiredAsset::Binaries)?;
 
     if version::is_newer(version::current_version(), &latest.version)? {
         Ok(Some(latest))
