@@ -1994,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "russignol-setup"
-version = "0.25.0-beta.1"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "russignol-signer"
-version = "0.25.0-beta.1"
+version = "0.25.0"
 dependencies = [
  "crossbeam-channel",
  "ctrlc",
