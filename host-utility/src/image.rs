@@ -176,7 +176,7 @@ pub enum ImageCommands {
         /// Path to the image file (.img.xz or .img)
         image: PathBuf,
 
-        /// Target device (e.g., /dev/sdc). Auto-detects if not specified.
+        /// Target device (e.g., /dev/sdc or /dev/mmcblk0). Auto-detects if not specified.
         #[arg(long, short)]
         device: Option<PathBuf>,
 
@@ -215,7 +215,7 @@ pub enum ImageCommands {
         #[arg(long)]
         url: Option<String>,
 
-        /// Target device (e.g., /dev/sdc). Auto-detects if not specified.
+        /// Target device (e.g., /dev/sdc or /dev/mmcblk0). Auto-detects if not specified.
         #[arg(long, short)]
         device: Option<PathBuf>,
 
@@ -1068,7 +1068,7 @@ fn cmd_list(include_prerelease: bool) -> Result<()> {
 // Device detection
 // =============================================================================
 
-/// Detect removable USB devices
+/// Detect removable SD card devices (USB card readers and built-in MMC readers)
 pub fn detect_removable_devices() -> Result<Vec<BlockDevice>> {
     #[cfg(target_os = "linux")]
     {
@@ -1098,24 +1098,49 @@ fn detect_removable_devices_linux() -> Result<Vec<BlockDevice>> {
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).context("Failed to parse lsblk JSON output")?;
 
+    Ok(filter_removable_devices(&json))
+}
+
+/// Normalize the lsblk transport for a device.
+///
+/// util-linux reports TRAN "mmc" for mmcblk devices only since v2.39; older
+/// versions report null. Store "mmc" for mmcblk-named devices either way so
+/// filtering and display see one transport regardless of lsblk version.
+fn normalize_transport(name: &str, tran: Option<&str>) -> String {
+    match tran {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ if name.starts_with("mmcblk") => "mmc".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Filter parsed `lsblk -d -o NAME,TYPE,TRAN,RM,SIZE,MODEL --json` output
+/// down to flashable removable devices.
+#[cfg(target_os = "linux")]
+fn filter_removable_devices(json: &serde_json::Value) -> Vec<BlockDevice> {
     let mut devices = Vec::new();
 
     if let Some(blockdevices) = json.get_nested("blockdevices").and_then(|v| v.as_array()) {
         for dev in blockdevices {
             let name = dev.get_str("name").unwrap_or("");
             let dev_type = dev.get_str("type").unwrap_or("");
-            let tran = dev.get_str("tran").unwrap_or("");
+            let transport = normalize_transport(name, dev.get_str("tran"));
             let rm = dev.get_bool("rm").unwrap_or(false);
             let size = dev.get_str("size").unwrap_or("0");
             let model = dev.get_str("model").unwrap_or("Unknown");
 
-            // Filter: must be a disk, removable, and USB transport
+            // Filter: must be a removable disk in a USB card reader or a
+            // built-in (SDHCI/MMC) reader; non-removable eMMC is excluded
             // Also filter out empty slots (size = "0B")
-            if dev_type == "disk" && rm && tran == "usb" && size != "0B" {
+            if dev_type == "disk"
+                && rm
+                && (transport == "usb" || transport == "mmc")
+                && size != "0B"
+            {
                 devices.push(BlockDevice {
                     name: name.to_string(),
                     path: PathBuf::from(format!("/dev/{name}")),
-                    transport: tran.to_string(),
+                    transport,
                     size: size.to_string(),
                     model: model.trim().to_string(),
                 });
@@ -1123,7 +1148,7 @@ fn detect_removable_devices_linux() -> Result<Vec<BlockDevice>> {
         }
     }
 
-    Ok(devices)
+    devices
 }
 
 #[cfg(target_os = "macos")]
@@ -1226,14 +1251,14 @@ pub(crate) fn lookup_block_device(device: &Path) -> Result<BlockDevice> {
         .context("No device info returned by lsblk")?;
 
     let name = dev.get_str("name").unwrap_or("unknown");
-    let tran = dev.get_str("tran").unwrap_or("unknown");
+    let transport = normalize_transport(name, dev.get_str("tran"));
     let size = dev.get_str("size").unwrap_or("unknown");
     let model = dev.get_str("model").unwrap_or("Unknown");
 
     Ok(BlockDevice {
         name: name.to_string(),
         path: device.to_path_buf(),
-        transport: tran.to_string(),
+        transport,
         size: size.to_string(),
         model: model.trim().to_string(),
     })
@@ -1245,14 +1270,14 @@ fn select_device() -> Result<BlockDevice> {
 
     if devices.is_empty() {
         bail!(
-            "No removable USB devices found.\n\
+            "No removable SD card devices found.\n\
              \n\
              Please:\n\
-             1. Insert an SD card into a USB card reader\n\
+             1. Insert an SD card into a USB or built-in card reader\n\
              2. Wait a few seconds for it to be detected\n\
              3. Run this command again\n\
              \n\
-             Or specify a device manually with --device /dev/sdX"
+             Or specify a device manually with --device /dev/sdX or --device /dev/mmcblk0"
         );
     }
 
@@ -2151,6 +2176,103 @@ mod tests {
             .take_while(|c| c.is_ascii_digit() || *c == '.')
             .collect();
         num_str.parse::<f64>().unwrap_or(0.0) as u64 * multiplier
+    }
+
+    /// Build lsblk JSON in the shape of `lsblk -d -o NAME,TYPE,TRAN,RM,SIZE,MODEL --json`
+    #[cfg(target_os = "linux")]
+    fn lsblk_json(devices: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "blockdevices": devices })
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn filter_includes_removable_usb_disk() {
+        let json = lsblk_json(serde_json::json!([
+            {"name": "sdb", "type": "disk", "tran": "usb", "rm": true, "size": "29.7G", "model": " UHSII uSD Reader "}
+        ]));
+        let devices = filter_removable_devices(&json);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "sdb");
+        assert_eq!(devices[0].path, PathBuf::from("/dev/sdb"));
+        assert_eq!(devices[0].transport, "usb");
+        assert_eq!(devices[0].size, "29.7G");
+        assert_eq!(devices[0].model, "UHSII uSD Reader");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn filter_excludes_internal_sata_and_nvme_disks() {
+        let json = lsblk_json(serde_json::json!([
+            {"name": "sda", "type": "disk", "tran": "sata", "rm": false, "size": "476.9G", "model": "Samsung SSD 860"},
+            {"name": "nvme0n1", "type": "disk", "tran": "nvme", "rm": false, "size": "1.8T", "model": "WD_BLACK SN850X"}
+        ]));
+        assert!(filter_removable_devices(&json).is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn filter_excludes_empty_usb_reader_slot() {
+        let json = lsblk_json(serde_json::json!([
+            {"name": "sdb", "type": "disk", "tran": "usb", "rm": true, "size": "0B", "model": "UHSII uSD Reader"}
+        ]));
+        assert!(filter_removable_devices(&json).is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn filter_includes_mmcblk_with_mmc_transport() {
+        // util-linux >= 2.39 reports TRAN "mmc" for mmcblk devices
+        let json = lsblk_json(serde_json::json!([
+            {"name": "mmcblk0", "type": "disk", "tran": "mmc", "rm": true, "size": "29.7G", "model": null}
+        ]));
+        let devices = filter_removable_devices(&json);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "mmcblk0");
+        assert_eq!(devices[0].path, PathBuf::from("/dev/mmcblk0"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn filter_includes_mmcblk_with_null_transport() {
+        // util-linux <= 2.38 reports no TRAN for mmcblk devices
+        let json = lsblk_json(serde_json::json!([
+            {"name": "mmcblk0", "type": "disk", "tran": null, "rm": true, "size": "29.7G", "model": null}
+        ]));
+        let devices = filter_removable_devices(&json);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "mmcblk0");
+        assert_eq!(devices[0].path, PathBuf::from("/dev/mmcblk0"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn filter_excludes_soldered_emmc() {
+        let json = lsblk_json(serde_json::json!([
+            {"name": "mmcblk1", "type": "disk", "tran": null, "rm": false, "size": "58.2G", "model": null}
+        ]));
+        assert!(filter_removable_devices(&json).is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn filter_excludes_emmc_boot_partition() {
+        let json = lsblk_json(serde_json::json!([
+            {"name": "mmcblk1boot0", "type": "disk", "tran": null, "rm": false, "size": "4M", "model": null}
+        ]));
+        assert!(filter_removable_devices(&json).is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn filter_normalizes_mmcblk_transport_to_mmc() {
+        // Both lsblk variants must store the same transport
+        let json = lsblk_json(serde_json::json!([
+            {"name": "mmcblk0", "type": "disk", "tran": "mmc", "rm": true, "size": "29.7G", "model": null},
+            {"name": "mmcblk1", "type": "disk", "tran": null, "rm": true, "size": "58.2G", "model": null}
+        ]));
+        let devices = filter_removable_devices(&json);
+        assert_eq!(devices.len(), 2);
+        assert!(devices.iter().all(|d| d.transport == "mmc"));
     }
 
     #[test]

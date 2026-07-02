@@ -199,7 +199,7 @@ enum Commands {
 pub enum WatermarkCommands {
     /// Initialize watermarks on an SD card (for manually flashed cards)
     Init {
-        /// Target device with boot partition (e.g., /dev/sdc)
+        /// Target device with boot partition (e.g., /dev/sdc or /dev/mmcblk0)
         #[arg(long, short)]
         device: Option<std::path::PathBuf>,
 

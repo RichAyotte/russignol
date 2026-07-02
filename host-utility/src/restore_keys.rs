@@ -155,7 +155,8 @@ pub fn check_restore_tools() -> Result<()> {
 ///
 /// When the user passes `--restore-keys` without a value, clap fills in
 /// `"auto"` via `default_missing_value`. This function detects that sentinel
-/// and auto-selects the source device from removable USB devices.
+/// and auto-selects the source device from removable SD card devices
+/// (USB card readers and built-in MMC readers).
 pub fn resolve_restore_source(arg: &Path) -> Result<PathBuf> {
     if arg.as_os_str() != "auto" {
         // Explicit device path — validate it exists
@@ -183,9 +184,9 @@ pub fn resolve_restore_source(arg: &Path) -> Result<PathBuf> {
             if std::time::Instant::now() > deadline {
                 spinner.finish_and_clear();
                 bail!(
-                    "No removable USB devices detected.\n\
+                    "No removable SD card devices detected.\n\
                      Please check that the SD card is inserted and try again,\n\
-                     or specify the device directly: --restore-keys /dev/sdX"
+                     or specify the device directly: --restore-keys /dev/sdX or /dev/mmcblk0"
                 );
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -922,19 +923,22 @@ fn describe_card(device: &Path) -> String {
     )
 }
 
-/// Wait for a card swap in a USB card reader, expecting the **target** card.
+/// Wait for a card swap in a card reader, expecting the **target** card.
 ///
 /// Equivalent to `wait_for_card_swap_labeled(device, "target")`.
 fn wait_for_card_swap(device: &Path) -> Result<()> {
     wait_for_card_swap_labeled(device, "target")
 }
 
-/// Wait for a card swap in a USB card reader.
+/// Wait for a card swap in a card reader.
 ///
 /// A USB card reader keeps its `/dev/sdX` block device even when no card is
-/// inserted — only the media size drops to zero. This function:
-/// 1. Waits for the old card to be **removed** (media sectors → 0)
-/// 2. Waits for the new card to be **inserted** (media sectors > 0)
+/// inserted — only the media size drops to zero. A built-in MMC reader
+/// instead deletes the `/dev/mmcblkN` node on removal and recreates it on
+/// insertion, so the loop conditions check node existence alongside media
+/// size. This function:
+/// 1. Waits for the old card to be **removed** (media sectors → 0 or node gone)
+/// 2. Waits for the new card to be **inserted** (node present, media sectors > 0)
 /// 3. Runs `udevadm settle` to let the kernel finish initializing the device
 ///
 /// `label` is shown in spinners (e.g. "source" or "target").
