@@ -87,17 +87,12 @@ pub const NM_CONNECTION_PATH: &str =
 // Required Dependencies
 // ============================================================================
 
-/// List of required command-line tools
-pub const REQUIRED_COMMANDS: &[&str] = &[
-    "octez-client",
-    "octez-node",
-    "ps",
-    "grep",
-    "ip",
-    "ping",
-    "udevadm",
-    "lsusb",
-];
+/// Required system command-line tools (octez binaries are checked separately:
+/// octez-node is only needed for localhost endpoints)
+pub const SYSTEM_COMMANDS: &[&str] = &["ps", "grep", "ip", "ping", "udevadm", "lsusb"];
+
+pub const OCTEZ_CLIENT: &str = "octez-client";
+pub const OCTEZ_NODE: &str = "octez-node";
 
 // ============================================================================
 // Progress Bar Theming

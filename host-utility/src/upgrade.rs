@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
-use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
@@ -116,7 +115,7 @@ fn download_binary(version_info: &version::VersionInfo, arch: &str) -> Result<Na
 }
 
 /// Download with progress bar
-fn download_with_progress(
+pub(crate) fn download_with_progress(
     agent: &ureq::Agent,
     url: &str,
     expected_size: u64,
@@ -175,21 +174,8 @@ fn download_with_progress(
 }
 
 /// Verify downloaded file checksum
-fn verify_checksum(file: &Path, expected: &str) -> Result<()> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(file).context("Failed to open file for checksum")?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = f
-            .read(&mut buf)
-            .context("Failed to read file for checksum")?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let hash = hex::encode(hasher.finalize());
+pub(crate) fn verify_checksum(file: &Path, expected: &str) -> Result<()> {
+    let hash = crate::image::compute_file_sha256(file)?;
 
     if hash != expected {
         anyhow::bail!("Checksum verification failed!\nExpected: {expected}\nGot:      {hash}");

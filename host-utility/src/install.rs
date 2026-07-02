@@ -47,7 +47,25 @@ pub fn run_install(backup: bool) -> Result<()> {
     ));
 
     // Check if in PATH and warn if not
-    if !is_in_path(&install_dir) {
+    warn_if_not_in_path(&install_dir);
+
+    Ok(())
+}
+
+/// Get installation target directory (~/.local/bin)
+pub(crate) fn get_install_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
+    Ok(PathBuf::from(home).join(".local/bin"))
+}
+
+/// Check if directory is in PATH
+fn is_in_path(dir: &Path) -> bool {
+    std::env::var("PATH").is_ok_and(|path| path.split(':').any(|p| Path::new(p) == dir))
+}
+
+/// Warn with shell-profile instructions when the install dir isn't on PATH
+pub(crate) fn warn_if_not_in_path(install_dir: &Path) {
+    if !is_in_path(install_dir) {
         utils::warning("~/.local/bin is not in your PATH.");
         println!();
         utils::info("Add this line to your ~/.bashrc or ~/.zshrc:");
@@ -57,19 +75,6 @@ pub fn run_install(backup: bool) -> Result<()> {
         utils::info("Then reload your shell: source ~/.bashrc");
         println!();
     }
-
-    Ok(())
-}
-
-/// Get installation target directory (~/.local/bin)
-fn get_install_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME environment variable not set")?;
-    Ok(PathBuf::from(home).join(".local/bin"))
-}
-
-/// Check if directory is in PATH
-fn is_in_path(dir: &Path) -> bool {
-    std::env::var("PATH").is_ok_and(|path| path.split(':').any(|p| Path::new(p) == dir))
 }
 
 /// Copy binary to target location
@@ -85,7 +90,7 @@ fn copy_binary(source: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Set executable permissions
-fn make_executable(path: &Path) -> Result<()> {
+pub(crate) fn make_executable(path: &Path) -> Result<()> {
     let mut perms = std::fs::metadata(path)
         .context("Failed to read file permissions")?
         .permissions();

@@ -57,6 +57,8 @@ struct HardwareData {
 
 struct SystemData {
     dependencies: Result<()>,
+    /// The commands `dependencies` actually checked (endpoint-dependent).
+    dependency_list: String,
     node_block: Result<Option<i64>>,
     client_dir: Result<()>,
     plugdev: Result<()>,
@@ -103,7 +105,12 @@ fn fetch_hardware_data() -> HardwareData {
 }
 
 fn fetch_system_data(config: &RussignolConfig) -> SystemData {
-    let dependencies = system::verify_dependencies();
+    let dependencies = crate::deps::verify_dependencies(&config.rpc_endpoint);
+    let dependency_list = crate::deps::required_octez_commands(&config.rpc_endpoint)
+        .into_iter()
+        .chain(crate::constants::SYSTEM_COMMANDS.iter().copied())
+        .collect::<Vec<_>>()
+        .join(", ");
     let node_block = system::get_node_block_height(config);
     let client_dir = system::verify_octez_client_directory(config);
     let plugdev = system::check_plugdev_membership().and_then(|(in_group, _)| {
@@ -116,6 +123,7 @@ fn fetch_system_data(config: &RussignolConfig) -> SystemData {
 
     SystemData {
         dependencies,
+        dependency_list,
         node_block,
         client_dir,
         plugdev,
@@ -304,8 +312,9 @@ fn display_system_status(verbose: bool, data: SystemData) {
     match data.dependencies {
         Ok(()) => {
             println!(
-                "  {} All dependencies available (octez-client, octez-node, ps, grep, ip, ping, udevadm, lsusb)",
-                "✓".green()
+                "  {} All dependencies available ({})",
+                "✓".green(),
+                data.dependency_list
             );
         }
         Err(e) => {

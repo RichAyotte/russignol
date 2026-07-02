@@ -13,11 +13,14 @@ mod blockchain;
 mod config;
 mod confirmation;
 mod constants;
+mod deps;
+mod device_access;
 mod hardware;
 mod image;
 mod install;
 mod keys;
 mod migrate_keys;
+mod network;
 mod phase2;
 mod phase3;
 mod phase5;
@@ -301,6 +304,9 @@ fn handle_watermark_command(command: WatermarkCommands) -> Result<()> {
             yes,
         } => {
             config.with_overrides(endpoint.as_deref(), None);
+            if endpoint.is_none() {
+                network::resolve_endpoint_interactively(&mut config, yes)?;
+            }
             watermark::cmd_watermark_init(device, yes, &config)?;
         }
     }
@@ -399,6 +405,9 @@ fn handle_status_command(
 
     let mut config = config::RussignolConfig::load()?;
     config.with_overrides(endpoint, signer_endpoint);
+    if endpoint.is_none() && !network::resolve_endpoint_interactively(&mut config, false)? {
+        utils::warning(network::NON_INTERACTIVE_HINT.trim_start());
+    }
     status::run_status(verbose, &config);
     Ok(())
 }
@@ -435,6 +444,9 @@ fn handle_rotate_keys_command(
 
     let mut config = config::RussignolConfig::load()?;
     config.with_overrides(endpoint, signer_endpoint);
+    if endpoint.is_none() {
+        network::resolve_endpoint_interactively(&mut config, opts.auto_confirm || opts.dry_run)?;
+    }
     rotate_keys::run(opts, hardware_config, restart_config, &config)
 }
 
@@ -461,6 +473,12 @@ fn run_setup(setup_config: &SetupConfig<'_>) -> Result<()> {
     let confirmation_config = initialize_setup_environment(confirmation, *baker_key)?;
     let mut config = config::RussignolConfig::load()?;
     config.with_overrides(*endpoint, *signer_endpoint);
+    if endpoint.is_none() {
+        network::resolve_endpoint_interactively(
+            &mut config,
+            confirmation.auto_confirm || confirmation.dry_run,
+        )?;
+    }
     let backup_dir = backup::create_backup_dir()?;
 
     run_setup_phases(
@@ -585,10 +603,13 @@ fn run_setup_phases(
     }
 
     // Phase 1: System validation (inlined)
+    let interactive =
+        !confirmation_config.auto_confirm && !dry_run && !confirmation::is_non_interactive();
+    deps::ensure_octez_available(&config.rpc_endpoint, interactive)?;
     progress::run_step(
         "Checking dependencies",
         "which octez-client octez-node ...",
-        system::verify_dependencies,
+        || deps::verify_dependencies(&config.rpc_endpoint),
     )?;
 
     progress::run_step_detail(

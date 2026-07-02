@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 
 use crate::config;
 use crate::constants::ORANGE_256;
+use crate::device_access::{self, FlashPrivilege};
 use crate::restore_keys;
 use crate::utils::{
     self, JsonValueExt, create_http_agent, create_orange_theme, format_with_separators,
@@ -380,24 +381,6 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
 // Command implementations
 // =============================================================================
 
-/// Check if the current user is in the 'disk' group (standard across Linux distros)
-#[cfg(target_os = "linux")]
-fn user_in_disk_group() -> bool {
-    use nix::unistd::{Group, getgroups};
-
-    // Get the disk group's GID
-    let disk_gid = match Group::from_name("disk") {
-        Ok(Some(group)) => group.gid,
-        _ => return false,
-    };
-
-    // Check if user's supplementary groups include disk
-    match getgroups() {
-        Ok(groups) => groups.contains(&disk_gid),
-        Err(_) => false,
-    }
-}
-
 /// Check for required flash tools and bail if critical ones are missing
 fn check_flash_tools() -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -416,20 +399,6 @@ fn check_flash_tools() -> Result<()> {
                 "Required tools not found: {}.\n  \
                  Install with: sudo apt install coreutils util-linux  (Debian/Ubuntu)",
                 missing.join(", ")
-            );
-        }
-
-        // Check block device access: require 'disk' group membership
-        let in_disk_group = user_in_disk_group();
-        if !in_disk_group {
-            bail!(
-                "Not in 'disk' group - SD card write will fail.\n\n\
-                 Options:\n  \
-                 1. Add yourself to disk group:\n     \
-                    sudo usermod -aG disk $USER\n     \
-                    (then log out and back in)\n\n  \
-                 2. Flash the SD card yourself using another tool\n     \
-                    (e.g., Raspberry Pi Imager, dd with sudo)"
             );
         }
 
@@ -485,23 +454,50 @@ fn effective_config(endpoint_override: Option<&str>) -> Option<config::Russignol
     }
 }
 
+/// A validated node context: the chain info the node reported and the config
+/// that produced it (carrying any interactively recovered endpoint).
+///
+/// Downstream node RPCs must use this config rather than re-loading one from
+/// disk: a recovered endpoint the user declined to persist exists only here.
+struct NodeCheck {
+    chain_info: watermark::ChainInfo,
+    config: config::RussignolConfig,
+}
+
 /// Check node connectivity and fetch chain info for watermark configuration
 ///
-/// Returns `Ok(Some(chain_info))` if node is available,
+/// Returns `Ok(Some(NodeCheck))` if node is available,
 /// Ok(None) if no config exists and no endpoint provided (with warning),
 /// or Err if node check fails.
 ///
-/// If `endpoint_override` is provided, it will be used instead of the configured endpoint.
+/// If `endpoint_override` is provided, it will be used instead of the
+/// configured endpoint and no endpoint recovery is offered.
 fn check_node_for_watermarks(
     endpoint_override: Option<&str>,
-) -> Result<Option<watermark::ChainInfo>> {
+    yes: bool,
+) -> Result<Option<NodeCheck>> {
     let effective_config = effective_config(endpoint_override);
 
-    if let Some(ref cfg) = effective_config {
-        match watermark::prefetch_chain_info(cfg) {
-            Ok(info) => Ok(Some(info)),
+    if let Some(mut cfg) = effective_config {
+        match watermark::prefetch_chain_info(&cfg) {
+            Ok(chain_info) => Ok(Some(NodeCheck {
+                chain_info,
+                config: cfg,
+            })),
             Err(e) => {
-                bail!("Node check failed: {e}. Ensure your node is running before flashing.");
+                if endpoint_override.is_none()
+                    && crate::network::resolve_endpoint_interactively(&mut cfg, yes)?
+                {
+                    let chain_info = watermark::prefetch_chain_info(&cfg)?;
+                    return Ok(Some(NodeCheck {
+                        chain_info,
+                        config: cfg,
+                    }));
+                }
+                bail!(
+                    "Node check failed: {e}. Ensure your node is running before flashing.{}",
+                    crate::network::NON_INTERACTIVE_HINT
+                );
             }
         }
     } else {
@@ -604,23 +600,14 @@ fn run_keyed_flash(
         return restore_keys::run_single_reader_restore(source, restore_source, job);
     }
 
-    // Dual reader: read source card first
-    let backup = source.read(restore_source)?;
-
-    // Check for network mismatch before target selection
-    if !restore_keys::warn_network_mismatch(&backup, job.chain_info, job.yes)? {
-        utils::info(&format!(
-            "{} cancelled",
-            restore_keys::uppercase_first(source.noun())
-        ));
-        println!();
-        return Ok(());
-    }
-
-    // Select/validate target device
+    // Dual reader: resolve the target and probe write access before the
+    // source card is read — recovery may re-exec the process (sg), which
+    // restarts the flow from scratch.
     let target = if let Some(dev) = device {
         utils::info(&format!("Using specified device: {}", dev.display()));
-        lookup_block_device(&dev).unwrap_or_else(|_| BlockDevice::from_path(dev))
+        let target = lookup_block_device(&dev).unwrap_or_else(|_| BlockDevice::from_path(dev));
+        warn_if_partition(&target);
+        target
     } else {
         let target = detected
             .into_iter()
@@ -632,8 +619,20 @@ fn run_keyed_flash(
 
     check_device_not_mounted(&target.path)?;
     check_device_has_media(&target.path)?;
+    let privilege = device_access::probe_write_access(&target.path, Some(&target.path), job.yes)?;
 
-    restore_keys::run_dual_reader_restore(&target, &backup, source.noun(), job)
+    let backup = source.read(restore_source)?;
+
+    if !restore_keys::warn_network_mismatch(&backup, job.chain_info, job.yes)? {
+        utils::info(&format!(
+            "{} cancelled",
+            restore_keys::uppercase_first(source.noun())
+        ));
+        println!();
+        return Ok(());
+    }
+
+    restore_keys::run_dual_reader_restore(&target, &backup, source.noun(), job, privilege)
 }
 
 /// Where a keyed flash gets its key material. Both `flash` and
@@ -663,18 +662,19 @@ fn check_key_source_exclusive(
 /// `None` when neither `--restore-keys` nor `--migrate-keys` was given.
 ///
 /// For migration this prompts for the source/new PINs and verifies the eCryptfs
-/// toolchain, so it runs before any download or destructive work. `endpoint`
-/// selects the node used to label the migrated keys by their on-chain roles.
+/// toolchain, so it runs before any download or destructive work. `config` is
+/// the node-checked config selecting the node used to label the migrated keys
+/// by their on-chain roles.
 fn resolve_key_source(
     keys: KeySourceArgs<'_>,
-    endpoint: Option<&str>,
+    config: Option<&config::RussignolConfig>,
 ) -> Result<Option<(Box<dyn restore_keys::CardSource>, PathBuf)>> {
     if let Some(arg) = keys.migrate_keys {
         let device = restore_keys::resolve_restore_source(arg)?;
         let source = crate::migrate_keys::MigrateSource::prompt(
             keys.consensus_key.map(str::to_string),
             keys.companion_key.map(str::to_string),
-            effective_config(endpoint),
+            config.cloned(),
         )?;
         Ok(Some((Box::new(source), device)))
     } else if let Some(arg) = keys.restore_keys {
@@ -711,10 +711,12 @@ fn cmd_flash(
     let image_sha256 = compute_file_sha256(image)?;
 
     // Check node FIRST - fail fast if node is unavailable
-    let chain_info = check_node_for_watermarks(endpoint)?;
+    let node_check = check_node_for_watermarks(endpoint, yes)?;
 
     // Keyed path: restore or migrate (mutually exclusive, checked above)
-    if let Some((source, source_device)) = resolve_key_source(keys, endpoint)? {
+    if let Some((source, source_device)) =
+        resolve_key_source(keys, node_check.as_ref().map(|nc| &nc.config))?
+    {
         println!();
         let suffix = if keys.migrate_keys.is_some() {
             "migration"
@@ -727,7 +729,7 @@ fn cmd_flash(
             image_version: None,
             channel: None,
         };
-        let chain_info = chain_info.as_ref().context(
+        let node_check = node_check.as_ref().context(
             "Node check required to write keys but no configuration found.\n  \
              Run 'russignol config' first, or use --endpoint to specify your node.",
         )?;
@@ -740,7 +742,7 @@ fn cmd_flash(
                 uncompressed_size: None,
                 yes,
                 metadata: &metadata,
-                chain_info,
+                chain_info: &node_check.chain_info,
             },
         );
     }
@@ -751,26 +753,16 @@ fn cmd_flash(
 
     // Detect or use provided device
     let target_device = if let Some(dev) = device {
-        utils::info(&format!("Using specified device: {}", dev.display()));
-        // Create a basic BlockDevice for the specified path
-        BlockDevice {
-            name: dev
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-            path: dev.clone(),
-            transport: "unknown".to_string(),
-            size: "unknown".to_string(),
-            model: "User specified".to_string(),
-        }
+        user_specified_device(dev)
     } else {
         select_device()?
     };
 
-    // Check if mounted and has media
+    // Check if mounted, has media, and is writable by this process
     check_device_not_mounted(&target_device.path)?;
     check_device_has_media(&target_device.path)?;
+    let privilege =
+        device_access::probe_write_access(&target_device.path, Some(&target_device.path), yes)?;
 
     // Safety confirmation
     if !confirm_flash_operation(&target_device, yes)? {
@@ -780,7 +772,7 @@ fn cmd_flash(
     }
 
     // Perform the flash (no size hint for local files)
-    flash_image_to_device(image, &target_device.path, None)?;
+    flash_image_to_device(image, &target_device.path, None, privilege)?;
 
     // Re-read partition table so kernel sees new partitions
     reread_partition_table(&target_device.path);
@@ -794,7 +786,10 @@ fn cmd_flash(
     write_flash_manifest(&target_device.path, &metadata)
         .context("Failed to write flash manifest")?;
 
-    finalize_flash(&target_device.path, chain_info.as_ref())
+    finalize_flash(
+        &target_device.path,
+        node_check.as_ref().map(|nc| &nc.chain_info),
+    )
 }
 
 /// Write watermark config (if available), verify it, and print flash success message
@@ -907,10 +902,12 @@ fn cmd_download_and_flash(
         bail!("Device not found: {}", dev.display());
     }
     // Check node FIRST - fail fast if node is unavailable
-    let chain_info = check_node_for_watermarks(endpoint)?;
+    let node_check = check_node_for_watermarks(endpoint, yes)?;
 
     // Keyed path: restore or migrate (mutually exclusive, checked above)
-    if let Some((source, source_device)) = resolve_key_source(keys, endpoint)? {
+    if let Some((source, source_device)) =
+        resolve_key_source(keys, node_check.as_ref().map(|nc| &nc.config))?
+    {
         println!();
         let suffix = if keys.migrate_keys.is_some() {
             "migration"
@@ -943,7 +940,7 @@ fn cmd_download_and_flash(
             channel: dl.channel,
         };
 
-        let chain_info = chain_info.as_ref().context(
+        let node_check = node_check.as_ref().context(
             "Node check required to write keys but no configuration found.\n  \
              Run 'russignol config' first, or use --endpoint to specify your node.",
         )?;
@@ -956,7 +953,7 @@ fn cmd_download_and_flash(
                 uncompressed_size: dl.uncompressed_size,
                 yes,
                 metadata: &metadata,
-                chain_info,
+                chain_info: &node_check.chain_info,
             },
         );
     }
@@ -967,25 +964,16 @@ fn cmd_download_and_flash(
 
     // Detect/select device
     let target_device = if let Some(dev) = device {
-        utils::info(&format!("Using specified device: {}", dev.display()));
-        BlockDevice {
-            name: dev
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-            path: dev.clone(),
-            transport: "unknown".to_string(),
-            size: "unknown".to_string(),
-            model: "User specified".to_string(),
-        }
+        user_specified_device(dev)
     } else {
         select_device()?
     };
 
-    // Check if mounted and has media
+    // Check if mounted, has media, and is writable by this process
     check_device_not_mounted(&target_device.path)?;
     check_device_has_media(&target_device.path)?;
+    let privilege =
+        device_access::probe_write_access(&target_device.path, Some(&target_device.path), yes)?;
 
     // Get download info (uncompressed_size is used for progress bar during flash)
     let dl = resolve_download_info(url, include_prerelease)?;
@@ -1013,7 +1001,12 @@ fn cmd_download_and_flash(
     }
 
     // Flash the downloaded image
-    flash_image_to_device(&image_path, &target_device.path, dl.uncompressed_size)?;
+    flash_image_to_device(
+        &image_path,
+        &target_device.path,
+        dl.uncompressed_size,
+        privilege,
+    )?;
 
     // Re-read partition table so kernel sees new partitions
     reread_partition_table(&target_device.path);
@@ -1027,7 +1020,10 @@ fn cmd_download_and_flash(
     write_flash_manifest(&target_device.path, &metadata)
         .context("Failed to write flash manifest")?;
 
-    finalize_flash(&target_device.path, chain_info.as_ref())
+    finalize_flash(
+        &target_device.path,
+        node_check.as_ref().map(|nc| &nc.chain_info),
+    )
 }
 
 fn cmd_list(include_prerelease: bool) -> Result<()> {
@@ -1115,6 +1111,48 @@ fn normalize_transport(name: &str, tran: Option<&str>) -> String {
         _ if name.starts_with("mmcblk") => "mmc".to_string(),
         _ => "unknown".to_string(),
     }
+}
+
+/// Whether a device name refers to a partition rather than a whole disk
+/// (e.g. sdc1, mmcblk0p1, nvme0n1p3). Flashing writes a full disk image, so
+/// a partition target produces a card that cannot boot.
+fn looks_like_partition(name: &str) -> bool {
+    // sda1 style: sd + letters + trailing digits
+    if let Some(rest) = name.strip_prefix("sd") {
+        let digits = rest.trim_start_matches(|c: char| c.is_ascii_lowercase());
+        return !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+    }
+    // mmcblk0p1 / nvme0n1p3 / loop0p1 style: <disk ending in digit> + p + digits
+    if let Some(p_idx) = name.rfind('p') {
+        let (before, after_p) = name.split_at(p_idx);
+        let digits = &after_p[1..];
+        return before.ends_with(|c: char| c.is_ascii_digit())
+            && !digits.is_empty()
+            && digits.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+/// Warn when an explicitly given device names a partition: flashing writes a
+/// whole-disk image, so the result would not boot.
+fn warn_if_partition(device: &BlockDevice) {
+    if looks_like_partition(&device.name) {
+        utils::warning(&format!(
+            "{} looks like a partition, not a whole disk. Flashing writes a \
+             whole-disk image; a card flashed to a partition will not boot. \
+             Use the parent disk device instead.",
+            device.path.display()
+        ));
+    }
+}
+
+/// Wrap an explicitly given `--device` path in a `BlockDevice`.
+fn user_specified_device(dev: PathBuf) -> BlockDevice {
+    utils::info(&format!("Using specified device: {}", dev.display()));
+    let mut device = BlockDevice::from_path(dev);
+    device.model = "User specified".to_string();
+    warn_if_partition(&device);
+    device
 }
 
 /// Filter parsed `lsblk -d -o NAME,TYPE,TRAN,RM,SIZE,MODEL --json` output
@@ -1747,18 +1785,20 @@ pub(crate) fn flash_image_to_device(
     image: &Path,
     device: &Path,
     expected_size: Option<u64>,
+    privilege: FlashPrivilege,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        flash_image_linux(image, device, expected_size)
+        flash_image_linux(image, device, expected_size, privilege)
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = privilege; // probe always grants Direct off Linux
         flash_image_macos(image, device, expected_size)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = expected_size; // suppress unused warning
+        let _ = (expected_size, privilege); // suppress unused warning
         bail!("Flash not supported on this platform")
     }
 }
@@ -1861,8 +1901,38 @@ impl<W: Write> Write for ProgressWriter<W> {
     }
 }
 
+/// Build the dd invocation, prefixed with sudo when the write-access probe
+/// escalated. Sudo credentials must already be cached (`ensure_sudo`) so the
+/// password prompt never competes with the image stream on stdin.
 #[cfg(target_os = "linux")]
-fn flash_image_linux(image: &Path, device: &Path, expected_size: Option<u64>) -> Result<()> {
+fn dd_command(device: &Path, privilege: FlashPrivilege) -> Command {
+    let dd_args = [
+        format!("of={}", device.display()),
+        "bs=4M".to_string(),
+        "iflag=fullblock".to_string(),
+        "oflag=direct".to_string(),
+    ];
+    let mut cmd = match privilege {
+        FlashPrivilege::Direct => Command::new("dd"),
+        FlashPrivilege::Sudo => {
+            let mut cmd = Command::new("sudo");
+            cmd.arg("dd");
+            cmd
+        }
+    };
+    cmd.args(dd_args)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+#[cfg(target_os = "linux")]
+fn flash_image_linux(
+    image: &Path,
+    device: &Path,
+    expected_size: Option<u64>,
+    privilege: FlashPrivilege,
+) -> Result<()> {
     use lzma_rs::xz_decompress;
 
     let extension = image.extension().and_then(|e| e.to_str());
@@ -1877,21 +1947,17 @@ fn flash_image_linux(image: &Path, device: &Path, expected_size: Option<u64>) ->
             .unwrap_or(DEFAULT_IMAGE_SIZE)
     };
 
+    if privilege == FlashPrivilege::Sudo {
+        utils::ensure_sudo()?;
+    }
+
     // Unmount any automounted partitions right before opening the device
     unmount_device_partitions(device)?;
 
     // Spawn dd process with stderr captured for error reporting
-    let mut dd = Command::new("dd")
-        .args([
-            &format!("of={}", device.display()),
-            "bs=4M",
-            "iflag=fullblock",
-            "oflag=direct",
-        ])
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut dd = dd_command(device, privilege)
         .spawn()
-        .context("Failed to start dd. Are you running with sudo?")?;
+        .context("Failed to start dd")?;
 
     let stdin = dd.stdin.take().context("Failed to get dd stdin")?;
     let mut progress_writer = ProgressWriter::new(stdin, total_size);
@@ -2185,6 +2251,20 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn lsblk_json(devices: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "blockdevices": devices })
+    }
+
+    #[test]
+    fn whole_disks_are_not_flagged_as_partitions() {
+        for name in ["sda", "sdc", "mmcblk0", "nvme0n1", "loop0"] {
+            assert!(!looks_like_partition(name), "{name} is a whole disk");
+        }
+    }
+
+    #[test]
+    fn partition_names_are_flagged() {
+        for name in ["sda1", "sdc12", "mmcblk0p1", "nvme0n1p3", "loop0p1"] {
+            assert!(looks_like_partition(name), "{name} is a partition");
+        }
     }
 
     #[test]

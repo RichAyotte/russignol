@@ -4,40 +4,20 @@
 // setup and status commands, including dependency checks, node verification,
 // and user group membership.
 
-use crate::constants::REQUIRED_COMMANDS;
-use crate::utils::{
-    JsonValueExt, command_exists, dir_exists, file_exists, info, run_command, success, warning,
-};
+use crate::utils::{JsonValueExt, dir_exists, file_exists, info, run_command, success, warning};
 use anyhow::{Context, Result};
-
-/// Verify that all required system dependencies are installed
-///
-/// Checks for: octez-client, octez-node, ps, grep, ip, ping, udevadm, lsusb
-pub fn verify_dependencies() -> Result<()> {
-    let mut missing = Vec::new();
-
-    for cmd in REQUIRED_COMMANDS {
-        if !command_exists(cmd) {
-            missing.push(*cmd);
-        }
-    }
-
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "Missing required dependencies: {}\nPlease install these tools before running this utility.",
-            missing.join(", ")
-        );
-    }
-
-    Ok(())
-}
 
 /// Verify that octez-node is accessible and synced
 ///
 /// Checks RPC responsiveness and sync status via timestamp comparison.
 pub fn verify_octez_node(config: &crate::config::RussignolConfig) -> Result<()> {
     // Check RPC responsiveness
-    crate::utils::rpc_get_json("/version", config).context("octez-node RPC is not responsive")?;
+    crate::utils::rpc_get_json("/version", config).with_context(|| {
+        format!(
+            "octez-node RPC is not responsive{}",
+            crate::network::NON_INTERACTIVE_HINT
+        )
+    })?;
 
     // Check sync status
     let head_json = crate::utils::rpc_get_json("/chains/main/blocks/head/header/shell", config)
@@ -174,7 +154,7 @@ pub fn verify_octez_client_directory(config: &crate::config::RussignolConfig) ->
     Ok(())
 }
 
-/// Check if the current user is in the plugdev group
+/// Check if the current user is in the plugdev group per the group database
 ///
 /// This is required for USB device access without root privileges
 pub fn check_plugdev_membership() -> Result<(bool, String)> {
@@ -184,27 +164,99 @@ pub fn check_plugdev_membership() -> Result<(bool, String)> {
     let output = run_command("groups", &[&username])?;
     let groups = String::from_utf8_lossy(&output.stdout);
 
-    let in_group = groups.contains("plugdev");
+    let in_group = groups.split_whitespace().any(|g| g == "plugdev");
     Ok((in_group, username))
+}
+
+/// Whether plugdev is active in this process's session credentials.
+///
+/// `None` when the group cannot be resolved, so callers never claim
+/// inactivity they could not verify.
+fn plugdev_active_in_session() -> Option<bool> {
+    use nix::unistd::{Group, getegid, getgroups};
+
+    let gid = Group::from_name("plugdev").ok().flatten()?.gid;
+    let mut gids = getgroups().ok()?;
+    gids.push(getegid());
+    Some(gids.contains(&gid))
+}
+
+/// The advice appropriate for the user's plugdev membership state.
+///
+/// `usermod` may only be suggested when the group database verifiably lacks
+/// the membership; a member whose session is stale needs a re-login, not a
+/// second usermod.
+#[derive(Debug, PartialEq, Eq)]
+enum PlugdevAdvice {
+    Ok,
+    ReloginNeeded,
+    JoinGroup,
+}
+
+fn plugdev_advice(in_db: bool, in_session: Option<bool>) -> PlugdevAdvice {
+    match (in_db, in_session) {
+        (true, Some(false)) => PlugdevAdvice::ReloginNeeded,
+        (true, _) => PlugdevAdvice::Ok,
+        (false, _) => PlugdevAdvice::JoinGroup,
+    }
 }
 
 /// Check plugdev membership and display appropriate warning
 ///
 /// Used by setup command (displays warning message)
 pub fn check_plugdev_with_warning() -> Result<()> {
-    let (in_group, username) = check_plugdev_membership()?;
+    let (in_db, username) = check_plugdev_membership()?;
 
-    if in_group {
-        success(&format!("User '{username}' is in the 'plugdev' group"));
-    } else {
-        warning(&format!(
-            "User '{username}' is not in the 'plugdev' group. Device access may be limited."
-        ));
-        info(&format!(
-            "To add user to plugdev group, run: sudo usermod -aG plugdev {username}"
-        ));
-        info("You will need to log out and log back in for the change to take effect.");
+    match plugdev_advice(in_db, plugdev_active_in_session()) {
+        PlugdevAdvice::Ok => {
+            success(&format!("User '{username}' is in the 'plugdev' group"));
+        }
+        PlugdevAdvice::ReloginNeeded => {
+            warning(&format!(
+                "User '{username}' is in the 'plugdev' group, but this login session \
+                 started before the membership was added."
+            ));
+            info("Log out completely (or reboot) and log back in to activate it.");
+        }
+        PlugdevAdvice::JoinGroup => {
+            warning(&format!(
+                "User '{username}' is not in the 'plugdev' group. Device access may be limited."
+            ));
+            info(&format!(
+                "To add user to plugdev group, run: sudo usermod -aG plugdev {username}"
+            ));
+            info("You will need to log out and log back in for the change to take effect.");
+        }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_member_needs_no_advice() {
+        assert_eq!(plugdev_advice(true, Some(true)), PlugdevAdvice::Ok);
+    }
+
+    #[test]
+    fn db_member_with_stale_session_needs_relogin_not_usermod() {
+        assert_eq!(
+            plugdev_advice(true, Some(false)),
+            PlugdevAdvice::ReloginNeeded
+        );
+    }
+
+    #[test]
+    fn unverifiable_session_state_never_alarms_a_db_member() {
+        assert_eq!(plugdev_advice(true, None), PlugdevAdvice::Ok);
+    }
+
+    #[test]
+    fn only_verified_non_members_are_told_to_join() {
+        assert_eq!(plugdev_advice(false, Some(false)), PlugdevAdvice::JoinGroup);
+        assert_eq!(plugdev_advice(false, None), PlugdevAdvice::JoinGroup);
+    }
 }

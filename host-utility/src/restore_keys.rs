@@ -14,6 +14,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use russignol_storage::{self, F2FS_FORMAT_FEATURES, MIN_ALIGNMENT, SECTOR_SIZE, watermark};
 
+use crate::device_access::{self, FlashPrivilege};
 use crate::image;
 use crate::progress;
 use crate::utils::{self, get_partition_path};
@@ -103,9 +104,15 @@ fn read_disk_size_sectors(device: &Path) -> Result<u64> {
 }
 
 /// Calculate restore partition layout by running sfdisk on the device
-pub fn calculate_restore_partition_layout(device: &Path) -> Result<RestorePartitionLayout> {
+///
+/// Reading the partition table needs the same device access as writing it,
+/// so the write-probe's privilege applies here too.
+pub fn calculate_restore_partition_layout(
+    device: &Path,
+    privilege: FlashPrivilege,
+) -> Result<RestorePartitionLayout> {
     let sfdisk = utils::resolve_tool("sfdisk").context("sfdisk not found")?;
-    let output = Command::new(sfdisk)
+    let output = raw_device_command(&sfdisk, privilege)
         .args(["--json"])
         .arg(device)
         .output()
@@ -425,19 +432,39 @@ pub(crate) struct FlashJob<'a> {
     pub chain_info: &'a crate::watermark::ChainInfo,
 }
 
+/// Build a raw-device command, prefixed with sudo when the write-access
+/// probe escalated. Sudo credentials must already be cached so no password
+/// prompt competes with piped stdin.
+fn raw_device_command(program: &Path, privilege: FlashPrivilege) -> Command {
+    match privilege {
+        FlashPrivilege::Direct => Command::new(program),
+        FlashPrivilege::Sudo => {
+            let mut cmd = Command::new("sudo");
+            cmd.arg(program);
+            cmd
+        }
+    }
+}
+
 /// Create and format p3/p4 partitions on the target device
-pub fn create_and_format_partitions(device: &Path) -> Result<()> {
+pub fn create_and_format_partitions(device: &Path, privilege: FlashPrivilege) -> Result<()> {
     let sfdisk = utils::resolve_tool("sfdisk").context("sfdisk not found")?;
     let mkfs_f2fs = utils::resolve_tool("mkfs.f2fs").context("mkfs.f2fs not found")?;
 
-    let layout = calculate_restore_partition_layout(device)?;
+    // Re-authenticate: the preceding image write can outlast sudo's
+    // credential-cache timeout.
+    if privilege == FlashPrivilege::Sudo {
+        utils::ensure_sudo()?;
+    }
+
+    let layout = calculate_restore_partition_layout(device, privilege)?;
 
     let script = russignol_storage::generate_sfdisk_script(&layout);
 
     utils::info("Creating key/data partitions...");
     log::info!("sfdisk append script:\n{script}");
 
-    let mut child = Command::new(&sfdisk)
+    let mut child = raw_device_command(&sfdisk, privilege)
         .args(["--append", "--no-reread"])
         .arg(device)
         .stdin(Stdio::piped())
@@ -487,7 +514,7 @@ pub fn create_and_format_partitions(device: &Path) -> Result<()> {
 
     // Format partitions
     utils::info("Formatting keys partition (F2FS)...");
-    let output = Command::new(&mkfs_f2fs)
+    let output = raw_device_command(&mkfs_f2fs, privilege)
         .args(["-l", "russignol-keys", "-O", F2FS_FORMAT_FEATURES, "-f"])
         .arg(&p3_path)
         .output()
@@ -501,7 +528,7 @@ pub fn create_and_format_partitions(device: &Path) -> Result<()> {
     }
 
     utils::info("Formatting data partition (F2FS)...");
-    let output = Command::new(&mkfs_f2fs)
+    let output = raw_device_command(&mkfs_f2fs, privilege)
         .args(["-l", "russignol-data", "-O", F2FS_FORMAT_FEATURES, "-f"])
         .arg(&p4_path)
         .output()
@@ -517,6 +544,30 @@ pub fn create_and_format_partitions(device: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Make a freshly formatted F2FS root writable by the invoking user again.
+///
+/// When mkfs.f2fs ran under sudo the fs root inode is root-owned, so the
+/// unprivileged key/watermark writes below would fail; chowning the mount
+/// root restores the same ownership the direct (non-sudo) path produces.
+fn reclaim_mount_ownership(mount: &Path, privilege: FlashPrivilege) -> Result<()> {
+    if privilege == FlashPrivilege::Sudo {
+        let ids = format!(
+            "{}:{}",
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw()
+        );
+        let output = utils::sudo_command("chown", &[ids.as_str(), &mount.to_string_lossy()])?;
+        if !output.status.success() {
+            bail!(
+                "chown of {} failed: {}",
+                mount.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Write backup data to target device partitions
 ///
 /// Chain info and watermarks are derived from the node, not the source card.
@@ -525,6 +576,7 @@ pub fn write_backup_to_target(
     device: &Path,
     backup: &SourceBackup,
     chain_info: &crate::watermark::ChainInfo,
+    privilege: FlashPrivilege,
 ) -> Result<()> {
     let p3_path = get_partition_path(device, 3);
     let p4_path = get_partition_path(device, 4);
@@ -533,6 +585,7 @@ pub fn write_backup_to_target(
     utils::info("Writing keys to target...");
     let p3_mount = utils::mount_partition(&p3_path, "f2fs", false)
         .context("Failed to mount target keys partition")?;
+    reclaim_mount_ownership(&p3_mount, privilege)?;
 
     let p3_result = (|| {
         write_pin_blobs(&p3_mount, &backup.pin_blobs).context("Failed to write PIN blobs")?;
@@ -570,6 +623,7 @@ pub fn write_backup_to_target(
     utils::info("Writing watermarks to target...");
     let p4_mount = utils::mount_partition(&p4_path, "f2fs", false)
         .context("Failed to mount target data partition")?;
+    reclaim_mount_ownership(&p4_mount, privilege)?;
 
     let p4_result = (|| {
         let watermarks_dir = p4_mount.join("watermarks");
@@ -1067,6 +1121,11 @@ pub fn run_single_reader_restore(
         wait_for_device_reappear(restore_from)?;
     }
 
+    // Probe before the source read and card swap: recovery may re-exec the
+    // process (sg), restarting the flow, and the reader's device node has
+    // the same permissions whichever card is inserted.
+    let privilege = device_access::probe_write_access(restore_from, None, job.yes)?;
+
     let backup = loop {
         match source.read(restore_from) {
             Ok(backup) => break backup,
@@ -1124,11 +1183,11 @@ pub fn run_single_reader_restore(
     }
 
     // Step 3: Flash, partition, and write keys
-    image::flash_image_to_device(job.image, restore_from, job.uncompressed_size)?;
+    image::flash_image_to_device(job.image, restore_from, job.uncompressed_size, privilege)?;
     image::reread_partition_table(restore_from);
 
-    create_and_format_partitions(restore_from)?;
-    write_backup_to_target(restore_from, &backup, job.chain_info)?;
+    create_and_format_partitions(restore_from, privilege)?;
+    write_backup_to_target(restore_from, &backup, job.chain_info, privilege)?;
 
     image::write_flash_manifest(restore_from, job.metadata)
         .context("Failed to write flash manifest")?;
@@ -1146,6 +1205,7 @@ pub fn run_dual_reader_restore(
     backup: &SourceBackup,
     noun: &str,
     job: FlashJob<'_>,
+    privilege: FlashPrivilege,
 ) -> Result<()> {
     // Confirm before flashing
     if !confirm_restore_operation(target, backup, job.chain_info, job.yes)? {
@@ -1155,12 +1215,12 @@ pub fn run_dual_reader_restore(
     }
 
     // Step 1: Flash target card
-    image::flash_image_to_device(job.image, &target.path, job.uncompressed_size)?;
+    image::flash_image_to_device(job.image, &target.path, job.uncompressed_size, privilege)?;
     image::reread_partition_table(&target.path);
 
     // Step 2: Create partitions and write backup
-    create_and_format_partitions(&target.path)?;
-    write_backup_to_target(&target.path, backup, job.chain_info)?;
+    create_and_format_partitions(&target.path, privilege)?;
+    write_backup_to_target(&target.path, backup, job.chain_info, privilege)?;
 
     image::write_flash_manifest(&target.path, job.metadata)
         .context("Failed to write flash manifest")?;

@@ -32,6 +32,8 @@ The Russignol host utility uses a persistent configuration system to manage cust
   - Format: `http://HOST:PORT` or `https://HOST:PORT`
   - Example: `http://localhost:8732`, `http://127.0.0.1:8733`
   - Can be overridden per-command with `--endpoint <URL>`
+  - The `octez-node` binary is only required when this points at localhost;
+    a remote or public endpoint needs `octez-client` alone
 - `signer_endpoint` (string|null): Remote signer endpoint (optional)
   - Format: `tcp://HOST:PORT`
   - Example: `tcp://192.168.1.50:7732`
@@ -203,6 +205,23 @@ russignol config set rpc-endpoint http://127.0.0.1:8732
 russignol config set octez-client-dir ~/.octez-client-shadownet
 russignol config set rpc-endpoint http://127.0.0.1:8733
 ```
+
+### Public RPC Networks
+
+When the configured endpoint doesn't answer and no `--endpoint` was given,
+interactive commands (`setup`, `status`, `image flash`/`download-and-flash`,
+`watermark init`, `rotate-keys`) offer recovery choices: retry, enter a
+different endpoint, or pick a public RPC network. The network list comes from
+[teztnets.com](https://teztnets.com/) (Mainnet first, then long-running and
+protocol testnets), with a built-in fallback of Mainnet
+(`https://rpc.tzbeta.net`) and Shadownet
+(`https://rpc.shadownet.teztnets.com`) when teztnets.com is unreachable.
+After a working endpoint is chosen you are offered to persist it to the
+config file; declining uses it for the current run only.
+
+Passing `--endpoint <URL>` explicitly bypasses the picker. Note that baking
+requires your own node — public RPCs are suitable for status and watermark
+reads.
 
 ### Fresh Setup After Changes
 

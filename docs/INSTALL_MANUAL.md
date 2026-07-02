@@ -69,7 +69,8 @@ xzcat russignol-pi-zero.img.xz | sudo dd of=/dev/sdX bs=4M iflag=fullblock oflag
 sudo eject /dev/sdX
 ```
 
-**macOS** (replace `/dev/diskN` with your SD card device):
+**macOS** (replace `/dev/diskN` with your SD card device — identify it in
+`diskutil list` as the `external, physical` disk matching the card's size):
 
 > **Warning:** macOS support has not been tested.
 
@@ -81,15 +82,14 @@ sync
 diskutil eject /dev/diskN
 ```
 
+> **Note:** macOS `dd` prints nothing while it runs; press `Ctrl+T` to see
+> bytes written so far. If `dd` fails with `Operation not permitted` even
+> under `sudo`, grant your terminal app Full Disk Access
+> (System Settings → Privacy & Security → Full Disk Access) and retry.
+
 > **Warning:** Double-check the device path. `dd` will overwrite without confirmation.
 
 > **Note:** Users in the `disk` group (Linux) can omit `sudo` for `dd` and `eject`.
-
-> **Note:** For USB device access without root, ensure your user is in the `plugdev` group:
-> ```bash
-> sudo usermod -aG plugdev $USER
-> ```
-> Log out and back in for the change to take effect.
 
 ## Step 2: Boot and Initialize Device
 
@@ -182,21 +182,46 @@ recognizes without extra drivers. Identify the interface it created:
 networksetup -listallhardwareports
 ```
 
-Look for the hardware port backed by a newly added `enN` device; the signer
-reports its product as `Russignol Ethernet`. Note both the hardware port name
-and the `enN` device.
+macOS names the hardware port from the USB product string, so look for an
+entry like:
+
+```
+Hardware Port: Russignol Ethernet
+Device: en5
+Ethernet Address: 02:xx:xx:xx:xx:xx
+```
+
+Note both the hardware port name and the `enN` device. If no port is named
+`Russignol Ethernet`, compare `ifconfig -l` output with the device unplugged
+and plugged in — the interface that appears is the signer.
+
+macOS automatically creates a network service for the new interface. Find its
+exact name (usually the same as the hardware port name):
+
+```bash
+networksetup -listallnetworkservices
+```
+
+If no matching service appears, run `sudo networksetup -detectnewhardware`
+and list again.
 
 Assign the static address `169.254.1.2/30` (netmask `255.255.255.252`).
-Persistent, by hardware port name:
+Persistent, by network service name (case-sensitive):
 
 ```bash
 sudo networksetup -setmanual "Russignol Ethernet" 169.254.1.2 255.255.255.252
 ```
 
+Verify:
+
+```bash
+networksetup -getinfo "Russignol Ethernet"
+```
+
 Temporary (cleared on replug or reboot), by device name:
 
 ```bash
-sudo ifconfig en5 169.254.1.2 255.255.255.252
+sudo ifconfig enN 169.254.1.2 255.255.255.252
 ```
 
 > **Note:** The host address must be exactly `169.254.1.2`. The device pings
@@ -204,6 +229,12 @@ sudo ifconfig en5 169.254.1.2 255.255.255.252
 > so the automatic link-local address macOS would otherwise self-assign (a
 > random `169.254.x.x`) makes the link flap. Confirm `ifconfig enN` shows
 > `169.254.1.2` and no second self-assigned address.
+
+> **Note:** macOS ties this configuration to the adapter's MAC address, and
+> each Russignol derives its MAC from its CPU serial. The same device needs
+> no reconfiguration across replugs and reboots, but a replacement device
+> (e.g. after key rotation) appears as a new adapter with a fresh service
+> defaulting to DHCP — repeat this step once for it.
 
 ### Verify Connectivity
 
@@ -282,11 +313,13 @@ See [Running Octez](https://octez.tezos.com/docs/introduction/howtorun.html) for
 
 Check the signer is responding.
 
-Watch baker logs for signing activity:
+Watch baker logs for signing activity — if the baker runs under systemd:
 
 ```bash
 journalctl -u octez-baker -f | grep -i sign
 ```
+
+Otherwise, watch the baker's stdout.
 
 You can also check the signer status via the e-ink display, which shows recent signing activity.
 
@@ -294,7 +327,7 @@ You can also check the signer status via the e-ink display, which shows recent s
 
 ### Device Not Appearing
 
-Check USB connection:
+Check USB connection (Linux):
 
 ```bash
 lsusb -d 1d6b:0104 -v 2>/dev/null | grep -i russignol
@@ -326,6 +359,15 @@ Expected output:
 ```
 coresize  drivers  holders  initsize  initstate  refcnt  taint  uevent
 ```
+
+On macOS, check the USB device is enumerated:
+
+```bash
+system_profiler SPUSBDataType | grep -A 8 -i russignol
+```
+
+and confirm a matching hardware port exists
+(`networksetup -listallhardwareports`).
 
 ### Network Unreachable
 
@@ -361,6 +403,16 @@ sudo ip addr flush dev russignol
 sudo ip addr add 169.254.1.2/30 dev russignol
 sudo ip link set russignol up
 ```
+
+On macOS, check the interface address:
+
+```bash
+ifconfig enN
+```
+
+It must show `inet 169.254.1.2 netmask 0xfffffffc` and no second
+self-assigned `169.254.x.x` address. If the address is wrong or missing,
+re-run the `networksetup -setmanual` command from Step 3.
 
 ### Key Import Fails
 

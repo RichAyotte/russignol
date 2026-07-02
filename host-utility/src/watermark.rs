@@ -19,12 +19,10 @@ use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use inquire::Confirm;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Mainnet chain name (only hardcoded network - testnets are looked up dynamically)
-const MAINNET_CHAIN_NAME: &str = "TEZOS_MAINNET";
+use crate::network::MAINNET_CHAIN_NAME;
 
 /// Config file name on boot partition
 pub const CONFIG_FILENAME: &str = "watermark-config.json";
@@ -63,13 +61,6 @@ struct VersionResponse {
 #[derive(Debug, Deserialize)]
 struct NetworkVersion {
     chain_name: String,
-}
-
-/// Teztnets.com network entry (only fields we need)
-#[derive(Debug, Deserialize)]
-struct TeztnetEntry {
-    chain_name: String,
-    human_name: String,
 }
 
 /// Prefetch chain information from the node
@@ -409,16 +400,7 @@ fn lookup_human_name(rpc_endpoint: &str) -> Option<String> {
         return Some("Mainnet".to_string());
     }
 
-    // Query teztnets.com for testnets (short timeout - this is just cosmetic)
-    let agent = create_http_agent(3);
-    let json = http_get_json(&agent, "https://teztnets.com/teztnets.json").ok()?;
-    let networks: HashMap<String, TeztnetEntry> = serde_json::from_value(json).ok()?;
-
-    // Find matching chain_name
-    networks
-        .values()
-        .find(|entry| entry.chain_name == chain_name)
-        .map(|entry| entry.human_name.clone())
+    crate::network::human_name_for_chain(&chain_name, &crate::network::fetch_public_networks())
 }
 
 fn create_watermark_config(
