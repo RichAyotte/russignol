@@ -124,6 +124,8 @@ fn run_build(config_name: &str, force_clean: bool, external_tree: &Path) -> Resu
 
     run_cmd_in_dir(".", "make", &[], "Buildroot build failed")?;
     verify_kernel_hardening(Path::new("output/build/linux-custom/.config"))?;
+    verify_compression_backend(Path::new("output/build/linux-custom/.config"))?;
+    verify_mount_opts_drift()?;
     save_buildroot_state(config_name, &state_file)?;
 
     Ok(())
@@ -172,13 +174,20 @@ const KERNEL_HARDENING: &[(&str, bool)] = &[
     ("CONFIG_DEVMEM", false),
 ];
 
-/// Violations of [`KERNEL_HARDENING`] in a kernel `.config`; empty when compliant.
-fn kernel_hardening_violations(config: &str) -> Vec<String> {
-    let enabled: std::collections::HashMap<&str, &str> = config
+/// Map of `CONFIG_X` -> value built from `CONFIG_X=y`/`=m`/… lines. `# CONFIG_X
+/// is not set` lines are ignored, so an absent symbol is simply missing from
+/// the map.
+fn enabled_configs(config: &str) -> std::collections::HashMap<&str, &str> {
+    config
         .lines()
         .filter(|line| line.starts_with("CONFIG_"))
         .filter_map(|line| line.split_once('='))
-        .collect();
+        .collect()
+}
+
+/// Violations of [`KERNEL_HARDENING`] in a kernel `.config`; empty when compliant.
+fn kernel_hardening_violations(config: &str) -> Vec<String> {
+    let enabled = enabled_configs(config);
 
     KERNEL_HARDENING
         .iter()
@@ -219,6 +228,122 @@ fn verify_kernel_hardening(config_path: &Path) -> Result<()> {
     }
 
     println!("  {} Kernel hardening config verified", "✓".green());
+    Ok(())
+}
+
+/// Kernel `CONFIG_` symbols required to mount with a given F2FS
+/// `compress_algorithm=` value. Empty when the mount options request no
+/// compression. Requesting an algorithm the kernel lacks makes the mount fail.
+fn required_compression_symbols(mount_opts: &str) -> Vec<&'static str> {
+    let Some(algo) = mount_opts
+        .split(',')
+        .find_map(|opt| opt.trim().strip_prefix("compress_algorithm="))
+    else {
+        return Vec::new();
+    };
+    let mut syms = vec!["CONFIG_F2FS_FS_COMPRESSION"];
+    match algo {
+        "zstd" => syms.extend(["CONFIG_F2FS_FS_ZSTD", "CONFIG_ZSTD_COMPRESS"]),
+        "lz4" => syms.push("CONFIG_F2FS_FS_LZ4"),
+        "lzo" => syms.push("CONFIG_F2FS_FS_LZO"),
+        "lzo-rle" => syms.extend(["CONFIG_F2FS_FS_LZO", "CONFIG_F2FS_FS_LZORLE"]),
+        _ => {}
+    }
+    syms
+}
+
+/// Config symbols the F2FS mount options need but the `.config` lacks.
+fn compression_backend_violations(mount_opts: &str, config: &str) -> Vec<String> {
+    let enabled = enabled_configs(config);
+    required_compression_symbols(mount_opts)
+        .into_iter()
+        .filter(|sym| enabled.get(sym).copied() != Some("y"))
+        .map(|sym| {
+            format!("{sym} must be =y (required by compress_algorithm in the /data mount options)")
+        })
+        .collect()
+}
+
+/// Fail the build when the data-partition mount options request a compression
+/// algorithm the kernel was not built to support — the mount would be rejected
+/// at boot and `/data` would silently fail to mount.
+fn verify_compression_backend(config_path: &Path) -> Result<()> {
+    let config = std::fs::read_to_string(config_path).with_context(|| {
+        format!(
+            "Failed to read generated kernel config: {}",
+            config_path.display()
+        )
+    })?;
+
+    let violations = compression_backend_violations(russignol_storage::F2FS_MOUNT_OPTS, &config);
+    if !violations.is_empty() {
+        bail!(
+            "F2FS compression backend missing in {}:\n  {}\n\n\
+            The /data mount options request a compress_algorithm the kernel\n\
+            cannot provide, so /data will fail to mount. Enable the backend or\n\
+            drop compression from russignol_storage::F2FS_MOUNT_OPTS.",
+            config_path.display(),
+            violations.join("\n  ")
+        );
+    }
+
+    println!("  {} F2FS mount options supported by kernel", "✓".green());
+    Ok(())
+}
+
+/// Data-partition mount option strings that must stay byte-identical to
+/// `russignol_storage::F2FS_MOUNT_OPTS`, relative to the buildroot dir the
+/// build runs in.
+const MOUNT_OPT_SHELL_FILES: &[&str] = &[
+    "../rpi-signer/buildroot-external/rootfs-overlay-hardened/init",
+    "../rpi-signer/buildroot-external/rootfs-overlay-dev/etc/init.d/S20russignol",
+];
+
+/// Value of a `NAME="value"` (or `NAME=value`) shell assignment, ignoring an
+/// optional `export ` and surrounding quotes.
+fn extract_shell_var(content: &str, name: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+        let rest = line.strip_prefix(name)?.strip_prefix('=')?;
+        Some(rest.trim().trim_matches('"').to_string())
+    })
+}
+
+/// Description of a shell `F2FS_OPTS` that has drifted from `expected`, or
+/// `None` when it matches.
+fn shell_opts_mismatch(expected: &str, label: &str, content: &str) -> Option<String> {
+    match extract_shell_var(content, "F2FS_OPTS") {
+        Some(v) if v == expected => None,
+        Some(v) => Some(format!(
+            "{label}: F2FS_OPTS is\n    {v}\n  but expected\n    {expected}"
+        )),
+        None => Some(format!("{label}: F2FS_OPTS assignment not found")),
+    }
+}
+
+/// Fail the build when an init script's `F2FS_OPTS` no longer matches the
+/// shared Rust constant, so the shell and Rust mount options cannot drift.
+fn verify_mount_opts_drift() -> Result<()> {
+    let expected = russignol_storage::F2FS_MOUNT_OPTS;
+    let mut violations = Vec::new();
+    for path in MOUNT_OPT_SHELL_FILES {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read init script: {path}"))?;
+        if let Some(v) = shell_opts_mismatch(expected, path, &content) {
+            violations.push(v);
+        }
+    }
+    if !violations.is_empty() {
+        bail!(
+            "F2FS mount option drift between shell and russignol_storage::F2FS_MOUNT_OPTS:\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    println!(
+        "  {} F2FS mount options match across shell and Rust",
+        "✓".green()
+    );
     Ok(())
 }
 
@@ -383,5 +508,83 @@ mod tests {
             violations.is_empty(),
             "unexpected violations: {violations:?}"
         );
+    }
+
+    #[test]
+    fn shared_mount_opts_request_no_compression() {
+        // The shipped constant must not demand a compression backend.
+        assert!(required_compression_symbols(russignol_storage::F2FS_MOUNT_OPTS).is_empty());
+        let violations = compression_backend_violations(russignol_storage::F2FS_MOUNT_OPTS, "");
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn required_compression_symbols_map_by_algorithm() {
+        assert_eq!(
+            required_compression_symbols("rw,compress_algorithm=zstd,atgc"),
+            vec![
+                "CONFIG_F2FS_FS_COMPRESSION",
+                "CONFIG_F2FS_FS_ZSTD",
+                "CONFIG_ZSTD_COMPRESS"
+            ]
+        );
+        assert_eq!(
+            required_compression_symbols("rw,compress_algorithm=lz4"),
+            vec!["CONFIG_F2FS_FS_COMPRESSION", "CONFIG_F2FS_FS_LZ4"]
+        );
+        assert!(required_compression_symbols("rw,inline_data").is_empty());
+    }
+
+    #[test]
+    fn reports_missing_compression_backend() {
+        // Compression requested, but the kernel enables no zstd backend.
+        let config = "CONFIG_F2FS_FS_COMPRESSION=y\n";
+        let violations = compression_backend_violations("rw,compress_algorithm=zstd", config);
+        assert!(
+            violations.iter().any(|v| v.contains("CONFIG_F2FS_FS_ZSTD")),
+            "missing zstd backend must be reported: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_present_compression_backend() {
+        let config =
+            "CONFIG_F2FS_FS_COMPRESSION=y\nCONFIG_F2FS_FS_ZSTD=y\nCONFIG_ZSTD_COMPRESS=y\n";
+        let violations = compression_backend_violations("rw,compress_algorithm=zstd", config);
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn extract_shell_var_reads_quoted_assignment() {
+        assert_eq!(
+            extract_shell_var("F2FS_OPTS=\"rw,atgc\"\n", "F2FS_OPTS").as_deref(),
+            Some("rw,atgc")
+        );
+        assert_eq!(
+            extract_shell_var("export F2FS_OPTS=rw\n", "F2FS_OPTS").as_deref(),
+            Some("rw")
+        );
+        // A longer variable name must not match.
+        assert_eq!(
+            extract_shell_var("F2FS_OPTS_EXTRA=\"x\"\n", "F2FS_OPTS"),
+            None
+        );
+    }
+
+    #[test]
+    fn shell_opts_mismatch_detects_drift() {
+        let expected = "rw,atgc";
+        assert!(shell_opts_mismatch(expected, "f", "F2FS_OPTS=\"rw,atgc\"").is_none());
+        assert!(
+            shell_opts_mismatch(expected, "f", "F2FS_OPTS=\"rw,compress_algorithm=zstd\"")
+                .is_some()
+        );
+        assert!(shell_opts_mismatch(expected, "f", "nothing here").is_some());
     }
 }
