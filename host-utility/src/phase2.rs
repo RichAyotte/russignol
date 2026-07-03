@@ -552,8 +552,11 @@ fn validate_network_connectivity() -> Result<()> {
                 );
             }
 
-            // TCP connection test to signer service
-            let _ = std::net::TcpStream::connect("169.254.1.1:7732");
+            // Ping only proves L3 reachability; confirm the signer service is
+            // actually accepting connections before calling connectivity good.
+            std::net::TcpStream::connect("169.254.1.1:7732").context(
+                "Signer reachable via ping but its service port 7732 is not accepting connections",
+            )?;
 
             Ok(())
         },

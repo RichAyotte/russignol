@@ -4,7 +4,7 @@ use crate::config::RussignolConfig;
 use crate::constants::{COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, ORANGE_RGB};
 use crate::keys;
 use crate::progress::{run_step, run_step_detail};
-use crate::utils::{JsonValueExt, read_file, run_octez_client_command, success};
+use crate::utils::{JsonValueExt, read_file, run_octez_client_command, success, warning};
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
@@ -244,7 +244,11 @@ pub fn run(
         && baker.staked_balance == 0
         && let Err(e) = check_and_set_stake(&baker, auto_confirm, russignol_config)
     {
-        log::debug!("Stake check failed: {e}");
+        // Setup can still complete, but the operator must know stake was not set
+        // so they can set it manually rather than believing it was configured.
+        warning(&format!(
+            "Could not set stake automatically: {e:#}. Set it manually with 'octez-client stake ...'."
+        ));
     }
 
     // Ensure signer is accessible and discover remote keys

@@ -688,11 +688,20 @@ fn verify_preconditions(config: &RussignolConfig, verbose: bool) -> Result<(Stri
 
     // Check 3: Baker not deactivated
     if !delegate.is_empty() {
-        if blockchain::is_registered_delegate(&delegate, config) {
-            success("Baker is active (not deactivated)");
-        } else {
-            println!("  {} Baker is deactivated", "✗".red());
-            all_ok = false;
+        match blockchain::is_registered_delegate(&delegate, config) {
+            Ok(true) => success("Baker is active (not deactivated)"),
+            Ok(false) => {
+                println!("  {} Baker is deactivated", "✗".red());
+                all_ok = false;
+            }
+            Err(e) => {
+                // Cannot confirm the baker is active — block rather than assume.
+                println!("  {} Could not verify baker registration", "✗".red());
+                if verbose {
+                    log::debug!("Baker registration check failed: {e}");
+                }
+                all_ok = false;
+            }
         }
     }
 
@@ -711,9 +720,12 @@ fn verify_preconditions(config: &RussignolConfig, verbose: bool) -> Result<(Stri
                 all_ok = false;
             }
             Err(e) => {
+                // An unreadable balance must not silently pass the balance gate.
+                println!("  {} Could not verify balance (RPC unavailable)", "✗".red());
                 if verbose {
                     log::debug!("Error checking balance: {e}");
                 }
+                all_ok = false;
             }
         }
     }
@@ -1471,6 +1483,22 @@ fn start_baker(restart_config: &ResolvedRestartConfig) -> Result<()> {
     Ok(())
 }
 
+/// Fold rollback-rename failures into `err`, naming the aliases a rollback
+/// could not restore. A swallowed rollback failure would otherwise leave the
+/// wallet inconsistent behind a clean-looking error; naming the unrestored
+/// aliases tells the operator exactly what to repair by hand.
+fn rollback_incomplete(err: anyhow::Error, unrestored: &[&str]) -> anyhow::Error {
+    if unrestored.is_empty() {
+        err
+    } else {
+        err.context(format!(
+            "Rollback incomplete — wallet is inconsistent. Could not restore alias(es): {}. \
+             Restore them manually before retrying.",
+            unrestored.join(", ")
+        ))
+    }
+}
+
 /// Promote -pending aliases to primary, keeping -old backup
 ///
 /// NOTE: Uses local alias manipulation because the NEW signer is connected during
@@ -1504,8 +1532,15 @@ fn promote_aliases_with_backup(config: &RussignolConfig) -> Result<()> {
     if let Err(e) = keys::rename_alias_locally(COMPANION_KEY_ALIAS, COMPANION_KEY_OLD_ALIAS, config)
     {
         warning("Companion backup failed, rolling back consensus backup...");
-        let _ = keys::rename_alias_locally(CONSENSUS_KEY_OLD_ALIAS, CONSENSUS_KEY_ALIAS, config);
-        return Err(e).context("Failed to backup companion key");
+        let mut unrestored = Vec::new();
+        if keys::rename_alias_locally(CONSENSUS_KEY_OLD_ALIAS, CONSENSUS_KEY_ALIAS, config).is_err()
+        {
+            unrestored.push(CONSENSUS_KEY_ALIAS);
+        }
+        return Err(rollback_incomplete(
+            e.context("Failed to backup companion key"),
+            &unrestored,
+        ));
     }
 
     // STEP 3: Rename -pending -> primary
@@ -1513,22 +1548,44 @@ fn promote_aliases_with_backup(config: &RussignolConfig) -> Result<()> {
         keys::rename_alias_locally(CONSENSUS_KEY_PENDING_ALIAS, CONSENSUS_KEY_ALIAS, config)
     {
         warning("Consensus promotion failed, rolling back backups...");
-        let _ = keys::rename_alias_locally(CONSENSUS_KEY_OLD_ALIAS, CONSENSUS_KEY_ALIAS, config);
-        let _ = keys::rename_alias_locally(COMPANION_KEY_OLD_ALIAS, COMPANION_KEY_ALIAS, config);
-        return Err(e).context("Failed to promote pending consensus key");
+        let mut unrestored = Vec::new();
+        if keys::rename_alias_locally(CONSENSUS_KEY_OLD_ALIAS, CONSENSUS_KEY_ALIAS, config).is_err()
+        {
+            unrestored.push(CONSENSUS_KEY_ALIAS);
+        }
+        if keys::rename_alias_locally(COMPANION_KEY_OLD_ALIAS, COMPANION_KEY_ALIAS, config).is_err()
+        {
+            unrestored.push(COMPANION_KEY_ALIAS);
+        }
+        return Err(rollback_incomplete(
+            e.context("Failed to promote pending consensus key"),
+            &unrestored,
+        ));
     }
 
     if let Err(e) =
         keys::rename_alias_locally(COMPANION_KEY_PENDING_ALIAS, COMPANION_KEY_ALIAS, config)
     {
         warning("Companion promotion failed, rolling back...");
-        // Rollback consensus promotion
-        let _ =
-            keys::rename_alias_locally(CONSENSUS_KEY_ALIAS, CONSENSUS_KEY_PENDING_ALIAS, config);
-        // Rollback backups
-        let _ = keys::rename_alias_locally(CONSENSUS_KEY_OLD_ALIAS, CONSENSUS_KEY_ALIAS, config);
-        let _ = keys::rename_alias_locally(COMPANION_KEY_OLD_ALIAS, COMPANION_KEY_ALIAS, config);
-        return Err(e).context("Failed to promote pending companion key");
+        let mut unrestored = Vec::new();
+        // Undo the consensus promotion, then restore both backups.
+        if keys::rename_alias_locally(CONSENSUS_KEY_ALIAS, CONSENSUS_KEY_PENDING_ALIAS, config)
+            .is_err()
+        {
+            unrestored.push(CONSENSUS_KEY_PENDING_ALIAS);
+        }
+        if keys::rename_alias_locally(CONSENSUS_KEY_OLD_ALIAS, CONSENSUS_KEY_ALIAS, config).is_err()
+        {
+            unrestored.push(CONSENSUS_KEY_ALIAS);
+        }
+        if keys::rename_alias_locally(COMPANION_KEY_OLD_ALIAS, COMPANION_KEY_ALIAS, config).is_err()
+        {
+            unrestored.push(COMPANION_KEY_ALIAS);
+        }
+        return Err(rollback_incomplete(
+            e.context("Failed to promote pending companion key"),
+            &unrestored,
+        ));
     }
 
     // Suppress unused variable warnings - we verified these exist
@@ -2392,5 +2449,24 @@ mod tests {
         assert!(!signing_verified(true, true, None, EXPECTED));
         // On-chain active key is some other key.
         assert!(!signing_verified(true, true, Some("tz4other"), EXPECTED));
+    }
+
+    #[test]
+    fn rollback_incomplete_passes_error_through_when_rollback_succeeded() {
+        let err = rollback_incomplete(anyhow::anyhow!("promotion failed"), &[]);
+        assert_eq!(format!("{err:#}"), "promotion failed");
+    }
+
+    #[test]
+    fn rollback_incomplete_names_unrestored_aliases() {
+        let err = rollback_incomplete(
+            anyhow::anyhow!("promotion failed"),
+            &[CONSENSUS_KEY_ALIAS, COMPANION_KEY_ALIAS],
+        );
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("inconsistent"));
+        assert!(rendered.contains(CONSENSUS_KEY_ALIAS));
+        assert!(rendered.contains(COMPANION_KEY_ALIAS));
+        assert!(rendered.contains("promotion failed"));
     }
 }

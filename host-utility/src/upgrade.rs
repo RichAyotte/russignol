@@ -184,6 +184,18 @@ pub(crate) fn verify_checksum(file: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
+/// The trailing note describing whether the pre-upgrade binary was put back
+/// after a failed replacement — the difference between "the upgrade failed but
+/// the tool still runs" and "no working binary is installed at that path."
+fn restore_note(restored: bool) -> &'static str {
+    if restored {
+        "Original restored."
+    } else {
+        "The original could NOT be restored — no working binary is installed at that path. \
+         Reinstall before continuing."
+    }
+}
+
 /// Replace current binary atomically using Bun's strategy
 fn replace_binary(temp_file: &NamedTempFile) -> Result<()> {
     let current_path = current_binary_path()?;
@@ -246,24 +258,24 @@ fn replace_binary(temp_file: &NamedTempFile) -> Result<()> {
                     Ok(())
                 }
                 Err(copy_err) => {
-                    // Restore the old binary
-                    let _ = std::fs::rename(&backup_path, &current_path);
+                    let restored = std::fs::rename(&backup_path, &current_path).is_ok();
                     Err(copy_err).with_context(|| {
                         format!(
-                            "Failed to copy binary to {}. Original restored.",
-                            current_path.display()
+                            "Failed to copy binary to {}. {}",
+                            current_path.display(),
+                            restore_note(restored)
                         )
                     })
                 }
             }
         }
         Err(e) => {
-            // Restore the old binary
-            let _ = std::fs::rename(&backup_path, &current_path);
+            let restored = std::fs::rename(&backup_path, &current_path).is_ok();
             Err(e).with_context(|| {
                 format!(
-                    "Failed to replace binary at {}. Original restored.",
-                    current_path.display()
+                    "Failed to replace binary at {}. {}",
+                    current_path.display(),
+                    restore_note(restored)
                 )
             })
         }
@@ -273,4 +285,23 @@ fn replace_binary(temp_file: &NamedTempFile) -> Result<()> {
 /// Get current binary path
 fn current_binary_path() -> Result<PathBuf> {
     std::env::current_exe().context("Failed to determine current executable path")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_note_reflects_a_successful_restore() {
+        let note = restore_note(true);
+        assert!(note.contains("Original restored"));
+        assert!(!note.contains("could NOT"));
+    }
+
+    #[test]
+    fn restore_note_flags_a_failed_restore_as_no_working_binary() {
+        let note = restore_note(false);
+        assert!(note.contains("could NOT be restored"));
+        assert!(note.contains("no working binary"));
+    }
 }

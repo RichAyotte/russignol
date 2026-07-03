@@ -297,7 +297,7 @@ fn install_completions(shell: Shell) -> Result<()> {
 }
 
 fn handle_watermark_command(command: WatermarkCommands) -> Result<()> {
-    let mut config = config::RussignolConfig::load()?;
+    let mut config = config::RussignolConfig::load_valid()?;
     match command {
         WatermarkCommands::Init {
             device,
@@ -402,16 +402,24 @@ fn handle_status_command(
         .filter_level(log_level)
         .init();
 
+    // Status is read-only and degrades gracefully: an invalid config surfaces
+    // as unknown probes and a non-zero exit, which is more useful than refusing
+    // to run, so it keeps the lenient loader.
     let mut config = config::RussignolConfig::load()?;
     config.with_overrides(endpoint, signer_endpoint);
     if endpoint.is_none() && !network::resolve_endpoint_interactively(&mut config, false)? {
         utils::warning(network::NON_INTERACTIVE_HINT.trim_start());
     }
-    status::run_status(verbose, &config);
+    let healthy = status::run_status(verbose, &config);
+    if !healthy {
+        std::process::exit(constants::EXIT_UNHEALTHY);
+    }
     Ok(())
 }
 
 fn handle_purge_command(dry_run: bool) -> Result<()> {
+    // Purge is often run to clean up a broken install, so it must work even
+    // when the config is invalid; it surfaces unknown key state on its own.
     let clean = purge::run_purge(dry_run, &config::RussignolConfig::load()?)?;
     if !clean {
         std::process::exit(constants::EXIT_UNHEALTHY);
@@ -449,7 +457,7 @@ fn handle_rotate_keys_command(
         .filter_level(log_level)
         .init();
 
-    let mut config = config::RussignolConfig::load()?;
+    let mut config = config::RussignolConfig::load_valid()?;
     config.with_overrides(endpoint, signer_endpoint);
     if endpoint.is_none() {
         network::resolve_endpoint_interactively(&mut config, opts.auto_confirm || opts.dry_run)?;
@@ -478,7 +486,7 @@ fn run_setup(setup_config: &SetupConfig<'_>) -> Result<()> {
     } = setup_config;
 
     let confirmation_config = initialize_setup_environment(confirmation, *baker_key)?;
-    let mut config = config::RussignolConfig::load()?;
+    let mut config = config::RussignolConfig::load_valid()?;
     config.with_overrides(*endpoint, *signer_endpoint);
     if endpoint.is_none() {
         network::resolve_endpoint_interactively(

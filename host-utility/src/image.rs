@@ -208,6 +208,10 @@ pub enum ImageCommands {
         /// default: second key)
         #[arg(long)]
         companion_key: Option<String>,
+
+        /// Skip the post-flash read-back verification (faster, not recommended)
+        #[arg(long)]
+        skip_verify: bool,
     },
 
     /// Download and flash in one step
@@ -251,6 +255,10 @@ pub enum ImageCommands {
         /// Download the latest beta (pre-release) version
         #[arg(long)]
         beta: bool,
+
+        /// Skip the post-flash read-back verification (faster, not recommended)
+        #[arg(long)]
+        skip_verify: bool,
     },
 
     /// List available images
@@ -275,6 +283,7 @@ impl ImageCommands {
             consensus_key: None,
             companion_key: None,
             beta: false,
+            skip_verify: false,
         }
     }
 }
@@ -338,6 +347,7 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
             migrate_keys,
             consensus_key,
             companion_key,
+            skip_verify,
         } => cmd_flash(
             &image,
             device,
@@ -349,6 +359,7 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
                 consensus_key: consensus_key.as_deref(),
                 companion_key: companion_key.as_deref(),
             },
+            skip_verify,
         ),
         ImageCommands::DownloadAndFlash {
             url,
@@ -360,6 +371,7 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
             consensus_key,
             companion_key,
             beta,
+            skip_verify,
         } => cmd_download_and_flash(
             url,
             device,
@@ -372,6 +384,7 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
                 companion_key: companion_key.as_deref(),
             },
             beta,
+            skip_verify,
         ),
         ImageCommands::List { beta } => cmd_list(beta),
     }
@@ -692,6 +705,7 @@ fn cmd_flash(
     endpoint: Option<&str>,
     yes: bool,
     keys: KeySourceArgs<'_>,
+    skip_verify: bool,
 ) -> Result<()> {
     check_key_source_exclusive(keys.restore_keys, keys.migrate_keys)?;
 
@@ -773,24 +787,45 @@ fn cmd_flash(
     }
 
     // Perform the flash (no size hint for local files)
-    flash_image_to_device(image, &target_device.path, None, privilege)?;
-
-    // Re-read partition table so kernel sees new partitions
-    reread_partition_table(&target_device.path);
-
-    // Write flash manifest
     let metadata = FlashMetadata {
         image_sha256,
         image_version: None,
         channel: None,
     };
-    write_flash_manifest(&target_device.path, &metadata)
-        .context("Failed to write flash manifest")?;
-
-    finalize_flash(
+    finish_normal_flash(
+        image,
         &target_device.path,
+        None,
+        privilege,
+        skip_verify,
+        &metadata,
         node_check.as_ref().map(|nc| &nc.chain_info),
     )
+}
+
+/// Shared tail of both normal (non-keyed) flash paths: write the image, read it
+/// back to confirm the write, refresh the partition table, record the manifest,
+/// and finalize. Kept in one place so the two entry points cannot diverge.
+fn finish_normal_flash(
+    image: &Path,
+    device: &Path,
+    expected_size: Option<u64>,
+    privilege: FlashPrivilege,
+    skip_verify: bool,
+    metadata: &FlashMetadata,
+    chain_info: Option<&watermark::ChainInfo>,
+) -> Result<()> {
+    flash_image_to_device(image, device, expected_size, privilege)?;
+
+    // Read the card back and confirm it matches before declaring success.
+    verify_flash_or_note_skip(image, device, skip_verify)?;
+
+    // Re-read partition table so kernel sees new partitions
+    reread_partition_table(device);
+
+    write_flash_manifest(device, metadata).context("Failed to write flash manifest")?;
+
+    finalize_flash(device, chain_info)
 }
 
 /// Write watermark config (if available), verify it, and print flash success message
@@ -890,6 +925,7 @@ fn cmd_download_and_flash(
     yes: bool,
     keys: KeySourceArgs<'_>,
     include_prerelease: bool,
+    skip_verify: bool,
 ) -> Result<()> {
     check_key_source_exclusive(keys.restore_keys, keys.migrate_keys)?;
 
@@ -1002,27 +1038,18 @@ fn cmd_download_and_flash(
     }
 
     // Flash the downloaded image
-    flash_image_to_device(
-        &image_path,
-        &target_device.path,
-        dl.uncompressed_size,
-        privilege,
-    )?;
-
-    // Re-read partition table so kernel sees new partitions
-    reread_partition_table(&target_device.path);
-
-    // Write flash manifest
     let metadata = FlashMetadata {
         image_sha256,
         image_version: dl.version,
         channel: dl.channel,
     };
-    write_flash_manifest(&target_device.path, &metadata)
-        .context("Failed to write flash manifest")?;
-
-    finalize_flash(
+    finish_normal_flash(
+        &image_path,
         &target_device.path,
+        dl.uncompressed_size,
+        privilege,
+        skip_verify,
+        &metadata,
         node_check.as_ref().map(|nc| &nc.chain_info),
     )
 }
@@ -1782,6 +1809,150 @@ fn verify_checksum(file: &Path, expected: &str) -> Result<()> {
 
 /// Flash image to device
 /// `expected_size` is the uncompressed image size for progress estimation (from version.json)
+/// A `Write` sink that hashes and counts the bytes streamed through it without
+/// storing them — used to derive the reference SHA-256 and length of an image's
+/// decompressed contents in a single pass.
+struct HashCounter {
+    hasher: Sha256,
+    bytes: u64,
+}
+
+impl HashCounter {
+    fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            bytes: 0,
+        }
+    }
+
+    fn finish(self) -> (String, u64) {
+        (hex::encode(self.hasher.finalize()), self.bytes)
+    }
+}
+
+impl Write for HashCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        self.bytes += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Hash the decompressed contents of `image`, returning `(sha256_hex, len)`.
+///
+/// This is the reference the post-flash read-back compares against: the exact
+/// byte stream `dd` receives, so the comparison covers decompression as well as
+/// the write itself.
+fn hash_decompressed_source(image: &Path) -> Result<(String, u64)> {
+    use lzma_rs::xz_decompress;
+
+    let mut sink = HashCounter::new();
+    match image.extension().and_then(|e| e.to_str()) {
+        Some("xz") => {
+            let file = std::fs::File::open(image)
+                .with_context(|| format!("Failed to open image: {}", image.display()))?;
+            let mut reader = BufReader::new(file);
+            xz_decompress(&mut reader, &mut sink).context("Failed to decompress XZ image")?;
+        }
+        Some("img") => {
+            let mut file = std::fs::File::open(image)
+                .with_context(|| format!("Failed to open image: {}", image.display()))?;
+            std::io::copy(&mut file, &mut sink).context("Failed to read image data")?;
+        }
+        _ => bail!(
+            "Unsupported image format: {}\n Supported formats: .img.xz, .img",
+            image.display()
+        ),
+    }
+    Ok(sink.finish())
+}
+
+/// Hash the first `len` bytes of `reader`, returning `(sha256_hex, bytes_read)`.
+fn hash_reader_prefix<R: Read>(reader: R, len: u64) -> Result<(String, u64)> {
+    let mut hasher = HashCounter::new();
+    std::io::copy(&mut reader.take(len), &mut hasher)
+        .context("Failed to read back written image")?;
+    Ok(hasher.finish())
+}
+
+/// Read `len` bytes back from `device` via `sudo dd` and hash them, for the
+/// case where the raw device is only root-readable.
+fn hash_device_prefix_sudo(device: &Path, len: u64) -> Result<(String, u64)> {
+    let mut child = Command::new("sudo")
+        .arg("dd")
+        .arg(format!("if={}", device.display()))
+        .args(["bs=1M", "status=none"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to spawn sudo dd for read-back verification")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture dd output for read-back verification")?;
+    let result = hash_reader_prefix(stdout, len);
+    // Only the first `len` bytes are needed; stop dd rather than drain the card.
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+/// Hash the first `len` bytes read back from `device`. Reads directly when the
+/// process can open the raw device, otherwise falls back to `sudo dd` (reading
+/// a raw device typically needs root, and off Linux the flash runs without an
+/// explicit sudo privilege even when root is still required).
+fn hash_device_prefix(device: &Path, len: u64) -> Result<(String, u64)> {
+    match std::fs::File::open(device) {
+        Ok(file) => hash_reader_prefix(file, len),
+        Err(_) => hash_device_prefix_sudo(device, len),
+    }
+}
+
+/// Read the flashed image back off the card and confirm it matches the source.
+///
+/// Guards against a silently truncated or corrupted write before the card is
+/// walked to the signer. Reads only the source-sized prefix of the device, so
+/// the cost scales with the image, not the whole card.
+fn verify_flash_readback(image: &Path, device: &Path) -> Result<()> {
+    let spinner = crate::progress::create_spinner("Verifying written image...");
+    let result = (|| {
+        let (expected_sha, len) = hash_decompressed_source(image)?;
+        let (actual_sha, read) = hash_device_prefix(device, len)?;
+        if read != len {
+            bail!(
+                "Read back only {read} of {len} bytes from the card — the write was truncated \
+                 or the card is smaller than the image. Re-flash before using it."
+            );
+        }
+        if actual_sha != expected_sha {
+            bail!(
+                "Read-back verification FAILED: the data on the card does not match the image.\n  \
+                 Expected: {expected_sha}\n  Got:      {actual_sha}\n\n  \
+                 The write did not land correctly. Re-flash the card before using it."
+            );
+        }
+        Ok(())
+    })();
+    spinner.finish_and_clear();
+    result?;
+    utils::success("Written image verified");
+    Ok(())
+}
+
+/// Verify the write unless the user opted out with `--skip-verify`.
+fn verify_flash_or_note_skip(image: &Path, device: &Path, skip_verify: bool) -> Result<()> {
+    if skip_verify {
+        utils::warning("Skipping post-flash verification (--skip-verify).");
+        Ok(())
+    } else {
+        verify_flash_readback(image, device)
+    }
+}
+
 pub(crate) fn flash_image_to_device(
     image: &Path,
     device: &Path,
@@ -2223,6 +2394,31 @@ fn div_with_tenths(value: u64, divisor: u64) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hash_reader_prefix_hashes_only_the_requested_prefix() {
+        let data = b"hello world extra bytes";
+        let (hash, read) = hash_reader_prefix(&data[..], 11).unwrap();
+        assert_eq!(read, 11);
+        // sha256("hello world")
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[test]
+    fn hash_decompressed_source_agrees_with_file_hash_for_uncompressed_img() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.img");
+        std::fs::write(&path, b"raw image bytes").unwrap();
+
+        let (hash, len) = hash_decompressed_source(&path).unwrap();
+        assert_eq!(len, 15);
+        // The reference the read-back compares against must match the same
+        // SHA-256 the rest of the flash pipeline uses for a raw .img.
+        assert_eq!(hash, compute_file_sha256(&path).unwrap());
+    }
 
     /// Parse size string like "32G" or "16.5G" to bytes
     #[expect(

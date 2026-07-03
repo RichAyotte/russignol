@@ -685,7 +685,17 @@ fn decrypt_and_build(
         .map_err(NomadicReadError::Fatal)
     })();
 
-    let _ = umount(&plain);
+    // The decrypted eCryptfs view exposes plaintext key material. If it will
+    // not unmount, fail closed: disarm the TempDir so its recursive delete does
+    // not run through a live mount, and tell the operator to clear it by hand.
+    if let Err(e) = umount(&plain) {
+        let plain_display = plain.display().to_string();
+        let _ = work.keep();
+        return Err(NomadicReadError::Fatal(anyhow!(
+            "Failed to unmount decrypted key material at {plain_display}: {e:#}. \
+             Plaintext keys may remain mounted — unmount it and remove the directory manually."
+        )));
+    }
     result
 }
 

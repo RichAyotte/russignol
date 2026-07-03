@@ -54,8 +54,9 @@ pub fn find_delegate_address(config: &RussignolConfig) -> Result<Option<String>>
     if let Some(array) = pkhs.as_array() {
         for entry in array {
             if let Some(hash) = entry.get_str("value") {
-                // Check if this address is a registered delegate
-                if is_registered_delegate(hash, config) {
+                // Searching for a usable delegate: a candidate the node cannot
+                // confirm is simply not the one we want, so skip it.
+                if is_registered_delegate(hash, config).unwrap_or(false) {
                     return Ok(Some(hash.to_string()));
                 }
             }
@@ -65,17 +66,16 @@ pub fn find_delegate_address(config: &RussignolConfig) -> Result<Option<String>>
     Ok(None)
 }
 
-/// Check if an address is a registered (and not deactivated) delegate
-pub fn is_registered_delegate(address: &str, config: &RussignolConfig) -> bool {
+/// Check whether an address is a registered (and not deactivated) delegate.
+///
+/// `Ok(true)` = active delegate, `Ok(false)` = registered but deactivated,
+/// `Err` = the delegate RPC could not be evaluated. Keeping the error distinct
+/// from `Ok(false)` lets callers avoid reporting "not registered" for a baker
+/// whose status the node could not answer.
+pub fn is_registered_delegate(address: &str, config: &RussignolConfig) -> Result<bool> {
     let rpc_path = format!("/chains/main/blocks/head/context/delegates/{address}");
-    let Ok(delegate_info) = crate::utils::rpc_get_json(&rpc_path, config) else {
-        return false; // Not registered if RPC call fails
-    };
-
-    // Check if deactivated
-    let deactivated = delegate_info.get_bool("deactivated").unwrap_or(false);
-
-    !deactivated
+    let delegate_info = crate::utils::rpc_get_json(&rpc_path, config)?;
+    Ok(!delegate_info.get_bool("deactivated").unwrap_or(false))
 }
 
 /// Query staking information for a delegate

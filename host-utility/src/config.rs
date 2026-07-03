@@ -146,6 +146,20 @@ impl RussignolConfig {
         Ok(config)
     }
 
+    /// Load configuration and require that it passes [`validate`].
+    ///
+    /// [`load`] deliberately hands back a structurally invalid config (with a
+    /// warning) so the `config` repair subcommands can fix it. This is the entry
+    /// point for signing/RPC commands, which cannot act sensibly on a broken
+    /// config and must fail rather than proceed on invalid endpoints or paths.
+    pub fn load_valid() -> Result<Self> {
+        let config = Self::load()?;
+        config
+            .validate()
+            .context("Configuration is invalid; run 'russignol config reset' to reconfigure")?;
+        Ok(config)
+    }
+
     /// Create a minimal configuration with just an RPC endpoint
     ///
     /// Used when no config file exists but user provides --endpoint flag.

@@ -7,13 +7,39 @@
 use crate::utils::run_octez_client_command;
 use anyhow::Result;
 
-/// Check if a key alias exists in octez-client
+/// Classify a `show address` result into present, absent, or indeterminate.
 ///
-/// Returns true if the key exists, false otherwise
-pub fn check_key_alias_exists(alias: &str, config: &crate::config::RussignolConfig) -> bool {
-    let result = run_octez_client_command(&["show", "address", alias, "--show-secret"], config);
+/// `Some(true)` = the alias resolved, `Some(false)` = the client ran and said
+/// no such alias, `None` = a non-zero exit for some other reason (the probe
+/// could not decide). Kept pure so the three-way decision is unit-testable.
+fn classify_alias_probe(status_success: bool, stderr: &str) -> Option<bool> {
+    if status_success {
+        Some(true)
+    } else if stderr.contains(NO_SUCH_ALIAS) {
+        Some(false)
+    } else {
+        None
+    }
+}
 
-    result.is_ok() && result.unwrap().status.success()
+/// Check whether a key alias exists in octez-client.
+///
+/// `Ok(true)` = present, `Ok(false)` = the client ran and reported no such
+/// alias, `Err` = the probe itself could not run or gave an indeterminate
+/// failure. Keeping the probe failure distinct from a genuine absence lets
+/// callers avoid reporting "not imported" for a wallet whose state is unknown.
+pub fn check_key_alias_exists(
+    alias: &str,
+    config: &crate::config::RussignolConfig,
+) -> Result<bool> {
+    let output = run_octez_client_command(&["show", "address", alias, "--show-secret"], config)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    classify_alias_probe(output.status.success(), &stderr).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Could not determine whether alias '{alias}' exists: {}",
+            stderr.trim()
+        )
+    })
 }
 
 /// Get the public key hash for a given alias
@@ -344,5 +370,24 @@ mod tests {
             false,
             "Error: could not access wallet directory"
         ));
+    }
+
+    #[test]
+    fn classify_alias_probe_distinguishes_absence_from_probe_failure() {
+        // Present.
+        assert_eq!(classify_alias_probe(true, ""), Some(true));
+        // Ran, but the alias is simply not there.
+        assert_eq!(
+            classify_alias_probe(
+                false,
+                "Error:\n  no public key hash alias named russignol-consensus"
+            ),
+            Some(false)
+        );
+        // Non-zero exit for an unrelated reason: state is unknown, not absent.
+        assert_eq!(
+            classify_alias_probe(false, "Error: could not access wallet directory"),
+            None
+        );
     }
 }
