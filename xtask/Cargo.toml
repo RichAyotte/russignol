@@ -10,7 +10,6 @@ workspace = true
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
-test = false
 
 [lib]
 name = "xtask_lib"

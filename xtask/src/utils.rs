@@ -3,15 +3,28 @@ use std::env;
 use std::path::Path;
 use std::process::Command;
 
+/// Host compiler/linker flag variables that leak into child builds and break
+/// cross-compilation when they carry machine-specific options like
+/// `-march=native`. The kernel honors `KCFLAGS`/`KCPPFLAGS`/`KAFLAGS` directly.
+const HOST_FLAG_VARS: &[&str] = &[
+    "CFLAGS",
+    "CXXFLAGS",
+    "CPPFLAGS",
+    "LDFLAGS",
+    "FFLAGS",
+    "FCFLAGS",
+    "KCFLAGS",
+    "KCPPFLAGS",
+    "KAFLAGS",
+];
+
 /// Clear host-specific compiler flags that interfere with cross-compilation
 pub fn clear_host_compiler_flags() {
     // These env operations are safe in our single-threaded build context
     unsafe {
-        env::remove_var("CFLAGS");
-        env::remove_var("CXXFLAGS");
-        env::remove_var("LDFLAGS");
-        env::remove_var("KCFLAGS");
-        env::remove_var("KCPPFLAGS");
+        for var in HOST_FLAG_VARS {
+            env::remove_var(var);
+        }
     }
 }
 
@@ -56,15 +69,23 @@ pub fn get_busybox_config(is_dev: bool) -> &'static str {
     }
 }
 
-/// Run make in buildroot directory with `BR2_EXTERNAL` set.
+/// Build the make command for a buildroot invocation with `BR2_EXTERNAL` set.
 ///
 /// When the `rpi-linux` git submodule exists alongside the buildroot directory,
 /// passes `LINUX_OVERRIDE_SRCDIR` so Buildroot rsyncs the kernel source locally
 /// instead of downloading the tarball. This is significantly faster for clean builds.
-pub fn run_buildroot_make(buildroot_dir: &Path, external_tree: &Path, args: &[&str]) -> Result<()> {
+fn buildroot_make_command(
+    buildroot_dir: &Path,
+    external_tree: &Path,
+    args: &[&str],
+) -> Result<Command> {
     let mut cmd = Command::new("make");
     cmd.current_dir(buildroot_dir)
         .env("BR2_EXTERNAL", external_tree);
+
+    for var in HOST_FLAG_VARS {
+        cmd.env_remove(var);
+    }
 
     // Use local kernel source when the rpi-linux submodule is populated
     let rpi_linux_dir = buildroot_dir.join("../rpi-linux");
@@ -76,6 +97,13 @@ pub fn run_buildroot_make(buildroot_dir: &Path, external_tree: &Path, args: &[&s
     }
 
     cmd.args(args);
+
+    Ok(cmd)
+}
+
+/// Run make in buildroot directory with `BR2_EXTERNAL` set.
+pub fn run_buildroot_make(buildroot_dir: &Path, external_tree: &Path, args: &[&str]) -> Result<()> {
+    let mut cmd = buildroot_make_command(buildroot_dir, external_tree, args)?;
 
     let status = cmd
         .status()
@@ -175,4 +203,28 @@ pub fn check_command(cmd: &str, hint: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exported host flag vars like `CFLAGS=-march=native` leak into buildroot
+    /// child builds (the kernel honors `KCFLAGS`/`KCPPFLAGS`/`KAFLAGS`) and
+    /// break cross-compilation, so the command must remove them from the
+    /// child environment regardless of the caller's process env.
+    #[test]
+    fn test_buildroot_make_command_scrubs_host_flag_vars() {
+        let cmd = buildroot_make_command(Path::new("/nonexistent"), Path::new("/ext"), &["foo"])
+            .expect("command should build");
+
+        let envs: Vec<_> = cmd.get_envs().collect();
+        for var in HOST_FLAG_VARS {
+            assert!(
+                envs.iter()
+                    .any(|(k, v)| *k == std::ffi::OsStr::new(var) && v.is_none()),
+                "{var} must be removed from the child environment"
+            );
+        }
+    }
 }
