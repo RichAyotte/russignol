@@ -85,7 +85,9 @@ mount_data_partition() {
 
     mkdir -p "${DATA_MOUNT}"
     if ! is_mounted "${DATA_PART}"; then
-        mount -t f2fs -o "${F2FS_OPTS}" "${DATA_PART}" "${DATA_MOUNT}" 2>/dev/null || true
+        if ! mount -t f2fs -o "${F2FS_OPTS}" "${DATA_PART}" "${DATA_MOUNT}" 2>/dev/null; then
+            echo "ERROR: Failed to mount data partition (${DATA_PART})"
+        fi
     fi
 }
 

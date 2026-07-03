@@ -143,10 +143,13 @@ init_data_partition() {
     # Create mount point
     mkdir -p "${DATA_MOUNT}"
 
-    # Mount data partition
-    mount -t f2fs -o "${F2FS_OPTS}" "${DATA_PART}" "${DATA_MOUNT}" 2>/dev/null || true
-
-    log_debug "Data partition setup complete"
+    # Mount data partition. The signer shows a fatal DATA UNAVAILABLE screen
+    # when /data is missing, so record a mount failure rather than hiding it.
+    if mount -t f2fs -o "${F2FS_OPTS}" "${DATA_PART}" "${DATA_MOUNT}" 2>/dev/null; then
+        log_debug "Data partition setup complete"
+    else
+        log_debug "ERROR: Failed to mount data partition (${DATA_PART})"
+    fi
 }
 
 # ==============================================================================

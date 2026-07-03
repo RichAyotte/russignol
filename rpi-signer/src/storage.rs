@@ -548,3 +548,48 @@ pub fn drop_privileges() -> Result<bool, String> {
     );
     Ok(true)
 }
+
+/// Whether `/data` appears as a mount point in `/proc/mounts` text (the mount
+/// point is the second whitespace-separated field of each line).
+fn data_is_mounted(proc_mounts: &str) -> bool {
+    proc_mounts
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .any(|mount_point| mount_point == DATA_MOUNT)
+}
+
+/// Whether the data partition is currently mounted at `/data`.
+///
+/// The init script mounts `/data` best-effort; when that fails the signer must
+/// not proceed to write watermarks there — they would land on the read-only
+/// rootfs and abort startup obscurely. Returns false if `/proc/mounts` is
+/// unreadable.
+pub fn is_data_mounted() -> bool {
+    std::fs::read_to_string("/proc/mounts").is_ok_and(|mounts| data_is_mounted(&mounts))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_mounted_data_partition() {
+        let mounts = "/dev/mmcblk0p2 / ext4 ro,relatime 0 0\n\
+                      /dev/mmcblk0p4 /data f2fs rw,inline_data 0 0\n\
+                      proc /proc proc rw 0 0\n";
+        assert!(data_is_mounted(mounts));
+    }
+
+    #[test]
+    fn reports_unmounted_data_partition() {
+        let mounts = "/dev/mmcblk0p2 / ext4 ro,relatime 0 0\n\
+                      /dev/mmcblk0p3 /keys f2fs ro 0 0\n";
+        assert!(!data_is_mounted(mounts));
+    }
+
+    #[test]
+    fn does_not_match_data_substring_path() {
+        // `/database` must not be read as `/data`.
+        assert!(!data_is_mounted("/dev/sda1 /database ext4 rw 0 0\n"));
+    }
+}

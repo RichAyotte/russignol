@@ -319,14 +319,19 @@ fn run_ui_loop(
         let (action, effects) = app.handle_event(event);
 
         if action != LoopAction::Continue {
-            apply_effects(
+            // A failed effect otherwise unwinds to `main` and exits with the
+            // last frame still on the bistable panel — a crash that reads as a
+            // hang. Render it instead (fatal_error diverges).
+            if let Err(e) = apply_effects(
                 &mut app,
                 effects,
                 &mut device,
                 &mut current_page,
                 cpu_boost,
                 &screensaver_reset_tx,
-            )?;
+            ) {
+                fatal_error(&mut device, "SYSTEM ERROR", &e.to_string());
+            }
             if action == LoopAction::Break {
                 break;
             }
@@ -657,6 +662,15 @@ fn apply_init_watermark(
     context: &str,
 ) -> epd_2in13_v4::EpdResult<()> {
     log::info!("Creating high watermark tracker...");
+    // Watermarks live on /data; if the init script failed to mount it,
+    // creating them would hit the read-only rootfs and abort obscurely.
+    if !storage::is_data_mounted() {
+        fatal_error(
+            device,
+            "DATA UNAVAILABLE",
+            "Data partition not mounted. Re-flash the SD card with the host utility.",
+        );
+    }
     let config = signer_server::SignerConfig::default();
     let pkhs: Vec<PublicKeyHash> = tezos_signer::get_keys()
         .iter()
