@@ -123,8 +123,102 @@ fn run_build(config_name: &str, force_clean: bool, external_tree: &Path) -> Resu
     println!();
 
     run_cmd_in_dir(".", "make", &[], "Buildroot build failed")?;
+    verify_kernel_hardening(Path::new("output/build/linux-custom/.config"))?;
     save_buildroot_state(config_name, &state_file)?;
 
+    Ok(())
+}
+
+/// Kernel hardening requirements asserted against the generated kernel
+/// config on every image build; `true` = must be `=y`, `false` = must not
+/// be enabled. Every config cited in the `docs/SECURITY_AUDIT.md` §3.1
+/// table must appear here — that doc promises this list enforces the table.
+///
+/// The defconfig cannot pin several of these: they hold only through
+/// Kconfig side effects (`SECURITY_LOCKDOWN_LSM` selects `MODULE_SIG`;
+/// `INIT_STACK_ALL_ZERO` defaults on only when the toolchain supports
+/// `-ftrivial-auto-var-init=zero`; `NAMESPACES`/`AIO`/`IO_URING` default
+/// off only under `EXPERT`), and `savedefconfig` — which `cargo xtask
+/// config kernel update` runs — strips any symbol matching those computed
+/// defaults. A kernel or toolchain bump can therefore drop them without
+/// any build error; this check is the guard.
+const KERNEL_HARDENING: &[(&str, bool)] = &[
+    ("CONFIG_RANDOMIZE_BASE", true),
+    ("CONFIG_SECURITY_LOCKDOWN_LSM_EARLY", true),
+    ("CONFIG_LOCK_DOWN_KERNEL_FORCE_INTEGRITY", true),
+    ("CONFIG_MODULE_SIG", true),
+    ("CONFIG_MODULE_SIG_ALL", true),
+    ("CONFIG_MODULE_SIG_FORCE", true),
+    ("CONFIG_INIT_ON_ALLOC_DEFAULT_ON", true),
+    ("CONFIG_INIT_ON_FREE_DEFAULT_ON", true),
+    ("CONFIG_INIT_STACK_ALL_ZERO", true),
+    ("CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT", true),
+    ("CONFIG_ARM64_SW_TTBR0_PAN", true),
+    ("CONFIG_SLAB_FREELIST_RANDOM", true),
+    ("CONFIG_SLAB_FREELIST_HARDENED", true),
+    ("CONFIG_FORTIFY_SOURCE", true),
+    ("CONFIG_HARDENED_USERCOPY", true),
+    ("CONFIG_LIST_HARDENED", true),
+    ("CONFIG_SECURITY_YAMA", true),
+    ("CONFIG_SECURITY_DMESG_RESTRICT", true),
+    ("CONFIG_F2FS_FS", true),
+    ("CONFIG_SLAB_MERGE_DEFAULT", false),
+    ("CONFIG_COREDUMP", false),
+    ("CONFIG_SWAP", false),
+    ("CONFIG_AIO", false),
+    ("CONFIG_IO_URING", false),
+    ("CONFIG_NAMESPACES", false),
+    ("CONFIG_LEGACY_PTYS", false),
+    ("CONFIG_DEVMEM", false),
+];
+
+/// Violations of [`KERNEL_HARDENING`] in a kernel `.config`; empty when compliant.
+fn kernel_hardening_violations(config: &str) -> Vec<String> {
+    let enabled: std::collections::HashMap<&str, &str> = config
+        .lines()
+        .filter(|line| line.starts_with("CONFIG_"))
+        .filter_map(|line| line.split_once('='))
+        .collect();
+
+    KERNEL_HARDENING
+        .iter()
+        .filter_map(
+            |&(symbol, required)| match (required, enabled.get(symbol).copied()) {
+                (true, Some("y")) => None,
+                (true, value) => Some(format!(
+                    "{symbol} must be =y, found {}",
+                    value.map_or_else(|| "nothing".to_string(), |v| format!("={v}"))
+                )),
+                (false, Some(value @ ("y" | "m"))) => {
+                    Some(format!("{symbol} must stay disabled, found ={value}"))
+                }
+                (false, _) => None,
+            },
+        )
+        .collect()
+}
+
+/// Fail the build when the generated kernel config has lost a hardening option.
+fn verify_kernel_hardening(config_path: &Path) -> Result<()> {
+    let config = std::fs::read_to_string(config_path).with_context(|| {
+        format!(
+            "Failed to read generated kernel config: {}",
+            config_path.display()
+        )
+    })?;
+
+    let violations = kernel_hardening_violations(&config);
+    if !violations.is_empty() {
+        bail!(
+            "Kernel hardening drift in {}:\n  {}\n\n\
+            The image was built from a kernel config that lost hardening\n\
+            options docs/SECURITY_AUDIT.md claims. Do not release this image.",
+            config_path.display(),
+            violations.join("\n  ")
+        );
+    }
+
+    println!("  {} Kernel hardening config verified", "✓".green());
     Ok(())
 }
 
@@ -195,4 +289,99 @@ fn check_buildroot_state(config_name: &str, state_file: &Path) -> Result<bool> {
 fn save_buildroot_state(config_name: &str, state_file: &Path) -> Result<()> {
     std::fs::write(state_file, config_name).context("Failed to save buildroot state file")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal config satisfying every [`KERNEL_HARDENING`] requirement.
+    fn compliant_config() -> String {
+        KERNEL_HARDENING
+            .iter()
+            .map(|&(symbol, required)| {
+                if required {
+                    format!("{symbol}=y\n")
+                } else {
+                    format!("# {symbol} is not set\n")
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn accepts_compliant_config() {
+        let violations = kernel_hardening_violations(&compliant_config());
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
+        );
+    }
+
+    /// A required symbol silently dropped by a Kconfig default/select change
+    /// (e.g. `MODULE_SIG` when lockdown stops selecting it) must be reported.
+    #[test]
+    fn reports_missing_required_symbol() {
+        let config = compliant_config().replace("CONFIG_MODULE_SIG=y\n", "");
+        let violations = kernel_hardening_violations(&config);
+        assert!(
+            violations.iter().any(|v| v.contains("CONFIG_MODULE_SIG ")),
+            "missing CONFIG_MODULE_SIG must be reported: {violations:?}"
+        );
+    }
+
+    /// A must-stay-off symbol re-enabled by a default flip (e.g. NAMESPACES
+    /// when `CONFIG_EXPERT` is removed) must be reported.
+    #[test]
+    fn reports_reenabled_disabled_symbol() {
+        let config =
+            compliant_config().replace("# CONFIG_NAMESPACES is not set\n", "CONFIG_NAMESPACES=y\n");
+        let violations = kernel_hardening_violations(&config);
+        assert!(
+            violations.iter().any(|v| v.contains("CONFIG_NAMESPACES")),
+            "re-enabled CONFIG_NAMESPACES must be reported: {violations:?}"
+        );
+    }
+
+    /// `CONFIG_MODULE_SIG=y` must not satisfy the `CONFIG_MODULE_SIG_ALL`
+    /// or `CONFIG_MODULE_SIG_FORCE` requirements (prefix collision).
+    #[test]
+    fn requires_exact_symbol_match() {
+        let config = compliant_config()
+            .replace("CONFIG_MODULE_SIG_ALL=y\n", "")
+            .replace("CONFIG_MODULE_SIG_FORCE=y\n", "");
+        let violations = kernel_hardening_violations(&config);
+        assert_eq!(
+            violations.len(),
+            2,
+            "both dropped symbols must be reported: {violations:?}"
+        );
+    }
+
+    /// A disabled requirement is also violated by `=m`: a loadable module
+    /// still ships the feature.
+    #[test]
+    fn reports_disabled_symbol_built_as_module() {
+        let config = compliant_config().replace(
+            "# CONFIG_LEGACY_PTYS is not set\n",
+            "CONFIG_LEGACY_PTYS=m\n",
+        );
+        let violations = kernel_hardening_violations(&config);
+        assert!(
+            violations.iter().any(|v| v.contains("CONFIG_LEGACY_PTYS")),
+            "modular CONFIG_LEGACY_PTYS must be reported: {violations:?}"
+        );
+    }
+
+    /// A disabled symbol absent from the config entirely (dropped by a
+    /// kernel version bump) is fine: it cannot be enabled at all.
+    #[test]
+    fn accepts_absent_disabled_symbol() {
+        let config = compliant_config().replace("# CONFIG_DEVMEM is not set\n", "");
+        let violations = kernel_hardening_violations(&config);
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
+        );
+    }
 }
