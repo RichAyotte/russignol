@@ -347,9 +347,7 @@ fn dispatch(command: Option<Commands>) -> Result<()> {
             endpoint,
             signer_endpoint,
         }) => handle_status_command(verbose, endpoint.as_deref(), signer_endpoint.as_deref()),
-        Some(Commands::Purge { dry_run }) => {
-            purge::run_purge(dry_run, &config::RussignolConfig::load()?)
-        }
+        Some(Commands::Purge { dry_run }) => handle_purge_command(dry_run),
         Some(Commands::Install { backup }) => install::run_install(backup),
         Some(Commands::Upgrade { check, yes, beta }) => upgrade::run_upgrade(check, yes, beta),
         Some(Commands::Config { command }) => config::run_config_command(command),
@@ -410,6 +408,14 @@ fn handle_status_command(
         utils::warning(network::NON_INTERACTIVE_HINT.trim_start());
     }
     status::run_status(verbose, &config);
+    Ok(())
+}
+
+fn handle_purge_command(dry_run: bool) -> Result<()> {
+    let clean = purge::run_purge(dry_run, &config::RussignolConfig::load()?)?;
+    if !clean {
+        std::process::exit(constants::EXIT_UNHEALTHY);
+    }
     Ok(())
 }
 

@@ -339,7 +339,10 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
                 data
             }
             Err(e) => {
-                let _ = utils::unmount_partition(&p3_mount, &p3_path);
+                utils::warn_if_err(
+                    utils::unmount_partition(&p3_mount, &p3_path),
+                    "Failed to unmount source keys partition after a read error",
+                );
                 return Err(e);
             }
         };
@@ -578,6 +581,7 @@ fn reclaim_mount_ownership(mount: &Path, privilege: FlashPrivilege) -> Result<()
 pub fn write_backup_to_target(
     device: &Path,
     backup: &SourceBackup,
+    keys: &[NamedKey],
     chain_info: &crate::watermark::ChainInfo,
     privilege: FlashPrivilege,
 ) -> Result<()> {
@@ -615,9 +619,12 @@ pub fn write_backup_to_target(
     })();
 
     // Always sync and unmount p3, even on write error
-    let _ = Command::new("sync").output();
+    utils::run_best_effort("sync", &[], "Syncing keys partition");
     if let Err(e) = p3_result {
-        let _ = utils::unmount_partition(&p3_mount, &p3_path);
+        utils::warn_if_err(
+            utils::unmount_partition(&p3_mount, &p3_path),
+            "Failed to unmount keys partition after a write error",
+        );
         return Err(e);
     }
     utils::unmount_partition(&p3_mount, &p3_path)?;
@@ -631,7 +638,7 @@ pub fn write_backup_to_target(
     let p4_result = (|| {
         let watermarks_dir = p4_mount.join("watermarks");
         let wm_data = watermark::encode(chain_info.level, 0);
-        for key in extract_named_keys(&backup.public_key_hashs) {
+        for key in keys {
             let key_dir = watermarks_dir.join(&key.address);
             fs::create_dir_all(&key_dir)
                 .with_context(|| format!("Failed to create watermark dir for {}", key.address))?;
@@ -644,9 +651,12 @@ pub fn write_backup_to_target(
     })();
 
     // Always sync and unmount p4, even on write error
-    let _ = Command::new("sync").output();
+    utils::run_best_effort("sync", &[], "Syncing data partition");
     if let Err(e) = p4_result {
-        let _ = utils::unmount_partition(&p4_mount, &p4_path);
+        utils::warn_if_err(
+            utils::unmount_partition(&p4_mount, &p4_path),
+            "Failed to unmount data partition after a write error",
+        );
         return Err(e);
     }
     utils::unmount_partition(&p4_mount, &p4_path)?;
@@ -725,7 +735,7 @@ fn verify_watermarks_partition(data_mount: &Path, addresses: &[String]) -> Resul
 /// Re-mount the freshly written partitions read-only and confirm the flash
 /// produced a bootable card. Cheap insurance against a silently truncated or
 /// mis-formatted write before the user walks the card to the device.
-fn verify_target(device: &Path, backup: &SourceBackup) -> Result<()> {
+fn verify_target(device: &Path, keys: &[NamedKey]) -> Result<()> {
     utils::info("Verifying flashed card...");
 
     let p3_path = get_partition_path(device, 3);
@@ -735,10 +745,7 @@ fn verify_target(device: &Path, backup: &SourceBackup) -> Result<()> {
     utils::unmount_partition(&p3_mount, &p3_path)?;
     keys_result?;
 
-    let addresses: Vec<String> = extract_named_keys(&backup.public_key_hashs)
-        .into_iter()
-        .map(|k| k.address)
-        .collect();
+    let addresses: Vec<String> = keys.iter().map(|k| k.address.clone()).collect();
     let p4_path = get_partition_path(device, 4);
     let p4_mount = utils::mount_partition(&p4_path, "f2fs", true)
         .context("failed to mount target data partition for verification")?;
@@ -751,18 +758,21 @@ fn verify_target(device: &Path, backup: &SourceBackup) -> Result<()> {
 }
 
 /// A named key entry from the wallet's `public_key_hashs` file
-struct NamedKey {
+pub(crate) struct NamedKey {
     alias: String,
     address: String,
 }
 
-/// Extract named tz4 key entries from the `public_key_hashs` JSON data
-fn extract_named_keys(public_key_hashs: &[u8]) -> Vec<NamedKey> {
-    let Ok(entries) = serde_json::from_slice::<Vec<serde_json::Value>>(public_key_hashs) else {
-        return Vec::new();
-    };
+/// Extract named tz4 key entries from the `public_key_hashs` JSON data.
+///
+/// A malformed `public_key_hashs` is an error, not an empty list: silently
+/// returning empty would skip watermark seeding and let verification pass
+/// vacuously, reporting a successful restore of a card the signer can't use.
+fn extract_named_keys(public_key_hashs: &[u8]) -> Result<Vec<NamedKey>> {
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(public_key_hashs)
+        .context("Failed to parse public_key_hashs as a JSON array")?;
 
-    entries
+    Ok(entries
         .iter()
         .filter_map(|e| {
             let name = e.get("name").and_then(|v| v.as_str())?;
@@ -776,16 +786,16 @@ fn extract_named_keys(public_key_hashs: &[u8]) -> Vec<NamedKey> {
                 None
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Extract tz4 addresses from the `public_key_hashs` JSON data
 #[cfg(test)]
-fn extract_tz4_addresses(public_key_hashs: &[u8]) -> Vec<String> {
-    extract_named_keys(public_key_hashs)
+fn extract_tz4_addresses(public_key_hashs: &[u8]) -> Result<Vec<String>> {
+    Ok(extract_named_keys(public_key_hashs)?
         .into_iter()
         .map(|k| k.address)
-        .collect()
+        .collect())
 }
 
 /// Map a key alias to a user-friendly label.
@@ -916,7 +926,7 @@ pub fn warn_network_mismatch(
 /// Automatically confirms when `yes` is `true`.
 pub fn confirm_restore_operation(
     target: &image::BlockDevice,
-    backup: &SourceBackup,
+    keys: &[NamedKey],
     chain_info: &crate::watermark::ChainInfo,
     yes: bool,
 ) -> Result<bool> {
@@ -929,8 +939,7 @@ pub fn confirm_restore_operation(
         format!("Size:   {}", target.size),
     ];
 
-    let keys = extract_named_keys(&backup.public_key_hashs);
-    for key in &keys {
+    for key in keys {
         let label = friendly_key_label(&key.alias);
         lines.push(format!("{label}: {}", key.address));
     }
@@ -1312,8 +1321,12 @@ pub fn run_single_reader_restore(
     let target = image::lookup_block_device(restore_from)
         .unwrap_or_else(|_| image::BlockDevice::from_path(restore_from));
 
+    // Derive the key list once; a malformed source aborts here rather than
+    // silently seeding no watermarks and passing a vacuous verification.
+    let named_keys = extract_named_keys(&backup.public_key_hashs)?;
+
     // Confirm before flashing
-    if !confirm_restore_operation(&target, &backup, job.chain_info, job.yes)? {
+    if !confirm_restore_operation(&target, &named_keys, job.chain_info, job.yes)? {
         utils::info(&format!("{} cancelled", uppercase_first(source.noun())));
         println!();
         return Ok(());
@@ -1324,12 +1337,18 @@ pub fn run_single_reader_restore(
     image::reread_partition_table(restore_from);
 
     create_and_format_partitions(restore_from, privilege)?;
-    write_backup_to_target(restore_from, &backup, job.chain_info, privilege)?;
+    write_backup_to_target(
+        restore_from,
+        &backup,
+        &named_keys,
+        job.chain_info,
+        privilege,
+    )?;
 
     image::write_flash_manifest(restore_from, job.metadata)
         .context("Failed to write flash manifest")?;
 
-    verify_target(restore_from, &backup)?;
+    verify_target(restore_from, &named_keys)?;
 
     print_restore_success(source.noun());
     Ok(())
@@ -1346,8 +1365,12 @@ pub fn run_dual_reader_restore(
     job: FlashJob<'_>,
     privilege: FlashPrivilege,
 ) -> Result<()> {
+    // Derive the key list once; a malformed source aborts here rather than
+    // silently seeding no watermarks and passing a vacuous verification.
+    let named_keys = extract_named_keys(&backup.public_key_hashs)?;
+
     // Confirm before flashing
-    if !confirm_restore_operation(target, backup, job.chain_info, job.yes)? {
+    if !confirm_restore_operation(target, &named_keys, job.chain_info, job.yes)? {
         utils::info(&format!("{} cancelled", uppercase_first(noun)));
         println!();
         return Ok(());
@@ -1359,12 +1382,12 @@ pub fn run_dual_reader_restore(
 
     // Step 2: Create partitions and write backup
     create_and_format_partitions(&target.path, privilege)?;
-    write_backup_to_target(&target.path, backup, job.chain_info, privilege)?;
+    write_backup_to_target(&target.path, backup, &named_keys, job.chain_info, privilege)?;
 
     image::write_flash_manifest(&target.path, job.metadata)
         .context("Failed to write flash manifest")?;
 
-    verify_target(&target.path, backup)?;
+    verify_target(&target.path, &named_keys)?;
 
     print_restore_success(noun);
     Ok(())
@@ -1666,16 +1689,23 @@ mod tests {
         ]))
         .unwrap();
 
-        let addresses = extract_tz4_addresses(&json);
+        let addresses = extract_tz4_addresses(&json).unwrap();
         assert_eq!(addresses.len(), 2);
         assert!(addresses[0].starts_with("tz4"));
         assert!(addresses[1].starts_with("tz4"));
     }
 
     #[test]
-    fn test_extract_tz4_addresses_empty() {
-        let addresses = extract_tz4_addresses(b"invalid json");
-        assert!(addresses.is_empty());
+    fn extract_named_keys_rejects_malformed_input() {
+        // A non-empty but unparseable blob must error, not silently yield zero
+        // keys (which would skip watermark seeding and pass a vacuous verify).
+        assert!(extract_named_keys(b"invalid json").is_err());
+    }
+
+    #[test]
+    fn extract_named_keys_allows_valid_but_keyless() {
+        // A valid, genuinely keyless array is not an error.
+        assert!(extract_named_keys(b"[]").unwrap().is_empty());
     }
 
     #[test]

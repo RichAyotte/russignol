@@ -44,6 +44,12 @@ pub const SIGNER_URI: &str = "tcp://169.254.1.1:7732";
 /// Network interface name for Russignol
 pub const INTERFACE_NAME: &str = "russignol";
 
+/// Process exit code for a command that ran successfully but found the system
+/// unhealthy or incompletely acted upon (e.g. `status` on an unreachable node,
+/// `purge` leaving material behind). Distinct from a hard error so monitoring
+/// scripts can gate on `$?` without confusing it with a crash.
+pub const EXIT_UNHEALTHY: i32 = 2;
+
 // ============================================================================
 // Key Aliases
 // ============================================================================

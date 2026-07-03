@@ -2027,19 +2027,23 @@ fn flash_image_linux(
 pub(crate) fn reread_partition_table(device: &Path) {
     #[cfg(target_os = "linux")]
     {
-        // Try partprobe first (from parted package)
-        let _ = Command::new("partprobe").arg(device).output();
+        let dev = device.to_string_lossy();
 
-        // Also try blockdev --rereadpt (from util-linux)
-        let _ = Command::new("blockdev")
-            .args(["--rereadpt"])
-            .arg(device)
-            .output();
-
-        // Give udev a moment to settle and create device nodes
-        let _ = Command::new("udevadm")
-            .args(["settle", "--timeout=3"])
-            .output();
+        // partprobe (parted) and blockdev --rereadpt (util-linux) can each
+        // legitimately return non-zero (e.g. EBUSY) yet the other still
+        // refreshes the table, so these are best-effort — but a failure must
+        // surface rather than vanish, since a stale table corrupts later reads.
+        utils::run_best_effort("partprobe", &[&dev], "Partition table re-read (partprobe)");
+        utils::run_best_effort(
+            "blockdev",
+            &["--rereadpt", &dev],
+            "Partition table re-read (blockdev)",
+        );
+        utils::run_best_effort(
+            "udevadm",
+            &["settle", "--timeout=3"],
+            "Waiting for udev to settle",
+        );
     }
 
     #[cfg(target_os = "macos")]

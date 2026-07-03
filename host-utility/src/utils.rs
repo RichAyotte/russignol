@@ -60,6 +60,45 @@ pub fn info(message: &str) {
     println!("  • {message}");
 }
 
+/// Surface a discarded fallible result as a warning instead of dropping it.
+///
+/// For best-effort cleanup where the failure is not fatal but must not vanish.
+/// Returns whether a warning was emitted so callers can react and tests can
+/// observe the branch taken.
+pub fn warn_if_err<T, E: std::fmt::Display>(res: Result<T, E>, context: &str) -> bool {
+    match res {
+        Ok(_) => false,
+        Err(e) => {
+            warning(&format!("{context}: {e}"));
+            true
+        }
+    }
+}
+
+/// Run a command as best-effort: warn (but never propagate) on a spawn failure
+/// or a non-zero exit, surfacing stderr so the failure is visible.
+///
+/// For side-effecting commands (sync, partition re-read, service reload) whose
+/// failure should be reported but should not abort the caller.
+pub fn run_best_effort(program: &str, args: &[&str], context: &str) {
+    match Command::new(program).args(args).output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let trimmed = stderr.trim();
+            if trimmed.is_empty() {
+                warning(&format!(
+                    "{context}: {program} exited with {}",
+                    output.status
+                ));
+            } else {
+                warning(&format!("{context}: {trimmed}"));
+            }
+        }
+        Err(e) => warning(&format!("{context}: failed to run {program}: {e}")),
+    }
+}
+
 /// Create orange-themed render config for inquire prompts
 ///
 /// Uses 2-space indent prefix to align with `utils::info/success` output style.
@@ -712,6 +751,12 @@ pub fn format_with_separators(num: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warn_if_err_reports_only_on_error() {
+        assert!(!warn_if_err(Ok::<_, String>(()), "ok path"));
+        assert!(warn_if_err(Err::<(), _>("boom"), "err path"));
+    }
 
     #[test]
     fn test_format_with_separators() {

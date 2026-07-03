@@ -69,6 +69,20 @@ pub fn check_remote_signer(config: &crate::config::RussignolConfig) -> bool {
     }
 }
 
+/// Check whether the connected remote signer holds a specific key.
+///
+/// Round-trips to the device via [`discover_remote_keys`], so the `Err` case
+/// (signer unreachable) is distinct from `Ok(false)` (signer reachable but
+/// does not hold `expected_hash`). Callers that need to distinguish "wrong or
+/// absent device" from "right device, wrong key" rely on that distinction.
+pub fn signer_holds_key(
+    expected_hash: &str,
+    config: &crate::config::RussignolConfig,
+) -> Result<bool> {
+    let keys = discover_remote_keys(config)?;
+    Ok(keys.iter().any(|k| k == expected_hash))
+}
+
 /// Wait for the remote signer to become accessible, showing a spinner while waiting
 ///
 /// This polls `check_remote_signer` until it succeeds (signer accessible with ≥2 keys),
@@ -200,15 +214,30 @@ pub fn get_alias_for_address(
     Ok(address.to_string())
 }
 
-/// Forget (remove) a key alias from octez-client
+/// octez-client stderr fragment emitted when the alias is already absent.
+const NO_SUCH_ALIAS: &str = "no public key hash alias named";
+
+/// Decide whether a `forget address` invocation left the alias gone.
 ///
-/// Returns the command output for callers that need to inspect results.
-/// Use `let _ = forget_key_alias(...)` to ignore the result.
-pub fn forget_key_alias(
-    alias: &str,
-    config: &crate::config::RussignolConfig,
-) -> Result<std::process::Output> {
-    run_octez_client_command(&["forget", "address", alias, "--force"], config)
+/// A non-zero exit whose stderr only says the alias was already absent is a
+/// success for our purposes (the desired end state — no such alias — holds).
+fn forget_alias_ok(status_success: bool, stderr: &str) -> bool {
+    status_success || stderr.contains(NO_SUCH_ALIAS)
+}
+
+/// Forget (remove) a key alias from octez-client.
+///
+/// Errors when the command fails for any reason other than the alias already
+/// being absent, so a swallowed failure can no longer masquerade as a clean
+/// removal.
+pub fn forget_key_alias(alias: &str, config: &crate::config::RussignolConfig) -> Result<()> {
+    let output = run_octez_client_command(&["forget", "address", alias, "--force"], config)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if forget_alias_ok(output.status.success(), &stderr) {
+        Ok(())
+    } else {
+        anyhow::bail!("Failed to forget alias '{alias}': {}", stderr.trim())
+    }
 }
 
 /// Rename a key alias locally without contacting the remote signer
@@ -291,4 +320,29 @@ pub fn rename_alias_locally(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forget_alias_ok_treats_success_and_absent_as_done() {
+        // Clean success.
+        assert!(forget_alias_ok(true, ""));
+        // Non-zero exit but the alias was simply already gone.
+        assert!(forget_alias_ok(
+            false,
+            "Error:\n  no public key hash alias named russignol-consensus-pending"
+        ));
+    }
+
+    #[test]
+    fn forget_alias_ok_rejects_a_genuine_failure() {
+        // Non-zero exit with an unrelated error must not read as success.
+        assert!(!forget_alias_ok(
+            false,
+            "Error: could not access wallet directory"
+        ));
+    }
 }

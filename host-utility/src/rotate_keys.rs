@@ -996,9 +996,9 @@ fn wait_for_device(expectation: &DeviceExpectation, config: &RussignolConfig) ->
                 DeviceExpectation::Old {
                     expected_consensus_hash,
                 } => {
-                    // For OLD device, query the existing russignol-consensus alias
-                    // This contacts the signer - succeeds only if OLD device is connected
-                    if signer_has_expected_consensus_key(config) {
+                    // Confirm the attached signer actually holds the OLD
+                    // consensus key, not merely that the local alias exists.
+                    if signer_has_expected_consensus_key(expected_consensus_hash, config) {
                         spinner.finish_and_clear();
                         success("Device connected and signer responding");
                         return Ok(());
@@ -1029,15 +1029,14 @@ fn wait_for_device(expectation: &DeviceExpectation, config: &RussignolConfig) ->
     anyhow::bail!("Could not connect to device at {signer_ip}. Please check USB connection.");
 }
 
-/// Check if the connected signer has the key for the existing consensus alias
+/// Check whether the connected signer actually holds the expected consensus key.
 ///
-/// Queries the existing `russignol-consensus` alias. This triggers a signer
-/// query - if the signer has the key, it responds with the public key.
-/// If not (wrong device), the query fails.
-fn signer_has_expected_consensus_key(config: &RussignolConfig) -> bool {
-    // Query the existing alias - this will contact the signer
-    run_octez_client_command(&["show", "address", CONSENSUS_KEY_ALIAS], config)
-        .is_ok_and(|output| output.status.success())
+/// Round-trips to the device via the remote signer (a `show address` on the
+/// local alias would succeed regardless of which device is attached, so it
+/// cannot tell the OLD device from a wrong one). A signer that is unreachable
+/// or holds a different key yields `false`, so the wrong-device guard fires.
+fn signer_has_expected_consensus_key(expected_hash: &str, config: &RussignolConfig) -> bool {
+    keys::signer_holds_key(expected_hash, config).unwrap_or(false)
 }
 
 /// Discover key hashes from the remote signer
@@ -1542,25 +1541,57 @@ fn promote_aliases_with_backup(config: &RussignolConfig) -> Result<()> {
     Ok(())
 }
 
-/// Verify the baker is signing with the new key
-fn verify_baker_signing(_config: &RussignolConfig) -> bool {
+/// Fail-closed gate standing in for "the baker is signing with the new key."
+///
+/// The host cannot observe signing directly — the remote-signer protocol
+/// exposes no signing-activity query — so this requires all three observable
+/// signals to agree: the baker process is alive, the attached signer holds the
+/// new consensus key, and that key is the active consensus key on-chain. Any
+/// missing or disagreeing signal is `false`, because the caller deletes the
+/// `-old` rollback aliases only on `true`.
+fn signing_verified(
+    process_alive: bool,
+    signer_has_new_key: bool,
+    active_consensus_key: Option<&str>,
+    expected_consensus_hash: &str,
+) -> bool {
+    process_alive && signer_has_new_key && active_consensus_key == Some(expected_consensus_hash)
+}
+
+/// Verify the baker is signing with the new key (see [`signing_verified`]).
+fn verify_baker_signing(config: &RussignolConfig) -> bool {
     let spinner = create_spinner("Step 6/7: Verifying baker is signing...");
 
-    // Wait up to 60 seconds for signing activity
-    for attempt in 1..=12 {
-        log::debug!("Checking for signing activity (attempt {attempt}/12)");
+    // After promotion the current consensus alias holds the new key.
+    let expected = match keys::get_key_hash(CONSENSUS_KEY_ALIAS, config) {
+        Ok(hash) => hash,
+        Err(e) => {
+            spinner.finish_and_clear();
+            warning(&format!("Could not read the new consensus key: {e:#}"));
+            return false;
+        }
+    };
 
-        // Check if baker process is running
-        let ps_result = run_command("pgrep", &["-f", "octez-baker"]);
-        if let Ok(output) = ps_result
-            && output.status.success()
-        {
-            // Baker is running, assume OK for now
-            // A more thorough check would examine baker logs
-            if attempt >= 3 {
-                spinner.finish_and_clear();
-                return true;
-            }
+    // Wait up to 60 seconds for all signals to line up.
+    for attempt in 1..=12 {
+        log::debug!("Checking signing signals (attempt {attempt}/12)");
+
+        let process_alive =
+            run_command("pgrep", &["-f", "octez-baker"]).is_ok_and(|o| o.status.success());
+        let signer_has_new_key = keys::signer_holds_key(&expected, config).unwrap_or(false);
+        let active_key = blockchain::find_delegate_address(config)
+            .ok()
+            .flatten()
+            .and_then(|delegate| blockchain::get_active_consensus_key(&delegate, config).ok());
+
+        if signing_verified(
+            process_alive,
+            signer_has_new_key,
+            active_key.as_deref(),
+            &expected,
+        ) {
+            spinner.finish_and_clear();
+            return true;
         }
 
         sleep(Duration::from_secs(5));
@@ -2338,4 +2369,28 @@ fn display_key_details(delegate: &str, config: &RussignolConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EXPECTED: &str = "tz4HVR6aty9KwsQFHh81C1G7gBdhxT8kuHtm";
+
+    #[test]
+    fn signing_verified_requires_every_signal() {
+        assert!(signing_verified(true, true, Some(EXPECTED), EXPECTED));
+    }
+
+    #[test]
+    fn signing_verified_fails_closed_on_any_missing_signal() {
+        // Baker process down.
+        assert!(!signing_verified(false, true, Some(EXPECTED), EXPECTED));
+        // Signer does not hold the new key (wrong/absent device).
+        assert!(!signing_verified(true, false, Some(EXPECTED), EXPECTED));
+        // On-chain active key could not be determined (node unreachable).
+        assert!(!signing_verified(true, true, None, EXPECTED));
+        // On-chain active key is some other key.
+        assert!(!signing_verified(true, true, Some("tz4other"), EXPECTED));
+    }
 }
