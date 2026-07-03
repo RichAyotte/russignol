@@ -420,16 +420,10 @@ let sk = blst::min_pk::SecretKey::from_bytes(&reversed_bytes)?;
 
 ### Out-of-Range Keys
 
-Octez rejects keys whose **little-endian value** is >= the curve order (`Bls12_381_signature.sk_of_bytes_exn` raises). This implementation instead reduces such keys modulo the curve order and logs a warning:
+Keys whose **little-endian value** is >= the curve order are rejected, matching octez (`Bls12_381_signature.sk_of_bytes_exn` raises):
 
-```rust
-const CURVE_ORDER: &str =
-    "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001";
-
-// Read as LE, reduce mod r, write as BE
-let key_int = BigUint::from_bytes_le(bytes);
-let reduced = key_int % curve_order;
-let sk_bytes = reduced.to_bytes_be();
+```text
+r = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001
 ```
 
 Note: because keys are little-endian, the most significant byte is the *last* stored byte — a key file beginning `0xb5...` is not necessarily out of range.
@@ -553,7 +547,7 @@ b0 8f ... a0 f7 → 20 bytes PKH
 - [ ] Decode **nested BLS PKH** (3 levels: outer tag, inner tag, version)
 - [ ] Use **correct BLS ciphersuites** (distinct DSTs for sign and PoP)
 - [ ] **Reverse secret key bytes** (LE to BE)
-- [ ] Decide **out-of-range key** handling (octez rejects; this implementation reduces mod r)
+- [ ] Reject **out-of-range keys** (little-endian value >= curve order, as octez does)
 - [ ] Return **No_authentication** (tag 0x00) when auth disabled
 
 ### Client Implementation

@@ -166,7 +166,7 @@ The device runs at stock clock speeds for maximum reliability.
 - Constant-time operations (BLST library guarantee)
 - Deterministic nonce generation
 - Proof of Possession support
-- Out-of-range keys are reduced to the valid range (logged as a warning); note this diverges from octez, which rejects such keys outright
+- Out-of-range secret keys are rejected on load, matching octez
 
 ### 4.2 Key Encryption
 
@@ -338,7 +338,7 @@ The following security measures are in place:
 1. **PIN Rate Limiting**: 5 failed attempts → lockout requiring power cycle
 2. **PIN Minimum Length**: Enforced 5-digit minimum (~17 bits entropy)
 3. **Large Gap Detection**: Warns on watermark gaps >4 cycles
-4. **Out-of-Range Key Reduction Logging**: Modular reductions of out-of-range keys emit a warning
+4. **Strict Key Validation**: Secret keys >= the BLS12-381 curve order are rejected on load, matching octez
 
 ### 13.2 Suggested Enhancements
 

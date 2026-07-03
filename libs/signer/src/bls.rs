@@ -16,17 +16,13 @@
 //! r = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001
 //! ```
 //!
-//! BLST rejects secret keys >= r with `BLST_BAD_ENCODING`. Octez also rejects
-//! such keys (`Bls12_381_signature.sk_of_bytes_exn` raises on
-//! `Fr.Not_in_field`). This implementation instead reduces them modulo r and
-//! logs a warning, so a key file octez would refuse still loads here; the
-//! reduced key is in the same equivalence class modulo r.
+//! Keys >= r are rejected, matching octez
+//! (`Bls12_381_signature.sk_of_bytes_exn` raises on `Fr.Not_in_field`).
 
 use crate::base58check;
 use blake2::digest::consts::U20;
 use blake2::{Blake2b, Digest};
 use hmac::{Hmac, KeyInit, Mac};
-use num_bigint::BigUint;
 use sha2::Sha256;
 use thiserror::Error;
 
@@ -114,25 +110,13 @@ impl SecretKey {
     ///
     /// Corresponds to: `src/lib_crypto/bls.ml:158` - `of_bytes_opt`
     ///
-    /// # Out-of-Range Keys: Modular Reduction
-    ///
     /// Bytes are interpreted as a little-endian scalar (reversed before BLST,
-    /// which expects big-endian). If BLST rejects the key as >= the curve
-    /// order (`BLST_BAD_ENCODING`), it is reduced modulo r and a warning is
-    /// logged. Octez rejects such keys outright
-    /// (`Bls12_381_signature.sk_of_bytes_exn`), so this lenience accepts key
-    /// files octez would refuse.
-    ///
-    /// **Security note:** Modular reduction is cryptographically safe as it preserves
-    /// the equivalence class of the secret key in the scalar field.
+    /// which expects big-endian). Keys >= the curve order r are rejected,
+    /// matching octez (`Bls12_381_signature.sk_of_bytes_exn`).
     ///
     /// # Errors
     ///
     /// Returns an error if the byte slice length is not 32 or the key is invalid.
-    ///
-    /// # Panics
-    ///
-    /// Cannot panic: the BLS12-381 curve order is a hardcoded valid constant.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != Self::SIZE {
             return Err(Error::InvalidKeyLength {
@@ -146,47 +130,8 @@ impl SecretKey {
         let mut reversed_bytes = bytes.to_vec();
         reversed_bytes.reverse();
 
-        // Try strict validation first
         match blst::min_pk::SecretKey::from_bytes(&reversed_bytes) {
             Ok(sk) => Ok(Self { sk }),
-            Err(blst::BLST_ERROR::BLST_BAD_ENCODING) => {
-                // Key is out of range - reduce it modulo the curve order
-                // (octez rejects such keys; see the from_bytes doc comment)
-                log::warn!(
-                    "BLS secret key out of range (>= curve order r), applying modular reduction for OCaml compatibility"
-                );
-
-                // BLS12-381 scalar field order (r)
-                // This is the order of the scalar field for BLS12-381
-                let r = BigUint::parse_bytes(
-                    b"73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001",
-                    16,
-                )
-                .expect("Failed to parse curve order");
-
-                // Convert bytes to BigUint (little-endian per BLS12-381 spec)
-                let key_int = BigUint::from_bytes_le(bytes);
-
-                // Reduce modulo r
-                let reduced_int = key_int % &r;
-
-                // Convert back to bytes
-                // BLST expects big-endian bytes, but the value was little-endian
-                let mut reduced_bytes = reduced_int.to_bytes_be();
-
-                // Pad with leading zeros if necessary (big-endian padding for BLST)
-                if reduced_bytes.len() < Self::SIZE {
-                    let mut padded = vec![0u8; Self::SIZE - reduced_bytes.len()];
-                    padded.extend_from_slice(&reduced_bytes);
-                    reduced_bytes = padded;
-                }
-
-                // Now it should be in range
-                let sk = blst::min_pk::SecretKey::from_bytes(&reduced_bytes)
-                    .map_err(|e| Error::InvalidSecretKey(format!("After reduction: {e:?}")))?;
-
-                Ok(Self { sk })
-            }
             Err(e) => Err(Error::InvalidSecretKey(format!("{e:?}"))),
         }
     }
@@ -487,12 +432,16 @@ pub fn pop_verify(pk: &PublicKey, proof: &Signature, msg: Option<&[u8]>) -> bool
 /// Generate a new keypair from seed
 /// Corresponds to: `src/lib_crypto/bls.ml:359-371` - `generate_key`
 ///
+/// The seed is IKM for RFC BLS `KeyGen` (`blst_keygen`), matching octez's
+/// `Bls12_381_signature.generate_sk` — not the scalar itself, so any 32-byte
+/// seed yields a valid in-range key.
+///
 /// # Arguments
 /// * `seed` - Optional 32-byte seed. If None, uses random bytes.
 ///
 /// # Errors
 ///
-/// Returns an error if random generation fails or the seed produces an invalid key.
+/// Returns an error if random generation or key derivation fails.
 pub fn generate_key(seed: Option<&[u8; 32]>) -> Result<(PublicKeyHash, PublicKey, SecretKey)> {
     let seed_bytes = if let Some(s) = seed {
         *s
@@ -504,7 +453,9 @@ pub fn generate_key(seed: Option<&[u8; 32]>) -> Result<(PublicKeyHash, PublicKey
         seed
     };
 
-    let sk = SecretKey::from_bytes(&seed_bytes)?;
+    let sk = blst::min_pk::SecretKey::key_gen(&seed_bytes, &[])
+        .map_err(|e| Error::KeyGeneration(format!("{e:?}")))?;
+    let sk = SecretKey { sk };
     let pk = sk.to_public_key();
     let pkh = pk.hash();
 
@@ -656,8 +607,7 @@ mod tests {
     ///
     /// The stored bytes begin 0xb5 — above 0x73, the first byte of the scalar
     /// field order r — but keys are little-endian, so the value is in range
-    /// (its most significant byte is the last byte, 0x46) and loading it must
-    /// not trigger modular reduction.
+    /// (its most significant byte is the last byte, 0x46) and must load.
     #[test]
     fn test_ocaml_vector_key_derivation() {
         let vector_key = "BLsk2snGqdSb7qBDhKbc62AxbZXJycDvA5QmeYYhB7Nb3wFuMMbq9x";
@@ -682,6 +632,51 @@ mod tests {
             pkh.to_b58check(),
             expected_pkh,
             "Public key hash must match OCaml derivation"
+        );
+    }
+
+    /// The seed is IKM for RFC BLS `KeyGen` (`blst_keygen`), not the scalar
+    /// itself, so a seed whose little-endian value exceeds r must still
+    /// produce a valid key, deterministically.
+    #[test]
+    fn test_generate_key_from_out_of_range_seed() {
+        let seed = [0xffu8; 32];
+        let (pkh1, _pk1, sk1) = generate_key(Some(&seed)).expect("seed is IKM, not a scalar");
+        let (pkh2, _pk2, sk2) = generate_key(Some(&seed)).unwrap();
+        assert_eq!(pkh1.to_b58check(), pkh2.to_b58check());
+        assert_eq!(sk1.to_bytes(), sk2.to_bytes());
+    }
+
+    /// Out-of-range secret keys (little-endian value >= r) must be rejected,
+    /// matching octez (`Bls12_381_signature.sk_of_bytes_exn` raises on
+    /// `Fr.Not_in_field`).
+    #[test]
+    fn test_out_of_range_key_rejected() {
+        // 2^256 - 1: far above r regardless of byte order
+        let max_value = [0xffu8; 32];
+        assert!(
+            SecretKey::from_bytes(&max_value).is_err(),
+            "key >= r must be rejected"
+        );
+
+        // r itself (little-endian): the smallest out-of-range value
+        let mut r_le =
+            hex::decode("73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001")
+                .unwrap();
+        r_le.reverse();
+        assert!(
+            SecretKey::from_bytes(&r_le).is_err(),
+            "key == r must be rejected"
+        );
+
+        // r - 1 (little-endian): the largest in-range value
+        let mut r_minus_1_le =
+            hex::decode("73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000000")
+                .unwrap();
+        r_minus_1_le.reverse();
+        assert!(
+            SecretKey::from_bytes(&r_minus_1_le).is_ok(),
+            "key == r - 1 must load"
         );
     }
 
