@@ -724,6 +724,37 @@ fn card_ids_match(source: Option<&str>, target: Option<&str>) -> bool {
     matches!((source, target), (Some(s), Some(t)) if s == t)
 }
 
+/// Which `secret_keys.enc*` formats the source carries, read from the
+/// filenames alone rather than inferred from firmware age.
+fn key_format_summary(pin_blobs: &[(String, Vec<u8>)]) -> &'static str {
+    let has_v1 = pin_blobs.iter().any(|(n, _)| n == "secret_keys.enc");
+    let has_v2 = pin_blobs.iter().any(|(n, _)| n == "secret_keys.enc.v2");
+    match (has_v1, has_v2) {
+        (true, true) => "v1 + v2 (migration pending)",
+        (false, true) => "v2",
+        (true, false) => "v1 (legacy)",
+        (false, false) => "unrecognized",
+    }
+}
+
+/// Print a short provenance summary before proceeding: which key-blob format
+/// the source carries, and a warning when it has no flash manifest — meaning
+/// it was not produced by this tool (e.g. written with `dd`), which also
+/// degrades the same-card swap guard.
+fn describe_source(backup: &SourceBackup) {
+    utils::info(&format!(
+        "Source key format: {}",
+        key_format_summary(&backup.pin_blobs)
+    ));
+    if backup.source_card_id.is_none() {
+        utils::warning(
+            "Source card has no flash manifest: it was not flashed by this tool \
+             (e.g. written with dd). Keys will still be restored, but same-card \
+             swap detection is degraded.",
+        );
+    }
+}
+
 /// Warn the user if the source card's network differs from or cannot be
 /// verified against the node's network.
 ///
@@ -735,6 +766,7 @@ pub fn warn_network_mismatch(
     chain_info: &crate::watermark::ChainInfo,
     yes: bool,
 ) -> Result<bool> {
+    describe_source(backup);
     match backup.source_chain_id.as_deref() {
         Some(source_id) if source_id == chain_info.id => return Ok(true),
         Some(source_id) => {
@@ -757,9 +789,9 @@ pub fn warn_network_mismatch(
                 "Could not determine the source card's network.\n  \
                  Node: {} ({})\n  \
                  \n  \
-                 The source card has no chain info (older firmware). The restored\n  \
-                 device will use the node's network. Make sure your --endpoint\n  \
-                 points to the correct network.",
+                 The source card has no chain info, so its network cannot be\n  \
+                 checked. The restored device will use the node's network. Make\n  \
+                 sure your --endpoint points to the correct network.",
                 chain_info.name, chain_info.id,
             ));
         }
@@ -1263,6 +1295,26 @@ mod tests {
         assert_eq!(backup.source_card_id, None);
         assert_eq!(backup.source_chain_id, None);
         assert_eq!(backup.source_chain_name, None);
+    }
+
+    #[test]
+    fn key_format_summary_classifies_by_filename() {
+        assert_eq!(
+            key_format_summary(&[("secret_keys.enc.v2".into(), vec![1])]),
+            "v2"
+        );
+        assert_eq!(
+            key_format_summary(&[("secret_keys.enc".into(), vec![1])]),
+            "v1 (legacy)"
+        );
+        assert_eq!(
+            key_format_summary(&[
+                ("secret_keys.enc".into(), vec![1]),
+                ("secret_keys.enc.v2".into(), vec![1]),
+            ]),
+            "v1 + v2 (migration pending)"
+        );
+        assert_eq!(key_format_summary(&[]), "unrecognized");
     }
 
     #[test]
