@@ -1,6 +1,6 @@
 # Device
 
-- **SSH**: `sshpass -p russignol ssh russignol@russignol`
+- **SSH**: `sshpass -p russignol ssh russignol@russignol` (dev images only — hardened builds have no SSH)
 - **Hardware**: Raspberry Pi Zero 2W (BCM2710A1 / Cortex-A53, ARMv8.0-A)
 - **Display**: Waveshare 2.13" Touch e-Paper HAT V4 (SPI: SSD1680Z8, I2C: GT1151Q)
 - **Workload**: ~3 BLS12-381 signatures (~6ms each) every ~6 seconds; idle 99.9% of the time
@@ -14,13 +14,17 @@ cargo xtask test              # Run tests (--no-fuzz skips proptest fuzzing)
 cargo xtask rpi-signer        # Build RPi signer (--dev for debug build)
 cargo xtask host-utility      # Build host utility
 cargo xtask image             # Build SD card image
-cargo xtask release           # Full release build (bumps version, builds, tags)
-cargo xtask release --github  # Release and publish to GitHub
+cargo xtask release stable    # Full release build (bumps version, builds, tags); channel is beta|stable
+cargo xtask release stable --github  # Release and publish to GitHub
 cargo xtask publish --github  # Publish existing build to GitHub (no rebuild)
 cargo xtask publish --website # Publish website to Cloudflare Pages
 cargo xtask deploy            # Build, deploy, and restart signer on device
 cargo xtask deploy --dev      # Build and deploy debug binary
 cargo xtask deploy --skip-build  # Deploy previously built binary
+cargo xtask coverage          # Code coverage report (--open, --lcov)
+cargo xtask watermark-test    # Watermark E2E tests on a physical device
+cargo xtask upgrade           # Upgrade dependencies
+cargo xtask deps              # Check for unused dependencies
 cargo xtask validate          # Validate build environment
 cargo xtask clean             # Clean build artifacts
 cargo xtask config buildroot nconfig   # Configure buildroot (ncurses menu)

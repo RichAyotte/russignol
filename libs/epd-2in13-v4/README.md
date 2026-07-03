@@ -6,18 +6,19 @@ This driver is built on top of the `embedded-hal` crate and provides a high-leve
 
 ## Features
 
-- Drawing graphics and text on the display.
+- Drawing graphics and text on the display via `embedded-graphics`.
 - Handling touch input events.
-- Partial and full screen updates.
-- Low-level access to the display controller.
+- Partial and full screen updates, selected automatically (full-refresh cadence configurable via `max_partial_updates`).
 
 ## Installation
 
-Add the following to your `Cargo.toml` file:
+This crate is not published on crates.io; it lives in the Russignol workspace. Add it as a path or git dependency:
 
 ```toml
 [dependencies]
-epd-2in13-v4 = "0.1.2"
+epd-2in13-v4 = { path = "../libs/epd-2in13-v4" }
+# or
+epd-2in13-v4 = { git = "https://github.com/RichAyotte/russignol" }
 ```
 
 ## Usage
@@ -25,17 +26,16 @@ epd-2in13-v4 = "0.1.2"
 Here's a simple example of how to use the library to initialize the display, draw some text, and handle touch input:
 
 ```rust
-use epd_2in13_v4::{Device, DeviceConfig};
 use embedded_graphics::{
     mono_font::{MonoTextStyleBuilder, ascii::FONT_10X20},
     pixelcolor::BinaryColor,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
-    text::{Alignment, Baseline, Text, TextStyleBuilder},
+    text::Text,
 };
+use epd_2in13_v4::{Device, device};
 
 fn main() -> epd_2in13_v4::EpdResult<()> {
-    let (mut device, mut touch_events) = Device::new(DeviceConfig::default())?;
+    let (mut device, touch_events) = Device::new(device::Config::default())?;
 
     device.display.clear(BinaryColor::On)?;
 
@@ -49,10 +49,10 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
 
     device.display.update()?;
 
-    println!("Application started. Touch the screen to draw.");
+    println!("Application started. Touch the screen to print coordinates.");
 
-    for touch in touch_events {
-        println!("Touch at: {:?}", touch);
+    for touch in touch_events.iter().take(5) {
+        println!("Touch at: {touch:?}");
     }
 
     device.sleep()?;

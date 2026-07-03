@@ -125,9 +125,11 @@ sudo lxc-attach -n <container-name> -- \
 ```
 
 `open` means the data path works end to end. `closed` with the host-side
-check passing usually points back to the device — the PIN may have timed
-out and require re-entry. If `octez-client` is installed in the container,
-the protocol-level check is:
+check passing points to the NAT rules (Step 3) or missing FORWARD accepts —
+`sudo iptables -t nat -L PREROUTING -n -v` shows whether packets match the
+DNAT rule. If the host-side check also fails, the device has likely
+rebooted and needs its PIN re-entered. If `octez-client` is installed in
+the container, the protocol-level check is:
 
 ```sh
 sudo lxc-attach -n <container-name> -- \

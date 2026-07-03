@@ -2,7 +2,7 @@
 
 High-performance BLS12-381 signer for Tezos, optimized for **Raspberry Pi Zero 2W** (ARM Cortex-A53).
 
-This is a minimal, lightweight port of the Tezos `russignol-signer` from OCaml to Rust, focusing exclusively on BLS12-381 signatures with Tenderbake consensus support.
+This is a minimal, lightweight port of the Tezos `octez-signer` from OCaml to Rust, focusing exclusively on BLS12-381 signatures with Tenderbake consensus support.
 
 ## Documentation
 
@@ -11,14 +11,13 @@ This is a minimal, lightweight port of the Tezos `russignol-signer` from OCaml t
 🔧 **[DEVELOPMENT.md](DEVELOPMENT.md)** - Development guide and testing
 📋 **[PROTOCOL_SPECIFICATION.md](PROTOCOL_SPECIFICATION.md)** - Wire protocol details
 
-## TCP Signer Server ⭐ NEW
+## TCP Signer Server
 
-Full TCP server implementation compatible with OCaml octez-client protocol:
+Full TCP server implementation compatible with the OCaml octez-client protocol:
 
 ```bash
-# Production: Launch with CLI (loads all your keys)
-russignol-signer gen keys my_baker --sig bls
-russignol-signer launch socket signer \
+# Production: launch with the CLI (loads keys from an OCaml-format wallet directory)
+russignol-signer-lib --base-dir ~/.tezos-signer launch socket signer \
   --address 127.0.0.1 \
   --port 7732 \
   --magic-bytes 0x11,0x12,0x13 \
@@ -32,43 +31,38 @@ cargo run --example tcp_client_test
 ```
 
 **Features:**
-- ✅ Production-ready CLI: `russignol-signer launch socket signer`
-- ✅ All request types (Sign, PublicKey, KnownKeys, etc.)
-- ✅ High watermark protection (prevents double-signing)
+- ✅ CLI: `russignol-signer-lib launch socket signer`
+- ✅ All request types (Sign, PublicKey, KnownKeys, etc.; KnownKeys and proof-of-possession require `--allow-list-known-keys` / `--allow-to-prove-possession`)
+- ✅ High watermark protection (prevents double-signing; watermarks must be initialized before the first signature)
 - ✅ Magic byte filtering (Tenderbake consensus)
-- ✅ Async I/O with Tokio (concurrent connections)
+- ✅ Synchronous TCP server, one thread per connection (default limit: 4 concurrent connections)
 
 See **[PROTOCOL_SPECIFICATION.md](PROTOCOL_SPECIFICATION.md)** for protocol details.
 
 ## Features
 
 - **BLS12-381 Only**: Focused implementation for modern Tezos consensus
-- **Tenderbake Magic Bytes**: Only signs blocks (0x11), preattestations (0x12), and attestations (0x13)
+- **Tenderbake Magic Bytes**: Filter that only signs blocks (0x11), preattestations (0x12), and attestations (0x13)
 - **ARM Cortex-A53 Optimized**: NEON SIMD acceleration, cache-aligned memory access
 - **Minimal Binary Size**: Aggressive LTO and size optimizations
 - **Low Latency**: Stack-allocated buffers, minimal heap allocations
 - **Constant-Time**: Side-channel resistant cryptographic operations
-- **1:1 OCaml Port**: Direct mapping from OCaml Tezos signer
+- **1:1 OCaml Port**: Direct mapping from the OCaml Tezos signer
 
 ## OCaml Compatibility
 
-This implementation is fully compatible with the OCaml `russignol-signer`, including:
+This implementation is compatible with the OCaml `octez-signer`:
 
-- ✅ **Key file format**: Reads/writes same three files (`public_key_hashs`, `public_keys`, `secret_keys`)
-- ✅ **High watermark format**: Uses same three files (`block_high_watermarks`, `attestation_high_watermarks`, `preattestation_high_watermarks`)
-- ✅ **TCP protocol**: Binary-compatible with `octez-client` remote signer protocol
+- ✅ **Key file format**: Reads the same three files (`public_key_hashs`, `public_keys`, `secret_keys`); writes only the two public files — secret keys are never written to disk by this library
+- ✅ **TCP protocol**: Binary-compatible with the `octez-client` remote signer protocol
 - ✅ **Base58check encoding**: Identical encoding for keys, signatures, and hashes
+- ⚠️ **High watermark storage**: Rust-specific format — per-key directories of 40-byte binary files (see [DEVELOPMENT.md](DEVELOPMENT.md)); not shared with OCaml watermark files
 
-### Important: Out-of-Range Secret Keys
+### Secret Key Byte Order and Out-of-Range Keys
 
-The BLST library strictly validates that secret keys must be in range `[0, r)` where `r` is the BLS12-381 scalar field order. However, some existing Tezos key files contain keys with values >= r.
+Tezos stores BLS12-381 secret keys as little-endian scalars, while the BLST library expects big-endian bytes; keys are byte-reversed on load. The most significant byte of a stored key is therefore the *last* byte — a key file beginning `0xb5...` is not necessarily out of range.
 
-**This implementation handles this automatically** by reducing out-of-range keys modulo r, matching OCaml's lenient behavior. This ensures:
-- Existing key files work without modification
-- Keys are cryptographically equivalent after reduction
-- No manual intervention needed
-
-**Example**: A key like `BLsk2snGqdSb7qBDhKbc62AxbZXJycDvA5QmeYYhB7Nb3wFuMMbq9x` (value `0xb5...`) is automatically reduced to a valid key (value `0x41...`) when loaded.
+If a key's little-endian value is >= `r` (the BLS12-381 scalar field order), this implementation reduces it modulo `r` on load and logs a warning. Note that octez rejects such keys outright, so this lenience accepts key files octez would refuse; the reduced key is cryptographically equivalent (same class modulo `r`).
 
 See the bls module documentation for technical details.
 
@@ -77,36 +71,32 @@ See the bls module documentation for technical details.
 ### Build and Install
 
 ```bash
-# Clone and build
-cd russignol-signer-rust
-cargo build --release
+# From the workspace root
+cargo build --release -p russignol-signer-lib
 
 # Run tests
-cargo test
+cargo test -p russignol-signer-lib
 
 # The CLI binary is at:
-./target/release/russignol-signer
+./target/release/russignol-signer-lib
 ```
 
 ### Key Management (CLI)
 
-The signer includes a command-line interface matching the OCaml russignol-signer:
+The CLI reads keys from an OCaml-format wallet directory (`public_key_hashs`, `public_keys`, `secret_keys`). Key material is provisioned externally — for example generated with `octez-client` — and is not created by this CLI.
 
 ```bash
-# Generate a new BLS12-381 key
-./target/release/russignol-signer gen keys my_baker --sig bls
-
 # List all keys
-./target/release/russignol-signer list known addresses
+./target/release/russignol-signer-lib list known addresses
 
-# Show key details
-./target/release/russignol-signer show address my_baker
+# Show key details (public data only)
+./target/release/russignol-signer-lib show address my_baker
 
-# Import existing key
-./target/release/russignol-signer import secret key imported_key BLsk...
+# Use the OCaml wallet directory
+./target/release/russignol-signer-lib --base-dir ~/.tezos-signer list known addresses
 
-# Use custom directory (OCaml compatible)
-./target/release/russignol-signer --base-dir ~/.tezos-signer gen keys my_key --sig bls
+# Launch the TCP signer
+./target/release/russignol-signer-lib --base-dir ~/.tezos-signer launch socket signer
 ```
 
 **📖 See [USAGE.md](USAGE.md) for complete CLI documentation**
@@ -126,26 +116,23 @@ rustup target add aarch64-unknown-linux-gnu
 #### Build for Pi Zero 2W
 
 ```bash
-# Build optimized for size (smaller binary, faster load times)
+# Release build (LTO + size optimizations from the workspace profile)
 cargo build --release --target=aarch64-unknown-linux-gnu
 
-# Build optimized for speed (maximum performance)
-cargo build --profile=fast --target=aarch64-unknown-linux-gnu
-
 # Binary location
-ls -lh target/aarch64-unknown-linux-gnu/release/russignol-signer
+ls -lh target/aarch64-unknown-linux-gnu/release/russignol-signer-lib
 ```
 
 #### Deploy to Raspberry Pi Zero 2W
 
 ```bash
 # Copy to Pi Zero 2W
-scp target/aarch64-unknown-linux-gnu/release/russignol-signer pi@raspberrypi.local:~/
+scp target/aarch64-unknown-linux-gnu/release/russignol-signer-lib pi@raspberrypi.local:~/
 
 # SSH and run
 ssh pi@raspberrypi.local
-chmod +x russignol-signer
-./russignol-signer
+chmod +x russignol-signer-lib
+./russignol-signer-lib --help
 ```
 
 ## Performance Benchmarks
@@ -158,8 +145,8 @@ cargo bench
 
 # Cross-compile and run on Pi Zero 2W
 cargo build --release --target=aarch64-unknown-linux-gnu
-scp target/aarch64-unknown-linux-gnu/release/russignol-signer pi@raspberrypi.local:~/
-ssh pi@raspberrypi.local './russignol-signer --help'
+scp target/aarch64-unknown-linux-gnu/release/russignol-signer-lib pi@raspberrypi.local:~/
+ssh pi@raspberrypi.local './russignol-signer-lib --help'
 ```
 
 ### Expected Performance (Pi Zero 2W @ 1GHz)
@@ -181,19 +168,19 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-russignol-signer = { path = "../russignol-signer-rust" }
+russignol-signer-lib = { path = "libs/signer" }
 ```
 
 Example code:
 
 ```rust
-use russignol_signer::{UnencryptedSigner, SignerHandler};
+use russignol_signer_lib::signer::{Unencrypted, Handler};
 
-// Generate BLS12-381 keypair
-let signer = UnencryptedSigner::generate(None).unwrap();
+// Generate a BLS12-381 keypair (random seed)
+let signer = Unencrypted::generate(None).unwrap();
 
 // Create handler with Tenderbake-only magic bytes (0x11, 0x12, 0x13)
-let handler = SignerHandler::new_tenderbake_only(signer);
+let handler = Handler::new_tenderbake_only(signer);
 
 // Sign Tenderbake block
 let block_data = b"\x11\x00\x00\x00\x01...";  // Magic byte 0x11 + block data
@@ -207,9 +194,11 @@ println!("Address: {}", pkh.to_b58check());
 let proof = handler.bls_prove_possession(None).unwrap();
 ```
 
+See [DEVELOPMENT.md](DEVELOPMENT.md) for an overview of the library API (modules, server configuration, callbacks).
+
 ## Magic Byte Filtering
 
-Only the following Tenderbake consensus operations are signed:
+When the Tenderbake magic-byte filter is enabled (`--magic-bytes 0x11,0x12,0x13` on the CLI, or `Handler::new_tenderbake_only` in the library), only the following consensus operations are signed:
 
 | Magic Byte | Operation | Description |
 |------------|-----------|-------------|
@@ -217,7 +206,15 @@ Only the following Tenderbake consensus operations are signed:
 | `0x12` | Tenderbake Preattestation | Pre-vote on block |
 | `0x13` | Tenderbake Attestation | Final vote on block |
 
-Legacy Emmy operations (`0x01`, `0x02`) are **rejected** by default.
+Legacy Emmy operations (`0x01`, `0x02`) are rejected when the filter is enabled. Without a filter, all magic bytes are allowed.
+
+## High Watermark Protection
+
+With `--check-high-watermark`, the signer refuses to sign a consensus operation at or below the last signed level/round for that key and operation type (block, preattestation, attestation): the level must be strictly higher, or the round strictly higher at the same level.
+
+Watermarks must be initialized before the first signature — a sign request for a key/operation with no existing watermark entry is rejected. A corrupt watermark file prevents the signer from starting (manual re-initialization required). The library additionally supports large level-gap detection (rejecting requests more than 4 cycles ahead of the current watermark) when configured with a gap callback.
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for the on-disk watermark format.
 
 ## Testing
 
@@ -254,22 +251,29 @@ The Rust implementation produces a significantly smaller binary than the OCaml v
 
 ### Key Storage
 
-Keys are stored in JSON format:
+Keys are stored in the OCaml-compatible wallet format: three JSON files in the base directory.
 
-**Default Location:**
-- Linux: `~/.local/share/signer/keys.json`
-- macOS (untested): `~/Library/Application Support/org.tezos.signer/keys.json`
-- Windows: `%APPDATA%\tezos\signer\keys.json`
+| File | Contents |
+|------|----------|
+| `public_key_hashs` | `[{"name": "<alias>", "value": "tz4..."}]` |
+| `public_keys` | `[{"name": "<alias>", "value": {"locator": "unencrypted:BLpk...", "key": "BLpk..."}}]` |
+| `secret_keys` | `[{"name": "<alias>", "value": "unencrypted:BLsk..."}]` |
+
+**Default base directory:**
+- Linux: `~/.local/share/signer/`
+- macOS (untested): `~/Library/Application Support/org.tezos.signer/`
+- Windows (untested): `%APPDATA%\tezos\signer\data\`
 
 **OCaml Compatible Mode:**
 ```bash
-# Use same directory as OCaml russignol-signer
-russignol-signer --base-dir ~/.tezos-signer gen keys my_key --sig bls
+# Use the same directory as octez-client / octez-signer
+russignol-signer-lib --base-dir ~/.tezos-signer list known addresses
 ```
 
 **Security Notes:**
-- Keys are stored **unencrypted** in plaintext JSON
-- Set restrictive file permissions: `chmod 600 ~/.local/share/signer/keys.json`
+- Secret keys in `secret_keys` are plaintext (`unencrypted:BLsk...`); `encrypted:` entries are skipped on load
+- This library reads `secret_keys` but never writes it — persisting secret keys (encrypted) is the caller's responsibility
+- Set restrictive file permissions: `chmod 600 ~/.tezos-signer/secret_keys`
 - For production use, consider:
   - Hardware Security Modules (HSM)
   - Encrypted key storage
@@ -293,10 +297,10 @@ echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governo
 sudo systemctl disable ondemand
 
 # Increase process priority
-sudo nice -n -20 ./russignol-signer
+sudo nice -n -20 ./russignol-signer-lib
 
 # Pin to specific CPU core
-taskset -c 0 ./russignol-signer
+taskset -c 0 ./russignol-signer-lib
 ```
 
 ## Power Consumption
@@ -328,7 +332,7 @@ rustup target add aarch64-unknown-linux-gnu
 uname -m  # Should output: aarch64
 
 # Check for missing libraries
-ldd ./russignol-signer
+ldd ./russignol-signer-lib
 
 # If libgcc_s.so.1 missing:
 sudo apt-get install libgcc-10-dev
@@ -353,27 +357,31 @@ vcgencmd get_throttled
 
 | Command | Description |
 |---------|-------------|
-| `gen keys <name>` | Generate new BLS12-381 keypair |
 | `list known addresses` | List all stored keys |
-| `show address <name>` | Display key details |
-| `import secret key <name> <BLsk...>` | Import existing secret key |
+| `show address <name>` | Display key details (public data only) |
+| `launch socket signer` | Start the TCP signer server |
 
 ### Global Options
 
 | Option | Description |
 |--------|-------------|
-| `--base-dir <PATH>`, `-d` | Custom signer data directory |
+| `--base-dir <PATH>`, `-d` | Signer data directory |
 | `--help`, `-h` | Show help message |
 | `--version`, `-V` | Show version |
 
-### Command Options
+### `launch socket signer` Options
 
-| Command | Option | Description |
-|---------|--------|-------------|
-| `gen keys` | `--sig <ALGORITHM>` | Signature algorithm (default: bls) |
-| `gen keys` | `--force`, `-f` | Overwrite existing key |
-| `show address` | `--show-secret`, `-S` | Display secret key |
-| `import secret key` | `--force`, `-f` | Overwrite existing key |
+| Option | Description |
+|--------|-------------|
+| `-a, --address <ADDRESS>` | Listen address (default: `localhost`) |
+| `-p, --port <PORT>` | Listen port (default: `7732`) |
+| `-M, --magic-bytes <BYTES>` | Magic byte filter, comma-separated hex (e.g. `0x11,0x12,0x13`) |
+| `-W, --check-high-watermark` | Enable high watermark protection |
+| `--allow-list-known-keys` | Allow the KnownKeys request |
+| `--allow-to-prove-possession` | Allow BLS proof-of-possession requests |
+| `-A, --require-authentication` | Require authentication (not yet implemented) |
+| `-t, --timeout <SECONDS>` | Connection timeout in seconds |
+| `-P, --pidfile <PATH>` | Write PID to file |
 
 **📖 See [USAGE.md](USAGE.md) for detailed examples and workflows**
 
@@ -395,14 +403,14 @@ cargo bench
 # Build documentation
 cargo doc --open
 
-# Test CLI
-cargo run --release -- gen keys test_key --sig bls
-cargo run --release -- list known addresses
+# Test CLI (against an existing wallet directory)
+cargo run --release -- --base-dir ~/.tezos-signer list known addresses
+cargo run --release -- --base-dir ~/.tezos-signer show address my_baker
 
 # Profile (requires `perf` on Linux)
 cargo build --release --target=aarch64-unknown-linux-gnu
-scp target/aarch64-unknown-linux-gnu/release/russignol-signer pi@raspberrypi.local:~/
-ssh pi@raspberrypi.local 'perf record -g ./russignol-signer'
+scp target/aarch64-unknown-linux-gnu/release/russignol-signer-lib pi@raspberrypi.local:~/
+ssh pi@raspberrypi.local 'perf record -g ./russignol-signer-lib'
 ```
 
 ## Contributing
@@ -424,4 +432,3 @@ MIT License (matching Tezos OCaml codebase)
 - [Tenderbake Consensus](https://research-development.nomadic-labs.com/tenderbake.html)
 - [BLST Library](https://github.com/supranational/blst)
 - [Raspberry Pi Zero 2 W](https://www.raspberrypi.com/products/raspberry-pi-zero-2-w/)
-

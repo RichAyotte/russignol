@@ -222,7 +222,8 @@ enum ConfigCommands {
     Show,
     /// Set a configuration value
     Set {
-        /// Configuration key (octez-client-dir, octez-node-dir, rpc-endpoint)
+        /// Configuration key (octez-client-dir, octez-node-dir, rpc-endpoint,
+        /// dal-node-endpoint, signer-endpoint)
         key: String,
         /// Configuration value
         value: String,

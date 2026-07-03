@@ -17,11 +17,11 @@ The firmware is built using **Buildroot**, which creates a minimal Linux system 
 ### 1. Hardened Production Image (Default)
 **Default build.** Minimal attack surface for production use.
 - **SSH Server**: REMOVED.
-- **Tools**: REMOVED (`htop`, `inotify-tools`, etc.).
+- **Tools**: REMOVED (`htop`, `lm-sensors`, etc.).
 - **BusyBox**: Stripped down (no telnet, netcat, wget, editors, user management).
-- **Root Account**: Locked (password hash removed).
+- **Root Account**: Unreachable — no login services exist (no getty, no sshd, no login applet).
 - **Console**: Login services removed.
-- **Access**: Only via Touch UI or the specific signer TCP port (7732).
+- **Access**: Only via Touch UI or the signer TCP port (7732) over USB gadget ethernet (device address 169.254.1.1).
 
 **Build Command:**
 ```bash
@@ -30,10 +30,10 @@ cargo xtask image
 
 ### 2. Development Image
 **Development build.** Includes tools helpful for debugging and development.
-- **SSH Server**: Enabled (login as `root` or `russignol`).
-- **Tools**: `htop`, `inotify-tools`, `strace`, full BusyBox suite (telnet, netcat, etc.).
-- **Root Password**: Disabled (no password required for console login).
-- **Console**: HDMI/Serial console enabled.
+- **SSH Server**: Enabled (login as `russignol`, password `russignol`).
+- **Tools**: `htop`, `lm-sensors`, fuller BusyBox applet set (telnet, wget, vi).
+- **Root Password**: Set to `russignol`.
+- **Console**: None (headless — no getty on HDMI or serial; access via SSH over USB gadget ethernet).
 
 **Build Command:**
 ```bash
@@ -75,4 +75,4 @@ cargo xtask image           # Build hardened image
 cargo xtask image --dev     # Build development image
 ```
 
-See the main [README.md](../README.md) for flashing instructions.
+See [docs/INSTALL_HOST_UTILITY.md](../docs/INSTALL_HOST_UTILITY.md) (recommended) or [docs/INSTALL_MANUAL.md](../docs/INSTALL_MANUAL.md) for flashing instructions.

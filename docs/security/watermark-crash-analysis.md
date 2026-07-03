@@ -227,8 +227,9 @@ The redesign eliminated the vulnerability at the source:
 **Fast path** (ceiling on disk covers the update):
 
 - Only BLS sign runs, no disk I/O
-- `ceiling_covers()` only returns true if the disk already has a value **strictly
-  higher** than the signed level (ceilings are written as `(level+1, u32::MAX)`)
+- `ceiling_covers()` only returns true if the disk value already blocks the signed
+  `(level, round)` -- a strictly higher level, or the same level with a round at or
+  above the request (ceilings are written as `(level+1, u32::MAX)`)
 - On crash: disk loads the ceiling which blocks the signed level and below
 - **Critical window: 0** (disk already has a safe value)
 

@@ -245,7 +245,10 @@ fn launch_socket_signer(
 
     // Check authentication flag
     if opts.require_authentication {
-        return Err("Authentication is not yet implemented (Phase 4). Remove --require-authentication flag.".to_string());
+        return Err(
+            "Authentication is not yet implemented. Remove --require-authentication flag."
+                .to_string(),
+        );
     }
 
     // Create request handler

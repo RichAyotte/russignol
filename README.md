@@ -25,12 +25,14 @@ Ledger Nano can't perform BLS signatures fast enough for 6-second blocks, and so
 - **[BLS12-381](https://octez.tezos.com/docs/active/accounts.html#tz4-bls) signing** — ~6ms via BLST
 - **USB gadget ethernet only** — WiFi, Bluetooth, Ethernet compiled out of kernel
 - **PIN-protected key storage** — AES-256-GCM encryption, PIN-derived key via Scrypt (256MB memory-hard)
-- **Hardened kernel** — Module signature enforcement, kernel lockdown, locked accounts
-- **High watermark protection** — Per-key watermarks for consensus and companion key signing, pre-set one level into the future so signing never blocks on disk I/O, Blake3-hashed for corruption detection, persists across reboots
-- **Touch-enabled e-ink display** — On-device PIN entry (never crosses USB), menu-based navigation with Status, Activity, Blockchain, Watermarks, About, and Shutdown pages
+- **Hardened kernel** — Kernel lockdown (integrity mode, enforced early), locked accounts, no getty or SSH
+- **High watermark protection** — Per-key watermarks for consensus and companion key signing, pre-set one level into the future so steady-state signing doesn't block on disk I/O, Blake3-hashed for corruption detection, persists across reboots
+- **Touch-enabled e-ink display** — On-device PIN entry (never crosses USB), menu-based navigation with System, Activity, Blockchain, Watermarks, About, and Shutdown pages
 - **Activity LED** — Visual indication of baker connection
 - **CPU frequency scaling** — Idles at 600 MHz, boosts to 1000 MHz during signing and PIN entry
 - **Flash-optimized storage** — F2FS with hardware-adaptive alignment, over-provisioning for wear leveling
+- **Key restore across reflashes** — `russignol image flash --restore-keys` carries keys and watermarks over from an existing card
+- **Key migration** — `russignol image flash --migrate-keys` imports keys from a Nomadic Labs [tezos-rpi-bls-signer](https://gitlab.com/nomadic-labs/tezos-rpi-bls-signer) card
 - **Network mismatch detection** — Warns during key restore if the key's network doesn't match the connected node
 
 ## Hardware Requirements
@@ -46,11 +48,13 @@ Ledger Nano can't perform BLS signatures fast enough for 6-second blocks, and so
 
 - [Automated Installation](docs/INSTALL_HOST_UTILITY.md) (recommended)
 - [Manual Installation](docs/INSTALL_MANUAL.md)
+- [LXC Container Setup](docs/INSTALL_LXC.md)
 
 ## Documentation
 
 - [Device Operation](docs/DEVICE_OPERATION.md)
 - [Security Audit](docs/SECURITY_AUDIT.md)
+- [Watermark Crash Analysis](docs/security/watermark-crash-analysis.md)
 - [Host Utility](host-utility/README.md)
 - [Configuration](host-utility/CONFIGURATION.md)
 - [Key Rotation](host-utility/KEY_ROTATION.md)

@@ -45,7 +45,6 @@ brew install xz
 > The [host utility](INSTALL_HOST_UTILITY.md) performs essential setup that manual flashing cannot replicate:
 >
 > - **No watermark initialization** — The host utility queries your live Tezos node and writes blockchain state to the boot partition. Without this, an attacker who obtains the image could modify watermark values to enable replay attacks or double-signing.
-> - **No SD card wear leveling** — The host utility configures over-provisioning and TRIMs unpartitioned space for optimal flash wear leveling. Manual flashing skips this optimization, reducing SD card longevity.
 > - **No image integrity verification** — Manual `dd` doesn't verify the SHA256 checksum; corrupted downloads go undetected.
 > - **No device safety checks** — Risk of accidentally overwriting the wrong drive. The host utility validates removable devices and requires explicit confirmation.
 > - **No node validation** — Manual process doesn't verify your node is running and synced before flashing.
@@ -90,6 +89,17 @@ diskutil eject /dev/diskN
 > **Warning:** Double-check the device path. `dd` will overwrite without confirmation.
 
 > **Note:** Users in the `disk` group (Linux) can omit `sudo` for `dd` and `eject`.
+
+> **Note:** If the [host utility](INSTALL_HOST_UTILITY.md) is available on a Linux
+> machine, seed the watermark floor after flashing:
+>
+> ```bash
+> russignol watermark init --device /dev/sdX
+> ```
+>
+> This performs the watermark initialization described in the warning above,
+> querying your Tezos node and writing the current blockchain state to the
+> card's boot partition.
 
 ## Step 2: Boot and Initialize Device
 

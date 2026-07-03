@@ -4,15 +4,18 @@ Developer documentation for the russignol-signer library implementation.
 
 ## Table of Contents
 1. [Project Architecture](#project-architecture)
-2. [TCP Server Implementation](#tcp-server-implementation)
-3. [Testing Guide](#testing-guide)
-4. [Test Results](#test-results)
+2. [Library API Overview](#library-api-overview)
+3. [TCP Server Implementation](#tcp-server-implementation)
+4. [High Watermark Storage](#high-watermark-storage)
+5. [Feature Flags](#feature-flags)
+6. [Testing Guide](#testing-guide)
+7. [Test Results](#test-results)
 
 ## Project Architecture
 
 ### Overview
 
-Successfully ported the Tezos `russignol-signer` from OCaml to Rust with specific optimizations for the **Raspberry Pi Zero 2W** (ARM Cortex-A53 CPU).
+A port of the Tezos `octez-signer` from OCaml to Rust with specific optimizations for the **Raspberry Pi Zero 2W** (ARM Cortex-A53 CPU).
 
 
 ### Implemented Features
@@ -30,7 +33,8 @@ Successfully ported the Tezos `russignol-signer` from OCaml to Rust with specifi
 - Tenderbake block (0x11) ✓
 - Tenderbake preattestation (0x12) ✓
 - Tenderbake attestation (0x13) ✓
-- Rejection of legacy Emmy operations (0x01, 0x02) ✓
+- Rejection of legacy Emmy operations (0x01, 0x02) when the filter is enabled ✓
+- No filter configured = all magic bytes allowed
 
 #### 3. Base58Check Encoding
 - tz4 (public key hash) encoding/decoding
@@ -40,17 +44,43 @@ Successfully ported the Tezos `russignol-signer` from OCaml to Rust with specifi
 
 #### 4. High Watermark Protection
 - Level-based protection against double-baking
-- Round-based protection for same level
+- Round-based protection for same level (round must be strictly higher)
 - Separate watermarks per operation type
-- Persistent storage across restarts
 - Per-key watermark tracking
+- Persistent storage across restarts (pwrite + fdatasync before returning a signature)
+- Watermarks must be initialized before the first signature
+- Corrupt watermark files refuse to load (manual re-initialization required)
 
 #### 5. TCP Server
-- Async TCP server with Tokio
+- Synchronous TCP server, one thread per connection (default limit: 4)
 - Binary protocol encoding/decoding
 - Key manager for multiple keys
 - Request routing and handling
 - Error handling and responses
+
+## Library API Overview
+
+A map of the public API; see the module docs (`cargo doc --open`) for details.
+
+| Module | Contents |
+|--------|----------|
+| `bls` (`src/bls.rs`) | `SecretKey`, `PublicKey`, `PublicKeyHash`, `Signature`, `sign`/`verify`, `pop_prove`/`pop_verify`, `generate_key`, deterministic nonces, base58check prefixes |
+| `magic_bytes` (`src/magic_bytes.rs`) | `MagicByte`, `check_magic_byte`, level/round/chain-ID extraction from Tenderbake payloads |
+| `signer` (`src/signer.rs`) | `Unencrypted` signer, `Handler` (magic-byte-filtering wrapper), `SignatureVersion` |
+| `protocol` (`src/protocol.rs`) | `SignerRequest`, `SignerResponse`, `encoding::{encode_request, decode_request, encode_response, decode_response}` |
+| `high_watermark` (`src/high_watermark.rs`) | `HighWatermark`, `WatermarkUpdate`, `ChainId`, `WatermarkError` |
+| `server` (`src/server.rs`) | `Server`, `RequestHandler`, `KeyManager` (re-exported as `ServerKeyManager`), `KEY_ROLES` |
+| `wallet` (`src/wallet.rs`) | `KeyManager` for OCaml-format wallet files, `StoredKey` |
+| `signing_activity` (`src/signing_activity.rs`) | `SigningActivity`, `SigningEvent`, `SigningEventRing` — per-key signing metrics |
+| `test_utils` (`src/test_utils.rs`) | Builders for Tenderbake test payloads, watermark pre-initialization helpers |
+
+Notable API points:
+
+- **`RequestHandler` builder callbacks** (`src/server.rs`): `with_signing_activity`, `with_watermark_error_callback`, `with_signing_notify`, `with_large_gap_callback` (enables rejection of sign requests more than 4 cycles ahead of the current watermark), `with_pre_sign_callback` / `with_post_sign_callback` (e.g. CPU frequency boost/restore).
+- **`Server` configuration** (`src/server.rs`): `with_max_message_size` (default 64 KiB), `with_max_connections` (default 4), `with_connection_counter`.
+- **`KEY_ROLES` ordering contract** (`src/server.rs`): `KeyManager::list_keys()` returns the consensus key first, then the companion key; the host utility relies on this ordering.
+- **`HighWatermark` write path** (`src/high_watermark.rs`): `check_and_update` advances the in-memory watermark and returns a `WatermarkUpdate`; `write_watermark` persists it (pwrite + fdatasync) before the signature is returned; `rollback_update` / `rollback_disk_watermark` undo a failed sign. `write_ceiling` / `ceiling_covers` implement the ceiling optimization (see below).
+- **`wallet::KeyManager` split storage** (`src/wallet.rs`): `new_with_secret_keys_path` keeps `secret_keys` in a separate directory (e.g. tmpfs for decrypted keys); `gen_keys_in_memory` generates without disk writes; `save_public_keys_only` never writes secret keys.
 
 ## TCP Server Implementation
 
@@ -76,18 +106,29 @@ flowchart TB
     router --> nonce
     pubkey --> keymgr
     sign --> keymgr
-    nonce --> watermark
-    watermark --> keymgr
+    sign --> watermark
+    nonce --> keymgr
 ```
+
+The server is synchronous: an accept loop spawns one OS thread per connection (default limit: 4 concurrent connections). No async runtime is used.
 
 ### Protocol Format
 
 #### Message Framing
 
-| Length (2B) | Type (1B) | Payload (var) |
-|-------------|-----------|---------------|
+Requests:
 
-#### Request Types
+| Length (2B, BE) | Request tag (1B) | Payload (var) |
+|-----------------|------------------|---------------|
+
+Responses:
+
+| Length (2B, BE) | Result tag (1B: 0x00 Ok / 0x01 Error) | Payload (var) |
+|-----------------|----------------------------------------|---------------|
+
+Responses carry **no request-type tag** — the client decodes the payload based on the request it sent. See [PROTOCOL_SPECIFICATION.md](PROTOCOL_SPECIFICATION.md) for the full wire format.
+
+#### Request Tags
 - `0x00` - Sign
 - `0x01` - Public Key
 - `0x02` - Authorized Keys
@@ -97,35 +138,36 @@ flowchart TB
 - `0x06` - Known Keys
 - `0x07` - BLS Prove Request
 
-#### Response Types
-- `0x00` - Signature
-- `0x01` - Public Key
-- `0x02` - Authorized Keys
-- `0x03` - Nonce
-- `0x04` - Nonce Hash
-- `0x05` - Bool
-- `0x06` - Known Keys
-- `0xFF` - Error
+## High Watermark Storage
 
-### Watermark File Format
-```json
-{
-  "block": {
-    "level": 1234567,
-    "round": 0,
-    "hash": "BLockGenesisGenesisGenesisGenesisb83baZgbyZe",
-    "signature": "BLsig..."
-  },
-  "preattestation": {
-    "level": 1234567,
-    "round": 0
-  },
-  "attestation": {
-    "level": 1234567,
-    "round": 0
-  }
-}
+Watermarks are stored per key, in a subdirectory of the base directory named by the key's base58check PKH:
+
 ```
+<base_dir>/<pkh_b58check>/
+├── block_watermark
+├── preattestation_watermark
+└── attestation_watermark
+```
+
+Each file is exactly **40 bytes** of binary data:
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | level (u32, big-endian) |
+| 4 | 4 | round (u32, big-endian) |
+| 8 | 32 | Blake3 hash of the first 8 bytes |
+
+Semantics:
+
+- A sign request must be at a strictly higher level, or at the same level with a strictly higher round, than the stored watermark
+- An empty file means "no watermark yet"; signing is rejected (`NotInitialized`) until the watermark is initialized
+- A file with the wrong size or a Blake3 mismatch is treated as corrupt and the signer refuses to load — manual re-initialization is required
+- The watermark is written (pwrite at offset 0) and fdatasynced **before** the signature is returned; if the write fails, the signature is withheld
+- **Ceiling optimization**: during idle time, a ceiling entry `(next_level, u32::MAX)` can be fdatasynced to disk (`write_ceiling`). A later sign at that level can then skip the fdatasync in the critical path (`ceiling_covers`), because any crash would reload the ceiling, which safely blocks that level
+
+## Feature Flags
+
+- `perf-trace` — logs per-stage timings for the sign path (magic byte check, watermark, BLS sign, TCP read/write) and tracks request concurrency (`src/server.rs`). For performance investigation only.
 
 ## Testing Guide
 
@@ -141,28 +183,45 @@ cargo test -- --nocapture
 # Run specific module tests
 cargo test bls::
 cargo test protocol::
-cargo test tcp_server::
+cargo test server::
+cargo test high_watermark::
+
+# Workspace-wide (from the repo root; --no-fuzz skips proptest fuzzing)
+cargo xtask test
 
 # Run with coverage
 cargo tarpaulin --out Html
 ```
 
-### Integration Testing
+### Integration and Property Tests
+
+The `tests/` directory contains:
+
+- `tcp_integration_test.rs` — end-to-end TCP server tests
+- `race_watermark.rs` — concurrent watermark race conditions
+- `crash_lock_poison.rs` — lock-poisoning recovery
+- `dos_memory_exhaustion.rs` — oversized/malicious message handling
+- `proptest_protocol.rs` — property-based protocol roundtrip fuzzing
+
+Benchmarks live in `benches/signing_benchmark.rs` (criterion; run with `cargo bench`).
+
+### Integration Testing with Octez
 
 The TCP server can be tested with actual Octez clients:
 
 ```bash
-# Start the signer
-cargo run --release -- tcp 0.0.0.0:7732 --base-dir ~/.tezos-signer
+# Start the signer against an existing octez wallet
+cargo run --release -- --base-dir ~/.tezos-signer launch socket signer \
+  --address 0.0.0.0 --port 7732 --check-high-watermark
 
-# Import a key
+# Import the remote key
 octez-client import secret key my_baker tcp://localhost:7732/tz4...
 
 # Sign with the baker
 octez-client sign bytes 0x11... for my_baker
 
-# Check watermark files
-cat ~/.tezos-signer/<chain_id>/<pkh>.json
+# Inspect watermark files (40-byte binary, per key)
+xxd ~/.tezos-signer/<pkh>/block_watermark
 ```
 
 ### Test Coverage by Module
@@ -179,8 +238,11 @@ cat ~/.tezos-signer/<chain_id>/<pkh>.json
 
 #### Watermark Module
 - Level and round-based protection
+- Initialization requirement (rejects first signature without pre-configured watermark)
 - Per-operation-type and per-key isolation
 - Persistence across instances
+- Corruption detection (size and Blake3 mismatch)
+- Ceiling write/skip and rollback paths
 
 #### Protocol Module
 - Request/response encoding and decoding

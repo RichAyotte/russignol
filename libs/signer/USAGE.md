@@ -1,34 +1,32 @@
 # russignol-signer Usage Guide
 
-Complete guide to using the Rust implementation of russignol-signer for BLS12-381 key management and signing on Tezos.
+Complete guide to using the `russignol-signer-lib` CLI for BLS12-381 signing on Tezos.
 
 ## Table of Contents
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Command Reference](#command-reference)
-- [Key Management](#key-management)
+- [Key Provisioning](#key-provisioning)
 - [Storage Locations](#storage-locations)
 - [Common Workflows](#common-workflows)
 - [Examples](#examples)
 - [Compatibility](#compatibility)
+- [Troubleshooting](#troubleshooting)
 
 ## Installation
 
 ### Build from Source
 
 ```bash
-# Clone the repository
-cd russignol-signer-rust
-
-# Build for your platform
-cargo build --release
+# From the workspace root
+cargo build --release -p russignol-signer-lib
 
 # Binary location
-./target/release/russignol-signer
+./target/release/russignol-signer-lib
 
-# Optional: Install to system PATH
-cargo install --path .
+# Optional: install to the cargo bin directory (installs as `russignol-signer-lib`)
+cargo install --path libs/signer
 ```
 
 ### Cross-Compile for Raspberry Pi
@@ -42,35 +40,33 @@ rustup target add aarch64-unknown-linux-gnu
 cargo build --release --target=aarch64-unknown-linux-gnu
 
 # Deploy to Raspberry Pi
-scp target/aarch64-unknown-linux-gnu/release/russignol-signer pi@raspberrypi.local:~/
+scp target/aarch64-unknown-linux-gnu/release/russignol-signer-lib pi@raspberrypi.local:~/
 ```
 
 ## Quick Start
 
-Generate your first key pair:
+Provision a key with `octez-client` (this CLI does not generate keys):
 
 ```bash
-# Generate a new BLS12-381 key
-./target/release/russignol-signer gen keys my_baker --sig bls
-
-# Output:
-# Generating new BLS12-381 keypair...
-#
-# Generated key: my_baker
-#   Public Key Hash (tz4): tz4...
-#   Public Key (BLpk):     BLpk...
+octez-client --base-dir ~/.tezos-signer gen keys my_baker --sig bls
 ```
 
 List your keys:
 
 ```bash
-./target/release/russignol-signer list known addresses
+./target/release/russignol-signer-lib --base-dir ~/.tezos-signer list known addresses
 ```
 
 Show key details:
 
 ```bash
-./target/release/russignol-signer show address my_baker
+./target/release/russignol-signer-lib --base-dir ~/.tezos-signer show address my_baker
+```
+
+Launch the TCP signer:
+
+```bash
+./target/release/russignol-signer-lib --base-dir ~/.tezos-signer launch socket signer
 ```
 
 ## Command Reference
@@ -82,10 +78,11 @@ These options can be used with any command:
 ```bash
 --base-dir <PATH>, -d <PATH>
     Specify custom signer data directory
-    Default: ~/.local/share/signer/
+    Default: ~/.local/share/signer/ on Linux
+    (falls back to ~/.tezos-signer if the platform directory lookup fails)
 
     Example:
-    russignol-signer --base-dir ~/.tezos-signer gen keys my_key --sig bls
+    russignol-signer-lib --base-dir ~/.tezos-signer list known addresses
 
 --help, -h
     Show help message
@@ -96,62 +93,22 @@ These options can be used with any command:
 
 ### Commands
 
-#### `gen keys` - Generate New Keypair
-
-Generate a new BLS12-381 keypair.
-
-```bash
-russignol-signer gen keys <NAME> [OPTIONS]
-```
-
-**Arguments:**
-- `<NAME>` - Alias for the new key (required)
-
-**Options:**
-- `--sig <ALGORITHM>` - Signature algorithm (default: `bls`, only BLS12-381 supported)
-- `--force`, `-f` - Overwrite existing key with same name
-
-**Examples:**
-
-```bash
-# Generate a new key
-russignol-signer gen keys my_baker --sig bls
-
-# Overwrite existing key
-russignol-signer gen keys my_baker --sig bls --force
-
-# Generate with custom base directory
-russignol-signer --base-dir /secure/keys gen keys validator1 --sig bls
-```
-
-**Output:**
-
-```
-Generating new BLS12-381 keypair...
-
-Generated key: my_baker
-  Public Key Hash (tz4): tz4VkfTGTaaVPjcXRniznS9vKVR6JZZbE8mj
-  Public Key (BLpk):     BLpk1uZk...
-```
-
 #### `list known addresses` - List All Keys
 
-Display all stored keypairs.
+Display all stored keys.
 
 ```bash
-russignol-signer list known addresses
+russignol-signer-lib list known addresses
 ```
-
-**No arguments or options**
 
 **Examples:**
 
 ```bash
 # List all keys
-russignol-signer list known addresses
+russignol-signer-lib list known addresses
 
 # List keys from custom directory
-russignol-signer --base-dir ~/.tezos-signer list known addresses
+russignol-signer-lib --base-dir ~/.tezos-signer list known addresses
 ```
 
 **Output:**
@@ -166,133 +123,105 @@ validator1           tz4GQqkKCM1m5uQEBMyrKQiREjCM1QmMM3HQ
 
 #### `show address` - Show Key Details
 
-Display details for a specific key.
+Display details for a specific key. Only public data is shown — the CLI never displays secret keys.
 
 ```bash
-russignol-signer show address <NAME> [OPTIONS]
+russignol-signer-lib show address <NAME>
 ```
 
 **Arguments:**
 - `<NAME>` - Alias of the key to show (required)
 
-**Options:**
-- `--show-secret`, `-S` - Display the secret key (BLsk...)
-
-**Examples:**
-
-```bash
-# Show public key information
-russignol-signer show address my_baker
-
-# Show including secret key (⚠️ sensitive!)
-russignol-signer show address my_baker --show-secret
-```
-
-**Output (without --show-secret):**
-
-```
-Key: my_baker
-  Public Key Hash: tz4VkfTGTaaVPjcXRniznS9vKVR6JZZbE8mj
-  Public Key:      BLpk1uZkN...
-```
-
-**Output (with --show-secret):**
-
-```
-Key: my_baker
-  Public Key Hash: tz4VkfTGTaaVPjcXRniznS9vKVR6JZZbE8mj
-  Public Key:      BLpk1uZkN...
-  Secret Key:      BLsk2Ab7h...
-```
-
-#### `import secret key` - Import Existing Key
-
-Import a BLS12-381 secret key.
-
-```bash
-russignol-signer import secret key <NAME> <SK_URI> [OPTIONS]
-```
-
-**Arguments:**
-- `<NAME>` - Alias for the imported key (required)
-- `<SK_URI>` - Base58-encoded secret key starting with `BLsk` (required)
-
-**Options:**
-- `--force`, `-f` - Overwrite existing key with same name
-
-**Examples:**
-
-```bash
-# Import a secret key
-russignol-signer import secret key imported_baker BLsk2Ab7hN...
-
-# Import and overwrite existing
-russignol-signer import secret key my_baker BLsk2Ab7hN... --force
-
-# Import to custom directory
-russignol-signer --base-dir /secure/keys import secret key backup_key BLsk2Ab7hN...
-```
-
 **Output:**
 
 ```
-Importing secret key...
-
-Imported key: imported_baker
-  Public Key Hash (tz4): tz4VkfTGTaaVPjcXRniznS9vKVR6JZZbE8mj
-  Public Key (BLpk):     BLpk1uZkN...
+Key: my_baker
+  Public Key Hash: tz4VkfTGTaaVPjcXRniznS9vKVR6JZZbE8mj
+  Public Key:      BLpk1uZkN...
 ```
 
-## Key Management
+#### `launch socket signer` - Start the TCP Signer Server
 
-### Key Generation
+Load all keys from the base directory and serve the octez remote-signer TCP protocol.
 
-Keys are generated using cryptographically secure random number generation (via `getrandom` crate):
+```bash
+russignol-signer-lib [--base-dir <PATH>] launch socket signer [OPTIONS]
+```
+
+**Options:**
+- `-a, --address <ADDRESS>` - Listen address (default: `localhost`)
+- `-p, --port <PORT>` - Listen port (default: `7732`)
+- `-M, --magic-bytes <BYTES>` - Magic byte filter, comma-separated hex (e.g. `0x11,0x12,0x13`); without it, all magic bytes are allowed
+- `-W, --check-high-watermark` - Enable high watermark protection
+- `--allow-list-known-keys` - Allow the KnownKeys request (refused otherwise)
+- `--allow-to-prove-possession` - Allow BLS proof-of-possession requests (refused otherwise)
+- `-A, --require-authentication` - Require authentication (not yet implemented; the server refuses to start with this flag)
+- `-t, --timeout <SECONDS>` - Connection read/write timeout
+- `-P, --pidfile <PATH>` - Write PID to file
+
+**Example:**
+
+```bash
+russignol-signer-lib --base-dir ~/.tezos-signer launch socket signer \
+  --address 127.0.0.1 --port 7732 \
+  --magic-bytes 0x11,0x12,0x13 \
+  --check-high-watermark
+```
+
+**Notes:**
+- Only keys with an `unencrypted:` entry in `secret_keys` are loaded; `encrypted:` entries are skipped
+- With `-W`, watermarks must be initialized before the first signature; signing with no existing watermark entry is rejected (see [README.md](README.md) for the watermark semantics)
+
+## Key Provisioning
+
+This CLI has no key generation or import commands. Provision keys externally:
+
+- **`octez-client`**: generate or import keys into a shared base directory (e.g. `octez-client --base-dir ~/.tezos-signer gen keys my_baker --sig bls`), then point this signer at the same directory with `--base-dir`
+- **Copy an existing wallet**: place the three wallet files in the base directory
+
+For programmatic use, the library exposes `wallet::KeyManager::gen_keys_in_memory`, which generates a keypair without writing anything to disk; `save_public_keys_only` persists only the two public files. Secret keys are never written to disk by this crate — persisting them (encrypted) is the caller's responsibility.
+
+### Key Generation Properties
+
+Keys generated by the library use cryptographically secure randomness (via the `getrandom` crate):
 
 - **Algorithm**: BLS12-381 (MinPk variant with proof-of-possession)
 - **Key Size**: 32 bytes (256 bits) of entropy
 - **Address Format**: tz4 (Tezos BLS public key hash)
 
-### Key Storage
+### Storage Format
 
-Keys are stored in JSON format at:
+Keys are stored in the OCaml-compatible wallet format: three JSON files in the base directory.
 
-**Default Location:**
-```
-~/.local/share/signer/keys.json
-```
-
-**Custom Location:**
-```bash
-russignol-signer --base-dir /path/to/keys gen keys my_key --sig bls
-# Stores in: /path/to/keys/keys.json
-```
-
-**Storage Format:**
-
+**`public_key_hashs`:**
 ```json
-{
-  "my_baker": {
-    "alias": "my_baker",
-    "public_key_hash": "tz4VkfTGTaaVPjcXRniznS9vKVR6JZZbE8mj",
-    "public_key": "BLpk1uZkN...",
-    "secret_key": "BLsk2Ab7h..."
-  }
-}
+[{"name": "my_baker", "value": "tz4VkfTGTaaVPjcXRniznS9vKVR6JZZbE8mj"}]
 ```
+
+**`public_keys`:**
+```json
+[{"name": "my_baker", "value": {"locator": "unencrypted:BLpk1uZkN...", "key": "BLpk1uZkN..."}}]
+```
+
+**`secret_keys`:**
+```json
+[{"name": "my_baker", "value": "unencrypted:BLsk2Ab7h..."}]
+```
+
+`encrypted:` values in `secret_keys` are skipped when loading.
 
 ### Security Considerations
 
 ⚠️ **Important Security Notes:**
 
-1. **Unencrypted Storage**: Secret keys are stored in plaintext JSON
-2. **File Permissions**: Ensure restrictive permissions on key files:
+1. **Unencrypted Storage**: `unencrypted:` secret keys are plaintext
+2. **File Permissions**: Ensure restrictive permissions on the secret key file:
    ```bash
-   chmod 600 ~/.local/share/signer/keys.json
+   chmod 600 ~/.tezos-signer/secret_keys
    ```
 3. **Backup**: Always backup your keys securely:
    ```bash
-   cp ~/.local/share/signer/keys.json /secure/backup/location/
+   cp ~/.tezos-signer/{public_key_hashs,public_keys,secret_keys} /secure/backup/location/
    ```
 4. **Production Use**: For production, consider:
    - Hardware Security Modules (HSM)
@@ -307,107 +236,80 @@ russignol-signer --base-dir /path/to/keys gen keys my_key --sig bls
 |----------|------------------|
 | Linux | `~/.local/share/signer/` |
 | macOS (untested) | `~/Library/Application Support/org.tezos.signer/` |
-| Windows | `C:\Users\<USER>\AppData\Roaming\tezos\signer\` |
+| Windows (untested) | `C:\Users\<USER>\AppData\Roaming\tezos\signer\data\` |
 
 ### OCaml Compatibility Mode
 
-To use the same directory as the OCaml russignol-signer:
+The wallet format is identical to `octez-client` / `octez-signer` — to share a wallet, just point `--base-dir` at the same directory:
 
 ```bash
-# Always specify --base-dir for OCaml compatibility
-russignol-signer --base-dir ~/.tezos-signer gen keys my_key --sig bls
-russignol-signer --base-dir ~/.tezos-signer list known addresses
+russignol-signer-lib --base-dir ~/.tezos-signer list known addresses
 ```
-
-**Note**: The Rust version uses a single `keys.json` file, while OCaml uses separate files for `secret_keys`, `public_keys`, and `public_key_hashs`.
 
 ### Directory Structure
 
 ```
-~/.local/share/signer/
-├── keys.json          # All keys stored here
-├── public_keys/       # (reserved for future use)
-└── secret_keys/       # (reserved for future use)
+~/.tezos-signer/
+├── public_key_hashs               # [{"name": ..., "value": "tz4..."}]
+├── public_keys                    # [{"name": ..., "value": {"locator": ..., "key": ...}}]
+├── secret_keys                    # [{"name": ..., "value": "unencrypted:BLsk..."}]
+└── tz4.../                        # per-key watermark directory (with --check-high-watermark)
+    ├── block_watermark            # 40-byte binary: level + round + Blake3
+    ├── preattestation_watermark
+    └── attestation_watermark
 ```
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for the watermark file format.
 
 ## Common Workflows
 
 ### 1. Setting Up a New Baker
 
 ```bash
-# Generate baker key
-russignol-signer gen keys my_baker --sig bls
+# Generate the baker key with octez-client in a shared directory
+octez-client --base-dir ~/.tezos-signer gen keys my_baker --sig bls
 
 # Show the tz4 address
-russignol-signer show address my_baker
+russignol-signer-lib --base-dir ~/.tezos-signer show address my_baker
 
-# Copy the tz4 address for baker registration
-# tz4VkfTGTaaVPjcXRniznS9vKVR6JZZbE8mj
+# Launch the signer for the baker
+russignol-signer-lib --base-dir ~/.tezos-signer launch socket signer \
+  --magic-bytes 0x11,0x12,0x13 --check-high-watermark
 ```
 
-### 2. Migrating from OCaml Signer
+### 2. Using an Existing OCaml Wallet
+
+No migration is needed — the wallet format is the same:
 
 ```bash
-# Export secret key from OCaml signer
-octez-client show address my_baker --show-secret
-# Copy the BLsk... secret key
-
-# Import to Rust signer
-russignol-signer import secret key my_baker BLsk2Ab7hN...
-
-# Verify import
-russignol-signer show address my_baker
+russignol-signer-lib --base-dir ~/.tezos-signer list known addresses
+russignol-signer-lib --base-dir ~/.tezos-signer show address my_baker
 ```
 
-### 3. Managing Multiple Keys
-
-```bash
-# Generate multiple keys
-russignol-signer gen keys baker1 --sig bls
-russignol-signer gen keys baker2 --sig bls
-russignol-signer gen keys validator1 --sig bls
-
-# List all keys
-russignol-signer list known addresses
-
-# Show specific key
-russignol-signer show address baker1
-```
-
-### 4. Backup and Restore
+### 3. Backup and Restore
 
 **Backup:**
 ```bash
-# Backup keys file
-cp ~/.local/share/signer/keys.json ~/backup/keys-$(date +%Y%m%d).json
-
-# Or backup entire directory
-tar -czf signer-backup-$(date +%Y%m%d).tar.gz ~/.local/share/signer/
+# Backup the wallet files (and watermark directories, if any)
+tar -czf signer-backup-$(date +%Y%m%d).tar.gz -C ~ .tezos-signer
 ```
 
 **Restore:**
 ```bash
-# Restore from backup
-cp ~/backup/keys-20250114.json ~/.local/share/signer/keys.json
+tar -xzf signer-backup-20250114.tar.gz -C ~
 
 # Verify restored keys
-russignol-signer list known addresses
+russignol-signer-lib --base-dir ~/.tezos-signer list known addresses
 ```
 
-### 5. Using Custom Directory for Different Networks
+### 4. Using Custom Directory for Different Networks
 
 ```bash
 # Mainnet keys
-russignol-signer --base-dir ~/.tezos-signer-mainnet gen keys mainnet_baker --sig bls
+russignol-signer-lib --base-dir ~/.tezos-signer-mainnet list known addresses
 
 # Testnet keys
-russignol-signer --base-dir ~/.tezos-signer-ghostnet gen keys testnet_baker --sig bls
-
-# List mainnet keys
-russignol-signer --base-dir ~/.tezos-signer-mainnet list known addresses
-
-# List testnet keys
-russignol-signer --base-dir ~/.tezos-signer-ghostnet list known addresses
+russignol-signer-lib --base-dir ~/.tezos-signer-ghostnet list known addresses
 ```
 
 ## Examples
@@ -416,85 +318,51 @@ russignol-signer --base-dir ~/.tezos-signer-ghostnet list known addresses
 
 ```bash
 # Build the signer
-cargo build --release
+cargo build --release -p russignol-signer-lib
 
 # Create an alias for convenience
-alias russignol-signer="./target/release/russignol-signer"
+alias russignol-signer-lib="./target/release/russignol-signer-lib"
 
-# Generate your first key
-russignol-signer gen keys my_first_key --sig bls
+# Provision a key
+octez-client --base-dir ~/.tezos-signer gen keys my_first_key --sig bls
 
-# View the generated address
-russignol-signer show address my_first_key
+# View the address
+russignol-signer-lib --base-dir ~/.tezos-signer show address my_first_key
 
 # List all keys
-russignol-signer list known addresses
+russignol-signer-lib --base-dir ~/.tezos-signer list known addresses
 ```
 
-### Example 2: Import and Verify
-
-```bash
-# Import existing key
-russignol-signer import secret key imported_key BLsk2Y84M3vJhMTE8D...
-
-# Verify it was imported correctly
-russignol-signer show address imported_key
-
-# Compare with original (optional)
-russignol-signer show address imported_key --show-secret
-```
-
-### Example 3: Multiple Networks
-
-```bash
-#!/bin/bash
-# setup-multi-network.sh
-
-# Mainnet
-export MAINNET_DIR=~/.tezos-signer-mainnet
-russignol-signer --base-dir $MAINNET_DIR gen keys baker --sig bls
-echo "Mainnet baker: $(russignol-signer --base-dir $MAINNET_DIR show address baker | grep 'Public Key Hash' | awk '{print $4}')"
-
-# Ghostnet (testnet)
-export GHOSTNET_DIR=~/.tezos-signer-ghostnet
-russignol-signer --base-dir $GHOSTNET_DIR gen keys baker --sig bls
-echo "Ghostnet baker: $(russignol-signer --base-dir $GHOSTNET_DIR show address baker | grep 'Public Key Hash' | awk '{print $4}')"
-```
-
-### Example 4: Raspberry Pi Deployment
+### Example 2: Raspberry Pi Deployment
 
 ```bash
 # On development machine
 cargo build --release --target=aarch64-unknown-linux-gnu
-scp target/aarch64-unknown-linux-gnu/release/russignol-signer pi@raspberrypi.local:~/
+scp target/aarch64-unknown-linux-gnu/release/russignol-signer-lib pi@raspberrypi.local:~/
 
-# On Raspberry Pi
+# On Raspberry Pi (wallet files already provisioned)
 ssh pi@raspberrypi.local
-chmod +x russignol-signer
-./russignol-signer gen keys pi_baker --sig bls
-./russignol-signer show address pi_baker
+chmod +x russignol-signer-lib
+./russignol-signer-lib --base-dir ~/.tezos-signer list known addresses
+./russignol-signer-lib --base-dir ~/.tezos-signer launch socket signer -W
 ```
 
-### Example 5: Batch Key Generation
+### Example 3: Serving a Baker
 
 ```bash
-#!/bin/bash
-# generate-batch-keys.sh
+# Terminal 1: launch the signer
+russignol-signer-lib --base-dir ~/.tezos-signer launch socket signer \
+  --address 127.0.0.1 --port 7732 --magic-bytes 0x11,0x12,0x13 -W
 
-for i in {1..5}; do
-    russignol-signer gen keys validator_$i --sig bls
-    echo "Generated validator_$i"
-done
-
-# List all generated keys
-russignol-signer list known addresses
+# Terminal 2: register the remote key with octez-client
+octez-client import secret key my_baker tcp://127.0.0.1:7732/tz4...
 ```
 
 ## Compatibility
 
-### OCaml russignol-signer Compatibility
+### OCaml octez-signer Compatibility
 
-The Rust implementation is compatible with OCaml russignol-signer for:
+The Rust implementation is compatible with the OCaml `octez-signer` for:
 
 ✅ **Compatible:**
 - BLS12-381 key format (BLsk, BLpk, tz4)
@@ -502,92 +370,58 @@ The Rust implementation is compatible with OCaml russignol-signer for:
 - Key derivation from seed
 - Proof of possession
 - Signature format
+- Wallet file format (`public_key_hashs`, `public_keys`, `secret_keys`)
+- TCP remote signer protocol
 
 ⚠️ **Differences:**
-- Default storage format (JSON vs OCaml's separate files; use `--base-dir ~/.tezos-signer` for OCaml compatibility)
-- No HTTP interface yet (coming soon)
+- No key generation or import commands (use `octez-client`)
+- Secret keys are never written to disk by this signer
+- High watermark storage uses a Rust-specific binary format (not shared with OCaml watermark files)
+- No HTTP interface
 
 ### Command Comparison
 
 | OCaml Command | Rust Command | Status |
 |---------------|--------------|--------|
-| `octez-client gen keys <name> --sig bls` | `russignol-signer gen keys <name> --sig bls` | ✅ Compatible |
-| `octez-client list known addresses` | `russignol-signer list known addresses` | ✅ Compatible |
-| `octez-client show address <name>` | `russignol-signer show address <name>` | ✅ Compatible |
-| `octez-client import secret key <name> <sk>` | `russignol-signer import secret key <name> <sk>` | ✅ Compatible |
-| `octez-signer launch socket signer` | `russignol-signer launch socket signer` | ✅ Compatible |
-| `octez-signer launch http signer` | Not implemented yet | ❌ Coming soon |
-
-### Key Format Compatibility
-
-Keys generated by the Rust signer can be used with OCaml tools:
-
-```bash
-# Generate key in Rust
-russignol-signer gen keys my_key --sig bls
-russignol-signer show address my_key --show-secret
-
-# Copy the BLsk... secret key
-# Import to OCaml client
-octez-client import secret key my_key <BLsk...>
-```
-
-And vice versa:
-
-```bash
-# Generate in OCaml
-octez-client gen keys my_key --sig bls
-octez-client show address my_key --show-secret
-
-# Copy the BLsk... secret key
-# Import to Rust signer
-russignol-signer import secret key my_key <BLsk...>
-```
+| `octez-client list known addresses` | `russignol-signer-lib list known addresses` | ✅ Compatible |
+| `octez-client show address <name>` | `russignol-signer-lib show address <name>` | ✅ Compatible (public data only) |
+| `octez-signer launch socket signer` | `russignol-signer-lib launch socket signer` | ✅ Compatible |
+| `octez-client gen keys <name> --sig bls` | Not implemented (use `octez-client`) | ❌ |
+| `octez-client import secret key <name> <sk>` | Not implemented (use `octez-client`) | ❌ |
+| `octez-signer launch http signer` | Not implemented | ❌ |
 
 ## Troubleshooting
 
-### Error: "Key already exists"
+### Error: "No keys found"
+
+The base directory has no wallet files. Provision keys first (see [Key Provisioning](#key-provisioning)) and check `--base-dir` points at the right directory.
+
+### Error: "Key '<name>' not found"
 
 ```bash
-# Use --force to overwrite
-russignol-signer gen keys my_key --sig bls --force
+# Check which aliases exist and in which directory
+russignol-signer-lib --base-dir ~/.tezos-signer list known addresses
 ```
 
-### Error: "Failed to import secret key"
+### Error: "Failed to load key"
 
-Check that your secret key:
-- Starts with `BLsk`
-- Is a valid Base58Check encoded string
-- Was not truncated when copying
+The key's `secret_keys` entry is missing or `encrypted:` (encrypted entries are skipped). Provide an `unencrypted:BLsk...` entry.
 
-### Error: "Failed to create directories"
+### Error: watermark "not initialized"
 
-```bash
-# Ensure you have write permissions
-mkdir -p ~/.local/share/signer
-chmod 755 ~/.local/share/signer
-```
+With `--check-high-watermark`, a key/operation with no existing watermark entry cannot sign. Initialize the watermark files before the first signature (see [DEVELOPMENT.md](DEVELOPMENT.md) for the file format).
 
 ### Keys not showing up
 
 ```bash
 # Check the correct directory
-russignol-signer --base-dir ~/.local/share/signer list known addresses
+russignol-signer-lib --base-dir ~/.tezos-signer list known addresses
 
-# Verify keys.json exists
-cat ~/.local/share/signer/keys.json
+# Verify public_key_hashs exists and is valid JSON
+cat ~/.tezos-signer/public_key_hashs
 ```
 
-### Invalid secret key when generating
-
-This usually means random generation failed. Check:
-```bash
-# Ensure /dev/urandom is accessible
-ls -l /dev/urandom
-
-# Try again - generation is probabilistic
-russignol-signer gen keys my_key --sig bls
-```
+Note: if `public_key_hashs` contains invalid JSON, the key list is empty.
 
 ## Getting Help
 
@@ -595,13 +429,12 @@ russignol-signer gen keys my_key --sig bls
 
 ```bash
 # Main help
-russignol-signer --help
+russignol-signer-lib --help
 
 # Command-specific help
-russignol-signer gen --help
-russignol-signer list --help
-russignol-signer show --help
-russignol-signer import --help
+russignol-signer-lib list --help
+russignol-signer-lib show --help
+russignol-signer-lib launch --help
 ```
 
 ### Additional Resources
@@ -614,8 +447,7 @@ russignol-signer import --help
 
 ```bash
 # Show version
-russignol-signer --version
+russignol-signer-lib --version
 
 # Output: russignol-signer 0.6.4
 ```
-

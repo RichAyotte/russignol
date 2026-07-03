@@ -4,34 +4,42 @@ Day-to-day usage of the Russignol signer after installation.
 
 ## Display & Interface
 
-The device uses a 2.13" e-ink touchscreen for all interaction. After unlocking with your PIN, it displays live signing activity.
+The device uses a 2.13" e-ink touchscreen for all interaction. After unlocking with your PIN, it displays a main menu with six pages:
 
-After 3 minutes of inactivity the display enters screensaver mode. Touch the screen once to wake it.
+- **System** — baker status, CPU temperature, uptime, and signature count since boot
+- **Activity** — recent signing activity
+- **Blockchain** — chain name, chain ID, and key addresses
+- **Watermarks** — per-key watermark levels, both in-memory and persisted to disk
+- **About** — version information
+- **Shutdown** — safe shutdown (see below)
+
+After 1 minute of inactivity the display enters screensaver mode. Touch the screen once to wake it. The screensaver only puts the display to sleep — signing continues, and no PIN re-entry is required.
+
+## PIN Entry & Lockout
+
+The device requires PIN entry on every boot before it starts signing. The PIN stays unlocked until the device reboots or loses power.
+
+After 5 failed PIN attempts the device shows a **LOCKED** screen and the signer stops. Power cycle the device to retry.
+
+## Watermark Gap Confirmation
+
+If a signing request arrives at a level far above the stored watermark (more than about 4 cycles — for example, after the device was offline for an extended period), the signer rejects the request and shows a **"Stale watermark"** confirmation listing the current level, the requested level, and the gap. Tap the update button to advance the watermark to the requested level; subsequent signing requests then succeed. Tap **Cancel** to leave the watermark unchanged.
 
 ## Shutting Down
 
-Tap the touchscreen 5 times in rapid succession to trigger a safe shutdown. Each tap must be within 300ms of the previous one.
-
-### Behavior by screen state
-
-- **Screensaver** — all taps count toward the shutdown sequence; reaching 5 wakes the display and shows the confirmation dialog
-- **Normal pages** — taps count toward shutdown; intermediate taps are suppressed so page buttons aren't accidentally activated
-- **Modal dialogs** — taps are handled normally by the dialog buttons; the shutdown counter is disabled so button presses always work
-
-### Confirmation dialog
-
-After 5 rapid taps the device displays a "Shutdown the device?" confirmation with two buttons:
+From the main menu, tap **Shutdown**. The device displays a "Shutdown the device?" confirmation with two buttons:
 
 - **Shutdown** — proceeds with shutdown
-- **Cancel** — returns to the previous screen
+- **Cancel** — returns to the menu
 
 ### What shutdown does
 
-1. Flushes high watermark data to disk
-2. Syncs filesystem buffers
-3. Clears the display (blank white screen)
-4. Puts the device to sleep
+1. Syncs filesystem buffers
+2. Clears the display (blank white screen)
+3. Puts the display to sleep and halts the signer
 
-## Why Tap-to-Shutdown?
+Once the screen is blank, it is safe to remove power.
 
-The Raspberry Pi Zero 2W has no physical power button. Without a shutdown mechanism, the only way to power off is pulling the USB cable — risking high watermark data loss if writes haven't been flushed to disk. Tap-to-shutdown provides a safe way to halt the device while preserving signing state.
+## Why a Shutdown Button?
+
+The Raspberry Pi Zero 2W has no physical power button. The shutdown button provides a clean halt: filesystem buffers are flushed and the e-ink display is cleared and put into deep sleep before power is removed. Signing safety does not depend on a clean shutdown — high watermark data is committed to stable storage before each signature is returned — but a clean halt flushes buffered log data and leaves the display blank rather than showing stale content while powered off.

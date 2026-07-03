@@ -7,8 +7,11 @@ CLI tool for configuring and managing a Russignol hardware signer from your bake
 - Automated hardware detection and signer setup
 - udev rules and network configuration
 - Key discovery, import, and on-chain assignment
-- SD card image flashing
+- SD card image flashing, with key restore and migration when re-flashing
+  (including from Nomadic Labs RPI BLS signer cards)
 - Key rotation with minimal downtime
+- Interactive RPC endpoint recovery with a public-network picker
+- Self-install and self-upgrade
 
 ## Installation
 
@@ -27,25 +30,41 @@ russignol setup                     Run full setup wizard
 russignol setup --dry-run           Simulate without changes
 russignol setup --verbose           Detailed output
 russignol setup --endpoint <URL>    Use remote node RPC endpoint
+russignol setup --signer-endpoint <URL>     Use remote signer (skips USB/network config)
+russignol setup --yes --baker-key <ALIAS>   Non-interactive setup
 
 russignol image download-and-flash  Download and flash SD card
 russignol image download            Download image only
+russignol image download --beta     Download the latest beta image
 russignol image flash <path>        Flash local image
+russignol image flash <path> --restore-keys   Carry keys and watermarks over from an existing card
+russignol image flash <path> --migrate-keys   Migrate keys from a Nomadic Labs RPI BLS signer card
 russignol image list                List available images
 
 russignol config show               View current configuration
 russignol config set <key> <value>  Update configuration
 russignol config reset              Re-run auto-detection
+russignol config path               Show configuration file path
 
 russignol rotate-keys               Start key rotation workflow
 russignol rotate-keys --monitor     Check pending rotation status
 
-russignol purge                     Remove all system configuration
+russignol watermark init            Initialize watermarks on a manually flashed SD card
+
+russignol purge                     Remove system configuration and imported key aliases
 russignol purge --dry-run           Simulate without changes
 
 russignol status                    Check device connectivity
+russignol status --verbose          Detailed diagnostics
 russignol status --endpoint <URL>   Check status using remote node
+
+russignol install                   Install russignol to ~/.local/bin
+russignol upgrade                   Upgrade to the latest release
+russignol upgrade --check           Check for updates only
+russignol upgrade --beta            Upgrade to the latest beta
+
 russignol completions <shell>       Install shell completions (bash/zsh/fish)
+russignol completions <shell> --print   Print completions to stdout instead
 ```
 
 All node-dependent commands (`setup`, `status`, `rotate-keys`, `image flash`, `image download-and-flash`, `watermark init`) support `--endpoint` to override the configured RPC endpoint.

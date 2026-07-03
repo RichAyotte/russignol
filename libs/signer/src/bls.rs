@@ -5,28 +5,22 @@
 //!
 //! Ported directly from: `src/lib_crypto/bls.ml`
 //!
-//! ## Important Compatibility Note: Out-of-Range Secret Keys
+//! ## Secret Key Byte Order and Out-of-Range Keys
 //!
-//! The BLST library strictly validates that secret keys must be in the range
-//! `[0, r)` where `r` is the BLS12-381 scalar field order:
+//! Tezos serializes BLS12-381 secret keys as little-endian scalars, while BLST
+//! expects big-endian bytes; keys are byte-reversed on load. The most
+//! significant byte of a stored key is therefore the *last* byte — a key file
+//! beginning `0xb5...` is not out of range unless its little-endian value is
+//! >= `r`, the BLS12-381 scalar field order:
 //! ```text
 //! r = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001
 //! ```
 //!
-//! However, the OCaml implementation (`russignol-signer`) accepts secret keys with
-//! values >= r and automatically reduces them modulo r. This is necessary for
-//! compatibility with existing Tezos key files that may contain out-of-range keys.
-//!
-//! **Example**: A key like `BLsk2snGqdSb7qBDhKbc62AxbZXJycDvA5QmeYYhB7Nb3wFuMMbq9x`
-//! decodes to bytes starting with `0xb5...` which is > `0x73...` (the first byte
-//! of r). The OCaml signer loads this key successfully by reducing it modulo r.
-//!
-//! This implementation matches the OCaml behavior by performing modular reduction
-//! when BLST rejects a key with `BLST_BAD_ENCODING`. This ensures that:
-//! - Existing Tezos key files can be read without errors
-//! - The same keys work in both OCaml and Rust implementations
-//! - The cryptographic properties remain correct (reduction preserves the key's
-//!   equivalence class modulo r)
+//! BLST rejects secret keys >= r with `BLST_BAD_ENCODING`. Octez also rejects
+//! such keys (`Bls12_381_signature.sk_of_bytes_exn` raises on
+//! `Fr.Not_in_field`). This implementation instead reduces them modulo r and
+//! logs a warning, so a key file octez would refuse still loads here; the
+//! reduced key is in the same equivalence class modulo r.
 
 use crate::base58check;
 use blake2::digest::consts::U20;
@@ -120,21 +114,14 @@ impl SecretKey {
     ///
     /// Corresponds to: `src/lib_crypto/bls.ml:158` - `of_bytes_opt`
     ///
-    /// # OCaml Compatibility: Modular Reduction
+    /// # Out-of-Range Keys: Modular Reduction
     ///
-    /// Unlike strict BLST validation (which rejects keys >= curve order with
-    /// `BLST_BAD_ENCODING`), this function matches OCaml's lenient behavior by
-    /// automatically reducing out-of-range keys modulo r.
-    ///
-    /// **Why this is needed:**
-    /// - Existing Tezos key files may contain keys with values >= r
-    /// - The OCaml `russignol-signer` accepts such keys via reduction
-    /// - Without this, valid OCaml keys would fail to load in the Rust implementation
-    ///
-    /// **Implementation:**
-    /// 1. First attempts strict validation (fast path)
-    /// 2. On `BLST_BAD_ENCODING`, performs: `key_reduced = key mod r` using `BigUint`
-    /// 3. Creates secret key from reduced bytes (guaranteed to be < r)
+    /// Bytes are interpreted as a little-endian scalar (reversed before BLST,
+    /// which expects big-endian). If BLST rejects the key as >= the curve
+    /// order (`BLST_BAD_ENCODING`), it is reduced modulo r and a warning is
+    /// logged. Octez rejects such keys outright
+    /// (`Bls12_381_signature.sk_of_bytes_exn`), so this lenience accepts key
+    /// files octez would refuse.
     ///
     /// **Security note:** Modular reduction is cryptographically safe as it preserves
     /// the equivalence class of the secret key in the scalar field.
@@ -164,7 +151,7 @@ impl SecretKey {
             Ok(sk) => Ok(Self { sk }),
             Err(blst::BLST_ERROR::BLST_BAD_ENCODING) => {
                 // Key is out of range - reduce it modulo the curve order
-                // This matches OCaml's behavior which accepts out-of-range keys
+                // (octez rejects such keys; see the from_bytes doc comment)
                 log::warn!(
                     "BLS secret key out of range (>= curve order r), applying modular reduction for OCaml compatibility"
                 );
@@ -665,27 +652,22 @@ mod tests {
         );
     }
 
-    /// Test that out-of-range secret keys are properly handled via modular reduction.
+    /// Test key derivation against OCaml-generated vector values.
     ///
-    /// BLS12-381 scalar field order r:
-    /// 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001
-    ///
-    /// Keys with first byte >= 0x73 might be >= r and require reduction.
-    /// This test verifies OCaml compatibility for existing Tezos key files.
+    /// The stored bytes begin 0xb5 — above 0x73, the first byte of the scalar
+    /// field order r — but keys are little-endian, so the value is in range
+    /// (its most significant byte is the last byte, 0x46) and loading it must
+    /// not trigger modular reduction.
     #[test]
-    fn test_out_of_range_key_modular_reduction() {
-        // This key from OCaml has first byte 0xb5 > 0x73 (order's first byte)
-        // OCaml accepts it via modular reduction; we must too for compatibility
-        let out_of_range_key = "BLsk2snGqdSb7qBDhKbc62AxbZXJycDvA5QmeYYhB7Nb3wFuMMbq9x";
+    fn test_ocaml_vector_key_derivation() {
+        let vector_key = "BLsk2snGqdSb7qBDhKbc62AxbZXJycDvA5QmeYYhB7Nb3wFuMMbq9x";
 
         // Expected values from OCaml implementation
         let expected_pk =
             "BLpk1pn59Bwwi9K5VjubG4jphCVhdqWfji8GkV8eBXJCEYNMqE6s5LHv5W13zWtMey6Qipg5yCUD";
         let expected_pkh = "tz4QZtotXaZibHhGUUELAedaoHr8sPMw72fW";
 
-        // Must load without error (modular reduction applied internally)
-        let sk = SecretKey::from_b58check(out_of_range_key)
-            .expect("Out-of-range key should be accepted via modular reduction");
+        let sk = SecretKey::from_b58check(vector_key).expect("vector key should load");
 
         // Derived values must match OCaml exactly
         let pk = sk.to_public_key();

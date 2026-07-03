@@ -1,7 +1,6 @@
 # Tezos Remote Signer TCP Protocol Specification
 
 **Reverse-engineered from OCaml implementation**
-**Date:** November 2025
 **Source:** `src/lib_base/unix/socket.ml`, `src/lib_signer_services/signer_messages.ml`
 
 ## Overview
@@ -11,9 +10,8 @@ The Tezos remote signer uses a binary protocol over TCP sockets for communicatio
 ## Message Framing
 
 ### Length Prefix
-- **Size:** 2 bytes (uint16, big-endian)
+- **Size:** 2 bytes (uint16, big-endian) — not 4 bytes
 - **Maximum message size:** 65,535 bytes
-- **Note:** Earlier documentation incorrectly stated 4 bytes
 
 ```rust
 // OCaml source: src/lib_base/unix/socket.ml
@@ -44,7 +42,7 @@ let size_of_length_of_message_payload = 2
 
 ```
 [0x01]  // Result::Error tag
-[error message as bytes]
+[error trace]  // See "Error Response" below — NOT a raw string
 ```
 
 **Important:** Responses do NOT include a response type tag after the Result tag. The client knows what type to expect based on the request sent.
@@ -69,7 +67,7 @@ let size_of_length_of_message_payload = 2
 **Structure:**
 ```
 [0x00]  // Sign tag
-[PKH encoding]  // See PKH Encoding section
+[versioned PKH]  // See PKH Encoding section (23 bytes for BLS)
 [data length: 4 bytes big-endian]
 [data bytes]
 [optional signature]  // Omitted entirely if None (EOF = None)
@@ -91,7 +89,7 @@ b0 8f...        // PKH: 20 bytes
 **Structure:**
 ```
 [0x01]  // PublicKey tag
-[PKH encoding]
+[raw PKH]  // 21 bytes — no version byte (see PKH Encoding section)
 ```
 
 ### 3. AuthorizedKeys Request (Tag 0x02)
@@ -103,24 +101,76 @@ b0 8f...        // PKH: 20 bytes
 
 **Note:** This is the simplest request - just one byte!
 
-### 4-7. Other Requests
+### 4. DeterministicNonce (Tag 0x03) and DeterministicNonceHash (Tag 0x04)
 
-Similar structure to Sign request, with different tags and fields. See `signer_messages.ml` for details.
+Same layout as the Sign request:
+```
+[tag]  // 0x03 or 0x04
+[versioned PKH]
+[data length: 4 bytes big-endian]
+[data bytes]
+[optional signature]  // Omitted entirely if None (EOF = None)
+```
+
+### 5. SupportsDeterministicNonces Request (Tag 0x05)
+
+**Structure:**
+```
+[0x05]  // SupportsDeterministicNonces tag
+[raw PKH]  // 21 bytes
+```
+
+### 6. KnownKeys Request (Tag 0x06)
+
+**Structure:**
+```
+[0x06]  // KnownKeys tag only
+```
+
+### 7. BlsProveRequest (Tag 0x07)
+
+**Structure:**
+```
+[0x07]  // BlsProveRequest tag
+[raw PKH]  // 21 bytes
+[optional public key]  // Standard option encoding (NOT trailing-omitted)
+```
+
+The optional public key uses the standard option encoding: `0x00` = None, or `0xFF` followed by the public key encoding (`[0x03][48 bytes]` = 49 bytes, so 50 bytes total for Some).
 
 ## Public Key Hash (PKH) Encoding
 
-PKH encoding is a **union** with different variants for different key types and BLS versioning.
+Two distinct PKH encodings are used, depending on the request type.
 
-### Union Tags
+### Raw PKH (21 bytes)
+
+Used by PublicKey (0x01), SupportsDeterministicNonces (0x05), and BlsProveRequest (0x07). A tagged union with **no version byte**:
 
 ```rust
 0x00 - Ed25519 PKH (20 bytes)
 0x01 - Secp256k1 PKH (20 bytes)
 0x02 - P256 PKH (20 bytes)
-0x03 - BLS with version (nested structure)
+0x03 - BLS PKH (20 bytes)
 ```
 
-### Tag 0x03: BLS with Version (CRITICAL!)
+```
+[tag][20 bytes]  // 21 bytes total
+```
+
+This implementation accepts only tag 0x03 (BLS) and returns a decoding error for tags 0x00–0x02.
+
+### Versioned PKH
+
+Used by Sign (0x00), DeterministicNonce (0x03), and DeterministicNonceHash (0x04). A union where **only the BLS case carries a version byte**:
+
+```rust
+0x00 - Ed25519 PKH (20 bytes)              // 21 bytes total
+0x01 - Secp256k1 PKH (20 bytes)            // 21 bytes total
+0x02 - P256 PKH (20 bytes)                 // 21 bytes total
+0x03 - BLS: nested raw PKH + version byte  // 23 bytes total
+```
+
+#### Tag 0x03: BLS with Version (CRITICAL!)
 
 This is a **nested encoding** with the following structure:
 
@@ -163,7 +213,7 @@ b0 8f 04 00 ... // 20 bytes PKH
 
 **Important:** Responses start with Result::Ok tag (0x00) but do NOT have a response type tag. The client knows what type to expect based on its request.
 
-### 1. Signature Response (for Sign request)
+### 1. Signature Response (for Sign and BlsProveRequest)
 
 **Structure:**
 ```
@@ -171,15 +221,18 @@ b0 8f 04 00 ... // 20 bytes PKH
 [96 bytes]  // BLS signature bytes
 ```
 
-**Total: 97 bytes**
+**Payload: 97 bytes (99 bytes on wire with the length prefix)**
 
 ### 2. PublicKey Response
 
 **Structure:**
 ```
 [0x00]      // Result::Ok
+[0x03]      // Public key union tag (BLS)
 [48 bytes]  // BLS public key bytes
 ```
+
+**Payload: 50 bytes (52 bytes on wire).** Note: unlike the signature, the public key encoding is a tagged union, so the payload includes the `0x03` tag before the 48 key bytes.
 
 ### 3. AuthorizedKeys Response
 
@@ -189,14 +242,17 @@ b0 8f 04 00 ... // 20 bytes PKH
 [0x00]  // Union tag 0: No_authentication
 ```
 
-**Total: 2 bytes**
+**Payload: 2 bytes (4 bytes on wire)**
 
 **Structure (With Authentication):**
 ```
 [0x00]          // Result::Ok
 [0x01]          // Union tag 1: Authorized_keys
-[list encoding] // List of PKH (4-byte length + PKHs)
+[list encoding] // 4-byte big-endian TOTAL BYTE LENGTH of the list,
+                // followed by raw PKHs (21 bytes each)
 ```
+
+The list length prefix is the total byte size of the list contents (`N × 21`), not the item count.
 
 **OCaml Source:**
 ```ocaml
@@ -212,14 +268,49 @@ module Response = struct
 end
 ```
 
-### 4. Error Response
+### 4. Nonce and NonceHash Responses
+
+**Structure (for DeterministicNonce and DeterministicNonceHash):**
+```
+[0x00]      // Result::Ok
+[32 bytes]  // Raw nonce (or nonce hash) bytes, no length prefix
+```
+
+### 5. Bool Response (for SupportsDeterministicNonces)
+
+**Structure:**
+```
+[0x00]  // Result::Ok
+[0xFF]  // true
+```
+or
+```
+[0x00]  // Result::Ok
+[0x00]  // false
+```
+
+### 6. KnownKeys Response
+
+**Structure:**
+```
+[0x00]           // Result::Ok
+[4 bytes BE]     // Total byte length of the list (N × 21)
+[N × 21 bytes]   // Raw PKHs ([0x03][20 bytes] each)
+```
+
+### 7. Error Response
 
 **Structure:**
 ```
 [0x01]              // Result::Error tag
-[4-byte length]     // Error message length
-[error message]     // UTF-8 error string
+[4 bytes BE]        // Total byte length of the error trace
+[4 bytes BE]        // Byte length of the first trace item
+[BSON document]     // {"kind": "generic", "error": "<message>"}
 ```
+
+Errors are encoded as a Data_encoding error **trace**: a list (4-byte total byte length) of items, where each item is a 4-byte length followed by a BSON-serialized JSON error object. The trace total length equals the item length + 4 (for the item's own length prefix). This implementation emits a single "generic" error item, which octez-client accepts.
+
+**The error message is NOT a raw UTF-8 string** — decoders must parse the trace framing and the BSON document to extract the `error` field.
 
 ## Optional Field Encoding
 
@@ -236,21 +327,23 @@ end
 [value] // The value
 ```
 
+Used by the BlsProveRequest override public key.
+
 ### Optional Fields at End of Object
 
 **CRITICAL:** When an optional field is at the END of an object (like signature in Sign request), it is **omitted entirely** when None. There is NO tag byte.
 
 **Detection:** EOF (end of message) = None
 
-**Implementation:**
+Because the field is omitted when None, a `0x00` tag byte is **invalid** in this position — only `0xFF` (Some) or EOF (None) are accepted:
+
 ```rust
 fn decode_option_signature<R: Read>(cursor: &mut R) -> Result<Option<Signature>> {
     match read_u8(cursor) {
         Ok(0xFF) => Ok(Some(decode_signature(cursor)?)),
-        Ok(0x00) => Ok(None),
         Err(e) if e.kind() == UnexpectedEof => Ok(None), // EOF = None!
+        Ok(tag) => Err(InvalidFormat(tag)),              // includes 0x00
         Err(e) => Err(e),
-        Ok(tag) => Err(InvalidFormat(tag)),
     }
 }
 ```
@@ -281,13 +374,22 @@ fn decode_option_signature<R: Read>(cursor: &mut R) -> Result<Option<Signature>>
 - **Variant:** MinPk (minimize public key size)
 - **Scheme:** PoP (Proof of Possession)
 
-### Ciphersuite
+### Ciphersuites
 
-**CRITICAL:** Must use the correct DST (Domain Separation Tag):
+**CRITICAL:** Two distinct DSTs (Domain Separation Tags) are used.
+
+Regular signatures (`sign`/`verify`):
 
 ```rust
-const POP_CIPHERSUITE_ID: &[u8] =
+const SIG_DST: &[u8] =
     b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+```
+
+Proof of possession (`pop_prove`/`pop_verify`):
+
+```rust
+const POP_DST: &[u8] =
+    b"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 ```
 
 **OCaml Source:**
@@ -318,7 +420,7 @@ let sk = blst::min_pk::SecretKey::from_bytes(&reversed_bytes)?;
 
 ### Out-of-Range Keys
 
-Keys exceeding the curve order must be reduced modulo the curve order:
+Octez rejects keys whose **little-endian value** is >= the curve order (`Bls12_381_signature.sk_of_bytes_exn` raises). This implementation instead reduces such keys modulo the curve order and logs a warning:
 
 ```rust
 const CURVE_ORDER: &str =
@@ -329,6 +431,8 @@ let key_int = BigUint::from_bytes_le(bytes);
 let reduced = key_int % curve_order;
 let sk_bytes = reduced.to_bytes_be();
 ```
+
+Note: because keys are little-endian, the most significant byte is the *last* stored byte — a key file beginning `0xb5...` is not necessarily out of range.
 
 ### Signature Encoding
 
@@ -367,7 +471,7 @@ Operations to be signed are prefixed with magic bytes:
 [02]     // AuthorizedKeys tag
 ```
 
-**Response (2 bytes):**
+**Response (2-byte payload):**
 ```
 [00 02]  // Length: 2
 [00]     // Result::Ok
@@ -376,7 +480,7 @@ Operations to be signed are prefixed with magic bytes:
 
 ### Example 2: Sign Request/Response
 
-**Request (106 bytes):**
+**Request (106-byte payload):**
 ```
 [00 6a]                              // Length: 106
 [00]                                 // Sign tag
@@ -386,7 +490,7 @@ Operations to be signed are prefixed with magic bytes:
                                      // No signature (EOF)
 ```
 
-**Response (97 bytes):**
+**Response (97-byte payload):**
 ```
 [00 61]                              // Length: 97
 [00]                                 // Result::Ok
@@ -425,8 +529,11 @@ b0 8f ... a0 f7 → 20 bytes PKH
 - Except for optional fields at end → EOF = None
 
 ### 4. High Watermark Violations
-- Server tracks last signed level/round per chain
-- Reject signing at lower level → Watermark error
+- The server tracks the last signed level/round **per key and per operation type** (block, preattestation, attestation); chain ID is not part of the watermark state
+- Signing below the current level → Watermark error
+- Signing at the current level with a round <= the current round → Watermark error (the round must be strictly higher at the same level)
+- Signing with no existing watermark entry → Watermark error (watermarks must be initialized before the first signature)
+- A corrupt watermark file prevents the signer from loading
 
 ### 5. Invalid Magic Bytes
 - Server can be configured to only allow specific magic bytes
@@ -440,18 +547,20 @@ b0 8f ... a0 f7 → 20 bytes PKH
 - [ ] Handle **persistent connections** (loop for multiple requests)
 - [ ] Wrap responses in **Result::Ok** (0x00)
 - [ ] **Do NOT** add response type tag
+- [ ] Include the **union tag (0x03)** in PublicKey responses
+- [ ] Encode errors as a **trace of BSON items**, not a raw string
 - [ ] Handle **EOF as None** for optional signature
 - [ ] Decode **nested BLS PKH** (3 levels: outer tag, inner tag, version)
-- [ ] Use **correct BLS ciphersuite** (Pop with DST)
+- [ ] Use **correct BLS ciphersuites** (distinct DSTs for sign and PoP)
 - [ ] **Reverse secret key bytes** (LE to BE)
-- [ ] Handle **out-of-range keys** (modular reduction)
+- [ ] Decide **out-of-range key** handling (octez rejects; this implementation reduces mod r)
 - [ ] Return **No_authentication** (tag 0x00) when auth disabled
 
 ### Client Implementation
 
 - [ ] Send **2-byte length prefix**
 - [ ] Include **request type tag**
-- [ ] Encode **BLS PKH correctly** (3 levels)
+- [ ] Encode **BLS PKH correctly** (versioned for Sign/nonce requests, raw for the rest)
 - [ ] **Omit optional signature** entirely when None (no tag)
 - [ ] Expect **Result wrapper** on responses
 - [ ] **No response type tag** (client knows expected type)
@@ -463,10 +572,12 @@ b0 8f ... a0 f7 → 20 bytes PKH
 2. ❌ **Adding response type tag** → Don't! Only Result::Ok/Error tag
 3. ❌ **Writing 0x00 for None signature** → Omit entirely (EOF)
 4. ❌ **Missing nested BLS encoding** → 3 levels: tag, inner tag, version
-5. ❌ **Wrong BLS ciphersuite** → Must use Pop with correct DST
-6. ❌ **Not reversing secret key bytes** → LE to BE conversion required
-7. ❌ **Closing connection too early** → Support multiple requests
-8. ❌ **Returning key list for AuthorizedKeys** → Return No_authentication (0x00)
+5. ❌ **Using the versioned PKH everywhere** → PublicKey/SupportsDeterministicNonces/BlsProveRequest use the 21-byte raw PKH
+6. ❌ **Treating the error payload as a UTF-8 string** → It is a trace of BSON items
+7. ❌ **Wrong BLS ciphersuite** → Distinct DSTs for signing and proof of possession
+8. ❌ **Not reversing secret key bytes** → LE to BE conversion required
+9. ❌ **Closing connection too early** → Support multiple requests
+10. ❌ **Returning key list for AuthorizedKeys** → Return No_authentication (0x00)
 
 ## Testing
 
@@ -487,14 +598,19 @@ BLpk1pn59Bwwi9K5VjubG4jphCVhdqWfji8GkV8eBXJCEYNMqE6s5LHv5W13zWtMey6Qipg5yCUD
 tz4QZtotXaZibHhGUUELAedaoHr8sPMw72fW
 ```
 
-### Test Vector 2: Out-of-Range Key
+**Note:** The stored key bytes begin `0xb5...`, which exceeds the first byte of the curve order (`0x73...`) if misread as big-endian. Secret keys are little-endian, so the actual scalar value is in range — an implementation that skips the byte reversal will derive the wrong public key.
+
+### Test Vector 2: BLS Key Derivation
 
 **Secret Key (base58):**
 ```
 BLsk2L4dMse5ac4V9RhPHwZmDp1nbK2mzsfjtGURyMtnZnVrr89uZQ
 ```
 
-**Note:** This key exceeds curve order and requires modular reduction.
+**Expected Public Key:**
+```
+BLpk1xn1JkUyo2edVE9RAFgC6MEDRSKEzddXLBy1zzczX52TTuxJ2NcsPZTRhP6EidWayhYbcAMr
+```
 
 **Expected PKH:**
 ```
@@ -518,19 +634,21 @@ This section provides a practical breakdown of the total size of common requests
 
 ### Attestation Request Size
 
-Attestation signing requests have a fixed and predictable size. The example below is for a non-BLS key, which is the largest variant.
+Attestation and preattestation signing requests are fixed-size. The signed payload is: magic byte (1) + chain ID (4) + branch (32) + kind (1) + slot (2, non-BLS keys only) + level (4) + round (4) + block payload hash (32) — **78 bytes for BLS (tz4) keys, 80 bytes otherwise**.
 
-| Part | Size (Bytes) | Description |
-| :--- | :--- | :--- |
-| **Length Prefix** | **2** | A `u16` value indicating the payload length (76 bytes). |
-| | | **--- Payload Starts ---** |
-| Request Tag | 1 | `0x00` to indicate a `Sign` request. |
-| PKH Encoding | 24 | The public key hash (`pkh`) of the key to sign with. |
-| Data Length | 4 | A `u32` value indicating the signed data length (48 bytes). |
-| Data to Sign | 48 | The actual attestation payload (magic byte, etc.). |
-| Auth Signature | 0 | Optional field, absent in standard baking requests. |
-| **Total Payload** | **76** | (1 + 24 + 4 + 48) |
-| **Total on Wire** | **78** | (2-byte prefix + 76-byte payload) |
+| Part | BLS key (tz4) | Non-BLS key | Description |
+| :--- | :--- | :--- | :--- |
+| **Length Prefix** | **2** | **2** | A `u16` value indicating the payload length. |
+| | | | **--- Payload Starts ---** |
+| Request Tag | 1 | 1 | `0x00` to indicate a `Sign` request. |
+| PKH Encoding | 23 | 21 | Versioned PKH; only the BLS case carries a version byte. |
+| Data Length | 4 | 4 | A `u32` value indicating the signed data length. |
+| Data to Sign | 78 | 80 | The attestation payload (magic byte, etc.). |
+| Auth Signature | 0 | 0 | Trailing optional field, omitted in standard baking requests. |
+| **Total Payload** | **106** | **106** | |
+| **Total on Wire** | **108** | **108** | |
+
+Both key families yield the same totals: the BLS PKH is 2 bytes longer, and the BLS attestation payload is 2 bytes shorter (no slot field).
 
 ### Block Signing Request Size
 
@@ -541,11 +659,11 @@ Block signing requests have a variable size because the block header format cont
 | **Length Prefix** | **2** | A `u16` value indicating the payload length. |
 | | | **--- Payload Starts ---** |
 | Request Tag | 1 | `0x00` to indicate a `Sign` request. |
-| PKH Encoding | 24 | The public key hash (`pkh`) of the key to sign with. |
+| PKH Encoding | 23 | The versioned BLS PKH (21 for non-BLS keys). |
 | Data Length | 4 | A `u32` value indicating the block header's length. |
 | Data to Sign | **Variable** | The block header. Typically 100-200 bytes, but can be up to 32KB. |
-| Auth Signature | 0 | Optional field, absent in standard baking requests. |
-| **Total Payload** | **Variable** | (29 bytes of metadata + variable block header size) |
+| Auth Signature | 0 | Trailing optional field, absent in standard baking requests. |
+| **Total Payload** | **Variable** | (28 bytes of metadata + variable block header size) |
 | **Total on Wire** | **Variable** | (2-byte prefix + Total Payload) |
 
-This variability in the block signing request is the primary motivation for enforcing a maximum size limit (e.g., 64KB) in the protocol parser to prevent memory exhaustion attacks.
+This variability in the block signing request is the primary motivation for enforcing a maximum size limit (e.g. 64KB) in the protocol parser to prevent memory exhaustion attacks.

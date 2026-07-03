@@ -100,7 +100,8 @@ The project uses Buildroot to create a minimal, purpose-built Linux distribution
 ### 2.2 User Configuration
 
 **Security Properties:**
-- ✅ Root account locked (no password, cannot login)
+- ✅ No login vector for root (no getty, no SSH daemon, UART disabled)
+- ⚠️ Root account carries an empty password rather than a locked hash — mitigated only by the absence of any login path
 - ✅ `russignol` user locked (password hash set to `*`)
 - ✅ Non-root user runs signer application
 - ✅ Hardware groups have no login shell
@@ -159,13 +160,13 @@ The device runs at stock clock speeds for maximum reliability.
 
 ### 4.1 BLS12-381 Implementation
 
-**Library:** BLST (portable mode)
+**Library:** BLST 0.3.x (default build)
 
 **Properties:**
 - Constant-time operations (BLST library guarantee)
 - Deterministic nonce generation
 - Proof of Possession support
-- Out-of-range keys are silently reduced to valid range (no logging)
+- Out-of-range keys are reduced to the valid range (logged as a warning); note this diverges from octez, which rejects such keys outright
 
 ### 4.2 Key Encryption
 
@@ -212,14 +213,14 @@ The signer relies on **physical network isolation** (USB Gadget Ethernet) rather
 The high watermark prevents re-signing at the same level/round:
 - ✅ Level-based protection (monotonically increasing)
 - ✅ Round-based protection (at same level)
-- ✅ Persisted to disk via write-behind cache
+- ✅ Persisted synchronously — pwrite + fdatasync completes before the signature is returned; idle-time ceiling writes keep the signing hot path free of disk I/O
 - ✅ Loaded on startup
 
 ## 7. Runtime Security Features
 
 ### 7.1 Screensaver
 
-The display enters sleep mode after 3 minutes of inactivity. Touch to wake. This is not a security lock - no PIN re-entry is required.
+The display enters sleep mode after 1 minute of inactivity. Touch to wake. This is not a security lock - no PIN re-entry is required.
 
 ### 7.2 PIN Rate Limiting
 
@@ -283,7 +284,6 @@ Protection against stale watermarks that could indicate misconfiguration:
 ### 9.1 Memory
 
 - ASLR enabled
-- Core dumps disabled in kernel
 - Swap disabled (keys cannot be paged to disk)
 - BLST library handles key zeroization on drop
 
@@ -309,7 +309,7 @@ Keys at rest are protected by AES-256-GCM with Scrypt KDF (log_n=18, r=8, p=4, 2
 
 - Unsafe code limited to `libc` FFI calls for privilege management
 - Secrets passed in memory, never written to disk in plaintext
-- Watermarks flushed to disk after each signature
+- Watermark durability guaranteed before any signature is returned (fdatasync ordering, with pre-written ceilings covering the hot path)
 
 ## 12. Vulnerability Summary
 
@@ -321,9 +321,7 @@ Keys at rest are protected by AES-256-GCM with Scrypt KDF (log_n=18, r=8, p=4, 2
 
 ### 12.2 Medium-Risk Issues
 
-| ID | Issue | Impact |
-|----|-------|--------|
-| M1 | Out-of-range key reduction | Silent key modification (no logging) |
+**None identified.**
 
 ### 12.3 Low-Risk Issues
 
@@ -340,6 +338,7 @@ The following security measures are in place:
 1. **PIN Rate Limiting**: 5 failed attempts → lockout requiring power cycle
 2. **PIN Minimum Length**: Enforced 5-digit minimum (~17 bits entropy)
 3. **Large Gap Detection**: Warns on watermark gaps >4 cycles
+4. **Out-of-Range Key Reduction Logging**: Modular reductions of out-of-range keys emit a warning
 
 ### 13.2 Suggested Enhancements
 
@@ -347,7 +346,6 @@ The following security measures are in place:
 |-------------|---------|
 | Persistent audit logging | Track signing operations across reboots |
 | Watermark redundancy | Prevent corruption |
-| Log out-of-range key reductions | Detect corrupted keys (addresses M1) |
 
 ## Appendix A: Threat Model Summary
 
@@ -374,7 +372,7 @@ The following security measures are in place:
 | Security Control | Status |
 |------------------|--------|
 | SSH Access | ✅ Disabled |
-| Root Login | ✅ Locked |
+| Root Login | ✅ No login vector (no getty/SSH/UART; account has empty password, not a locked hash) |
 | User Login | ✅ Locked |
 | Network Tools | ✅ Removed (telnet, ftp, wget, netcat) |
 | Text Editors | ✅ Removed (vi, ed) |
@@ -392,7 +390,7 @@ Keys are protected by AES-256-GCM with Scrypt KDF (log_n=18, r=8, p=4, 256MB mem
 
 ### Benchmarks
 
-Measured March 2026 on AMD Ryzen 7 7700X (8C/16T, 4.5 GHz) + AMD Radeon RX 6700 XT (12 GB VRAM):
+Measured March 2026, after the initial assessment, on AMD Ryzen 7 7700X (8C/16T, 4.5 GHz) + AMD Radeon RX 6700 XT (12 GB VRAM):
 
 | Method | Our scrypt (N=2^18, r=8, p=4) | Default scrypt (N=2^14, r=1, p=1) |
 |--------|-------------------------------|-------------------------------------|

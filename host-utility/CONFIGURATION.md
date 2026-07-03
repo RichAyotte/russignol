@@ -27,13 +27,16 @@ The Russignol host utility uses a persistent configuration system to manage cust
   - Example: `~/.tezos-client`, `~/.octez-client-shadownet`
 - `octez_node_dir` (string|null): Path to octez-node directory (optional)
   - Contains: `config.json`, `identity.json`
-  - Currently unused but reserved for future features
+  - Used in the suggested baker start command printed after setup
 - `rpc_endpoint` (string): RPC endpoint URL for octez-client (required)
   - Format: `http://HOST:PORT` or `https://HOST:PORT`
   - Example: `http://localhost:8732`, `http://127.0.0.1:8733`
   - Can be overridden per-command with `--endpoint <URL>`
   - The `octez-node` binary is only required when this points at localhost;
     a remote or public endpoint needs `octez-client` alone
+- `dal_node_endpoint` (string|null): DAL node RPC endpoint (optional, for bakers participating in DAL)
+  - Format: `http://HOST:PORT`
+  - Default when auto-detected: `http://localhost:10732`
 - `signer_endpoint` (string|null): Remote signer endpoint (optional)
   - Format: `tcp://HOST:PORT`
   - Example: `tcp://192.168.1.50:7732`
@@ -63,7 +66,12 @@ The utility automatically detects configuration on first run:
    - If detected: use automatically without prompting
    - If not detected: prompt with default `http://localhost:8732`
 
-3. **Save Configuration**:
+3. **DAL Node Endpoint Detection**:
+   - Search for DAL node directories: `~/.tezos-dal-node`, `~/.octez-dal-node`, `~/.tezos-dal-node-*`, `~/.octez-dal-node-*`
+   - If one exists: assume the default endpoint `http://localhost:10732`
+   - If none found: leave unset
+
+4. **Save Configuration**:
    - Configuration saved to `~/.config/russignol/config.json`
    - Used for all subsequent runs
 
@@ -156,18 +164,20 @@ run_octez_client_command(&["list", "known", "addresses"], config)
 
 **Equivalent to**:
 ```bash
-octez-client --endpoint http://127.0.0.1:8733 --base-dir ~/.octez-client-shadownet list known addresses
+octez-client --wait 1 --endpoint http://127.0.0.1:8733 --base-dir ~/.octez-client-shadownet list known addresses
 ```
 
 ### Flags Added Automatically
 
 Every octez-client command receives:
 
-1. **`--endpoint <RPC_URL>`**: Specifies which RPC endpoint to connect to
+1. **`--wait 1`**: Waits for one confirmation on injected operations
+
+2. **`--endpoint <RPC_URL>`**: Specifies which RPC endpoint to connect to
    - Ensures commands connect to the correct node
    - Critical when running multiple testnets on different ports
 
-2. **`--base-dir <CLIENT_DIR>`**: Specifies which client directory to use
+3. **`--base-dir <CLIENT_DIR>`**: Specifies which client directory to use
    - Determines which keys are available
    - Ensures operations use the correct network's keys
    - Prevents accidentally mixing keys between networks

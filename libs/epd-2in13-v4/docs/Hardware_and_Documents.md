@@ -19,7 +19,7 @@ This document contains the specifications for the 2.13-inch e-paper display.
 
 ### `GT1151QM_Datasheet-EN.pdf`
 
-This is the datasheet for the GT1151Q capacitive touch chip.
+This is the datasheet for the GT1151QM variant of the GT1151Q capacitive touch chip used on the HAT.
 
 *   **Function:** 10-point capacitive touch controller with gesture wake-up.
 *   **Interface:** I2C
@@ -40,7 +40,11 @@ This document is a programming guide for the GT1151Q touch controller. It provid
 *   **Gesture Recognition:** How to configure and read gesture data.
 *   **Register Maps:** Detailed information on configuration, coordinate, and gesture registers.
 
-## Controller Notes
+## Display Controller
+
+### `SSD1680-SolomonSystech.pdf`
+
+The full Solomon Systech datasheet for the SSD1680 display controller — command set, timing, and application circuit. Source for the reset-timing notes below.
 
 ### `SSD1680_datasheet_notes.md`
 

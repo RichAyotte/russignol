@@ -8,6 +8,8 @@ Quality PRs are focused, small, and include tests.
 
 Latest stable Rust (edition 2024)
 
+Run `cargo xtask validate` to check your build environment.
+
 ## Before Submitting
 
 ```sh

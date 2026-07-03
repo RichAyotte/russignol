@@ -2,7 +2,7 @@
 
 This directory contains the source code for the Russignol project website (landing page).
 
-Russignol is a secure Tezos hardware signer designed for the Raspberry Pi Zero 2 with an e-paper display. This website serves as the main hub for information, features, downloads, and setup guides.
+Russignol is a secure Tezos hardware signer designed for the Raspberry Pi Zero 2 W with an e-paper display. This website serves as the main hub for information, features, downloads, and setup guides.
 
 ## Local Development
 
@@ -21,3 +21,13 @@ bun x serve .
 ```
 
 This will start a static file server. Open your browser and navigate to the URL provided in the terminal (typically `http://localhost:3000`) to view the website.
+
+## Deployment
+
+The website is deployed to Cloudflare Pages and served at [russignol.com](https://russignol.com). From the repository root:
+
+```bash
+cargo xtask publish --website
+```
+
+This requires the `wrangler` CLI (`bun add -g wrangler`).

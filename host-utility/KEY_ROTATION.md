@@ -28,6 +28,8 @@ OPTIONS:
     --dry-run                  Show what would be done without executing
     --yes                      Skip confirmation prompts
     --verbose                  Show detailed output
+    --endpoint URL             Tezos node RPC endpoint (overrides configured endpoint)
+    --signer-endpoint URL      Remote signer endpoint (overrides configured endpoint)
 
 Hardware configuration:
     --config MODE              Hardware setup: "two-devices" or "single-pi"
@@ -58,6 +60,10 @@ Verifies all requirements before starting:
 
 1. Connect your NEW Russignol device (or insert NEW SD card)
 2. The utility discovers and validates the new keys
+
+If you don't have a flashed card yet, the command offers to download and
+flash one for you before continuing, then guides you through device
+initialization (Begin → create PIN → key generation).
 
 ### Step 3: Import New Keys
 
@@ -149,7 +155,9 @@ It means the connected signer doesn't have the key you're trying to register. En
 
 The `-old` aliases are kept as backups until verification passes:
 - If baker fails to start → aliases can be restored
-- If verification succeeds → backup aliases are removed
+- If verification succeeds → you are prompted to remove the backup aliases
+  (default: keep them; the prompt prints the manual `forget address` commands
+  if you decline)
 
 ## Timing and Downtime
 
@@ -164,13 +172,11 @@ The `-old` aliases are kept as backups until verification passes:
 | Phase | Duration | Impact |
 |-------|----------|--------|
 | NEW device for tx submission | ~10-60 seconds | OLD device offline (missed attestations) |
-| Swap sequence at cycle boundary | ~10-60 seconds | May miss 1-6 attestations |
-
-**Cost estimate:** ~0.01-0.06 XTZ in missed attestation rewards
+| Swap sequence at cycle boundary | ~10-60 seconds | May miss ~2-10 attestations (one slot per 6-second block) |
 
 ### Optimal Swap Window
 
-The utility queries your baking rights and recommends swapping during gaps between your round 0 (priority) baking slots. This minimizes the risk of missing block rewards (~10-20 XTZ per block).
+The utility queries your baking rights and recommends swapping during gaps between your round 0 (priority) baking slots. This minimizes the risk of missing block rewards.
 
 ## Hardware Configurations
 
