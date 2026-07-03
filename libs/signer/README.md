@@ -62,7 +62,7 @@ This implementation is compatible with the OCaml `octez-signer`:
 
 Tezos stores BLS12-381 secret keys as little-endian scalars, while the BLST library expects big-endian bytes; keys are byte-reversed on load. The most significant byte of a stored key is therefore the *last* byte — a key file beginning `0xb5...` is not necessarily out of range.
 
-If a key's little-endian value is >= `r` (the BLS12-381 scalar field order), it is rejected on load, matching octez.
+If a key's little-endian value is >= `r` (the BLS12-381 scalar field order), it is rejected on load, as in octez. Stricter than octez: the all-zero key is also rejected, where octez accepts the zero scalar.
 
 See the bls module documentation for technical details.
 

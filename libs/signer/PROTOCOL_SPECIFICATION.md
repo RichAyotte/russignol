@@ -420,13 +420,15 @@ let sk = blst::min_pk::SecretKey::from_bytes(&reversed_bytes)?;
 
 ### Out-of-Range Keys
 
-Keys whose **little-endian value** is >= the curve order are rejected, matching octez (`Bls12_381_signature.sk_of_bytes_exn` raises):
+Keys whose **little-endian value** is >= the curve order are rejected, as in octez (`Bls12_381_signature.sk_of_bytes_exn` raises):
 
 ```text
 r = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001
 ```
 
 Note: because keys are little-endian, the most significant byte is the *last* stored byte — a key file beginning `0xb5...` is not necessarily out of range.
+
+Two divergences from octez are deliberate and stricter: the zero scalar is rejected (octez accepts `Fr.zero`), and exactly 32 bytes are required (octez zero-pads shorter input). Neither is reachable through base58check — a `BLsk` payload is always 32 bytes, and no standard tool produces a zero key.
 
 ### Signature Encoding
 

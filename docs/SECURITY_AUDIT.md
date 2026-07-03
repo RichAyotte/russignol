@@ -133,21 +133,35 @@ The project uses Buildroot to create a minimal, purpose-built Linux distribution
 | Feature | Config | Status |
 |---------|--------|--------|
 | KASLR | `CONFIG_RANDOMIZE_BASE=y` | ✅ Enabled |
-| Kernel lockdown | `CONFIG_LOCK_DOWN_KERNEL_FORCE_INTEGRITY=y` | ✅ Integrity mode, enforced early |
-| Module signing | `CONFIG_MODULE_SIG_ALL=y`, `CONFIG_MODULE_SIG_FORCE=y` | ✅ Unsigned modules rejected |
+| Kernel lockdown | `CONFIG_LOCK_DOWN_KERNEL_FORCE_INTEGRITY=y`, `CONFIG_SECURITY_LOCKDOWN_LSM_EARLY=y` | ✅ Integrity mode, enforced early |
+| Module signing | `CONFIG_MODULE_SIG=y`, `CONFIG_MODULE_SIG_ALL=y`, `CONFIG_MODULE_SIG_FORCE=y` | ✅ Unsigned modules rejected |
 | Core dumps | `# CONFIG_COREDUMP is not set` | ✅ Disabled |
 | Heap zeroing | `CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y`, `CONFIG_INIT_ON_FREE_DEFAULT_ON=y` | ✅ Allocations and freed memory wiped |
 | Stack zeroing | `CONFIG_INIT_STACK_ALL_ZERO=y` | ✅ Enabled |
 | Kernel stack offset randomization | `CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT=y` | ✅ Enabled |
 | PAN emulation | `CONFIG_ARM64_SW_TTBR0_PAN=y` | ✅ Kernel blocked from stray user-memory access |
 | Slab hardening | `CONFIG_SLAB_FREELIST_RANDOM=y`, `CONFIG_SLAB_FREELIST_HARDENED=y`, `# CONFIG_SLAB_MERGE_DEFAULT is not set` | ✅ Enabled |
+| FORTIFY_SOURCE | `CONFIG_FORTIFY_SOURCE=y` | ✅ Compile-time and runtime bounds checks |
+| Hardened usercopy | `CONFIG_HARDENED_USERCOPY=y` | ✅ Enabled |
+| Linked-list hardening | `CONFIG_LIST_HARDENED=y` | ✅ Enabled |
 | ptrace scoping | `CONFIG_SECURITY_YAMA=y` | ✅ Restricted to descendants |
 | dmesg access | `CONFIG_SECURITY_DMESG_RESTRICT=y` | ✅ Root only |
 | io_uring / legacy AIO | `# CONFIG_IO_URING is not set`, `# CONFIG_AIO is not set` | ✅ Removed |
 | Namespaces | `# CONFIG_NAMESPACES is not set` | ✅ Removed |
+| /dev/mem | `# CONFIG_DEVMEM is not set` | ✅ Removed |
 | F2FS | `CONFIG_F2FS_FS=y` | ✅ Enabled |
 | No Swap | `# CONFIG_SWAP is not set` | ✅ Prevents key leakage |
-| Legacy PTY | `CONFIG_LEGACY_PTYS` | ✅ Disabled |
+| Legacy PTY | `# CONFIG_LEGACY_PTYS is not set` | ✅ Removed |
+
+These are properties of the *generated* kernel config. Several are not
+explicit `linux-russignol_defconfig` lines — they hold via Kconfig selects
+and defaults (`SECURITY_LOCKDOWN_LSM` selects `MODULE_SIG`;
+`INIT_STACK_ALL_ZERO` defaults on only when the toolchain supports
+`-ftrivial-auto-var-init=zero`; `NAMESPACES`, `AIO`, and `IO_URING` default
+off only under `CONFIG_EXPERT=y`), and `savedefconfig` strips default-equal
+symbols, so the defconfig cannot pin them. Every config cited in this table
+is therefore asserted against the generated kernel `.config` on each image
+build (`KERNEL_HARDENING` in `xtask/src/image.rs`); drift fails the build.
 
 The dev and hardened images build the same kernel from this configuration.
 
@@ -180,7 +194,7 @@ The device runs at stock clock speeds for maximum reliability.
 - Constant-time operations (BLST library guarantee)
 - Deterministic nonce generation
 - Proof of Possession support
-- Out-of-range secret keys are rejected on load, matching octez
+- Out-of-range and zero secret keys are rejected on load (octez rejects out-of-range keys too, but accepts the zero scalar)
 
 ### 4.2 Key Encryption
 
@@ -354,7 +368,7 @@ The following security measures are in place:
 1. **PIN Rate Limiting**: 5 failed attempts → lockout requiring power cycle
 2. **PIN Minimum Length**: Enforced 5-digit minimum (~17 bits entropy)
 3. **Large Gap Detection**: Warns on watermark gaps >4 cycles
-4. **Strict Key Validation**: Secret keys >= the BLS12-381 curve order are rejected on load, matching octez
+4. **Strict Key Validation**: Secret keys >= the BLS12-381 curve order are rejected on load, as in octez; the zero scalar is additionally rejected
 
 ### 13.2 Suggested Enhancements
 
