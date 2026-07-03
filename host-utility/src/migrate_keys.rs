@@ -570,7 +570,7 @@ impl CardSource for MigrateSource {
     }
 
     fn identity(&self, device: &Path) -> Option<String> {
-        source_disk_ptuuid(device)
+        utils::source_disk_ptuuid(device)
     }
 
     fn noun(&self) -> &'static str {
@@ -814,29 +814,6 @@ fn umount(mount_point: &Path) -> Result<()> {
         bail!("umount failed: {}", command_failure_detail(&output));
     }
     Ok(())
-}
-
-/// Read a card's partition-table UUID (MBR signature or GPT GUID) as its
-/// swap-guard identity, probing the device directly under sudo.
-///
-/// `-c /dev/null` bypasses blkid's cache so the value reflects the media
-/// currently in the reader (not a stale entry from before a swap); sudo is
-/// already cached for migration, so the read never depends on the invoking
-/// user's direct access to the block device. Returns `None` when the device has
-/// no partition table (e.g. a blank target) or `blkid` is unavailable.
-fn source_disk_ptuuid(device: &Path) -> Option<String> {
-    let blkid = utils::resolve_tool("blkid")?;
-    let output = Command::new("sudo")
-        .arg(blkid)
-        .args(["-c", "/dev/null", "-s", "PTUUID", "-o", "value"])
-        .arg(device)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if id.is_empty() { None } else { Some(id) }
 }
 
 #[cfg(test)]

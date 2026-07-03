@@ -561,6 +561,39 @@ pub fn unmount_partition(mount_point: &Path, partition: &Path) -> Result<()> {
     }
 }
 
+/// Partition-table UUID of a whole-disk device, used as a stable card identity
+/// for the swap guard when no flash manifest is present.
+///
+/// `-c /dev/null` bypasses blkid's cache so the value reflects the media
+/// currently inserted, not a stale entry from before a swap. An unprivileged
+/// read is tried first, then a non-interactive `sudo` (`-n`, never prompting),
+/// so a manifest-less card is still identifiable without stalling the flow on
+/// a password prompt. Returns `None` when the device has no partition table or
+/// `blkid` is unavailable.
+pub fn source_disk_ptuuid(device: &Path) -> Option<String> {
+    let blkid = resolve_tool("blkid")?;
+    let read = |sudo: bool| -> Option<String> {
+        let mut cmd = if sudo {
+            let mut c = Command::new("sudo");
+            c.arg("-n").arg(&blkid);
+            c
+        } else {
+            Command::new(&blkid)
+        };
+        let output = cmd
+            .args(["-c", "/dev/null", "-s", "PTUUID", "-o", "value"])
+            .arg(device)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if id.is_empty() { None } else { Some(id) }
+    };
+    read(false).or_else(|| read(true))
+}
+
 // =============================================================================
 // JSON Value Extraction Utilities
 // =============================================================================

@@ -408,7 +408,10 @@ impl CardSource for RestoreSource {
     }
 
     fn identity(&self, device: &Path) -> Option<String> {
-        image::read_card_id(device)
+        // A card written outside this tool (e.g. dd) has no flash manifest;
+        // fall back to the partition-table UUID so the swap guard can still
+        // tell whether the same physical card was reinserted.
+        image::read_card_id(device).or_else(|| utils::source_disk_ptuuid(device))
     }
 
     fn noun(&self) -> &'static str {
@@ -749,8 +752,7 @@ fn describe_source(backup: &SourceBackup) {
     if backup.source_card_id.is_none() {
         utils::warning(
             "Source card has no flash manifest: it was not flashed by this tool \
-             (e.g. written with dd). Keys will still be restored, but same-card \
-             swap detection is degraded.",
+             (e.g. written with dd). Keys will still be restored.",
         );
     }
 }
@@ -1186,6 +1188,13 @@ pub fn run_single_reader_restore(
     // Capture the source card's identity while it's still inserted, so the swap
     // guard below can detect that it was never removed.
     let source_id = source.identity(restore_from);
+    if source_id.is_none() {
+        utils::warning(
+            "Cannot identify the source card (no flash manifest or partition UUID).\n  \
+             Same-card swap detection is disabled — be sure to insert a DIFFERENT\n  \
+             TARGET card before continuing, or the source will be overwritten.",
+        );
+    }
 
     // Step 2: Swap to target card — auto-detect via media presence
     utils::info("Remove SOURCE card from the reader, then insert TARGET card");
