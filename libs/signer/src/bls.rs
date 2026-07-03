@@ -16,8 +16,10 @@
 //! r = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001
 //! ```
 //!
-//! Keys >= r are rejected, matching octez
+//! Keys >= r are rejected, as in octez
 //! (`Bls12_381_signature.sk_of_bytes_exn` raises on `Fr.Not_in_field`).
+//! Stricter than octez: the zero scalar is also rejected (blst `sk_check`),
+//! where octez accepts `Fr.zero`.
 
 use crate::base58check;
 use blake2::digest::consts::U20;
@@ -111,8 +113,12 @@ impl SecretKey {
     /// Corresponds to: `src/lib_crypto/bls.ml:158` - `of_bytes_opt`
     ///
     /// Bytes are interpreted as a little-endian scalar (reversed before BLST,
-    /// which expects big-endian). Keys >= the curve order r are rejected,
-    /// matching octez (`Bls12_381_signature.sk_of_bytes_exn`).
+    /// which expects big-endian). Keys >= the curve order r are rejected, as
+    /// in octez (`Bls12_381_signature.sk_of_bytes_exn`). Stricter than octez
+    /// in two ways: the zero scalar is rejected (blst `sk_check`) where octez
+    /// accepts `Fr.zero`, and exactly 32 bytes are required where octez
+    /// zero-pads shorter input. The length difference is unreachable through
+    /// base58check — a `BLsk` payload is always 32 bytes.
     ///
     /// # Errors
     ///
@@ -132,6 +138,12 @@ impl SecretKey {
 
         match blst::min_pk::SecretKey::from_bytes(&reversed_bytes) {
             Ok(sk) => Ok(Self { sk }),
+            // blst maps every sk_check failure (zero or >= r) to BAD_ENCODING;
+            // spell out the cause since this message is the only diagnostic an
+            // operator sees when a stored key fails to load.
+            Err(blst::BLST_ERROR::BLST_BAD_ENCODING) => Err(Error::InvalidSecretKey(
+                "scalar is zero or >= the BLS12-381 curve order r".to_string(),
+            )),
             Err(e) => Err(Error::InvalidSecretKey(format!("{e:?}"))),
         }
     }
@@ -648,26 +660,35 @@ mod tests {
     }
 
     /// Out-of-range secret keys (little-endian value >= r) must be rejected,
-    /// matching octez (`Bls12_381_signature.sk_of_bytes_exn` raises on
-    /// `Fr.Not_in_field`).
+    /// as in octez (`Bls12_381_signature.sk_of_bytes_exn` raises on
+    /// `Fr.Not_in_field`). The error must name the cause: it is the only
+    /// diagnostic an operator sees when a stored key fails to load.
     #[test]
     fn test_out_of_range_key_rejected() {
+        let assert_range_error = |result: Result<SecretKey>, what: &str| {
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{what} must be rejected"));
+            assert!(
+                err.to_string().contains("curve order"),
+                "{what} rejection must name the curve-order cause, got: {err}"
+            );
+        };
+
         // 2^256 - 1: far above r regardless of byte order
         let max_value = [0xffu8; 32];
-        assert!(
-            SecretKey::from_bytes(&max_value).is_err(),
-            "key >= r must be rejected"
-        );
+        assert_range_error(SecretKey::from_bytes(&max_value), "key >= r");
 
         // r itself (little-endian): the smallest out-of-range value
         let mut r_le =
             hex::decode("73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001")
                 .unwrap();
         r_le.reverse();
-        assert!(
-            SecretKey::from_bytes(&r_le).is_err(),
-            "key == r must be rejected"
-        );
+        assert_range_error(SecretKey::from_bytes(&r_le), "key == r");
+
+        // The zero scalar: rejected by blst's sk_check, unlike octez
+        // (Fr.zero is a valid field element there).
+        assert_range_error(SecretKey::from_bytes(&[0u8; 32]), "zero key");
 
         // r - 1 (little-endian): the largest in-range value
         let mut r_minus_1_le =
