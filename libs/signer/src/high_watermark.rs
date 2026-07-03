@@ -707,6 +707,28 @@ pub fn encode_entry(level: u32, round: u32) -> [u8; WATERMARK_FILE_SIZE] {
     russignol_storage::watermark::encode(level, round)
 }
 
+/// Seed the watermark files for a key at the given level (round 0).
+///
+/// Creates the per-key subdirectory under `base_dir` and writes all three
+/// operation-type watermark files. Required before the first signature:
+/// initialization is mandatory, and [`HighWatermark::new`] refuses to
+/// operate on missing or corrupt watermark files. Signing then succeeds
+/// only above `level`.
+///
+/// # Errors
+///
+/// Returns an error if the directory or a watermark file cannot be written.
+pub fn seed_watermarks(base_dir: &Path, pkh: &PublicKeyHash, level: u32) -> io::Result<()> {
+    let key_dir = base_dir.join(pkh.to_b58check());
+    fs::create_dir_all(&key_dir)?;
+
+    let buf = encode_entry(level, 0);
+    for filename in FILENAMES {
+        fs::write(key_dir.join(filename), buf)?;
+    }
+    Ok(())
+}
+
 /// Decode a 40-byte buffer into a watermark entry, validating Blake3 hash.
 fn decode_entry(buf: &[u8; WATERMARK_FILE_SIZE]) -> Option<WatermarkEntry> {
     let (level, round) = russignol_storage::watermark::decode(buf)?;
@@ -759,6 +781,18 @@ mod tests {
 
     fn create_test_chain_id() -> ChainId {
         default_test_chain_id()
+    }
+
+    #[test]
+    fn seed_watermarks_initializes_all_files_at_level() {
+        let temp_dir = TempDir::new().unwrap();
+        let (pkh, _pk, _sk) = generate_key(Some(&[42u8; 32])).unwrap();
+
+        seed_watermarks(temp_dir.path(), &pkh, 42).unwrap();
+
+        let hwm = HighWatermark::new(temp_dir.path(), &[pkh])
+            .expect("seeded watermarks must satisfy mandatory initialization");
+        assert_eq!(hwm.get_persisted_level(&pkh), Some(42));
     }
 
     #[test]

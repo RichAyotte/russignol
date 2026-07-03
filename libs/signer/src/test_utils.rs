@@ -5,10 +5,9 @@
 //! Tenderbake consensus protocol specifications.
 
 use crate::bls::PublicKeyHash;
-use crate::high_watermark::{ChainId, encode_entry};
+use crate::high_watermark::ChainId;
 use crate::protocol::encoding::{decode_response, encode_request};
 use crate::protocol::{SignerRequest, SignerResponse};
-use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -143,35 +142,18 @@ pub fn ghostnet_chain_id() -> ChainId {
     create_chain_id(&GHOSTNET_CHAIN_ID)
 }
 
-/// Pre-initialize watermark files for testing
+/// Pre-initialize watermark files, panicking on I/O failure.
 ///
-/// Creates 40-byte binary watermark files for all three operation types
-/// (block, attestation, preattestation) in the per-key subdirectory.
-/// This is required because the watermark system enforces mandatory
-/// initialization - signing attempts without pre-initialized watermarks
-/// are rejected.
-///
-/// # Arguments
-/// * `base_dir` - Base watermark directory
-/// * `pkh` - Public key hash (determines the per-key subdirectory)
-/// * `level` - The initial watermark level (signing will only succeed above this level)
+/// Test convenience wrapper around
+/// [`seed_watermarks`](crate::high_watermark::seed_watermarks); non-test
+/// code should call that directly and handle the error.
 ///
 /// # Panics
 ///
-/// Panics on I/O failure. Intended for test use only.
+/// Panics on I/O failure.
 pub fn preinit_watermarks(base_dir: &Path, pkh: &PublicKeyHash, level: u32) {
-    let key_dir = base_dir.join(pkh.to_b58check());
-    fs::create_dir_all(&key_dir).unwrap();
-
-    let buf = encode_entry(level, 0);
-
-    for filename in &[
-        "block_watermark",
-        "preattestation_watermark",
-        "attestation_watermark",
-    ] {
-        fs::write(key_dir.join(filename), buf).unwrap();
-    }
+    crate::high_watermark::seed_watermarks(base_dir, pkh, level)
+        .expect("failed to seed watermark files");
 }
 
 /// Send a request over a TCP stream and receive the response
