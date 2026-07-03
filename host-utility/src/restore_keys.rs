@@ -4,7 +4,7 @@
 //! on the host. The `SourceBackup` struct derives `ZeroizeOnDrop` for defense-in-depth
 //! erasure of already-encrypted data.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use colored::Colorize;
 use std::fs;
 use std::io::Write;
@@ -654,6 +654,102 @@ pub fn write_backup_to_target(
     Ok(())
 }
 
+/// Assert the target keys partition (p3) has the files a bootable card needs.
+fn verify_keys_partition(keys_mount: &Path) -> Result<()> {
+    let require_nonempty = |name: &str| -> Result<()> {
+        let meta = fs::metadata(keys_mount.join(name))
+            .with_context(|| format!("missing {name} on target keys partition"))?;
+        if meta.len() == 0 {
+            bail!("{name} on target keys partition is empty");
+        }
+        Ok(())
+    };
+    require_nonempty("public_keys")?;
+    require_nonempty("public_key_hashs")?;
+
+    let has_key_blob = fs::read_dir(keys_mount)
+        .context("failed to read target keys partition")?
+        .filter_map(std::result::Result::ok)
+        .any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("secret_keys.enc"))
+                && e.metadata().is_ok_and(|m| m.len() > 0)
+        });
+    if !has_key_blob {
+        bail!("no non-empty secret_keys.enc* blob on target keys partition");
+    }
+
+    if !keys_mount.join(".setup_complete").exists() {
+        bail!(".setup_complete marker missing on target keys partition");
+    }
+
+    let chain_info = fs::read_to_string(keys_mount.join("chain_info.json"))
+        .context("missing chain_info.json on target keys partition")?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&chain_info).context("chain_info.json on target is not valid JSON")?;
+    let id = parsed
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let name = parsed
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if id.is_empty() || name.is_empty() {
+        bail!("chain_info.json on target is missing id/name");
+    }
+    Ok(())
+}
+
+/// Assert the target data partition (p4) has a valid watermark set for every key.
+fn verify_watermarks_partition(data_mount: &Path, addresses: &[String]) -> Result<()> {
+    let wm_dir = data_mount.join("watermarks");
+    for addr in addresses {
+        let key_dir = wm_dir.join(addr);
+        for filename in &watermark::FILENAMES {
+            let bytes = fs::read(key_dir.join(filename))
+                .with_context(|| format!("missing watermark {filename} for {addr}"))?;
+            let buf: [u8; watermark::FILE_SIZE] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("watermark {filename} for {addr} has wrong size"))?;
+            if watermark::decode(&buf).is_none() {
+                bail!("watermark {filename} for {addr} failed to decode");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Re-mount the freshly written partitions read-only and confirm the flash
+/// produced a bootable card. Cheap insurance against a silently truncated or
+/// mis-formatted write before the user walks the card to the device.
+fn verify_target(device: &Path, backup: &SourceBackup) -> Result<()> {
+    utils::info("Verifying flashed card...");
+
+    let p3_path = get_partition_path(device, 3);
+    let p3_mount = utils::mount_partition(&p3_path, "f2fs", true)
+        .context("failed to mount target keys partition for verification")?;
+    let keys_result = verify_keys_partition(&p3_mount);
+    utils::unmount_partition(&p3_mount, &p3_path)?;
+    keys_result?;
+
+    let addresses: Vec<String> = extract_named_keys(&backup.public_key_hashs)
+        .into_iter()
+        .map(|k| k.address)
+        .collect();
+    let p4_path = get_partition_path(device, 4);
+    let p4_mount = utils::mount_partition(&p4_path, "f2fs", true)
+        .context("failed to mount target data partition for verification")?;
+    let wm_result = verify_watermarks_partition(&p4_mount, &addresses);
+    utils::unmount_partition(&p4_mount, &p4_path)?;
+    wm_result?;
+
+    utils::success("Flashed card verified");
+    Ok(())
+}
+
 /// A named key entry from the wallet's `public_key_hashs` file
 struct NamedKey {
     alias: String,
@@ -1233,6 +1329,8 @@ pub fn run_single_reader_restore(
     image::write_flash_manifest(restore_from, job.metadata)
         .context("Failed to write flash manifest")?;
 
+    verify_target(restore_from, &backup)?;
+
     print_restore_success(source.noun());
     Ok(())
 }
@@ -1265,6 +1363,8 @@ pub fn run_dual_reader_restore(
 
     image::write_flash_manifest(&target.path, job.metadata)
         .context("Failed to write flash manifest")?;
+
+    verify_target(&target.path, backup)?;
 
     print_restore_success(noun);
     Ok(())
@@ -1324,6 +1424,94 @@ mod tests {
             "v1 + v2 (migration pending)"
         );
         assert_eq!(key_format_summary(&[]), "unrecognized");
+    }
+
+    fn write_complete_keys_dir(p: &Path) {
+        fs::write(p.join("public_keys"), b"pk").unwrap();
+        fs::write(p.join("public_key_hashs"), b"pkh").unwrap();
+        fs::write(p.join("secret_keys.enc.v2"), b"blob").unwrap();
+        fs::write(p.join(".setup_complete"), b"1").unwrap();
+        fs::write(
+            p.join("chain_info.json"),
+            br#"{"id":"NetXdQprcVkpaWU","name":"TEZOS_MAINNET"}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verify_keys_partition_accepts_complete_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        write_complete_keys_dir(dir.path());
+        assert!(verify_keys_partition(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn verify_keys_partition_rejects_missing_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        write_complete_keys_dir(dir.path());
+        fs::remove_file(dir.path().join("secret_keys.enc.v2")).unwrap();
+        assert!(verify_keys_partition(dir.path()).is_err());
+    }
+
+    #[test]
+    fn verify_keys_partition_rejects_empty_public_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        write_complete_keys_dir(dir.path());
+        fs::write(dir.path().join("public_keys"), b"").unwrap();
+        assert!(verify_keys_partition(dir.path()).is_err());
+    }
+
+    #[test]
+    fn verify_keys_partition_rejects_bad_chain_info() {
+        let dir = tempfile::tempdir().unwrap();
+        write_complete_keys_dir(dir.path());
+        fs::write(
+            dir.path().join("chain_info.json"),
+            br#"{"id":"","name":""}"#,
+        )
+        .unwrap();
+        assert!(verify_keys_partition(dir.path()).is_err());
+    }
+
+    fn write_valid_watermarks(root: &Path, addr: &str) {
+        let key_dir = root.join("watermarks").join(addr);
+        fs::create_dir_all(&key_dir).unwrap();
+        let buf = watermark::encode(100, 0);
+        for f in &watermark::FILENAMES {
+            fs::write(key_dir.join(f), buf).unwrap();
+        }
+    }
+
+    #[test]
+    fn verify_watermarks_partition_accepts_valid_set() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_watermarks(dir.path(), "tz4Example");
+        assert!(verify_watermarks_partition(dir.path(), &["tz4Example".into()]).is_ok());
+    }
+
+    #[test]
+    fn verify_watermarks_partition_rejects_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_watermarks(dir.path(), "tz4Example");
+        fs::remove_file(
+            dir.path()
+                .join("watermarks")
+                .join("tz4Example")
+                .join(watermark::FILENAMES[1]),
+        )
+        .unwrap();
+        assert!(verify_watermarks_partition(dir.path(), &["tz4Example".into()]).is_err());
+    }
+
+    #[test]
+    fn verify_watermarks_partition_rejects_wrong_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_dir = dir.path().join("watermarks").join("tz4Example");
+        fs::create_dir_all(&key_dir).unwrap();
+        for f in &watermark::FILENAMES {
+            fs::write(key_dir.join(f), b"short").unwrap();
+        }
+        assert!(verify_watermarks_partition(dir.path(), &["tz4Example".into()]).is_err());
     }
 
     #[test]
