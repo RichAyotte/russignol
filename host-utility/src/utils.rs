@@ -438,29 +438,35 @@ pub fn mount_partition(partition: &Path, fs_type: &str, read_only: bool) -> Resu
             }
         }
 
-        // Fall back to traditional mount
+        // Fall back to the traditional mount, which needs root.
         let mount_point = create_temp_mount_point()?;
-        let mut args = vec!["-t", fs_type];
         let mount_opts = if read_only { "ro" } else { "rw" };
-        args.push("-o");
-        args.push(mount_opts);
         let partition_str = partition.to_string_lossy().to_string();
-        args.push(&partition_str);
         let mount_point_str = mount_point.to_string_lossy().to_string();
-        args.push(&mount_point_str);
 
-        let output = Command::new("mount")
-            .args(&args)
-            .output()
-            .context("Failed to run mount")?;
+        let output = run_with_sudo_fallback(
+            "mount",
+            &[
+                "-t",
+                fs_type,
+                "-o",
+                mount_opts,
+                &partition_str,
+                &mount_point_str,
+            ],
+        )
+        .context("Failed to run mount")?;
 
         if !output.status.success() {
             let _ = std::fs::remove_dir(&mount_point);
             anyhow::bail!(
-                "Failed to mount {} partition {}: {}",
+                "Failed to mount {} partition {}: {}\n  \
+                 Mounting needs elevated privileges. Re-run with sudo (or cache \
+                 it first with `sudo -v`), or enable udisksctl/polkit for \
+                 removable media.",
                 fs_type,
                 partition.display(),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             );
         }
 
@@ -517,17 +523,16 @@ pub fn unmount_partition(mount_point: &Path, partition: &Path) -> Result<()> {
             return Ok(());
         }
 
-        // Fall back to traditional umount
-        let output = Command::new("umount")
-            .arg(mount_point)
-            .output()
+        // Fall back to the traditional umount, which needs root.
+        let mount_point_str = mount_point.to_string_lossy().to_string();
+        let output = run_with_sudo_fallback("umount", &[&mount_point_str])
             .context("Failed to run umount")?;
 
         if !output.status.success() {
             anyhow::bail!(
                 "Failed to unmount {}: {}",
                 mount_point.display(),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr).trim()
             );
         }
 
@@ -561,6 +566,27 @@ pub fn unmount_partition(mount_point: &Path, partition: &Path) -> Result<()> {
     }
 }
 
+/// Run `program args`, retrying under non-interactive `sudo -n` when the
+/// unprivileged attempt fails.
+///
+/// `sudo -n` never prompts, so a cached credential escalates silently and an
+/// uncached one fails cleanly rather than blocking a spinner on a password
+/// prompt — unlike [`sudo_command`], which shells out to interactive sudo.
+fn run_with_sudo_fallback(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    let program = program.as_ref();
+    match Command::new(program).args(args).output() {
+        Ok(output) if output.status.success() => Ok(output),
+        _ => Command::new("sudo")
+            .arg("-n")
+            .arg(program)
+            .args(args)
+            .output(),
+    }
+}
+
 /// Partition-table UUID of a whole-disk device, used as a stable card identity
 /// for the swap guard when no flash manifest is present.
 ///
@@ -572,27 +598,46 @@ pub fn unmount_partition(mount_point: &Path, partition: &Path) -> Result<()> {
 /// `blkid` is unavailable.
 pub fn source_disk_ptuuid(device: &Path) -> Option<String> {
     let blkid = resolve_tool("blkid")?;
-    let read = |sudo: bool| -> Option<String> {
-        let mut cmd = if sudo {
-            let mut c = Command::new("sudo");
-            c.arg("-n").arg(&blkid);
-            c
-        } else {
-            Command::new(&blkid)
-        };
-        let output = cmd
-            .args(["-c", "/dev/null", "-s", "PTUUID", "-o", "value"])
-            .arg(device)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if id.is_empty() { None } else { Some(id) }
-    };
-    read(false).or_else(|| read(true))
+    let device_str = device.to_string_lossy().to_string();
+    let output = run_with_sudo_fallback(
+        &blkid,
+        &[
+            "-c",
+            "/dev/null",
+            "-s",
+            "PTUUID",
+            "-o",
+            "value",
+            &device_str,
+        ],
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if id.is_empty() { None } else { Some(id) }
 }
+
+/// Warn up front when nothing can mount partitions, so a long flash does not
+/// fail deep inside a spinner. Mounting needs root, a working udisksctl/polkit,
+/// or (cached) sudo; the mount helpers escalate via `sudo -n` when creds are
+/// cached. Only warns — it does not prompt.
+#[cfg(target_os = "linux")]
+pub fn ensure_mount_capability() {
+    let is_root = nix::unistd::Uid::effective().is_root();
+    if is_root || resolve_tool("udisksctl").is_some() || resolve_tool("sudo").is_some() {
+        return;
+    }
+    warning(
+        "Cannot mount partitions: not root, and neither udisksctl nor sudo is \
+         available. Reading the source card and verifying the target will fail. \
+         Install udisks2, or run as root.",
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn ensure_mount_capability() {}
 
 // =============================================================================
 // JSON Value Extraction Utilities

@@ -591,6 +591,7 @@ fn run_keyed_flash(
     job: restore_keys::FlashJob<'_>,
 ) -> Result<()> {
     restore_keys::check_restore_tools()?;
+    utils::ensure_mount_capability();
 
     let detected = detect_removable_devices().unwrap_or_default();
     let single_reader =
