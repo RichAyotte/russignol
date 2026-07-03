@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use russignol_storage::{self, F2FS_FORMAT_FEATURES, MIN_ALIGNMENT, SECTOR_SIZE};
+use russignol_storage::{self, F2FS_FORMAT_FEATURES, F2FS_MOUNT_OPTS, MIN_ALIGNMENT, SECTOR_SIZE};
 
 // Device paths
 const DISK: &str = "/dev/mmcblk0";
@@ -35,10 +35,6 @@ const MOUNT: &str = "/bin/mount";
 const MDEV: &str = "/sbin/mdev";
 const SYNC: &str = "/bin/sync";
 const CHOWN: &str = "/bin/chown";
-
-// F2FS mount options for data partition
-// F2FS mount options: inline_data/inline_dentry store small files in inode (no data block needed)
-const F2FS_MOUNT_OPTS: &str = "rw,inline_data,inline_dentry,fsync_mode=strict,compress_algorithm=zstd,compress_chksum,atgc,gc_merge,alloc_mode=reuse,background_gc=off,errors=remount-ro";
 
 // BLKPG ioctl constants for kernel notification
 const BLKPG: libc::c_ulong = 0x1269; // _IO(0x12, 105)

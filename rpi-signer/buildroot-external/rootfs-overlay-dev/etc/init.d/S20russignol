@@ -33,7 +33,7 @@ DATA_PART="/dev/mmcblk0p4"
 DATA_MOUNT="/data"
 SETUP_MARKER="/keys/.setup_complete"
 # inline_data/inline_dentry: store small files in inode (reduces write amplification)
-F2FS_OPTS="rw,inline_data,inline_dentry,fsync_mode=strict,compress_algorithm=zstd,compress_chksum,atgc,gc_merge,alloc_mode=reuse,background_gc=off,errors=remount-ro"
+F2FS_OPTS="rw,inline_data,inline_dentry,fsync_mode=strict,atgc,gc_merge,alloc_mode=reuse,background_gc=off,errors=remount-ro"
 
 # Check if partition exists in kernel (created at first boot)
 partition_exists() {

@@ -12,7 +12,17 @@ pub const F2FS_PARTITION_SIZE: u64 = 64 * 1024 * 1024;
 pub const SECTOR_SIZE: u64 = 512;
 
 /// F2FS feature flags passed to `mkfs.f2fs -O`
-pub const F2FS_FORMAT_FEATURES: &str = "extra_attr,compression";
+pub const F2FS_FORMAT_FEATURES: &str = "extra_attr";
+
+/// F2FS mount options for the data partition (p4).
+///
+/// No `compress_algorithm`: the watermark hot path is stored via `inline_data`
+/// (in the inode) and is never compressible, so compression saves nothing yet
+/// forces the kernel to carry a compression backend or reject the mount. Kept
+/// byte-identical to the `F2FS_OPTS` in the init scripts — the xtask drift
+/// check enforces that, and the compression-backend assertion reads any
+/// `compress_algorithm=` here to require the matching kernel config.
+pub const F2FS_MOUNT_OPTS: &str = "rw,inline_data,inline_dentry,fsync_mode=strict,atgc,gc_merge,alloc_mode=reuse,background_gc=off,errors=remount-ro";
 
 /// Partition layout for keys (p3) and data (p4) partitions in sectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,5 +167,16 @@ mod tests {
             script,
             "start=4751360, size=131072, type=83\nstart=4882432, size=131072, type=83\n"
         );
+    }
+
+    #[test]
+    fn data_mount_opts_request_no_compression() {
+        assert!(!F2FS_MOUNT_OPTS.contains("compress_algorithm"));
+        assert!(!F2FS_MOUNT_OPTS.contains("compress_chksum"));
+    }
+
+    #[test]
+    fn format_features_drop_compression() {
+        assert_eq!(F2FS_FORMAT_FEATURES, "extra_attr");
     }
 }
