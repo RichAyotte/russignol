@@ -21,9 +21,6 @@ test = false
 [features]
 default = []
 perf-trace = []  # Enable performance tracing
-# WARNING: Enables gen_keys() which writes secret keys to disk in plaintext.
-# Only for development/CLI tools. Never use in production signers.
-insecure-disk-keys = []
 
 [dependencies]
 blake2 = "0.10.6"
