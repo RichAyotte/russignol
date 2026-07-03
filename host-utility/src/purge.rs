@@ -87,6 +87,9 @@ pub fn run_purge(dry_run: bool, config: &RussignolConfig) -> Result<bool> {
         for cmd in &displays {
             info(&format!("Would run: {cmd}"));
         }
+        for alias in &keys_to_remove {
+            info(&format!("Would run: {}", forget_display(alias)));
+        }
         return Ok(true);
     }
 
@@ -223,11 +226,14 @@ fn run_with_spinner(tasks: Vec<SpinnerTask<'_>>, success_msg: &str) -> usize {
     failures
 }
 
+/// The octez-client command line that forgets a key alias, shared by the
+/// dry-run preview and the live removal so the two cannot drift.
+fn forget_display(alias: &str) -> String {
+    format!("octez-client forget address {alias}")
+}
+
 fn remove_keys(aliases: &[&str], config: &RussignolConfig) -> Result<usize> {
-    let displays: Vec<String> = aliases
-        .iter()
-        .map(|a| format!("octez-client forget address {a}"))
-        .collect();
+    let displays: Vec<String> = aliases.iter().map(|a| forget_display(a)).collect();
 
     println!("Remove imported keys from octez-client:\n");
     for cmd in &displays {
