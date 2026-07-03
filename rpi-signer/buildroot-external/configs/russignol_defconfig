@@ -60,7 +60,10 @@ BR2_PACKAGE_LM_SENSORS=y
 # BR2_PACKAGE_LIBOPENSSL_ENABLE_CACHED_FETCH is not set
 # BR2_PACKAGE_LIBOPENSSL_ENABLE_CMP is not set
 # BR2_PACKAGE_LIBOPENSSL_ENABLE_THREAD_POOL is not set
-# BR2_PACKAGE_LIBOPENSSL_ENABLE_ECX is not set
+# OpenSSH >= 10.0 signs ed25519 host keys via OpenSSL EVP; no-ecx removes
+# the algorithm at runtime while the API still links, so sshd loads the
+# host key but dies at the first connection's KEX signature.
+BR2_PACKAGE_LIBOPENSSL_ENABLE_ECX=y
 # BR2_PACKAGE_LIBOPENSSL_ENABLE_PADLOCK_ENGINE is not set
 # BR2_PACKAGE_LIBOPENSSL_ENABLE_MODULE is not set
 # BR2_PACKAGE_LIBOPENSSL_ENABLE_QUIC is not set
