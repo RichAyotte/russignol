@@ -19,7 +19,7 @@ The firmware is built using **Buildroot**, which creates a minimal Linux system 
 - **SSH Server**: REMOVED.
 - **Tools**: REMOVED (`htop`, `lm-sensors`, etc.).
 - **BusyBox**: Stripped down (no telnet, netcat, wget, editors, user management).
-- **Root Account**: Unreachable — no login services exist (no getty, no sshd, no login applet).
+- **Root Account**: Locked (shadow hash `*`) and unreachable — no login services exist (no getty, no sshd, no login applet).
 - **Console**: Login services removed.
 - **Access**: Only via Touch UI or the signer TCP port (7732) over USB gadget ethernet (device address 169.254.1.1).
 
@@ -53,6 +53,9 @@ The buildroot configuration is managed via an external tree structure in `buildr
 - **Defconfig**: `buildroot-external/configs/russignol_hardened_defconfig`
 - **BusyBox**: `buildroot-external/package/busybox/busybox_hardened.config`
 - **Users**: `buildroot-external/board/russignol/users_hardened.txt` (Locked password)
+
+Both image variants build the same hardened kernel from
+`buildroot-external/board/russignol/linux-russignol_defconfig`.
 
 ## Configuration
 

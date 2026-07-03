@@ -101,7 +101,7 @@ The project uses Buildroot to create a minimal, purpose-built Linux distribution
 
 **Security Properties:**
 - ✅ No login vector for root (no getty, no SSH daemon, UART disabled)
-- ⚠️ Root account carries an empty password rather than a locked hash — mitigated only by the absence of any login path
+- ✅ Root account locked (`BR2_TARGET_ENABLE_ROOT_LOGIN` disabled; shadow hash set to `*`)
 - ✅ `russignol` user locked (password hash set to `*`)
 - ✅ Non-root user runs signer application
 - ✅ Hardware groups have no login shell
@@ -133,9 +133,23 @@ The project uses Buildroot to create a minimal, purpose-built Linux distribution
 | Feature | Config | Status |
 |---------|--------|--------|
 | KASLR | `CONFIG_RANDOMIZE_BASE=y` | ✅ Enabled |
+| Kernel lockdown | `CONFIG_LOCK_DOWN_KERNEL_FORCE_INTEGRITY=y` | ✅ Integrity mode, enforced early |
+| Module signing | `CONFIG_MODULE_SIG_ALL=y`, `CONFIG_MODULE_SIG_FORCE=y` | ✅ Unsigned modules rejected |
+| Core dumps | `# CONFIG_COREDUMP is not set` | ✅ Disabled |
+| Heap zeroing | `CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y`, `CONFIG_INIT_ON_FREE_DEFAULT_ON=y` | ✅ Allocations and freed memory wiped |
+| Stack zeroing | `CONFIG_INIT_STACK_ALL_ZERO=y` | ✅ Enabled |
+| Kernel stack offset randomization | `CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT=y` | ✅ Enabled |
+| PAN emulation | `CONFIG_ARM64_SW_TTBR0_PAN=y` | ✅ Kernel blocked from stray user-memory access |
+| Slab hardening | `CONFIG_SLAB_FREELIST_RANDOM=y`, `CONFIG_SLAB_FREELIST_HARDENED=y`, `# CONFIG_SLAB_MERGE_DEFAULT is not set` | ✅ Enabled |
+| ptrace scoping | `CONFIG_SECURITY_YAMA=y` | ✅ Restricted to descendants |
+| dmesg access | `CONFIG_SECURITY_DMESG_RESTRICT=y` | ✅ Root only |
+| io_uring / legacy AIO | `# CONFIG_IO_URING is not set`, `# CONFIG_AIO is not set` | ✅ Removed |
+| Namespaces | `# CONFIG_NAMESPACES is not set` | ✅ Removed |
 | F2FS | `CONFIG_F2FS_FS=y` | ✅ Enabled |
 | No Swap | `# CONFIG_SWAP is not set` | ✅ Prevents key leakage |
 | Legacy PTY | `CONFIG_LEGACY_PTYS` | ✅ Disabled |
+
+The dev and hardened images build the same kernel from this configuration.
 
 ### 3.2 Boot Configuration
 
@@ -284,6 +298,8 @@ Protection against stale watermarks that could indicate misconfiguration:
 ### 9.1 Memory
 
 - ASLR enabled
+- Core dumps disabled in the kernel (`CONFIG_COREDUMP` off)
+- Heap zeroed on allocation and free (`init_on_alloc`, `init_on_free`) — limits key material remanence in freed memory
 - Swap disabled (keys cannot be paged to disk)
 - BLST library handles key zeroization on drop
 
@@ -372,7 +388,7 @@ The following security measures are in place:
 | Security Control | Status |
 |------------------|--------|
 | SSH Access | ✅ Disabled |
-| Root Login | ✅ No login vector (no getty/SSH/UART; account has empty password, not a locked hash) |
+| Root Login | ✅ Locked (shadow hash `*`); no login vector (no getty/SSH/UART) |
 | User Login | ✅ Locked |
 | Network Tools | ✅ Removed (telnet, ftp, wget, netcat) |
 | Text Editors | ✅ Removed (vi, ed) |

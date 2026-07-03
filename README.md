@@ -25,7 +25,7 @@ Ledger Nano can't perform BLS signatures fast enough for 6-second blocks, and so
 - **[BLS12-381](https://octez.tezos.com/docs/active/accounts.html#tz4-bls) signing** — ~6ms via BLST
 - **USB gadget ethernet only** — WiFi, Bluetooth, Ethernet compiled out of kernel
 - **PIN-protected key storage** — AES-256-GCM encryption, PIN-derived key via Scrypt (256MB memory-hard)
-- **Hardened kernel** — Kernel lockdown (integrity mode, enforced early), locked accounts, no getty or SSH
+- **Hardened kernel** — Kernel lockdown (integrity mode, enforced early), module signature enforcement, no core dumps, heap zeroed on free, locked accounts, no getty or SSH
 - **High watermark protection** — Per-key watermarks for consensus and companion key signing, pre-set one level into the future so steady-state signing doesn't block on disk I/O, Blake3-hashed for corruption detection, persists across reboots
 - **Touch-enabled e-ink display** — On-device PIN entry (never crosses USB), menu-based navigation with System, Activity, Blockchain, Watermarks, About, and Shutdown pages
 - **Activity LED** — Visual indication of baker connection
