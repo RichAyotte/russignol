@@ -5,6 +5,7 @@
 
 use russignol_signer_lib::{
     HighWatermark, RequestHandler, ServerKeyManager, bls::generate_key, server, signer,
+    test_utils::preinit_watermarks,
 };
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
@@ -35,7 +36,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ✓ Keys loaded into manager\n");
 
     // 3. Setup high watermark
+    // Watermarks must exist before the first signature, so seed level 0 for
+    // both keys; signing then succeeds at any level >= 1.
     let temp_dir = TempDir::new()?;
+    preinit_watermarks(temp_dir.path(), &pkh1, 0);
+    preinit_watermarks(temp_dir.path(), &pkh2, 0);
     let watermark = HighWatermark::new(temp_dir.path(), &[pkh1, pkh2])?;
     println!("📊 High watermark protection enabled");
     println!("  Storage: {}\n", temp_dir.path().display());
