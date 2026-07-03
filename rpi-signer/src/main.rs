@@ -187,7 +187,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
                 &callbacks,
                 blocks_per_cycle,
             ) {
-                log::error!("Signer server error: {e}");
+                report_signer_failure(&tx_for_signer, e);
             }
         }
     });
@@ -208,6 +208,18 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
     log::info!("Shutdown complete");
 
     result
+}
+
+/// Surface a signer failure on the display: a deterministic startup failure
+/// (e.g. a stored key that no longer parses) ends the signer thread for
+/// good, and without a display error the operator only learns when the
+/// baker stops attesting.
+fn report_signer_failure(tx: &crossbeam_channel::Sender<AppEvent>, error: String) {
+    log::error!("Signer server error: {error}");
+    let _ = tx.send(AppEvent::FatalError {
+        title: "SIGNER FAILED".to_string(),
+        message: error,
+    });
 }
 
 fn run_ui_loop(

@@ -75,8 +75,11 @@ fn parse_secret_keys(secret_keys_json: &str) -> Result<ServerKeyManager, String>
                 info!("  ✓ Loaded key: {alias_owned} ({})", pkh.to_b58check());
                 key_manager.add_signer(pkh, signer, alias_owned);
             }
+            // Abort rather than skip: a signer missing one of its keys boots
+            // normally but silently stops signing for that pkh.
             Err(e) => {
                 error!("  ✗ Failed to load key '{alias}': {e}");
+                return Err(format!("Failed to load key '{alias}': {e}"));
             }
         }
     }
@@ -147,10 +150,15 @@ pub fn start_integrated_signer(
     callbacks: &SignerCallbacks,
     blocks_per_cycle: Option<u32>,
 ) -> Result<(), String> {
+    // Parse keys directly from memory - never touches disk. Parsed outside
+    // the retry loop: a key failure is deterministic, so retrying can never
+    // fix it — it must surface to the caller instead.
+    let key_manager = Arc::new(RwLock::new(parse_secret_keys(secret_keys_json)?));
+
     loop {
         match run_signer_once(
             config,
-            secret_keys_json,
+            key_manager.clone(),
             watermark.cloned(),
             signing_activity.clone(),
             callbacks,
@@ -170,7 +178,7 @@ pub fn start_integrated_signer(
 
 fn run_signer_once(
     config: &SignerConfig,
-    secret_keys_json: &str,
+    key_manager: Arc<RwLock<ServerKeyManager>>,
     watermark: Option<Arc<RwLock<HighWatermark>>>,
     signing_activity: Arc<Mutex<SigningActivity>>,
     callbacks: &SignerCallbacks,
@@ -178,12 +186,9 @@ fn run_signer_once(
 ) -> Result<(), String> {
     info!("Starting signer...");
 
-    // Parse keys directly from memory - never touches disk
-    let key_manager = parse_secret_keys(secret_keys_json)?;
-
     // Create request handler
     let mut handler = RequestHandler::new(
-        Arc::new(RwLock::new(key_manager)),
+        key_manager,
         watermark,
         Some(config.magic_bytes.clone()),
         true, // allow_list_known_keys
@@ -236,6 +241,36 @@ mod tests {
 
     fn parse(input: &str) -> Result<Vec<BorrowedKeyEntry<'_>>, serde_json::Error> {
         serde_json::from_str(input)
+    }
+
+    #[test]
+    fn parse_secret_keys_loads_all_valid_keys() {
+        let other_sk = signer::Unencrypted::generate(Some(&[7u8; 32]))
+            .unwrap()
+            .secret_key()
+            .to_b58check();
+        let input = format!(
+            r#"[{{"name":"consensus","value":"unencrypted:{SAMPLE_SK}"}},{{"name":"companion","value":"unencrypted:{other_sk}"}}]"#
+        );
+        let key_manager = parse_secret_keys(&input).expect("valid keys load");
+        assert_eq!(key_manager.list_keys().len(), 2);
+    }
+
+    /// A key that fails to parse must abort startup: silently dropping it
+    /// boots a signer that can no longer sign for that pkh, and the baker
+    /// stops attesting with nothing on the display.
+    #[test]
+    fn parse_secret_keys_rejects_any_unloadable_key() {
+        let input = format!(
+            r#"[{{"name":"consensus","value":"unencrypted:{SAMPLE_SK}"}},{{"name":"companion","value":"unencrypted:BLsk3NotAValidKey"}}]"#
+        );
+        let Err(err) = parse_secret_keys(&input) else {
+            panic!("unloadable key must abort")
+        };
+        assert!(
+            err.contains("companion"),
+            "error must name the failing alias: {err}"
+        );
     }
 
     #[test]
