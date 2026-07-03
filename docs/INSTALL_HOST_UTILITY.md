@@ -68,6 +68,8 @@ russignol image download-and-flash
 
 This downloads and flashes in one step, auto-detecting your SD card.
 
+This is the supported way to flash a card: it verifies the download checksum, guards against writing the wrong device, and — when restoring keys — verifies the result before reporting success. Flashing another way (see [manual installation](INSTALL_MANUAL.md)) skips those checks.
+
 > **Note:** If your user lacks write access to the SD card device, the utility offers guided recovery: activating existing group membership, adding you to the device's owning group, or running the raw write steps with sudo.
 
 The utility will:
@@ -93,6 +95,8 @@ russignol image download-and-flash --migrate-keys
 ```
 
 Both accept an optional source device (e.g. `--restore-keys /dev/sdd`) and auto-detect it when omitted. Migration accepts `--consensus-key` and `--companion-key` to choose which source key aliases become the consensus and companion keys.
+
+A source card not flashed by the host utility (for example one written with `dd`) has no flash manifest; the restore reports it as such, still carries its keys over, and uses the partition-table UUID for the same-card swap guard. After writing, the new card's key and watermark partitions are re-read and verified before success is reported.
 
 ## Step 5: Boot and Initialize Device
 

@@ -48,6 +48,7 @@ brew install xz
 > - **No image integrity verification** — Manual `dd` doesn't verify the SHA256 checksum; corrupted downloads go undetected.
 > - **No device safety checks** — Risk of accidentally overwriting the wrong drive. The host utility validates removable devices and requires explicit confirmation.
 > - **No node validation** — Manual process doesn't verify your node is running and synced before flashing.
+> - **No flash manifest** — The host utility writes a card identity the swap guard uses to detect the *same card* during a key restore. A manually flashed card has none, so a later restore flags it as "not flashed by this tool" and falls back to the partition-table UUID for same-card detection.
 >
 > **Recommended:** Use the [host utility](INSTALL_HOST_UTILITY.md) instead.
 >
