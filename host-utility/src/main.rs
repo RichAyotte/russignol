@@ -10,6 +10,7 @@ use utils::print_title_bar;
 
 mod backup;
 mod blockchain;
+mod card_fs;
 mod config;
 mod confirmation;
 mod constants;

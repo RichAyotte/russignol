@@ -15,6 +15,7 @@ use russignol_signer_lib::KeyManager;
 use russignol_signer_lib::server::KEY_ROLES;
 use russignol_storage::watermark;
 
+use crate::card_fs::{CHAIN_INFO_MODE, DEVICE_GID, DEVICE_UID};
 use crate::utils::{self, get_partition_path, info, print_title_bar, success, warning};
 use crate::watermark::ChainInfo;
 use crate::{config, network};
@@ -22,15 +23,6 @@ use crate::{config, network};
 /// Maximum `panic.log` size before the doctor offers to truncate it, matching
 /// the 1 MiB cap the device init applies on boot.
 const PANIC_LOG_MAX_BYTES: u64 = 1024 * 1024;
-
-/// Expected owner (uid:gid) of every device file the host writes. The
-/// `russignol` user is uid/gid 1000 on the device and does not exist on the
-/// host, so ownership is compared numerically.
-const DEVICE_UID: u32 = 1000;
-const DEVICE_GID: u32 = 1000;
-
-/// Expected mode of `chain_info.json`: owner read-only.
-const CHAIN_INFO_MODE: u32 = 0o400;
 
 /// Disk subcommands
 #[derive(Subcommand, Debug)]

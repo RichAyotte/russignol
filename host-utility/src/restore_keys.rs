@@ -14,6 +14,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use russignol_storage::{self, F2FS_FORMAT_FEATURES, MIN_ALIGNMENT, SECTOR_SIZE, watermark};
 
+use crate::card_fs;
 use crate::device_access::{self, FlashPrivilege};
 use crate::image;
 use crate::progress;
@@ -600,18 +601,8 @@ pub fn write_backup_to_target(
             .context("Failed to write public_keys")?;
         fs::write(p3_mount.join("public_key_hashs"), &backup.public_key_hashs)
             .context("Failed to write public_key_hashs")?;
-        // Generate chain_info.json from node data
-        let chain_info_json = serde_json::json!({
-            "id": chain_info.id,
-            "name": chain_info.name,
-            "blocks_per_cycle": chain_info.blocks_per_cycle,
-        });
-        fs::write(
-            p3_mount.join("chain_info.json"),
-            serde_json::to_string_pretty(&chain_info_json)
-                .context("Failed to serialize chain_info.json")?,
-        )
-        .context("Failed to write chain_info.json")?;
+        card_fs::write_chain_info(&p3_mount, chain_info)
+            .context("Failed to write chain_info.json")?;
         // Write setup marker so signer skips first-boot setup
         fs::write(p3_mount.join(".setup_complete"), "1")
             .context("Failed to write .setup_complete marker")?;
@@ -637,15 +628,10 @@ pub fn write_backup_to_target(
 
     let p4_result = (|| {
         let watermarks_dir = p4_mount.join("watermarks");
-        let wm_data = watermark::encode(chain_info.level, 0);
         for key in keys {
             let key_dir = watermarks_dir.join(&key.address);
-            fs::create_dir_all(&key_dir)
-                .with_context(|| format!("Failed to create watermark dir for {}", key.address))?;
-            for filename in &watermark::FILENAMES {
-                fs::write(key_dir.join(filename), wm_data)
-                    .with_context(|| format!("Failed to write {filename}"))?;
-            }
+            card_fs::write_watermark_file_set(&key_dir, chain_info.level)
+                .with_context(|| format!("Failed to seed watermarks for {}", key.address))?;
         }
         Ok(())
     })();
