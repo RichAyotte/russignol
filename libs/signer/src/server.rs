@@ -223,6 +223,9 @@ type WatermarkErrorCallback =
 /// Type alias for large level gap callback (pkh, `chain_id`, `current_level`, `requested_level`)
 type LargeGapCallback = Arc<dyn Fn(PublicKeyHash, ChainId, u32, u32) + Send + Sync>;
 
+/// Type alias for missing watermark callback (pkh, `chain_id`, `requested_level`)
+type MissingWatermarkCallback = Arc<dyn Fn(PublicKeyHash, ChainId, u32) + Send + Sync>;
+
 /// Type alias for signing notification callback (called after each successful signature)
 type SigningNotifyCallback = Arc<dyn Fn() + Send + Sync>;
 
@@ -251,6 +254,8 @@ pub struct RequestHandler {
     signing_notify_callback: Option<SigningNotifyCallback>,
     /// Callback for large level gap detection
     large_gap_callback: Option<LargeGapCallback>,
+    /// Callback for missing (uninitialized) watermark detection
+    missing_watermark_callback: Option<MissingWatermarkCallback>,
     /// Blocks per cycle (chain-specific, used for gap threshold calculation)
     blocks_per_cycle: Option<u32>,
     /// Callback invoked before each sign request (e.g., CPU frequency boost)
@@ -278,6 +283,7 @@ impl RequestHandler {
             watermark_error_callback: None,
             signing_notify_callback: None,
             large_gap_callback: None,
+            missing_watermark_callback: None,
             blocks_per_cycle: None,
             pre_sign_callback: None,
             post_sign_callback: None,
@@ -320,6 +326,21 @@ impl RequestHandler {
     ) -> Self {
         self.large_gap_callback = Some(callback);
         self.blocks_per_cycle = Some(blocks_per_cycle);
+        self
+    }
+
+    /// Set missing watermark detection callback.
+    ///
+    /// When a signing request arrives for a key with no initialized watermark,
+    /// the callback is invoked so the UI can offer on-device recovery. Signing
+    /// still fails with `NotInitialized`; the callback only supplies the
+    /// requested level the confirmation needs.
+    #[must_use]
+    pub fn with_watermark_missing_callback(
+        mut self,
+        callback: Arc<dyn Fn(PublicKeyHash, ChainId, u32) + Send + Sync>,
+    ) -> Self {
+        self.missing_watermark_callback = Some(callback);
         self
     }
 
@@ -472,6 +493,28 @@ impl RequestHandler {
                         ));
                     }
                 }
+            }
+        }
+
+        // 2a'. Detect a missing (uninitialized) watermark so the UI can offer
+        // on-device recovery. Signing still fails with NotInitialized; the
+        // callback only supplies the requested level the confirmation needs.
+        if let Some(chain_id) = operation_chain_id
+            && let Some(ref watermark) = self.watermark
+            && let Some(ref callback) = self.missing_watermark_callback
+            && let Some(requested_level) = Self::extract_level_from_data(data, &pkh)
+        {
+            let wm = watermark.read()?;
+            if wm.get_current_level(chain_id, &pkh).is_none() {
+                // Drop lock BEFORE calling callback to avoid deadlock
+                drop(wm);
+                callback(pkh, chain_id, requested_level);
+                return Err(Error::Watermark(
+                    crate::high_watermark::WatermarkError::NotInitialized {
+                        chain_id: chain_id.to_b58check(),
+                        pkh: pkh.to_b58check(),
+                    },
+                ));
             }
         }
 
@@ -1454,6 +1497,125 @@ mod tests {
         assert!(
             result.is_ok(),
             "Sign should succeed for gap below threshold"
+        );
+    }
+
+    #[test]
+    fn test_missing_watermark_detection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp_dir = TempDir::new().unwrap();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
+
+        let mut mgr = KeyManager::new();
+        mgr.add_signer(pkh, signer, "test_key".to_string());
+
+        // No preinit: the key has no watermark files, so it is uninitialized.
+        let hwm = Arc::new(RwLock::new(
+            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
+        ));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+
+        let handler = RequestHandler::new(
+            Arc::new(RwLock::new(mgr)),
+            Some(Arc::clone(&hwm)),
+            Some(vec![0x11, 0x12, 0x13]),
+            true,
+            true,
+        )
+        .with_watermark_missing_callback(Arc::new(move |_pkh, _chain_id, requested| {
+            call_count_clone.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(requested, 600);
+        }));
+
+        // Block data at level 600
+        let mut data = vec![0x11]; // Block magic byte
+        data.extend_from_slice(&[0, 0, 0, 1]); // chain_id
+        data.extend_from_slice(&600u32.to_be_bytes()); // level
+        data.push(0); // proto
+        data.extend_from_slice(&[0u8; 32]); // predecessor
+        data.extend_from_slice(&[0u8; 8]); // timestamp
+        data.push(0); // validation_pass
+        data.extend_from_slice(&[0u8; 32]); // operations_hash
+        data.extend_from_slice(&8u32.to_be_bytes()); // fitness_length
+        data.extend_from_slice(&0u32.to_be_bytes()); // round
+
+        let result = handler.handle_request(SignerRequest::Sign {
+            pkh: (pkh, 0),
+            data,
+            signature: None,
+        });
+
+        // Signing is still refused for an uninitialized key.
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                Error::Watermark(crate::high_watermark::WatermarkError::NotInitialized { .. })
+            ),
+            "Expected NotInitialized error for uninitialized key"
+        );
+
+        // The missing-watermark callback fired exactly once with the request's level.
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "Missing watermark callback should fire exactly once"
+        );
+    }
+
+    #[test]
+    fn test_missing_watermark_not_fired_when_initialized() {
+        let temp_dir = TempDir::new().unwrap();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
+
+        let mut mgr = KeyManager::new();
+        mgr.add_signer(pkh, signer, "test_key".to_string());
+
+        // Initialize the key's watermark at level 100.
+        preinit_watermarks(temp_dir.path(), &pkh, 100);
+        let hwm = Arc::new(RwLock::new(
+            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
+        ));
+
+        let handler = RequestHandler::new(
+            Arc::new(RwLock::new(mgr)),
+            Some(Arc::clone(&hwm)),
+            Some(vec![0x11, 0x12, 0x13]),
+            true,
+            true,
+        )
+        .with_watermark_missing_callback(Arc::new(|_pkh, _chain_id, _requested| {
+            panic!("Missing watermark callback should not fire for an initialized key");
+        }));
+
+        // Block data at level 200 (above current 100, a valid advance)
+        let mut data = vec![0x11]; // Block magic byte
+        data.extend_from_slice(&[0, 0, 0, 1]); // chain_id
+        data.extend_from_slice(&200u32.to_be_bytes()); // level
+        data.push(0); // proto
+        data.extend_from_slice(&[0u8; 32]); // predecessor
+        data.extend_from_slice(&[0u8; 8]); // timestamp
+        data.push(0); // validation_pass
+        data.extend_from_slice(&[0u8; 32]); // operations_hash
+        data.extend_from_slice(&8u32.to_be_bytes()); // fitness_length
+        data.extend_from_slice(&0u32.to_be_bytes()); // round
+
+        let result = handler.handle_request(SignerRequest::Sign {
+            pkh: (pkh, 0),
+            data,
+            signature: None,
+        });
+
+        assert!(
+            result.is_ok(),
+            "Initialized key should sign successfully: {result:?}"
         );
     }
 

@@ -554,7 +554,25 @@ impl App {
         effects.push(Effect::Emit(AppEvent::KeysDecrypted(json)));
     }
 
+    /// Page opened by a modal-guarded navigation event, if this event is one.
+    fn navigation_page(event: &AppEvent) -> Option<PageSpec> {
+        match event {
+            AppEvent::ShowStatus => Some(PageSpec::Status),
+            AppEvent::ShowSignatures => Some(PageSpec::Signatures),
+            AppEvent::ShowWatermarks => Some(PageSpec::Watermarks),
+            AppEvent::ShowBlockchain => Some(PageSpec::Blockchain),
+            AppEvent::ShowAbout => Some(PageSpec::About),
+            _ => None,
+        }
+    }
+
     fn handle_active(&mut self, event: AppEvent) -> (LoopAction, Vec<Effect>) {
+        if !self.current_page_modal
+            && let Some(spec) = Self::navigation_page(&event)
+        {
+            return (LoopAction::Proceed, vec![Effect::ShowPage(spec)]);
+        }
+
         let mut effects = Vec::new();
         match event {
             AppEvent::KeysDecrypted(secret_keys_json) => {
@@ -608,6 +626,13 @@ impl App {
                     requested_level,
                 ));
             }
+            AppEvent::WatermarkMissing {
+                pkh,
+                chain_id,
+                requested_level,
+            } if !self.current_page_modal => {
+                effects.extend(self.watermark_missing_effects(pkh, chain_id, requested_level));
+            }
             AppEvent::UpdateWatermarkToLevel {
                 pkh,
                 chain_id,
@@ -630,21 +655,6 @@ impl App {
                     warning: false,
                     button_text: "Shutdown".into(),
                 }));
-            }
-            AppEvent::ShowStatus if !self.current_page_modal => {
-                effects.push(Effect::ShowPage(PageSpec::Status));
-            }
-            AppEvent::ShowSignatures if !self.current_page_modal => {
-                effects.push(Effect::ShowPage(PageSpec::Signatures));
-            }
-            AppEvent::ShowWatermarks if !self.current_page_modal => {
-                effects.push(Effect::ShowPage(PageSpec::Watermarks));
-            }
-            AppEvent::ShowBlockchain if !self.current_page_modal => {
-                effects.push(Effect::ShowPage(PageSpec::Blockchain));
-            }
-            AppEvent::ShowAbout if !self.current_page_modal => {
-                effects.push(Effect::ShowPage(PageSpec::About));
             }
             _ => {}
         }
@@ -713,6 +723,35 @@ impl App {
             on_cancel: AppEvent::DialogDismissed,
             warning: true,
             button_text: format!("Update to {requested_level}"),
+        }));
+        effects
+    }
+
+    fn watermark_missing_effects(
+        &mut self,
+        pkh: String,
+        chain_id: ChainId,
+        requested_level: u32,
+    ) -> Vec<Effect> {
+        let mut effects = self.wake_from_screensaver_effects();
+        log::warn!("Missing watermark for {pkh}: offering recovery to level {requested_level}");
+        let pkh_short = if pkh.len() > 6 {
+            format!("{}…", &pkh[..6])
+        } else {
+            pkh.clone()
+        };
+        effects.push(Effect::ShowPage(PageSpec::Confirmation {
+            message: format!(
+                "Missing: {pkh_short} set {requested_level}?\nRun russignol watermark init\nthen reboot on host."
+            ),
+            on_confirm: AppEvent::UpdateWatermarkToLevel {
+                pkh,
+                chain_id,
+                new_level: requested_level,
+            },
+            on_cancel: AppEvent::DialogDismissed,
+            warning: true,
+            button_text: format!("Set level to {requested_level}"),
         }));
         effects
     }
@@ -1251,6 +1290,29 @@ mod tests {
     }
 
     #[test]
+    fn watermark_missing_when_modal_produces_no_effects() {
+        let mut app = active_app();
+        app.current_page_modal = true;
+        let (_action, effects) = app.handle_event(AppEvent::WatermarkMissing {
+            pkh: "tz4test".into(),
+            chain_id: test_chain_id(),
+            requested_level: 600,
+        });
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn watermark_missing_during_screensaver_wakes_display() {
+        let mut app = active_screensaver_app();
+        let (_action, effects) = app.handle_event(AppEvent::WatermarkMissing {
+            pkh: "tz4test".into(),
+            chain_id: test_chain_id(),
+            requested_level: 600,
+        });
+        assert!(has_effect(&effects, &Effect::WakeDisplay));
+    }
+
+    #[test]
     fn activate_screensaver_when_already_active_is_ignored() {
         let mut app = active_screensaver_app();
         let (action, effects) = app.handle_event(AppEvent::ActivateScreensaver);
@@ -1369,6 +1431,43 @@ mod tests {
             vec![Effect::DropCurrentPage, Effect::SleepDisplay,]
         );
         assert!(app.is_screensaver_active());
+    }
+
+    #[test]
+    fn watermark_missing_produces_warned_recovery_dialog() {
+        let mut app = active_app();
+        let chain_id = test_chain_id();
+        let (_action, effects) = app.handle_event(AppEvent::WatermarkMissing {
+            pkh: "tz4abcdefghijklmnop".into(),
+            chain_id,
+            requested_level: 600,
+        });
+
+        let dialog = effects.iter().find_map(|e| match e {
+            Effect::ShowPage(PageSpec::Confirmation {
+                message,
+                on_confirm,
+                warning,
+                ..
+            }) => Some((message, on_confirm, *warning)),
+            _ => None,
+        });
+        let (message, on_confirm, warning) =
+            dialog.expect("expected a Confirmation dialog for a missing watermark");
+
+        assert!(warning, "missing-watermark recovery dialog must be warned");
+        assert!(
+            message.contains("russignol watermark init"),
+            "dialog must name the host recovery command, got: {message}"
+        );
+        assert_eq!(
+            on_confirm,
+            &AppEvent::UpdateWatermarkToLevel {
+                pkh: "tz4abcdefghijklmnop".into(),
+                chain_id,
+                new_level: 600,
+            }
+        );
     }
 
     #[test]

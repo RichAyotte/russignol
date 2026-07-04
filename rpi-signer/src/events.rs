@@ -64,6 +64,11 @@ pub enum AppEvent {
         current_level: u32,
         requested_level: u32,
     }, // Large level gap detected, needs user confirmation
+    WatermarkMissing {
+        pkh: String,
+        chain_id: ChainId,
+        requested_level: u32,
+    }, // Signing request hit a key with no watermark, offer on-device recovery
     UpdateWatermarkToLevel {
         pkh: String,
         chain_id: ChainId,

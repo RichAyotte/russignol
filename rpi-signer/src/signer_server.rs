@@ -96,6 +96,9 @@ pub type WatermarkErrorCallback =
 /// Type alias for large level gap callback
 pub type LargeGapCallback = Arc<dyn Fn(PublicKeyHash, ChainId, u32, u32) + Send + Sync>;
 
+/// Type alias for missing watermark callback (pkh, `chain_id`, `requested_level`)
+pub type MissingWatermarkCallback = Arc<dyn Fn(PublicKeyHash, ChainId, u32) + Send + Sync>;
+
 /// Callbacks for the integrated signer
 #[derive(Default)]
 pub struct SignerCallbacks {
@@ -105,6 +108,8 @@ pub struct SignerCallbacks {
     pub signing: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Called when a large level gap is detected (pkh, `chain_id`, `current_level`, `new_level`)
     pub large_gap: Option<LargeGapCallback>,
+    /// Called when a signing request hits a key with no initialized watermark
+    pub missing_watermark: Option<MissingWatermarkCallback>,
     /// Called before each signing operation (e.g., CPU frequency boost)
     pub pre_sign: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Called after each signing operation (e.g., CPU frequency restore)
@@ -207,6 +212,10 @@ fn run_signer_once(
     // Wire up large level gap detection if blocks_per_cycle is configured
     if let (Some(callback), Some(bpc)) = (&callbacks.large_gap, blocks_per_cycle) {
         handler = handler.with_large_gap_callback(callback.clone(), bpc);
+    }
+
+    if let Some(ref callback) = callbacks.missing_watermark {
+        handler = handler.with_watermark_missing_callback(callback.clone());
     }
 
     if let Some(ref callback) = callbacks.pre_sign {

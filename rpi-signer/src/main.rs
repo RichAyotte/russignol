@@ -73,24 +73,18 @@ fn init_logging() {
     }
 }
 
-fn main() -> epd_2in13_v4::EpdResult<()> {
-    init_logging();
+/// Signer-thread callbacks that translate signing events into `AppEvent`s on
+/// the UI channel. Bundled so `main` constructs them in one place.
+struct SignerEventCallbacks {
+    watermark_error: signer_server::WatermarkErrorCallback,
+    signing: Arc<dyn Fn() + Send + Sync>,
+    large_gap: signer_server::LargeGapCallback,
+    missing_watermark: signer_server::MissingWatermarkCallback,
+}
 
-    // Shared signing activity tracker
-    let signing_activity = Arc::new(Mutex::new(signing_activity::SigningActivity::default()));
-
-    // Create app event channel
-    let (app_tx, app_rx) = crossbeam_channel::unbounded();
-
-    // Create channel to pass decrypted secret keys to signer (in memory, never written to disk)
-    let (start_signer_tx, start_signer_rx) = crossbeam_channel::bounded::<Secret<String>>(1);
-
-    // Watermark will be created after PIN entry and encryption unlock
-    let watermark: Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>> = Arc::new(RwLock::new(None));
-
-    // Create watermark error callback
+fn build_signer_event_callbacks(app_tx: &Sender<AppEvent>) -> SignerEventCallbacks {
     let tx_for_callback = app_tx.clone();
-    let watermark_error_callback: signer_server::WatermarkErrorCallback =
+    let watermark_error: signer_server::WatermarkErrorCallback =
         Arc::new(move |pkh, chain_id, error| {
             use russignol_signer_lib::WatermarkError;
 
@@ -111,15 +105,13 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
             });
         });
 
-    // Create signing notify callback - triggers display refresh when a signature is completed
     let tx_for_signing = app_tx.clone();
-    let signing_notify_callback: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+    let signing: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = tx_for_signing.send(AppEvent::DirtyDisplay);
     });
 
-    // Create large level gap callback - triggers when watermark gap exceeds 4 cycles
     let tx_for_large_gap = app_tx.clone();
-    let large_gap_callback: Arc<dyn Fn(PublicKeyHash, ChainId, u32, u32) + Send + Sync> =
+    let large_gap: signer_server::LargeGapCallback =
         Arc::new(move |pkh, chain_id, current_level, requested_level| {
             let _ = tx_for_large_gap.send(AppEvent::LargeWatermarkGap {
                 pkh: pkh.to_b58check(),
@@ -129,14 +121,50 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
             });
         });
 
+    let tx_for_missing = app_tx.clone();
+    let missing_watermark: signer_server::MissingWatermarkCallback =
+        Arc::new(move |pkh, chain_id, requested_level| {
+            let _ = tx_for_missing.send(AppEvent::WatermarkMissing {
+                pkh: pkh.to_b58check(),
+                chain_id,
+                requested_level,
+            });
+        });
+
+    SignerEventCallbacks {
+        watermark_error,
+        signing,
+        large_gap,
+        missing_watermark,
+    }
+}
+
+fn main() -> epd_2in13_v4::EpdResult<()> {
+    init_logging();
+
+    // Shared signing activity tracker
+    let signing_activity = Arc::new(Mutex::new(signing_activity::SigningActivity::default()));
+
+    // Create app event channel
+    let (app_tx, app_rx) = crossbeam_channel::unbounded();
+
+    // Create channel to pass decrypted secret keys to signer (in memory, never written to disk)
+    let (start_signer_tx, start_signer_rx) = crossbeam_channel::bounded::<Secret<String>>(1);
+
+    // Watermark will be created after PIN entry and encryption unlock
+    let watermark: Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>> = Arc::new(RwLock::new(None));
+
+    let event_callbacks = build_signer_event_callbacks(&app_tx);
+
     setup_signal_handler(&app_tx);
 
     // Spawn task that waits for keys to be ready before starting signer
     let signing_activity_clone = signing_activity.clone();
     let watermark_for_signer = watermark.clone();
-    let watermark_callback_for_signer = Some(watermark_error_callback);
-    let signing_callback_for_signer = Some(signing_notify_callback);
-    let large_gap_callback_for_signer = Some(large_gap_callback);
+    let watermark_callback_for_signer = Some(event_callbacks.watermark_error);
+    let signing_callback_for_signer = Some(event_callbacks.signing);
+    let large_gap_callback_for_signer = Some(event_callbacks.large_gap);
+    let missing_watermark_callback_for_signer = Some(event_callbacks.missing_watermark);
     let tx_for_signer = app_tx.clone();
 
     let cpu_boost = init_cpu_freq_control();
@@ -175,6 +203,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
                 watermark_error: watermark_callback_for_signer,
                 signing: signing_callback_for_signer,
                 large_gap: large_gap_callback_for_signer,
+                missing_watermark: missing_watermark_callback_for_signer,
                 pre_sign: pre_sign_callback,
                 post_sign: post_sign_callback,
             };
