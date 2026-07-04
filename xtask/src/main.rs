@@ -370,6 +370,37 @@ enum KernelAction {
 // Build targets for host utility
 const HOST_TARGETS: &[&str] = &["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"];
 
+// glibc symbol-version floor for released host binaries. cargo-zigbuild caps the
+// binary's required GLIBC symbols at this version so it runs on any distro at or
+// above it, independent of the build machine's glibc.
+const HOST_GLIBC_FLOOR: &str = "2.28";
+
+/// Format a plain target triple as the glibc-floored target cargo-zigbuild expects
+/// (e.g. `x86_64-unknown-linux-gnu` -> `x86_64-unknown-linux-gnu.2.28`).
+fn host_zig_target(triple: &str) -> String {
+    format!("{triple}.{HOST_GLIBC_FLOOR}")
+}
+
+/// cargo `--config` overrides for the host-utility zigbuild of a given target.
+///
+/// `.cargo/config.toml` force-sets `CFLAGS_aarch64_unknown_linux_gnu` to
+/// `-mcpu=cortex-a53` for the `RPi` signer. That GNU `-mcpu` syntax is rejected by
+/// `zig cc` (it reads the hyphen as a feature toggle → `unknown CPU: 'cortex'`) and
+/// is wrong for the generic-ARM64 host binary anyway, so neutralize it here. The
+/// `.force=true` is required to outrank the config file's own forced entry.
+fn host_zig_config_overrides(target: &str) -> &'static [&'static str] {
+    if target == "aarch64-unknown-linux-gnu" {
+        &[
+            "--config",
+            "env.CFLAGS_aarch64_unknown_linux_gnu.value=\"\"",
+            "--config",
+            "env.CFLAGS_aarch64_unknown_linux_gnu.force=true",
+        ]
+    } else {
+        &[]
+    }
+}
+
 fn main() {
     if let Err(e) = try_main() {
         eprintln!("{} {}", "Error:".red().bold(), e);
@@ -529,7 +560,15 @@ fn build_sequential(targets: &[&str], dev: bool) -> Result<()> {
 }
 
 fn build_for_target(target: &str, dev: bool) -> Result<()> {
-    let mut args = vec!["build", "--package", "russignol-setup", "--target", target];
+    let zig_target = host_zig_target(target);
+    let mut args = vec![
+        "zigbuild",
+        "--package",
+        "russignol-setup",
+        "--target",
+        zig_target.as_str(),
+    ];
+    args.extend_from_slice(host_zig_config_overrides(target));
     if !dev {
         args.push("--release");
     }
@@ -586,15 +625,17 @@ fn build_parallel(targets: &[&str], dev: bool) -> Result<()> {
 }
 
 fn build_for_target_with_dir(target: &str, dev: bool, target_dir: &str) -> Result<()> {
+    let zig_target = host_zig_target(target);
     let mut args = vec![
-        "build",
+        "zigbuild",
         "--package",
         "russignol-setup",
         "--target",
-        target,
+        zig_target.as_str(),
         "--target-dir",
         target_dir,
     ];
+    args.extend_from_slice(host_zig_config_overrides(target));
     if !dev {
         args.push("--release");
     }
@@ -1467,6 +1508,25 @@ fn cmd_validate() -> Result<()> {
         ),
     }
 
+    // Check host-utility glibc-floor toolchain (zig + cargo-zigbuild)
+    println!("  Checking host-utility glibc-floor toolchain...");
+    match check_command("zig", "") {
+        Ok(()) => println!("    {} zig", "✓".green()),
+        Err(_) => println!(
+            "    {} zig - install from: {}",
+            "✗".red(),
+            "https://ziglang.org/download/".cyan()
+        ),
+    }
+    match check_command("cargo-zigbuild", "") {
+        Ok(()) => println!("    {} cargo-zigbuild", "✓".green()),
+        Err(_) => println!(
+            "    {} cargo-zigbuild - install with: {}",
+            "✗".red(),
+            "cargo install cargo-zigbuild".cyan()
+        ),
+    }
+
     // Check buildroot
     println!("  Checking buildroot...");
     if Path::new("buildroot").exists() {
@@ -1552,4 +1612,32 @@ fn get_component_version(component: ReleaseComponent) -> Result<String> {
     }
 
     bail!("Could not find version in {}", component.cargo_toml_path())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_zig_target_appends_glibc_floor() {
+        assert_eq!(
+            host_zig_target("x86_64-unknown-linux-gnu"),
+            "x86_64-unknown-linux-gnu.2.28"
+        );
+        assert_eq!(
+            host_zig_target("aarch64-unknown-linux-gnu"),
+            "aarch64-unknown-linux-gnu.2.28"
+        );
+    }
+
+    #[test]
+    fn host_zig_config_overrides_only_neutralize_aarch64_cflags() {
+        assert!(host_zig_config_overrides("x86_64-unknown-linux-gnu").is_empty());
+        let aarch64 = host_zig_config_overrides("aarch64-unknown-linux-gnu");
+        assert!(
+            aarch64
+                .iter()
+                .any(|a| a.contains("CFLAGS_aarch64_unknown_linux_gnu"))
+        );
+    }
 }

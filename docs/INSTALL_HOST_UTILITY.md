@@ -12,7 +12,7 @@ See [Hardware Requirements](../README.md#hardware-requirements).
 
 - [Octez](https://tezos.gitlab.io/introduction/howtoget.html) with a running, synced node
 - `octez-client` with an existing baker key
-- Linux host (Debian/Ubuntu recommended)
+- Linux host with glibc 2.28 or newer (Debian 10+, Ubuntu 18.04+, RHEL 8+; Debian/Ubuntu recommended)
 
 > **Note:** If `octez-client` is missing, `russignol setup` offers to install the official Octez static binaries (sha256-verified, installed to `~/.local/bin`, no root required).
 
