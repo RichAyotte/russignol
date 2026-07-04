@@ -230,7 +230,7 @@ pub fn cmd_watermark_init(
     Ok(())
 }
 
-fn detect_and_verify_device(device: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn detect_and_verify_device(device: Option<PathBuf>) -> Result<PathBuf> {
     let device = if let Some(d) = device {
         if !d.exists() {
             bail!("Device not found: {}", d.display());

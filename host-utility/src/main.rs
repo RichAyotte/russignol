@@ -15,6 +15,7 @@ mod confirmation;
 mod constants;
 mod deps;
 mod device_access;
+mod disk;
 mod hardware;
 mod image;
 mod install;
@@ -144,6 +145,11 @@ enum Commands {
     Watermark {
         #[command(subcommand)]
         command: WatermarkCommands,
+    },
+    /// Diagnose and repair a signer SD card
+    Disk {
+        #[command(subcommand)]
+        command: disk::DiskCommands,
     },
     /// Rotate to new consensus and companion keys
     RotateKeys {
@@ -354,6 +360,7 @@ fn dispatch(command: Option<Commands>) -> Result<()> {
         Some(Commands::Completions { shell, print }) => handle_completions_command(shell, print),
         Some(Commands::Image { command }) => image::run_image_command(command),
         Some(Commands::Watermark { command }) => handle_watermark_command(command),
+        Some(Commands::Disk { command }) => disk::run_disk_command(command),
         Some(Commands::RotateKeys {
             monitor,
             replace,
