@@ -32,6 +32,11 @@ KEYS_MOUNT="/keys"
 DATA_PART="/dev/mmcblk0p4"
 DATA_MOUNT="/data"
 SETUP_MARKER="/keys/.setup_complete"
+# Boot partition (p1, vfat): a host doctor without f2fs support stages
+# watermark-config.json here for the device to consume on the next boot.
+BOOT_PART="/dev/mmcblk0p1"
+BOOT_PROBE_MOUNT="/tmp/boot-config-probe"
+WATERMARK_CONFIG="watermark-config.json"
 # inline_data/inline_dentry: store small files in inode (reduces write amplification)
 F2FS_OPTS="rw,inline_data,inline_dentry,fsync_mode=strict,atgc,gc_merge,alloc_mode=reuse,background_gc=off,errors=remount-ro"
 
@@ -52,6 +57,20 @@ needs_migration() {
     [ -f "${KEYS_MOUNT}/secret_keys.enc" ]
 }
 
+# Returns success when a watermark-config.json is staged on the vfat boot
+# partition. Probes with a throwaway read-only mount so the keys-mount and
+# daemon-start decisions below can keep /keys rw and run the signer as root,
+# letting it write chain_info.json and remount ro before demoting in-process.
+config_pending() {
+    mkdir -p "${BOOT_PROBE_MOUNT}"
+    mount -t vfat -o ro "${BOOT_PART}" "${BOOT_PROBE_MOUNT}" 2>/dev/null || return 1
+    pending=1
+    [ -f "${BOOT_PROBE_MOUNT}/${WATERMARK_CONFIG}" ] && pending=0
+    umount "${BOOT_PROBE_MOUNT}" 2>/dev/null
+    rmdir "${BOOT_PROBE_MOUNT}" 2>/dev/null
+    return "$pending"
+}
+
 mount_keys_partition() {
     # Check if p3 exists - if not, first boot hasn't created it yet
     if ! partition_exists 3; then
@@ -66,6 +85,8 @@ mount_keys_partition() {
             if [ -f "${SETUP_MARKER}" ]; then
                 if needs_migration; then
                     echo "Keys partition kept rw for PIN migration"
+                elif [ "$CONFIG_PENDING" = 1 ]; then
+                    echo "Keys partition kept rw for watermark config recovery"
                 else
                     # After setup: remount read-only for security
                     mount -o remount,ro "${KEYS_MOUNT}"
@@ -97,6 +118,14 @@ case "$1" in
         echo 0 >/sys/class/leds/ACT/brightness 2>/dev/null
 
         echo "Starting Russignol"
+
+        # Probe once for a staged boot-partition watermark config; the keys
+        # mount and daemon-start decisions below both consult the result.
+        if config_pending; then
+            CONFIG_PENDING=1
+        else
+            CONFIG_PENDING=0
+        fi
 
         # Mount partitions (if they exist)
         mount_keys_partition
@@ -132,11 +161,11 @@ case "$1" in
             if [ -f /data/logs/panic.log ] && [ "$(wc -c </data/logs/panic.log)" -gt 1048576 ]; then
                 : >/data/logs/panic.log
             fi
-            # Migration boots run as root so the signer can chown/chmod the
-            # promoted v2 canonical and remount /keys ro before demoting
-            # to russignol in-process.
-            if needs_migration; then
-                echo "Migration boot - running as root; signer demotes in-process"
+            # Migration and watermark-config-recovery boots both run as root so
+            # the signer can write /keys (promote the v2 blob, or write
+            # chain_info.json) and remount it ro before demoting in-process.
+            if needs_migration || [ "$CONFIG_PENDING" = 1 ]; then
+                echo "Privileged boot - running as root; signer demotes in-process"
                 # Binary manages its own log file via RotatingWriter; init only captures panics
                 if ! start-stop-daemon --start --make-pidfile --pidfile "$PID_FILE" \
                     --chdir /home/russignol \

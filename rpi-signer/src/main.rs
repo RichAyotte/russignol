@@ -290,6 +290,8 @@ fn run_ui_loop(
         fatal_error(&mut device, "SETUP ERROR", &e);
     }
 
+    recover_watermark_config(&mut device, is_first_boot);
+
     let mut app = App::new(
         is_first_boot,
         tx.clone(),
@@ -801,6 +803,59 @@ fn spawn_storage_setup(tx: Sender<AppEvent>) {
     });
 }
 
+/// Gate for consuming a staged boot-partition watermark config on a normal
+/// boot. Recovery is only safe when setup has completed (not first boot), the
+/// init script left us running as root (so we can write `/keys` and remount it
+/// read-only), and no v1->v2 PIN-blob migration is competing for the writable
+/// keys partition.
+fn should_recover_watermark_config(
+    is_first_boot: bool,
+    is_root: bool,
+    migration_pending: bool,
+) -> bool {
+    !is_first_boot && is_root && !migration_pending
+}
+
+/// Consume a staged boot-partition watermark config on a normal boot, then
+/// restore the read-only-keys, unprivileged posture before the UI loop runs.
+///
+/// The init script leaves the signer running as root with `/keys` writable only
+/// when a config is staged, so `save_chain_info` (which writes
+/// `/keys/chain_info.json`) can succeed. Consuming the config is best-effort:
+/// the on-device recovery dialog remains the fallback, so a consume failure must
+/// not brick a healthy device. The remount and privilege drop are load-bearing
+/// security steps and stay fatal on failure, matching the first-boot path.
+fn recover_watermark_config(device: &mut Device, is_first_boot: bool) {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let migration_pending = std::path::Path::new(tezos_encrypt::SECRET_KEYS_ENC_PATH).exists();
+
+    if !should_recover_watermark_config(is_first_boot, is_root, migration_pending) {
+        return;
+    }
+
+    log::info!("Pending watermark config detected on normal boot - recovering");
+    match watermark_setup::process_watermark_config() {
+        watermark_setup::WatermarkResult::Configured { chain_name, level } => {
+            log::info!("Recovered watermarks: {chain_name} at level {level}");
+        }
+        watermark_setup::WatermarkResult::NotFound => {
+            log::info!("No watermark config found during recovery");
+        }
+        watermark_setup::WatermarkResult::Error(e) => {
+            log::error!("Watermark config recovery failed (continuing): {e}");
+        }
+    }
+
+    // Order is load-bearing: consume with /keys writable, then remount it
+    // read-only and drop privileges before the signer thread can start.
+    if let Err(e) = storage::remount_keys_readonly() {
+        fatal_error(device, "SECURITY ERROR", &e);
+    }
+    if let Err(e) = storage::drop_privileges() {
+        fatal_error(device, "SECURITY ERROR", &e);
+    }
+}
+
 fn apply_watermark_config(device: &mut Device) {
     match watermark_setup::process_watermark_config() {
         watermark_setup::WatermarkResult::Configured { chain_name, level } => {
@@ -1123,6 +1178,23 @@ mod tests {
     fn emit_empty_input() {
         let secret = build_secret_keys_json(&[]);
         assert_eq!(&*secret, "[]");
+    }
+
+    #[test]
+    fn recover_gate_truth_table() {
+        // The one posture where consuming a staged config is safe: a normal
+        // boot (setup done), running as root (init kept us privileged for it),
+        // with no PIN-blob migration competing for the writable keys partition.
+        assert!(should_recover_watermark_config(false, true, false));
+
+        // Every other combination must not trigger recovery.
+        assert!(!should_recover_watermark_config(true, true, false));
+        assert!(!should_recover_watermark_config(false, false, false));
+        assert!(!should_recover_watermark_config(false, true, true));
+        assert!(!should_recover_watermark_config(true, false, false));
+        assert!(!should_recover_watermark_config(true, true, true));
+        assert!(!should_recover_watermark_config(false, false, true));
+        assert!(!should_recover_watermark_config(true, false, true));
     }
 
     #[test]

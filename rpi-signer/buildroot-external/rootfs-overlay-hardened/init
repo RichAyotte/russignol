@@ -88,6 +88,12 @@ R_USER="russignol"
 # inline_data/inline_dentry: store small files in inode (reduces write amplification)
 F2FS_OPTS="rw,inline_data,inline_dentry,fsync_mode=strict,atgc,gc_merge,alloc_mode=reuse,background_gc=off,errors=remount-ro"
 
+# Boot partition (p1, vfat): a host doctor without f2fs support stages
+# watermark-config.json here for the device to consume on the next boot.
+BOOT_PART="/dev/mmcblk0p1"
+BOOT_PROBE_MOUNT="/tmp/boot-config-probe"
+WATERMARK_CONFIG="watermark-config.json"
+
 # Check if partition exists in kernel (created at first boot)
 partition_exists() {
     [ -e "/sys/block/mmcblk0/mmcblk0p$1" ]
@@ -98,6 +104,21 @@ partition_exists() {
 # whole signal: it means either staging or verify-and-promote is pending.
 needs_migration() {
     [ -f "${KEYS_MOUNT}/secret_keys.enc" ]
+}
+
+# Returns success when a watermark-config.json is staged on the vfat boot
+# partition. Probes with a throwaway read-only mount so the keys-mount and
+# app-supervisor decisions below can keep /keys rw and run the signer as root,
+# letting it write chain_info.json and remount ro before demoting in-process.
+# Pipe-free (see init_signals): no `|` in this PID 1.
+config_pending() {
+    mkdir -p "${BOOT_PROBE_MOUNT}"
+    mount -t vfat -o ro "${BOOT_PART}" "${BOOT_PROBE_MOUNT}" 2>/dev/null || return 1
+    pending=1
+    [ -f "${BOOT_PROBE_MOUNT}/${WATERMARK_CONFIG}" ] && pending=0
+    umount "${BOOT_PROBE_MOUNT}" 2>/dev/null
+    rmdir "${BOOT_PROBE_MOUNT}" 2>/dev/null
+    return "$pending"
 }
 
 init_keys_partition() {
@@ -117,6 +138,8 @@ init_keys_partition() {
         if [ -f "${SETUP_MARKER}" ]; then
             if needs_migration; then
                 log_debug "Setup complete, keys partition kept rw for PIN migration"
+            elif [ "$CONFIG_PENDING" = 1 ]; then
+                log_debug "Setup complete, keys partition kept rw for watermark config recovery"
             else
                 # After setup: remount read-only for security
                 mount -o remount,ro "${KEYS_MOUNT}"
@@ -434,11 +457,11 @@ run_supervisor() {
             : >"$PANIC_LOG"
         fi
 
-        # Migration boots run as root so the signer can chown/chmod the
-        # promoted v2 canonical and remount /keys ro before demoting
-        # to russignol in-process.
-        if needs_migration; then
-            log_debug "Migration boot - running as root; signer demotes in-process"
+        # Migration and watermark-config-recovery boots both run as root so
+        # the signer can write /keys (promote the v2 blob, or write
+        # chain_info.json) and remount it ro before demoting in-process.
+        if needs_migration || [ "$CONFIG_PENDING" = 1 ]; then
+            log_debug "Privileged boot - running as root; signer demotes in-process"
             $R_CMD >/dev/null 2>>"$PANIC_LOG"
             ec=$?
         else
@@ -482,6 +505,14 @@ log_debug "After init_mdev"
 log_debug "Before init_rng"
 init_rng
 log_debug "After init_rng"
+
+# Probe once for a staged boot-partition watermark config; init_keys_partition
+# and run_supervisor both consult the result. mdev has created the p1 node by now.
+if config_pending; then
+    CONFIG_PENDING=1
+else
+    CONFIG_PENDING=0
+fi
 
 log_debug "Before init_keys_partition"
 init_keys_partition
