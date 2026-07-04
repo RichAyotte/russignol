@@ -229,8 +229,11 @@ type MissingWatermarkCallback = Arc<dyn Fn(PublicKeyHash, ChainId, u32) + Send +
 /// Type alias for signing notification callback (called after each successful signature)
 type SigningNotifyCallback = Arc<dyn Fn() + Send + Sync>;
 
-/// Number of cycles threshold for large level gap detection
-const LARGE_GAP_CYCLES: u32 = 4;
+/// Number of cycles threshold for large level gap detection. A signing request
+/// whose level exceeds the current watermark by more than this many cycles is
+/// refused at signing time and raises a touchscreen alert, so it is also the
+/// point past which a card's floor is "meaningfully" behind the chain.
+pub const LARGE_GAP_CYCLES: u32 = 4;
 
 /// Request handler for processing signer requests
 ///

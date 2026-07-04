@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use colored::Colorize;
 use russignol_signer_lib::KeyManager;
-use russignol_signer_lib::server::KEY_ROLES;
+use russignol_signer_lib::server::{KEY_ROLES, LARGE_GAP_CYCLES};
 use russignol_storage::watermark;
 
 use crate::card_fs::{self, CHAIN_INFO_MODE, DEVICE_GID, DEVICE_UID};
@@ -292,6 +292,17 @@ fn owner_ok(owner: Option<(u32, u32)>) -> bool {
     owner.is_none_or(|(u, g)| u == DEVICE_UID && g == DEVICE_GID)
 }
 
+/// Whether a key's floor is far enough behind the node head to flag. Any offline
+/// card lags a live chain, so a floor merely below head is normal; it only
+/// warrants a repair once the gap exceeds what the device itself tolerates
+/// (`LARGE_GAP_CYCLES`), the point past which a catch-up sign is refused on
+/// device anyway. `blocks_per_cycle` of 0 (a degenerate node) falls back to a
+/// plain below-head comparison.
+fn floor_significantly_behind(floor: u32, node: &ChainInfo) -> bool {
+    let threshold = LARGE_GAP_CYCLES.saturating_mul(node.blocks_per_cycle);
+    node.level.saturating_sub(floor) > threshold
+}
+
 /// Map gathered card state and an optional node snapshot to the full issue list.
 ///
 /// Pure: no IO, no clock, no environment. Detection that needs the node head or
@@ -386,19 +397,26 @@ fn classify_boot_config(state: &CardState, node: Option<&ChainInfo>, issues: &mu
     let Some(bc) = &state.boot_config else {
         return;
     };
+    let stale_delete = |message: String| Issue {
+        kind: IssueKind::LeftoverBootConfig,
+        severity: Severity::Warning,
+        partition: Partition::Boot,
+        remedy: Remedy::HostDirect,
+        action: Some(RepairAction::DeleteBootConfig),
+        message,
+    };
     match node {
-        Some(n) if n.id != bc.chain_id => issues.push(Issue {
-            kind: IssueKind::LeftoverBootConfig,
-            severity: Severity::Warning,
-            partition: Partition::Boot,
-            remedy: Remedy::HostDirect,
-            action: Some(RepairAction::DeleteBootConfig),
-            message: format!(
-                "a staged watermark-config.json targets chain {} at level {}, which \
-                 differs from the node's chain {}; it is stale and can be deleted",
-                bc.chain_id, bc.level, n.id,
-            ),
-        }),
+        Some(n) if n.id != bc.chain_id => issues.push(stale_delete(format!(
+            "a staged watermark-config.json targets chain {} at level {}, which differs \
+             from the node's chain {}; it is stale and can be deleted",
+            bc.chain_id, bc.level, n.id,
+        ))),
+        Some(n) if boot_config_superseded(state, &n.id, bc) => issues.push(stale_delete(format!(
+            "a staged watermark-config.json (chain {} at level {}) is at or below the \
+             card's current watermark floor and chain_info is current; it is superseded \
+             and can be deleted",
+            bc.chain_id, bc.level,
+        ))),
         _ => issues.push(Issue {
             kind: IssueKind::LeftoverBootConfig,
             severity: Severity::Info,
@@ -412,6 +430,25 @@ fn classify_boot_config(state: &CardState, node: Option<&ChainInfo>, issues: &mu
             ),
         }),
     }
+}
+
+/// Whether a staged boot config would do nothing if consumed: its chain is the
+/// node's, `chain_info.json` is already present and current, and every key
+/// already holds a valid floor at or above the config's level (so the device's
+/// never-lower guard would raise nothing). Only then is deleting it safe — a
+/// config that would still seed a missing floor or repair `chain_info` is kept.
+fn boot_config_superseded(state: &CardState, node_id: &str, bc: &BootConfigState) -> bool {
+    let chain_info_current =
+        matches!(&state.chain_info, ChainInfoState::Present { id, .. } if id == node_id);
+    let floors_covered = state.inspection == Inspection::Inspected
+        && !state.watermarks.is_empty()
+        && state.watermarks.iter().all(|key| {
+            !key.files.is_empty()
+                && key.files.iter().all(
+                    |f| matches!(f.status, WatermarkFileStatus::Valid { level } if level >= bc.level),
+                )
+        });
+    chain_info_current && floors_covered
 }
 
 fn classify_keys(state: &CardState, issues: &mut Vec<Issue>) {
@@ -618,7 +655,7 @@ fn classify_key_watermarks(
     }
 
     if let (Some(n), Some(level)) = (node, min_level)
-        && level < n.level
+        && floor_significantly_behind(level, n)
     {
         issues.push(Issue {
             kind: IssueKind::WatermarkBelowHead,
@@ -627,7 +664,8 @@ fn classify_key_watermarks(
             remedy,
             action: write_action.clone(),
             message: format!(
-                "the watermark floor for key {} is level {level}, below the node head {}",
+                "the watermark floor for key {} is level {level}, more than \
+                 {LARGE_GAP_CYCLES} cycles behind the node head {}",
                 key.pkh, n.level
             ),
         });
@@ -1503,11 +1541,21 @@ mod tests {
     #[test]
     fn below_head_floor_is_warning() {
         let mut n = node();
-        n.level = 2_000; // head above the card's 1_000 floor
+        n.level = 1_000_000; // more than 4 cycles above the card's 1_000 floor
         let issues = classify(&healthy_state(), Some(&n));
         let issue = find(&issues, IssueKind::WatermarkBelowHead).expect("below-head issue");
         assert_eq!(issue.severity, Severity::Warning);
         assert_eq!(issue.remedy, Remedy::HostDirect);
+    }
+
+    #[test]
+    fn floor_within_tolerance_is_not_flagged() {
+        // A floor merely behind the head is the normal state of any offline card
+        // on a live chain; only a gap beyond the device's own tolerance is flagged.
+        let mut n = node();
+        n.level = 50_000; // above the 1_000 floor but within 4 cycles (4 * 24576)
+        let issues = classify(&healthy_state(), Some(&n));
+        assert!(find(&issues, IssueKind::WatermarkBelowHead).is_none());
     }
 
     #[test]
@@ -1688,8 +1736,43 @@ mod tests {
     }
 
     #[test]
-    fn leftover_boot_config_fresh_is_info_only() {
+    fn leftover_boot_config_pending_is_info_only() {
+        // A config above the card's floor still has work to do on the next boot
+        // (it raises the floor), so it is left in place.
         let mut state = healthy_state();
+        state.boot_config = Some(BootConfigState {
+            chain_id: "NetXmainnet".to_string(),
+            level: 1_001, // above the card's 1_000 floor
+        });
+        let issues = classify(&state, Some(&node()));
+        let issue = find(&issues, IssueKind::LeftoverBootConfig).expect("boot-config issue");
+        assert_eq!(issue.severity, Severity::Info);
+        assert_eq!(issue.remedy, Remedy::Manual);
+        assert!(issue.action.is_none());
+    }
+
+    #[test]
+    fn leftover_boot_config_superseded_is_deletable() {
+        // Chain current, chain_info healthy, and every floor already at or above
+        // the config level: consuming it would do nothing, so offer to delete it.
+        let mut state = healthy_state();
+        state.boot_config = Some(BootConfigState {
+            chain_id: "NetXmainnet".to_string(),
+            level: 1_000, // at the card's 1_000 floor
+        });
+        let issues = classify(&state, Some(&node()));
+        let issue = find(&issues, IssueKind::LeftoverBootConfig).expect("boot-config issue");
+        assert_eq!(issue.severity, Severity::Warning);
+        assert_eq!(issue.remedy, Remedy::HostDirect);
+        assert_eq!(issue.action, Some(RepairAction::DeleteBootConfig));
+    }
+
+    #[test]
+    fn leftover_boot_config_kept_when_chain_info_needs_repair() {
+        // Floors cover the config level, but chain_info is missing — the config
+        // would still repair chain_info on boot, so it must not be deleted.
+        let mut state = healthy_state();
+        state.chain_info = ChainInfoState::Missing;
         state.boot_config = Some(BootConfigState {
             chain_id: "NetXmainnet".to_string(),
             level: 1_000,
@@ -1697,7 +1780,7 @@ mod tests {
         let issues = classify(&state, Some(&node()));
         let issue = find(&issues, IssueKind::LeftoverBootConfig).expect("boot-config issue");
         assert_eq!(issue.severity, Severity::Info);
-        assert_eq!(issue.remedy, Remedy::Manual);
+        assert!(issue.action.is_none());
     }
 
     #[test]
@@ -1778,11 +1861,11 @@ mod tests {
     #[test]
     fn below_head_rewrite_targets_the_node_head() {
         let mut n = node();
-        n.level = 5_000; // both keys' 1_000 floors are below the head
+        n.level = 500_000; // both keys' 1_000 floors are well beyond 4 cycles behind
         let plan = plan_repairs(&classify(&healthy_state(), Some(&n)));
         assert!(plan.contains(&RepairAction::WriteWatermarks {
             pkh: CONSENSUS_PKH.to_string(),
-            level: 5_000,
+            level: 500_000,
         }));
     }
 
