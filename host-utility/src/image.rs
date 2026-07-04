@@ -606,7 +606,10 @@ fn run_keyed_flash(
     restore_keys::check_restore_tools()?;
     utils::ensure_mount_capability();
 
-    let detected = detect_removable_devices().unwrap_or_default();
+    // A failed enumeration must not be flattened to "no devices" — that would
+    // silently flip the single-vs-dual reader decision below.
+    let detected = detect_removable_devices()
+        .context("Could not enumerate removable devices to determine reader mode")?;
     let single_reader =
         restore_keys::is_single_reader_mode(restore_source, device.as_deref(), &detected);
 
@@ -835,18 +838,7 @@ fn finalize_flash(device: &Path, chain_info: Option<&watermark::ChainInfo>) -> R
         watermark::write_watermark_config(device, info)
             .context("Failed to write watermark config")?;
 
-        let written = watermark::read_watermark_config(device)
-            .context("Failed to read back watermark config")?;
-
-        if written.chain.name.is_empty() || written.chain.id.is_empty() {
-            bail!(
-                "Invalid chain info written to SD card:\n  \
-                 Name: '{}'\n  ID: '{}'\n\n\
-                 The watermark config is corrupted. Please reflash the SD card.",
-                written.chain.name,
-                written.chain.id
-            );
-        }
+        let written = watermark::read_back_and_verify(device)?;
 
         utils::success("Flash complete!");
         println!(
@@ -1416,6 +1408,16 @@ pub(crate) fn check_device_not_mounted(device: &Path) -> Result<()> {
             .output()
             .context("Failed to check mount status")?;
 
+        // A failed query must not read as "not mounted" and wave the flash
+        // through onto a possibly-mounted disk.
+        if !output.status.success() {
+            bail!(
+                "Could not determine whether {} is mounted (diskutil info failed): {}",
+                device.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
         let info = String::from_utf8_lossy(&output.stdout);
         if info.contains("Mounted:") && info.contains("Yes") {
             bail!(
@@ -1482,37 +1484,58 @@ fn check_device_has_media(device: &Path) -> Result<()> {
 
         // Check /sys/block/<device>/size - returns 0 if no media
         let size_path = format!("/sys/block/{device_name}/size");
-        if let Ok(size_str) = std::fs::read_to_string(&size_path) {
-            let sectors: u64 = size_str.trim().parse().unwrap_or(0);
-            if sectors == 0 {
-                bail!(
+        match std::fs::read_to_string(&size_path) {
+            Ok(size_str) => match size_str.trim().parse::<u64>() {
+                Ok(0) => bail!(
                     "No media found in device {}.\n\
                      \n\
                      Please insert an SD card and try again.",
                     device.display()
-                );
-            }
+                ),
+                Ok(_) => {}
+                // A present-but-unparseable size means the check could not run;
+                // surface it rather than silently treating the media as present.
+                Err(e) => utils::warning(&format!(
+                    "Could not parse device size from {size_path} ({e}); \
+                     skipping the media-presence check."
+                )),
+            },
+            Err(e) => utils::warning(&format!(
+                "Could not read {size_path} ({e}) to verify media presence; \
+                 skipping the media-presence check."
+            )),
         }
     }
 
     #[cfg(target_os = "macos")]
     {
         // On macOS, check via diskutil
-        let output = Command::new("diskutil")
+        match Command::new("diskutil")
             .args(["info", &device.to_string_lossy()])
-            .output();
-
-        if let Ok(output) = output {
-            let info = String::from_utf8_lossy(&output.stdout);
-            // If diskutil can't find the disk or shows 0 bytes, no media
-            if info.contains("Total Size:") && info.contains("0 B") {
-                bail!(
-                    "No media found in device {}.\n\
-                     \n\
-                     Please insert an SD card and try again.",
-                    device.display()
-                );
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let info = String::from_utf8_lossy(&output.stdout);
+                // If diskutil can't find the disk or shows 0 bytes, no media
+                if info.contains("Total Size:") && info.contains("0 B") {
+                    bail!(
+                        "No media found in device {}.\n\
+                         \n\
+                         Please insert an SD card and try again.",
+                        device.display()
+                    );
+                }
             }
+            Ok(output) => utils::warning(&format!(
+                "diskutil could not report media for {} ({}); \
+                 skipping the media-presence check.",
+                device.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(e) => utils::warning(&format!(
+                "Could not run diskutil to verify media presence ({e}); \
+                 skipping the media-presence check."
+            )),
         }
     }
 

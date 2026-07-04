@@ -204,8 +204,12 @@ fn handle_replace_flag(state: RotationState, config: &RussignolConfig) -> Result
         | RotationState::PendingOnChainOnly { .. }
         | RotationState::KeysImported { .. } => {
             info("--replace flag: cleaning up pending keys to start fresh...");
-            let _ = keys::forget_key_alias(CONSENSUS_KEY_PENDING_ALIAS, config);
-            let _ = keys::forget_key_alias(COMPANION_KEY_PENDING_ALIAS, config);
+            // If the pending aliases cannot be cleared, a "fresh" rotation would
+            // collide with the leftovers — fail rather than claim a clean slate.
+            keys::forget_key_alias(CONSENSUS_KEY_PENDING_ALIAS, config)
+                .context("Failed to clear the pending consensus key for --replace")?;
+            keys::forget_key_alias(COMPANION_KEY_PENDING_ALIAS, config)
+                .context("Failed to clear the pending companion key for --replace")?;
             success("Pending keys cleared. Starting fresh rotation.");
             println!();
             Ok(RotationState::Clean)
@@ -490,7 +494,10 @@ fn check_existing_pending_keys(
         guide_device_swap(*hw_config, &old_expectation)?;
         wait_for_device(&old_expectation, config)?;
 
-        let activation_cycle = status.consensus_cycle.unwrap_or(0);
+        let activation_cycle = status.consensus_cycle.context(
+            "Keys are pending on-chain but no activation cycle was reported; \
+             cannot compute the swap window",
+        )?;
         return Ok(Some(resume_from_pending(
             delegate_address,
             activation_cycle,
@@ -1710,12 +1717,31 @@ fn cleanup_backup_aliases(auto_confirm: bool, config: &RussignolConfig) -> Resul
         }
     }
 
-    // Remove -old aliases
-    if consensus_old.is_some() {
-        let _ = keys::forget_key_alias(CONSENSUS_KEY_OLD_ALIAS, config);
+    // Remove -old aliases. A lingering -old alias makes the next rotation
+    // misdetect an in-progress swap, so a failed removal must be surfaced.
+    let mut unremoved = Vec::new();
+    if consensus_old.is_some()
+        && let Err(e) = keys::forget_key_alias(CONSENSUS_KEY_OLD_ALIAS, config)
+    {
+        warning(&format!(
+            "Failed to remove {CONSENSUS_KEY_OLD_ALIAS}: {e:#}"
+        ));
+        unremoved.push(CONSENSUS_KEY_OLD_ALIAS);
     }
-    if companion_old.is_some() {
-        let _ = keys::forget_key_alias(COMPANION_KEY_OLD_ALIAS, config);
+    if companion_old.is_some()
+        && let Err(e) = keys::forget_key_alias(COMPANION_KEY_OLD_ALIAS, config)
+    {
+        warning(&format!(
+            "Failed to remove {COMPANION_KEY_OLD_ALIAS}: {e:#}"
+        ));
+        unremoved.push(COMPANION_KEY_OLD_ALIAS);
+    }
+    if !unremoved.is_empty() {
+        anyhow::bail!(
+            "Could not remove backup alias(es): {}. Remove them manually — a leftover \
+             -old alias makes the next rotation misdetect an in-progress swap.",
+            unremoved.join(", ")
+        );
     }
 
     Ok(())
@@ -1785,7 +1811,9 @@ fn detect_rotation_state(delegate: &str, config: &RussignolConfig) -> Result<Rot
     let status = blockchain::query_key_activation_status(delegate, config)?;
 
     if status.consensus_pending {
-        let activation_cycle = status.consensus_cycle.unwrap_or(0);
+        let activation_cycle = status
+            .consensus_cycle
+            .context("On-chain consensus key is pending but no activation cycle was reported")?;
 
         // Check if we also have local -pending aliases
         if pending_aliases_exist(config) {
@@ -1814,11 +1842,15 @@ fn detect_rotation_state(delegate: &str, config: &RussignolConfig) -> Result<Rot
         let companion_hash =
             keys::get_key_hash(COMPANION_KEY_PENDING_ALIAS, config).unwrap_or_default();
 
-        // Check if the -pending key is now the ACTIVE key on-chain
-        // This means keys activated but we never did the alias swap
-        if let Ok(active_key) = blockchain::get_active_consensus_key(delegate, config)
-            && active_key == consensus_hash
-        {
+        // Check if the -pending key is now the ACTIVE key on-chain (keys
+        // activated but the alias swap never happened). If the active key cannot
+        // be read, do not fall through to KeysImported — that would drive a
+        // re-submission of an already-active key. Surface the failure instead.
+        let active_key = blockchain::get_active_consensus_key(delegate, config).context(
+            "Could not determine the active on-chain consensus key; cannot classify \
+             rotation state safely (risk of re-submitting an already-active key)",
+        )?;
+        if active_key == consensus_hash {
             log::debug!(
                 "Detected: -pending alias ({consensus_hash}) matches active on-chain key → KeysActivatedNeedSwap"
             );
@@ -1887,8 +1919,10 @@ fn resume_from_keys_imported(
     if selection == 1 {
         // Clean up pending aliases and exit
         info("Cleaning up -pending aliases...");
-        let _ = keys::forget_key_alias(CONSENSUS_KEY_PENDING_ALIAS, config);
-        let _ = keys::forget_key_alias(COMPANION_KEY_PENDING_ALIAS, config);
+        keys::forget_key_alias(CONSENSUS_KEY_PENDING_ALIAS, config)
+            .context("Failed to clean up the pending consensus key")?;
+        keys::forget_key_alias(COMPANION_KEY_PENDING_ALIAS, config)
+            .context("Failed to clean up the pending companion key")?;
         success("Cleanup complete. Run rotate-keys again to start fresh.");
         return Ok(());
     }

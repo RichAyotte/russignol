@@ -244,6 +244,7 @@ fn do_watermark_init(
     }
 
     write_watermark_config_and_cleanup(
+        device,
         mount_point,
         boot_partition,
         &header,
@@ -311,6 +312,7 @@ fn validate_level_bounds(level: u32) -> Result<()> {
 }
 
 fn write_watermark_config_and_cleanup(
+    device: &Path,
     mount_point: &Path,
     boot_partition: &Path,
     header: &BlockHeader,
@@ -323,6 +325,9 @@ fn write_watermark_config_and_cleanup(
     write_config_file(&config_path, &wm_config)?;
 
     unmount_partition(mount_point, boot_partition)?;
+
+    // Read the config back off the card to confirm the write landed.
+    read_back_and_verify(device)?;
 
     println!();
     success("Watermark configuration written successfully!");
@@ -460,6 +465,31 @@ fn verify_block_device(device: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether a blkid-reported filesystem type is acceptable for the boot
+/// partition. An empty type (blkid could not identify one) is accepted here;
+/// the subsequent vfat mount is the real gate.
+#[cfg(target_os = "linux")]
+fn boot_fstype_is_acceptable(fs_type: &str) -> bool {
+    fs_type.is_empty() || fs_type == "vfat"
+}
+
+/// Read the watermark config back off `device` and confirm it is non-empty.
+///
+/// The post-write check shared by the flash path and standalone `watermark
+/// init`, so the two verify the write the same way and cannot drift.
+pub fn read_back_and_verify(device: &Path) -> Result<WatermarkConfig> {
+    let written = read_watermark_config(device).context("Failed to read back watermark config")?;
+    if written.chain.name.is_empty() || written.chain.id.is_empty() {
+        bail!(
+            "Invalid chain info on the SD card (name '{}', id '{}'); the watermark config \
+             is corrupted. Reflash the card or re-run 'russignol watermark init'.",
+            written.chain.name,
+            written.chain.id
+        );
+    }
+    Ok(written)
+}
+
 fn verify_boot_partition(partition: &Path) -> Result<()> {
     if !partition.exists() {
         bail!(
@@ -476,15 +506,28 @@ fn verify_boot_partition(partition: &Path) -> Result<()> {
             .arg(partition)
             .output();
 
-        if let Ok(output) = output {
-            let fs_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !fs_type.is_empty() && fs_type != "vfat" {
-                bail!(
-                    "Boot partition {} is {} (expected vfat/FAT32)",
-                    partition.display(),
-                    fs_type
-                );
+        match output {
+            Ok(output) if output.status.success() => {
+                let fs_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !boot_fstype_is_acceptable(&fs_type) {
+                    bail!(
+                        "Boot partition {} is {} (expected vfat/FAT32)",
+                        partition.display(),
+                        fs_type
+                    );
+                }
             }
+            // blkid could not confirm the type; the check is skipped rather than
+            // silently passing — the vfat mount below is still a hard gate.
+            Ok(output) => warning(&format!(
+                "Could not verify boot partition type (blkid exited with {}); \
+                 skipping the vfat check — the mount step still enforces it.",
+                output.status
+            )),
+            Err(e) => warning(&format!(
+                "Could not run blkid to verify boot partition type ({e}); \
+                 skipping the vfat check — the mount step still enforces it."
+            )),
         }
     }
 
@@ -514,6 +557,16 @@ fn verify_russignol_image(mount_point: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn boot_fstype_only_accepts_vfat_or_unidentified() {
+        assert!(boot_fstype_is_acceptable("vfat"));
+        // Empty: blkid could not identify it — deferred to the vfat mount.
+        assert!(boot_fstype_is_acceptable(""));
+        assert!(!boot_fstype_is_acceptable("ext4"));
+        assert!(!boot_fstype_is_acceptable("f2fs"));
+    }
 
     #[test]
     fn test_config_serialization_with_name() {

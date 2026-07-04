@@ -379,10 +379,20 @@ impl RussignolConfig {
             Self::prompt_for_rpc_endpoint()?
         };
 
-        // Try to detect DAL node endpoint
+        // Try to detect DAL node endpoint. Finding a directory only tells us a
+        // DAL node is configured, not that it is reachable — probe the port
+        // before claiming detection, so a stopped node is not shown as verified.
         let dal_node_endpoint = Self::detect_dal_node_endpoint();
         if let Some(ref endpoint) = dal_node_endpoint {
-            println!("  {} Detected DAL node endpoint: {}", "✓".green(), endpoint);
+            if endpoint_port_responds(endpoint) {
+                println!("  {} Detected DAL node endpoint: {}", "✓".green(), endpoint);
+            } else {
+                println!(
+                    "  {} Found a DAL node directory; assuming {} (port not responding — verify it)",
+                    "?".yellow(),
+                    endpoint
+                );
+            }
         }
 
         Ok(Self {
@@ -547,8 +557,10 @@ impl RussignolConfig {
 
     /// Try to detect DAL node RPC endpoint
     ///
-    /// Searches for octez-dal-node directories and reads the RPC listen address
-    /// from config.json if available. Falls back to checking if default port responds.
+    /// Searches for octez-dal-node directories. A DAL node's config.json does
+    /// not record its RPC address the way octez-node does, so when a directory
+    /// exists this assumes the default endpoint; the caller probes the port
+    /// before presenting it as verified.
     fn detect_dal_node_endpoint() -> Option<String> {
         let home = std::env::var("HOME").ok()?;
         let home_path = Path::new(&home);
@@ -655,6 +667,24 @@ impl RussignolConfig {
         println!();
         Self::load()
     }
+}
+
+/// Strip the scheme and any path from an endpoint URL, leaving `host:port`
+/// suitable for a `TcpStream::connect` probe.
+fn endpoint_host_port(endpoint: &str) -> &str {
+    let no_scheme = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(endpoint);
+    no_scheme.split('/').next().unwrap_or(no_scheme)
+}
+
+/// Whether something is accepting TCP connections at `endpoint`'s host:port.
+///
+/// Used to gate the "detected" claim for an assumed DAL endpoint: a refused or
+/// failed connect means the node is not reachable, not that it is verified.
+fn endpoint_port_responds(endpoint: &str) -> bool {
+    std::net::TcpStream::connect(endpoint_host_port(endpoint)).is_ok()
 }
 
 /// CLI command handlers
@@ -771,4 +801,22 @@ fn cmd_config_path() -> Result<()> {
     let config_path = RussignolConfig::config_path()?;
     println!("{}", config_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_host_port_strips_scheme_and_path() {
+        assert_eq!(
+            endpoint_host_port("http://localhost:10732"),
+            "localhost:10732"
+        );
+        assert_eq!(
+            endpoint_host_port("https://example.com:443/path"),
+            "example.com:443"
+        );
+        assert_eq!(endpoint_host_port("localhost:10732"), "localhost:10732");
+    }
 }

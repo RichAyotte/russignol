@@ -590,12 +590,17 @@ fn detect_hardware_with_retry() -> Result<()> {
         Ok(((), detail))
     })?;
 
-    if let Ok(Some(power_info)) = hardware::get_usb_power_info()
-        && let Some(warning_msg) = hardware::check_power_warning(&power_info)
-    {
-        println!();
-        utils::warning(&warning_msg);
-        println!();
+    match hardware::get_usb_power_info() {
+        Ok(Some(power_info)) => {
+            if let Some(warning_msg) = hardware::check_power_warning(&power_info) {
+                println!();
+                utils::warning(&warning_msg);
+                println!();
+            }
+        }
+        Ok(None) => {}
+        // A probe failure must not silently skip the power-budget check.
+        Err(e) => utils::warning(&format!("Could not check USB power budget: {e:#}")),
     }
 
     Ok(())

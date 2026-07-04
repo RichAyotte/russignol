@@ -430,6 +430,16 @@ fn create_temp_mount_point() -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+/// Extract the mount point from `udisksctl mount` output, which reads like
+/// `Mounted /dev/sdb1 at /run/media/user/BOOT.` — the path after ` at `, with
+/// the trailing period stripped. `None` when the marker is absent or the target
+/// is empty, both of which mean the output could not be understood.
+#[cfg(target_os = "linux")]
+fn parse_udisks_mount_point(stdout: &str) -> Option<&str> {
+    let point = stdout.split(" at ").nth(1)?.trim().trim_end_matches('.');
+    (!point.is_empty()).then_some(point)
+}
+
 /// Mount a partition, auto-detecting existing mounts and trying udisksctl first.
 ///
 /// `fs_type` is the filesystem type passed to `mount -t` (e.g. `"vfat"`, `"f2fs"`).
@@ -468,13 +478,23 @@ pub fn mount_partition(partition: &Path, fs_type: &str, read_only: bool) -> Resu
             && output.status.success()
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(mount_point) = stdout
-                .split(" at ")
-                .nth(1)
-                .map(|s| s.trim().trim_end_matches('.'))
-            {
+            if let Some(mount_point) = parse_udisks_mount_point(&stdout) {
                 return Ok(PathBuf::from(mount_point));
             }
+            // udisksctl mounted the partition but its output did not name where.
+            // Falling through would mount a second time at a temp dir and leak
+            // this mount; undo it and surface the reason.
+            run_best_effort(
+                "udisksctl",
+                &["unmount", "-b", &partition_str],
+                "Failed to undo an unparseable udisksctl mount",
+            );
+            anyhow::bail!(
+                "udisksctl reported a successful mount of {} but its output could \
+                 not be parsed for the mount point: {}",
+                partition.display(),
+                stdout.trim()
+            );
         }
 
         // Fall back to the traditional mount, which needs root.
@@ -693,9 +713,6 @@ pub trait JsonValueExt {
     /// Get an i64 value by key (handles both numeric and string representations)
     fn get_i64(&self, key: &str) -> Option<i64>;
 
-    /// Get an i64 value by key, returning a default if not found
-    fn get_i64_or(&self, key: &str, default: i64) -> i64;
-
     /// Get a bool value by key
     fn get_bool(&self, key: &str) -> Option<bool>;
 
@@ -714,10 +731,6 @@ impl JsonValueExt for serde_json::Value {
             v.as_i64()
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
-    }
-
-    fn get_i64_or(&self, key: &str, default: i64) -> i64 {
-        self.get_i64(key).unwrap_or(default)
     }
 
     fn get_bool(&self, key: &str) -> Option<bool> {
@@ -756,6 +769,22 @@ mod tests {
     fn warn_if_err_reports_only_on_error() {
         assert!(!warn_if_err(Ok::<_, String>(()), "ok path"));
         assert!(warn_if_err(Err::<(), _>("boom"), "err path"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_udisks_mount_point_extracts_path_or_reports_unparseable() {
+        assert_eq!(
+            parse_udisks_mount_point("Mounted /dev/sdb1 at /run/media/user/BOOT.\n"),
+            Some("/run/media/user/BOOT")
+        );
+        // No " at " marker: the output cannot be understood.
+        assert_eq!(
+            parse_udisks_mount_point("Mounted /dev/sdb1 somewhere"),
+            None
+        );
+        // Marker present but empty target: also unparseable.
+        assert_eq!(parse_udisks_mount_point("Mounted /dev/sdb1 at ."), None);
     }
 
     #[test]

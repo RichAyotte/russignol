@@ -89,9 +89,15 @@ pub fn query_staking_info(
     let rpc_path = format!("/chains/main/blocks/head/context/delegates/{delegate}");
     let delegate_info = crate::utils::rpc_get_json(&rpc_path, config)?;
 
-    // Use total_staked (includes own + external stakes)
-    let staked = delegate_info.get_i64_or("total_staked", 0);
-    let total = delegate_info.get_i64_or("own_full_balance", 0);
+    // Use total_staked (includes own + external stakes). A missing field means
+    // the response was not the expected delegate shape, not a genuine zero
+    // stake — surface it rather than reporting fabricated staking numbers.
+    let staked = delegate_info
+        .get_i64("total_staked")
+        .context("delegate info is missing total_staked")?;
+    let total = delegate_info
+        .get_i64("own_full_balance")
+        .context("delegate info is missing own_full_balance")?;
 
     // Staking is enabled if total_staked > 0
     let staking_enabled = staked > 0;
@@ -117,8 +123,18 @@ pub fn query_staking_info(
 pub fn get_balance(address: &str, config: &RussignolConfig) -> Result<f64> {
     let rpc_path = format!("/chains/main/blocks/head/context/contracts/{address}/balance");
     let balance = rpc_get_json(&rpc_path, config)?;
-    let balance_mutez: u64 = balance.as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
-    Ok(mutez_to_tez(balance_mutez))
+    Ok(mutez_to_tez(parse_balance_mutez(&balance)?))
+}
+
+/// Parse a contract balance RPC response (a mutez amount encoded as a JSON
+/// string) into mutez. An absent or non-numeric value is an error rather than a
+/// fabricated 0, so a failed parse cannot masquerade as an empty account.
+fn parse_balance_mutez(balance: &serde_json::Value) -> Result<u64> {
+    balance
+        .as_str()
+        .context("balance RPC response was not a string")?
+        .parse::<u64>()
+        .context("balance RPC response was not a valid mutez amount")
 }
 
 /// Convert mutez to tez as f64 for display purposes.
@@ -290,6 +306,21 @@ pub fn query_key_activation_status(
     })
 }
 
+/// Decide the result when a rights scan matched no level for the delegate.
+///
+/// `queried_any` is whether at least one RPC batch returned a parseable answer.
+/// Without a single successful query, "no rights found" cannot be told apart
+/// from a total query failure, so it is reported as an error rather than a
+/// confident `Ok(None)` that a caller would render as "none scheduled".
+fn no_rights_found<T>(queried_any: bool, last_error: Option<anyhow::Error>) -> Result<Option<T>> {
+    if queried_any {
+        Ok(None)
+    } else {
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no rights data was returned")))
+            .context("Could not query rights")
+    }
+}
+
 /// Query the next baking right for a delegate
 ///
 /// Returns (`block_level`, `time_estimate`) or None if no upcoming rights found
@@ -326,6 +357,8 @@ pub fn query_next_baking_rights(
     let max_levels_to_check = blocks_per_cycle * 2;
 
     let mut all_delegate_rights: Vec<i64> = Vec::new();
+    let mut queried_any = false;
+    let mut last_error: Option<anyhow::Error> = None;
 
     // Process in batches
     for batch_start in
@@ -346,7 +379,10 @@ pub fn query_next_baking_rights(
 
         // Make RPC call for this batch
         let rights = match crate::utils::rpc_get_json(&rpc_path, config) {
-            Ok(r) => r,
+            Ok(r) => {
+                queried_any = true;
+                r
+            }
             Err(e) => {
                 // Check if error is due to seed not computed (querying too far into future)
                 let error_msg = e.to_string();
@@ -354,6 +390,7 @@ pub fn query_next_baking_rights(
                     // We've reached the limit of what can be queried, stop here
                     break;
                 }
+                last_error = Some(e);
                 continue; // Skip other failed batches
             }
         };
@@ -389,7 +426,7 @@ pub fn query_next_baking_rights(
         return Ok(Some((level, estimated_time)));
     }
 
-    Ok(None)
+    no_rights_found(queried_any, last_error)
 }
 
 /// Query the next attesting right for a delegate
@@ -415,6 +452,9 @@ pub fn query_next_attesting_rights(
     // Get block delay for time estimation
     let minimal_block_delay = get_minimal_block_delay(config);
 
+    let mut queried_any = false;
+    let mut last_error: Option<anyhow::Error> = None;
+
     // Query up to 3 cycles (current, current+1, current+2)
     // The RPC without cycle/level params returns 0 results, so we must query by cycle
     for cycle_offset in 0..=2 {
@@ -422,12 +462,16 @@ pub fn query_next_attesting_rights(
         let path = format!("/chains/main/blocks/head/helpers/attestation_rights?cycle={cycle}");
 
         let rights = match crate::utils::rpc_get_json(&path, config) {
-            Ok(r) => r,
+            Ok(r) => {
+                queried_any = true;
+                r
+            }
             Err(e) => {
                 // "seed has not been computed yet" means we've gone too far into the future
                 if e.to_string().contains("seed") {
                     break;
                 }
+                last_error = Some(e);
                 continue;
             }
         };
@@ -456,7 +500,7 @@ pub fn query_next_attesting_rights(
         }
     }
 
-    Ok(None)
+    no_rights_found(queried_any, last_error)
 }
 
 /// Get the minimal block delay from protocol constants
@@ -553,6 +597,36 @@ pub fn list_known_addresses(config: &RussignolConfig) -> Result<Vec<(String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_balance_mutez_accepts_a_numeric_string() {
+        assert_eq!(
+            parse_balance_mutez(&serde_json::json!("123456789")).unwrap(),
+            123_456_789
+        );
+    }
+
+    #[test]
+    fn parse_balance_mutez_rejects_non_numeric_instead_of_fabricating_zero() {
+        // A non-string or unparseable response must error, not silently read 0.
+        assert!(parse_balance_mutez(&serde_json::json!(42)).is_err());
+        assert!(parse_balance_mutez(&serde_json::json!("not-a-number")).is_err());
+    }
+
+    #[test]
+    fn no_rights_found_reports_empty_when_a_batch_succeeded() {
+        let r: Result<Option<(i64, String)>> = no_rights_found(true, None);
+        assert!(matches!(r, Ok(None)));
+    }
+
+    #[test]
+    fn no_rights_found_errors_when_no_batch_could_be_queried() {
+        let r: Result<Option<(i64, String)>> =
+            no_rights_found(false, Some(anyhow::anyhow!("connection refused")));
+        let rendered = format!("{:#}", r.unwrap_err());
+        assert!(rendered.contains("Could not query rights"));
+        assert!(rendered.contains("connection refused"));
+    }
 
     #[test]
     fn parses_alias_address_pairs_and_skips_non_tz_lines() {

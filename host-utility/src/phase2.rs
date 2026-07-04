@@ -6,8 +6,8 @@ use crate::hardware;
 use crate::progress::run_step;
 use crate::system;
 use crate::utils::{
-    command_exists, ensure_sudo, is_service_active, run_command, sudo_command_quiet,
-    sudo_command_success_quiet,
+    command_exists, ensure_sudo, is_service_active, run_command, sudo_command_success_quiet,
+    warn_if_err,
 };
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -428,10 +428,18 @@ fn reload_network_services() -> Result<()> {
         "Reloading network services",
         "sudo systemctl reload NetworkManager systemd-networkd",
         || {
+            // Best-effort: a failed reload must warn, not vanish, but the
+            // downstream connectivity check is the real gate on success.
             if is_service_active("NetworkManager") {
-                let _ = sudo_command_quiet("systemctl", &["reload", "NetworkManager"]);
+                warn_if_err(
+                    sudo_command_success_quiet("systemctl", &["reload", "NetworkManager"]),
+                    "Failed to reload NetworkManager",
+                );
             }
-            let _ = sudo_command_quiet("systemctl", &["reload", "systemd-networkd"]);
+            warn_if_err(
+                sudo_command_success_quiet("systemctl", &["reload", "systemd-networkd"]),
+                "Failed to reload systemd-networkd",
+            );
             Ok(())
         },
     )

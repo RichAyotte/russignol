@@ -73,13 +73,33 @@ pub fn get_node_block_height(config: &crate::config::RussignolConfig) -> Result<
     // First verify node is running and synced
     verify_octez_node(config)?;
 
-    // Get current block level
-    let Ok(header) = crate::utils::rpc_get_json("/chains/main/blocks/head/header", config) else {
-        return Ok(None);
-    };
-    let level = header.get_i64("level");
+    // The node just answered a health check, so a header read that fails now is
+    // an anomaly worth surfacing, not a silent "height unknown".
+    let header = crate::utils::rpc_get_json("/chains/main/blocks/head/header", config)
+        .context("Failed to read node block header after a successful health check")?;
 
-    Ok(level)
+    Ok(header.get_i64("level"))
+}
+
+/// How `wait_for_node_sync` should react to a `verify_octez_node` error.
+#[derive(Debug, PartialEq, Eq)]
+enum NodeWait {
+    /// Node is up but still catching up — keep waiting indefinitely.
+    Syncing,
+    /// Node is not reachable — a real error, stop waiting.
+    Down,
+    /// Unrecognized failure — wait, but only for a bounded number of rounds.
+    Unknown,
+}
+
+fn classify_node_wait(err_msg: &str) -> NodeWait {
+    if err_msg.contains("not synced") {
+        NodeWait::Syncing
+    } else if err_msg.contains("not responsive") || err_msg.contains("Cannot find") {
+        NodeWait::Down
+    } else {
+        NodeWait::Unknown
+    }
 }
 
 /// Wait for the node to be fully synced, showing a spinner while waiting
@@ -90,6 +110,10 @@ pub fn wait_for_node_sync(config: &crate::config::RussignolConfig) -> Result<()>
     use crate::progress::create_spinner;
     use std::time::Duration;
 
+    // An unrecognized error may be transient, but it must not loop forever
+    // silently: give up after this many consecutive unknown failures.
+    const MAX_UNKNOWN_RETRIES: u32 = 12;
+
     // Quick check first - if already synced, return immediately
     if verify_octez_node(config).is_ok() {
         return Ok(());
@@ -98,28 +122,37 @@ pub fn wait_for_node_sync(config: &crate::config::RussignolConfig) -> Result<()>
     // Not synced, show spinner and wait
     let spinner = create_spinner("Waiting for node to sync...");
 
+    let mut unknown_retries: u32 = 0;
+
     loop {
         match verify_octez_node(config) {
             Ok(()) => {
                 spinner.finish_and_clear();
                 return Ok(());
             }
-            Err(e) => {
-                // Check if it's a sync issue (expected) vs other error (bail)
-                let err_msg = e.to_string();
-                if err_msg.contains("not synced") {
-                    // Still syncing, continue waiting
+            Err(e) => match classify_node_wait(&e.to_string()) {
+                NodeWait::Syncing => {
+                    unknown_retries = 0;
                     std::thread::sleep(Duration::from_secs(5));
-                } else if err_msg.contains("not responsive") || err_msg.contains("Cannot find") {
+                }
+                NodeWait::Down => {
                     // Node not running - this is a real error
                     spinner.finish_and_clear();
                     return Err(e);
-                } else {
-                    // Unknown error, keep waiting but log it
+                }
+                NodeWait::Unknown => {
+                    unknown_retries += 1;
+                    if unknown_retries >= MAX_UNKNOWN_RETRIES {
+                        spinner.finish_and_clear();
+                        return Err(e).context(format!(
+                            "Node health check kept failing for an unrecognized reason \
+                             after {MAX_UNKNOWN_RETRIES} attempts"
+                        ));
+                    }
                     log::debug!("Node sync check failed: {e}");
                     std::thread::sleep(Duration::from_secs(5));
                 }
-            }
+            },
         }
     }
 }
@@ -160,8 +193,15 @@ pub fn verify_octez_client_directory(config: &crate::config::RussignolConfig) ->
 pub fn check_plugdev_membership() -> Result<(bool, String)> {
     let username = std::env::var("USER").context("USER environment variable not set")?;
 
-    // Get user's groups
+    // Get user's groups. A non-zero exit yields empty stdout, which would read
+    // as "not in plugdev" — surface the failure instead of a false negative.
     let output = run_command("groups", &[&username])?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`groups {username}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     let groups = String::from_utf8_lossy(&output.stdout);
 
     let in_group = groups.split_whitespace().any(|g| g == "plugdev");
@@ -235,6 +275,28 @@ pub fn check_plugdev_with_warning() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_node_wait_distinguishes_syncing_down_and_unknown() {
+        assert_eq!(
+            classify_node_wait(
+                "octez-node is running but not synced. Last block is 9 minutes old."
+            ),
+            NodeWait::Syncing
+        );
+        assert_eq!(
+            classify_node_wait("octez-node RPC is not responsive"),
+            NodeWait::Down
+        );
+        assert_eq!(
+            classify_node_wait("Cannot find the node data directory"),
+            NodeWait::Down
+        );
+        assert_eq!(
+            classify_node_wait("connection reset by peer"),
+            NodeWait::Unknown
+        );
+    }
 
     #[test]
     fn active_member_needs_no_advice() {

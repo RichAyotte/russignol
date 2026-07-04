@@ -262,6 +262,24 @@ fn parse_power_ma(value: &str) -> Option<u32> {
     value.trim().strip_suffix("mA")?.parse().ok()
 }
 
+/// Read and parse a USB device's `bMaxPower` (milliamps) from its sysfs dir.
+///
+/// A missing, unreadable, or unparseable value is an error rather than a
+/// fabricated 0mA: silently counting an unknown device as drawing nothing
+/// understates the hub total and can suppress a real over-budget warning.
+fn read_power_ma(sysfs_dir: &Path) -> Result<u32> {
+    let path = sysfs_dir.join("bMaxPower");
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    parse_power_ma(&content).with_context(|| {
+        format!(
+            "Unrecognized bMaxPower value {:?} in {}",
+            content.trim(),
+            path.display()
+        )
+    })
+}
+
 /// Check if a device path indicates it's behind a hub
 ///
 /// Device paths like "3-7" are direct connections, while "3-7.2" indicates
@@ -361,13 +379,7 @@ fn collect_hub_devices(hub_path: &str) -> Result<Vec<HubDevice>> {
                     .map_or_else(|| "Unknown Device".to_string(), |s| s.trim().to_string());
 
                 // Read power draw
-                let power_ma = device_path
-                    .join("bMaxPower")
-                    .exists()
-                    .then(|| std::fs::read_to_string(device_path.join("bMaxPower")).ok())
-                    .flatten()
-                    .and_then(|s| parse_power_ma(&s))
-                    .unwrap_or(0);
+                let power_ma = read_power_ma(&device_path)?;
 
                 devices.push(HubDevice {
                     path: name_str.to_string(),
@@ -419,13 +431,7 @@ pub fn get_usb_power_info() -> Result<Option<UsbPowerInfo>> {
     let device_sysfs = devices_base.join(&device_path);
 
     // Read device power draw
-    let device_power_ma = device_sysfs
-        .join("bMaxPower")
-        .exists()
-        .then(|| std::fs::read_to_string(device_sysfs.join("bMaxPower")).ok())
-        .flatten()
-        .and_then(|s| parse_power_ma(&s))
-        .unwrap_or(0);
+    let device_power_ma = read_power_ma(&device_sysfs)?;
 
     let behind_hub = is_behind_hub(&device_path);
 
@@ -434,13 +440,7 @@ pub fn get_usb_power_info() -> Result<Option<UsbPowerInfo>> {
             let hub_sysfs = devices_base.join(&hub_path);
 
             // Read hub's own power draw (for display purposes)
-            let hub_power_ma = hub_sysfs
-                .join("bMaxPower")
-                .exists()
-                .then(|| std::fs::read_to_string(hub_sysfs.join("bMaxPower")).ok())
-                .flatten()
-                .and_then(|s| parse_power_ma(&s))
-                .unwrap_or(0);
+            let hub_power_ma = read_power_ma(&hub_sysfs)?;
 
             // Check bmAttributes bit 6 for self-powered status (per USB spec)
             let is_bus_powered = !is_hub_self_powered(&hub_sysfs);
@@ -556,6 +556,24 @@ mod tests {
         assert_eq!(parse_power_ma(""), None);
         assert_eq!(parse_power_ma("abc"), None);
         assert_eq!(parse_power_ma("500ma"), None); // Case sensitive
+    }
+
+    #[test]
+    fn read_power_ma_reads_valid_value() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bMaxPower"), "500mA\n").unwrap();
+        assert_eq!(read_power_ma(dir.path()).unwrap(), 500);
+    }
+
+    #[test]
+    fn read_power_ma_errors_rather_than_fabricating_zero() {
+        // Missing file is an error, not 0mA.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_power_ma(dir.path()).is_err());
+
+        // Present but unparseable is also an error.
+        std::fs::write(dir.path().join("bMaxPower"), "garbage").unwrap();
+        assert!(read_power_ma(dir.path()).is_err());
     }
 
     #[test]

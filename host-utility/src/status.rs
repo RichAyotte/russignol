@@ -129,7 +129,7 @@ struct HardwareData {
     device_detected: Result<()>,
     serial: Option<String>,
     mac: Option<String>,
-    power_info: Option<hardware::UsbPowerInfo>,
+    power_info: Result<Option<hardware::UsbPowerInfo>>,
 }
 
 struct SystemData {
@@ -177,7 +177,7 @@ fn fetch_hardware_data() -> HardwareData {
         device_detected,
         serial: serial.ok().flatten(),
         mac: mac.ok().flatten(),
-        power_info: power_info.ok().flatten(),
+        power_info,
     }
 }
 
@@ -356,7 +356,7 @@ fn display_hardware_status(verbose: bool, data: HardwareData) {
             }
 
             // Display USB connection info
-            if let Some(ref power_info) = data.power_info {
+            if let Ok(Some(ref power_info)) = data.power_info {
                 if power_info.behind_hub {
                     if let Some(ref hub_info) = power_info.hub_info {
                         let power_type = if hub_info.is_bus_powered {
@@ -378,7 +378,7 @@ fn display_hardware_status(verbose: bool, data: HardwareData) {
 
             if verbose {
                 println!("      VID:PID: {USB_VID_PID}");
-                if let Some(ref power_info) = data.power_info {
+                if let Ok(Some(ref power_info)) = data.power_info {
                     println!("      Device power: {}mA", power_info.device_power_ma);
                     if let Some(ref hub_info) = power_info.hub_info {
                         println!("      Hub power: {}mA", hub_info.hub_power_ma);
@@ -386,8 +386,16 @@ fn display_hardware_status(verbose: bool, data: HardwareData) {
                 }
             }
 
+            // A failed power probe must not silently hide an over-budget hub.
+            if let Err(ref e) = data.power_info {
+                println!("  {} Could not determine USB power budget", "?".yellow());
+                if verbose {
+                    println!("      Error: {e:#}");
+                }
+            }
+
             // Check for power budget warning
-            if let Some(ref power_info) = data.power_info
+            if let Ok(Some(ref power_info)) = data.power_info
                 && let Some(ref hub_info) = power_info.hub_info
                 && hub_info.is_bus_powered
                 && hub_info.total_power_draw_ma > hub_info.power_budget_ma

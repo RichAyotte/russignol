@@ -95,6 +95,36 @@ fn parse_stable_version(version: &str) -> Option<Vec<u64>> {
         .collect()
 }
 
+/// Whether a skipped octez-binaries version looks like an intentional
+/// pre-release or dev build (an rc/beta suffix, or a datestamped `+commit`)
+/// rather than an unexpectedly unparseable stable version.
+fn is_prerelease_marker(version: &str) -> bool {
+    version.contains('-') || version.contains('+')
+}
+
+/// `octez-binaries-*` versions that `parse_stable_version` rejects yet do not
+/// look like a pre-release/dev build — a stable release we failed to parse,
+/// which would otherwise be dropped from "latest" without a trace.
+fn unexpected_unparsed_octez_versions(json: &serde_json::Value) -> Vec<String> {
+    let Some(array) = json.as_array() else {
+        return Vec::new();
+    };
+    array
+        .iter()
+        .filter_map(|pkg| {
+            let name = pkg.get("name")?.as_str()?;
+            if !name.starts_with("octez-binaries-") {
+                return None;
+            }
+            let version = pkg.get("version")?.as_str()?;
+            if parse_stable_version(version).is_some() || is_prerelease_marker(version) {
+                return None;
+            }
+            Some(version.to_string())
+        })
+        .collect()
+}
+
 /// Pick the newest stable `octez-binaries-*` release from the GitLab
 /// packages listing. Pre-releases (rc/beta suffixes) and datestamped dev
 /// builds are skipped.
@@ -169,16 +199,24 @@ pub fn ensure_octez_available(endpoint: &str, interactive: bool) -> Result<()> {
             missing.join(", ")
         );
     }
-    install_octez_static(&missing, &crate::install::get_install_dir()?)?;
+    let install_dir = crate::install::get_install_dir()?;
+    install_octez_static(&missing, &install_dir)?;
 
-    crate::install::warn_if_not_in_path(&crate::install::get_install_dir()?);
-    let still_missing: Vec<&&str> = missing
+    crate::install::warn_if_not_in_path(&install_dir);
+    let still_missing: Vec<&str> = missing
         .iter()
+        .copied()
         .filter(|cmd| !crate::utils::command_exists(cmd))
         .collect();
     if !still_missing.is_empty() {
-        crate::utils::warning(
-            "Installed binaries are not yet visible on PATH; fix PATH as above, then re-run.",
+        // The binaries are installed but octez still cannot be invoked from
+        // this process, so every downstream octez call would fail — stop with
+        // guidance rather than proceeding past an unusable install.
+        anyhow::bail!(
+            "Installed octez binaries are not on PATH: {}. They were installed to {}, \
+             which is not in your PATH — add it (see the note above) and re-run.",
+            still_missing.join(", "),
+            install_dir.display()
         );
     }
     Ok(())
@@ -201,6 +239,12 @@ fn install_octez_static(missing: &[&str], install_dir: &std::path::Path) -> Resu
         &format!("{GITLAB_API_BASE}/packages?order_by=created_at&sort=desc&per_page=50"),
     )
     .context("Failed to query the octez package registry")?;
+    for version in unexpected_unparsed_octez_versions(&packages) {
+        crate::utils::warning(&format!(
+            "Skipping octez-binaries release with an unrecognized version '{version}' \
+             while selecting the latest stable binaries"
+        ));
+    }
     let release = parse_octez_packages(&packages)
         .context("No stable octez-binaries release found in the GitLab package registry")?;
     crate::utils::info(&format!("Latest stable octez release: {}", release.version));
@@ -375,6 +419,23 @@ mod tests {
                 package_name: "octez-binaries-25.0".to_string(),
                 version: "25.0".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn flags_only_stable_looking_unparseable_octez_versions() {
+        let json = serde_json::json!([
+            {"id": 1, "name": "octez-binaries-25.0", "version": "25.0"},
+            {"id": 2, "name": "octez-binaries-25.0-rc1", "version": "25.0-rc1"},
+            {"id": 3, "name": "octez-binaries-202604010917+abc", "version": "202604010917+abc"},
+            {"id": 4, "name": "octez-binaries-26", "version": "26"},
+            {"id": 5, "name": "octez-evm-node-0.62", "version": "0.62"},
+        ]);
+        // Only the dotless "26" is an unexpectedly unparseable stable release;
+        // rc/dev builds and non-binaries packages are intentional skips.
+        assert_eq!(
+            unexpected_unparsed_octez_versions(&json),
+            vec!["26".to_string()]
         );
     }
 

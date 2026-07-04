@@ -92,6 +92,18 @@ fn select_baker(
         .context("Selected address not found")
 }
 
+/// Parse a string-encoded mutez field from a delegate RPC object. A missing or
+/// non-numeric value on a registered delegate is a malformed response, surfaced
+/// as an error rather than silently defaulted to 0.
+fn parse_mutez_field(delegate_info: &serde_json::Value, key: &str) -> Result<u64> {
+    delegate_info
+        .get(key)
+        .and_then(|v| v.as_str())
+        .with_context(|| format!("delegate info missing string field '{key}'"))?
+        .parse::<u64>()
+        .with_context(|| format!("delegate field '{key}' is not a valid mutez amount"))
+}
+
 /// Validate baker against the blockchain with a single delegate RPC fetch.
 ///
 /// Returns `BakerStatus` distinguishing unregistered, deactivated, and active.
@@ -103,21 +115,16 @@ fn validate_baker(alias: &str, address: &str, config: &RussignolConfig) -> Resul
     run_step(
         "Validating baker",
         &format!("octez-client rpc get .../delegates/{address}"),
-        || {
-            let result = crate::utils::rpc_get_json(&rpc_path, config);
-
-            if let Ok(delegate_info) = result {
-                let deactivated = delegate_info.get_bool("deactivated").unwrap_or(false);
-                let staked_balance = delegate_info
-                    .get("total_staked")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
-                let full_balance = delegate_info
-                    .get("own_full_balance")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
+        || match crate::utils::rpc_get_json(&rpc_path, config) {
+            Ok(delegate_info) => {
+                // A registered delegate always carries these fields; a missing or
+                // malformed value is a bad response, surfaced rather than
+                // defaulted to a healthy-looking zero/active.
+                let deactivated = delegate_info
+                    .get_bool("deactivated")
+                    .context("delegate info missing 'deactivated' field")?;
+                let staked_balance = parse_mutez_field(&delegate_info, "total_staked")?;
+                let full_balance = parse_mutez_field(&delegate_info, "own_full_balance")?;
 
                 log::info!(
                     "Baker {address}: registered=true, deactivated={deactivated}, \
@@ -132,16 +139,27 @@ fn validate_baker(alias: &str, address: &str, config: &RussignolConfig) -> Resul
                     staked_balance,
                     full_balance,
                 })
-            } else {
-                log::info!("Baker {address}: not registered as delegate");
-                Ok(BakerStatus {
-                    alias: alias.to_string(),
-                    address: address.to_string(),
-                    registered: false,
-                    deactivated: false,
-                    staked_balance: 0,
-                    full_balance: 0,
-                })
+            }
+            Err(e) => {
+                // Distinguish "not a delegate" from "node unreachable": if a basic
+                // node endpoint still answers, the delegate query legitimately
+                // found nothing; otherwise the failure is transport-level and
+                // must be surfaced, not reported as an unregistered baker.
+                if crate::utils::rpc_get_json("/chains/main/blocks/head/header", config).is_ok() {
+                    log::info!("Baker {address}: not registered as delegate");
+                    Ok(BakerStatus {
+                        alias: alias.to_string(),
+                        address: address.to_string(),
+                        registered: false,
+                        deactivated: false,
+                        staked_balance: 0,
+                        full_balance: 0,
+                    })
+                } else {
+                    Err(e).context(format!(
+                        "Could not query delegate status for {address}; the node is unreachable"
+                    ))
+                }
             }
         },
     )
@@ -731,9 +749,17 @@ fn validate_imported_keys(
         "Validating imported keys",
         "octez-client list known addresses",
         || {
-            let list_output = run_octez_client_command(&["list", "known", "addresses"], config)
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            let output = run_octez_client_command(&["list", "known", "addresses"], config)
                 .context("Failed to list known addresses")?;
+            // A non-zero exit yields empty stdout, which would read as "keys not
+            // imported"; surface the command failure as itself instead.
+            if !output.status.success() {
+                anyhow::bail!(
+                    "octez-client list known addresses failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            let list_output = String::from_utf8_lossy(&output.stdout).to_string();
 
             let has_consensus = list_output.contains(CONSENSUS_KEY_ALIAS)
                 && (list_output.contains("tcp sk known") || list_output.contains("tcp:sk known"));
@@ -988,4 +1014,25 @@ fn check_individual_keys_on_chain(
     }
 
     Ok((consensus_match, companion_match))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mutez_field_reads_a_string_encoded_amount() {
+        let info = serde_json::json!({"total_staked": "1000000"});
+        assert_eq!(parse_mutez_field(&info, "total_staked").unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn parse_mutez_field_errors_rather_than_defaulting_to_zero() {
+        // Missing field, and present-but-non-numeric, both surface as errors
+        // instead of a fabricated 0 balance.
+        let info = serde_json::json!({"total_staked": "1000000"});
+        assert!(parse_mutez_field(&info, "own_full_balance").is_err());
+        let bad = serde_json::json!({"total_staked": "not-a-number"});
+        assert!(parse_mutez_field(&bad, "total_staked").is_err());
+    }
 }

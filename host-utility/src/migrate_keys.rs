@@ -320,6 +320,20 @@ fn remaining_source_key(entries: &[(String, Zeroizing<String>)], taken: &str) ->
         .context("only one key resolves; assign roles with --consensus-key/--companion-key")
 }
 
+/// Classify a `public_key_hashs` read for the tamper cross-check. An absent
+/// file is a legitimate skip (`None`); any other read failure would silently
+/// disable the cross-check, so it is surfaced as an error instead.
+fn source_pkh_bytes(read: std::io::Result<Vec<u8>>) -> Result<Option<Vec<u8>>> {
+    match read {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow!(
+            "source public_key_hashs exists but could not be read ({e}); \
+             refusing to migrate with the tamper cross-check disabled"
+        )),
+    }
+}
+
 /// Map source alias → `tz4` address from an Octez `public_key_hashs` file.
 fn parse_pkh_map(json: &[u8]) -> Result<HashMap<String, String>> {
     let entries: Vec<serde_json::Value> =
@@ -672,7 +686,8 @@ fn decrypt_and_build(
                 "decrypted secret_keys is not valid JSON (wrong source PIN?)"
             )));
         }
-        let pkh = fs::read(plain.join("public_key_hashs")).ok();
+        let pkh = source_pkh_bytes(fs::read(plain.join("public_key_hashs")))
+            .map_err(NomadicReadError::Fatal)?;
         // The PIN is correct past this point; a build failure is a genuine
         // content problem, not something re-prompting can fix.
         build_migrated_backup(
@@ -949,6 +964,22 @@ mod tests {
         assert!(consensus_pos < sk2_pos);
         assert!(sk2_pos < sk1_pos);
         let _ = (tz1, tz2);
+    }
+
+    #[test]
+    fn source_pkh_absent_is_a_skip_but_unreadable_is_an_error() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            source_pkh_bytes(Ok(vec![1, 2, 3])).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        // Absent file: cross-check legitimately skipped.
+        assert_eq!(
+            source_pkh_bytes(Err(Error::from(ErrorKind::NotFound))).unwrap(),
+            None
+        );
+        // Present but unreadable: must not silently disable the cross-check.
+        assert!(source_pkh_bytes(Err(Error::from(ErrorKind::PermissionDenied))).is_err());
     }
 
     #[test]

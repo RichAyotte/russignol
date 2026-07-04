@@ -169,6 +169,25 @@ fn parse_tag_version(tag: &str) -> Option<Version> {
     Version::parse(version).ok()
 }
 
+/// Tags of releases that pass the prerelease/asset filters but whose version
+/// cannot be parsed, and would therefore be dropped from `latest` selection.
+///
+/// Surfaced as a warning so a newest release carrying an unexpected tag is not
+/// silently ignored in favour of an older, parseable one.
+fn unparsed_candidate_tags(
+    releases: &[GitHubRelease],
+    include_prerelease: bool,
+    required: RequiredAsset,
+) -> Vec<&str> {
+    releases
+        .iter()
+        .filter(|r| include_prerelease || !r.prerelease)
+        .filter(|r| has_required_asset(r, required))
+        .filter(|r| parse_tag_version(&r.tag_name).is_none())
+        .map(|r| r.tag_name.as_str())
+        .collect()
+}
+
 /// Select the latest release carrying the required asset from `v*` or
 /// `host-utility-v*` tagged releases.
 ///
@@ -267,6 +286,12 @@ pub fn fetch_latest_version(
 
     let releases: Vec<GitHubRelease> =
         serde_json::from_value(json).context("Failed to parse GitHub releases response")?;
+
+    for tag in unparsed_candidate_tags(&releases, include_prerelease, required) {
+        crate::utils::warning(&format!(
+            "Ignoring release with an unparseable version tag '{tag}' when selecting the latest release"
+        ));
+    }
 
     let release = select_latest_release(&releases, include_prerelease, required)
         .context("No matching release found")?;
@@ -435,6 +460,30 @@ def456  file2
     /// Helper to build a `GitHubRelease` with both host binaries
     fn make_release(tag: &str, prerelease: bool) -> GitHubRelease {
         make_release_with_assets(tag, prerelease, &["russignol-amd64", "russignol-aarch64"])
+    }
+
+    #[test]
+    fn unparsed_candidate_tags_flags_unparseable_but_qualifying_releases() {
+        let releases = [
+            make_release("v0.25.0", false),
+            make_release("garbage-tag", false),
+        ];
+        assert_eq!(
+            unparsed_candidate_tags(&releases, false, RequiredAsset::Binaries),
+            vec!["garbage-tag"]
+        );
+    }
+
+    #[test]
+    fn unparsed_candidate_tags_respects_prerelease_filtering() {
+        // An unparseable prerelease tag is filtered out before parsing, so it is
+        // only surfaced when prereleases are actually being considered.
+        let releases = [make_release("weird-beta", true)];
+        assert!(unparsed_candidate_tags(&releases, false, RequiredAsset::Binaries).is_empty());
+        assert_eq!(
+            unparsed_candidate_tags(&releases, true, RequiredAsset::Binaries),
+            vec!["weird-beta"]
+        );
     }
 
     #[test]
