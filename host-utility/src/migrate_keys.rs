@@ -642,7 +642,10 @@ fn read_nomadic_source(
             Ok(backup)
         }
         Err(e) => {
-            let _ = utils::unmount_partition(&rootfs, &p2);
+            utils::warn_if_err(
+                utils::unmount_partition(&rootfs, &p2),
+                "Failed to unmount rootfs after a read error",
+            );
             Err(e)
         }
     }
@@ -772,7 +775,11 @@ exec mount -i -t ecryptfs "$1" "$2" -o "ecryptfs_sig=$sig,$3"
 fn mount_ecryptfs(lower: &Path, plain: &Path, pin: &[u8]) -> Result<()> {
     // `mount -t ecryptfs` does not reliably auto-load the module; load it
     // best-effort. A genuine "module unavailable" still surfaces from the mount.
-    let _ = Command::new("sudo").args(["modprobe", "ecryptfs"]).output();
+    utils::run_best_effort(
+        "sudo",
+        &["modprobe", "ecryptfs"],
+        "Could not preload the ecryptfs kernel module",
+    );
 
     let mut child = Command::new("sudo")
         .arg("bash")

@@ -115,7 +115,10 @@ pub fn write_flash_manifest(device: &Path, metadata: &FlashMetadata) -> Result<S
     let manifest_path = mount_point.join(MANIFEST_FILENAME);
 
     if let Err(e) = std::fs::write(&manifest_path, &json) {
-        let _ = utils::unmount_partition(&mount_point, &boot_partition);
+        utils::warn_if_err(
+            utils::unmount_partition(&mount_point, &boot_partition),
+            "Failed to unmount after a failed manifest write",
+        );
         return Err(anyhow::anyhow!(
             "Failed to write {}: {e}",
             manifest_path.display()
@@ -146,7 +149,10 @@ pub fn read_card_id(device: &Path) -> Option<String> {
         .and_then(|content| serde_json::from_str::<FlashManifest>(&content).ok())
         .map(|m| m.card_id);
 
-    let _ = utils::unmount_partition(&mount_point, &boot_partition);
+    utils::warn_if_err(
+        utils::unmount_partition(&mount_point, &boot_partition),
+        "Failed to unmount after reading the flash manifest",
+    );
     result
 }
 

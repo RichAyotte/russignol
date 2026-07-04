@@ -13,7 +13,7 @@ use crate::system;
 use crate::utils::{
     create_http_agent, create_orange_theme, format_with_separators, get_partition_path,
     http_get_json, info, mount_partition, print_title_bar, resolve_tool, success,
-    unmount_partition, warning,
+    unmount_partition, warn_if_err, warning,
 };
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
@@ -134,7 +134,10 @@ pub fn write_watermark_config(device: &Path, chain_info: &ChainInfo) -> Result<(
     let config_path = mount_point.join(CONFIG_FILENAME);
 
     if let Err(e) = write_config_file(&config_path, &wm_config) {
-        let _ = unmount_partition(&mount_point, &boot_partition);
+        warn_if_err(
+            unmount_partition(&mount_point, &boot_partition),
+            "Failed to unmount after a failed watermark write",
+        );
         return Err(e);
     }
 
@@ -159,7 +162,10 @@ pub fn read_watermark_config(device: &Path) -> Result<WatermarkConfig> {
         });
 
     // Always unmount, even on error
-    let _ = unmount_partition(&mount_point, &boot_partition);
+    warn_if_err(
+        unmount_partition(&mount_point, &boot_partition),
+        "Failed to unmount after reading watermark config",
+    );
 
     result
 }
@@ -184,7 +190,10 @@ pub fn cmd_watermark_init(
 
     // Always try to unmount
     if result.is_err() {
-        let _ = unmount_partition(&mount_point, &boot_partition);
+        warn_if_err(
+            unmount_partition(&mount_point, &boot_partition),
+            "Failed to unmount after a failed watermark init",
+        );
     }
 
     result
@@ -238,7 +247,10 @@ fn do_watermark_init(
 
         if !confirmed {
             info("Watermark configuration cancelled");
-            let _ = unmount_partition(mount_point, boot_partition);
+            warn_if_err(
+                unmount_partition(mount_point, boot_partition),
+                "Failed to unmount after cancelling watermark init",
+            );
             return Ok(());
         }
     }

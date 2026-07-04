@@ -440,6 +440,48 @@ fn parse_udisks_mount_point(stdout: &str) -> Option<&str> {
     (!point.is_empty()).then_some(point)
 }
 
+/// Mount `partition` at a fresh temp dir via `mount`, escalating with `sudo -n`
+/// when the unprivileged attempt fails. The traditional fallback used when
+/// neither findmnt nor udisksctl already provides a mount point.
+#[cfg(target_os = "linux")]
+fn mount_partition_with_sudo(partition: &Path, fs_type: &str, read_only: bool) -> Result<PathBuf> {
+    let mount_point = create_temp_mount_point()?;
+    let mount_opts = if read_only { "ro" } else { "rw" };
+    let partition_str = partition.to_string_lossy().to_string();
+    let mount_point_str = mount_point.to_string_lossy().to_string();
+
+    let output = run_with_sudo_fallback(
+        "mount",
+        &[
+            "-t",
+            fs_type,
+            "-o",
+            mount_opts,
+            &partition_str,
+            &mount_point_str,
+        ],
+    )
+    .context("Failed to run mount")?;
+
+    if !output.status.success() {
+        warn_if_err(
+            std::fs::remove_dir(&mount_point),
+            "Failed to remove temporary mount point after a failed mount",
+        );
+        anyhow::bail!(
+            "Failed to mount {} partition {}: {}\n  \
+             Mounting needs elevated privileges. Re-run with sudo (or cache \
+             it first with `sudo -v`), or enable udisksctl/polkit for \
+             removable media.",
+            fs_type,
+            partition.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(mount_point)
+}
+
 /// Mount a partition, auto-detecting existing mounts and trying udisksctl first.
 ///
 /// `fs_type` is the filesystem type passed to `mount -t` (e.g. `"vfat"`, `"f2fs"`).
@@ -498,38 +540,7 @@ pub fn mount_partition(partition: &Path, fs_type: &str, read_only: bool) -> Resu
         }
 
         // Fall back to the traditional mount, which needs root.
-        let mount_point = create_temp_mount_point()?;
-        let mount_opts = if read_only { "ro" } else { "rw" };
-        let partition_str = partition.to_string_lossy().to_string();
-        let mount_point_str = mount_point.to_string_lossy().to_string();
-
-        let output = run_with_sudo_fallback(
-            "mount",
-            &[
-                "-t",
-                fs_type,
-                "-o",
-                mount_opts,
-                &partition_str,
-                &mount_point_str,
-            ],
-        )
-        .context("Failed to run mount")?;
-
-        if !output.status.success() {
-            let _ = std::fs::remove_dir(&mount_point);
-            anyhow::bail!(
-                "Failed to mount {} partition {}: {}\n  \
-                 Mounting needs elevated privileges. Re-run with sudo (or cache \
-                 it first with `sudo -v`), or enable udisksctl/polkit for \
-                 removable media.",
-                fs_type,
-                partition.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
-        Ok(mount_point)
+        mount_partition_with_sudo(partition, fs_type, read_only)
     }
 
     #[cfg(target_os = "macos")]
@@ -546,7 +557,10 @@ pub fn mount_partition(partition: &Path, fs_type: &str, read_only: bool) -> Resu
             .context("Failed to run mount")?;
 
         if !output.status.success() {
-            let _ = std::fs::remove_dir(&mount_point);
+            warn_if_err(
+                std::fs::remove_dir(&mount_point),
+                "Failed to remove temporary mount point after a failed mount",
+            );
             anyhow::bail!(
                 "Failed to mount partition: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -566,7 +580,7 @@ pub fn mount_partition(partition: &Path, fs_type: &str, read_only: bool) -> Resu
 /// Unmount a partition, trying udisksctl first then falling back to umount.
 pub fn unmount_partition(mount_point: &Path, partition: &Path) -> Result<()> {
     // Sync first
-    let _ = Command::new("sync").output();
+    run_best_effort("sync", &[], "Failed to sync before unmount");
 
     #[cfg(target_os = "linux")]
     {
@@ -595,7 +609,10 @@ pub fn unmount_partition(mount_point: &Path, partition: &Path) -> Result<()> {
             );
         }
 
-        let _ = std::fs::remove_dir(mount_point);
+        warn_if_err(
+            std::fs::remove_dir(mount_point),
+            "Failed to remove mount point after unmount",
+        );
         Ok(())
     }
 
@@ -614,7 +631,10 @@ pub fn unmount_partition(mount_point: &Path, partition: &Path) -> Result<()> {
             );
         }
 
-        let _ = std::fs::remove_dir(mount_point);
+        warn_if_err(
+            std::fs::remove_dir(mount_point),
+            "Failed to remove mount point after unmount",
+        );
         Ok(())
     }
 

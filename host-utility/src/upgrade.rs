@@ -242,7 +242,10 @@ fn replace_binary(temp_file: &NamedTempFile) -> Result<()> {
         Ok(()) => {
             // Success! Clean up the old binary
             if backup_path.exists() {
-                let _ = std::fs::remove_file(&backup_path);
+                crate::utils::warn_if_err(
+                    std::fs::remove_file(&backup_path),
+                    "Failed to remove the upgrade backup binary",
+                );
             }
             Ok(())
         }
@@ -253,7 +256,10 @@ fn replace_binary(temp_file: &NamedTempFile) -> Result<()> {
                 Ok(_) => {
                     // Success! Clean up the old binary
                     if backup_path.exists() {
-                        let _ = std::fs::remove_file(&backup_path);
+                        crate::utils::warn_if_err(
+                            std::fs::remove_file(&backup_path),
+                            "Failed to remove the upgrade backup binary",
+                        );
                     }
                     Ok(())
                 }

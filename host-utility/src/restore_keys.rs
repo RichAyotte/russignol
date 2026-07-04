@@ -1187,9 +1187,11 @@ fn wait_for_card_insert(device: &Path, deadline: std::time::Instant, label: &str
     }
 
     let spinner = progress::create_spinner("Card detected — waiting for kernel to initialize");
-    let _ = Command::new("udevadm")
-        .args(["settle", "--timeout=5"])
-        .output();
+    utils::run_best_effort(
+        "udevadm",
+        &["settle", "--timeout=5"],
+        "Failed to wait for udev to settle after card insertion",
+    );
     spinner.finish_and_clear();
 
     let desc = describe_card(device);
