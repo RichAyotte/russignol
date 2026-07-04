@@ -9,9 +9,6 @@ pub const KEYS_DIR: &str = "/keys";
 /// Chain information file (created during first-boot setup)
 pub const CHAIN_INFO_FILE: &str = "/keys/chain_info.json";
 
-/// Watermark storage directory on the data partition
-pub const WATERMARK_DIR: &str = "/data/watermarks";
-
 /// Boot partition device path (first partition on SD card)
 pub const BOOT_PARTITION: &str = "/dev/mmcblk0p1";
 

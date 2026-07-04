@@ -1,12 +1,13 @@
 //! Watermark configuration processing for first boot
 //!
-//! This module reads watermark configuration from the boot partition
-//! and creates the corresponding watermark files in /data/watermarks/.
+//! This module reads watermark configuration from the boot partition and
+//! records the chain info plus the staged floor level. The level is applied as
+//! an authenticated floor only after PIN unlock, when the per-key MAC key
+//! exists; no watermark bytes are written here.
 //!
 //! The watermark config is a one-time use file that is deleted after processing.
 
-use crate::constants::{BOOT_MOUNT, BOOT_PARTITION, CHAIN_INFO_FILE, WATERMARK_DIR};
-use crate::tezos_signer;
+use crate::constants::{BOOT_MOUNT, BOOT_PARTITION, CHAIN_INFO_FILE};
 use crate::util::run_command;
 use serde::Deserialize;
 use std::fs;
@@ -49,7 +50,8 @@ pub enum WatermarkResult {
 /// This function:
 /// 1. Mounts the FAT32 boot partition
 /// 2. Reads and validates watermark-config.json if present
-/// 3. Creates watermark files in /data/watermarks/
+/// 3. Records the chain info (the staged floor level is returned for the
+///    post-unlock authenticated seed)
 /// 4. Deletes the config file (one-time use)
 /// 5. Unmounts the boot partition
 pub fn process_watermark_config() -> WatermarkResult {
@@ -132,11 +134,6 @@ fn process_config_file(config_path: &Path) -> WatermarkResult {
         return WatermarkResult::Error(e);
     }
 
-    // Create watermark files
-    if let Err(e) = create_watermark_files(&config) {
-        return WatermarkResult::Error(e);
-    }
-
     // Save chain info for status page display
     if let Err(e) = save_chain_info(&config) {
         return WatermarkResult::Error(e);
@@ -178,46 +175,6 @@ fn validate_config(config: &WatermarkConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn create_watermark_files(config: &WatermarkConfig) -> Result<(), String> {
-    use russignol_storage::watermark::FILENAMES as WATERMARK_FILES;
-
-    // Read PKHs from /keys/public_key_hashs (written during key generation)
-    let keys = tezos_signer::get_keys();
-    if keys.is_empty() {
-        return Err("No keys found - cannot create per-key watermark directories".into());
-    }
-
-    // Ensure watermark directory exists
-    fs::create_dir_all(WATERMARK_DIR)
-        .map_err(|e| format!("Failed to create watermark directory: {e}"))?;
-
-    let level = config.chain.level;
-    let buf = russignol_storage::watermark::encode(level, 0);
-
-    // Create watermark files in per-key subdirectories
-    for key in &keys {
-        let key_dir = Path::new(WATERMARK_DIR).join(&key.value);
-        fs::create_dir_all(&key_dir)
-            .map_err(|e| format!("Failed to create key directory {}: {e}", key.value))?;
-
-        for filename in WATERMARK_FILES {
-            let path = key_dir.join(filename);
-            fs::write(&path, buf).map_err(|e| format!("Failed to write {filename}: {e}"))?;
-            log::debug!("Created {}", path.display());
-        }
-        log::info!("Watermark files created for {} at level {level}", key.name);
-    }
-
-    // Change ownership to russignol user (we're still running as root at this point,
-    // privileges are dropped later in main.rs after setup is complete)
-    run_command("chown", &["-R", "russignol:russignol", WATERMARK_DIR])?;
-    log::info!(
-        "Per-key watermarks initialized for {} key(s) at level {level}",
-        keys.len()
-    );
-    Ok(())
-}
-
 /// Save chain info to /`keys/chain_info.json` for display on status page
 ///
 /// This file is stored on the keys partition alongside the cryptographic keys.
@@ -249,4 +206,48 @@ fn save_chain_info(config: &WatermarkConfig) -> Result<(), String> {
         CHAIN_INFO_FILE
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_config_without_net_prefix() {
+        let config = WatermarkConfig {
+            chain: ChainInfo {
+                id: "BadPrefix".into(),
+                level: 1_000,
+                name: "test".into(),
+                blocks_per_cycle: 8_192,
+            },
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_level() {
+        let config = WatermarkConfig {
+            chain: ChainInfo {
+                id: "NetXtest".into(),
+                level: 0,
+                name: "test".into(),
+                blocks_per_cycle: 8_192,
+            },
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_config() {
+        let config = WatermarkConfig {
+            chain: ChainInfo {
+                id: "NetXtest".into(),
+                level: 1_000,
+                name: "test".into(),
+                blocks_per_cycle: 8_192,
+            },
+        };
+        assert!(validate_config(&config).is_ok());
+    }
 }

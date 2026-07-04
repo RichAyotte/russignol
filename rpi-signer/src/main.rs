@@ -290,7 +290,7 @@ fn run_ui_loop(
         fatal_error(&mut device, "SETUP ERROR", &e);
     }
 
-    recover_watermark_config(&mut device, is_first_boot);
+    let pending_watermark_level = recover_watermark_config(&mut device, is_first_boot);
 
     let mut app = App::new(
         is_first_boot,
@@ -299,6 +299,7 @@ fn run_ui_loop(
         start_signer_tx.clone(),
         watermark.clone(),
     );
+    app.pending_watermark_level = pending_watermark_level;
 
     let mut current_page: Box<dyn Page<Display>> = if is_first_boot {
         log::info!("First boot detected - starting setup flow");
@@ -594,7 +595,7 @@ fn apply_effects(
                     log::error!("Failed to set key permissions: {e}");
                 }
             }
-            Effect::ProcessWatermarkConfig => apply_watermark_config(device),
+            Effect::ProcessWatermarkConfig => apply_watermark_config(app, device),
             Effect::VerifyStorage => apply_verify_storage(device),
             Effect::UpdateWatermark {
                 pkh,
@@ -733,6 +734,27 @@ fn apply_init_watermark(
 
     let hwm = signer_server::create_high_watermark(&config, &pkhs, mac_keys, chain_id)
         .map_err(|e| std::io::Error::other(format!("Failed to create watermark: {e}")))?;
+
+    // Apply a staged config level as an authenticated floor now that the per-key
+    // MAC key exists. Never-lower: an existing higher mark is preserved. This is
+    // the only floor-establishment path that runs without a live baker request;
+    // if it fails, the signing-time recovery dialog remains the backstop.
+    if let (Some(level), Some(wm_arc)) = (app.pending_watermark_level.take(), hwm.as_ref()) {
+        match wm_arc.write() {
+            Ok(mut wm) => {
+                for pkh in &pkhs {
+                    if let Err(e) = wm.seed_floor(chain_id, pkh, level) {
+                        log::error!(
+                            "Failed to seed watermark floor for {}: {e}",
+                            pkh.to_b58check()
+                        );
+                    }
+                }
+            }
+            Err(_) => log::error!("Watermark lock poisoned while seeding floor"),
+        }
+    }
+
     let Ok(mut wm_lock) = app.watermark.write() else {
         fatal_error(
             device,
@@ -849,26 +871,29 @@ fn should_recover_watermark_config(
 /// the on-device recovery dialog remains the fallback, so a consume failure must
 /// not brick a healthy device. The remount and privilege drop are load-bearing
 /// security steps and stay fatal on failure, matching the first-boot path.
-fn recover_watermark_config(device: &mut Device, is_first_boot: bool) {
+fn recover_watermark_config(device: &mut Device, is_first_boot: bool) -> Option<u32> {
     let is_root = unsafe { libc::geteuid() } == 0;
     let migration_pending = std::path::Path::new(tezos_encrypt::SECRET_KEYS_ENC_PATH).exists();
 
     if !should_recover_watermark_config(is_first_boot, is_root, migration_pending) {
-        return;
+        return None;
     }
 
     log::info!("Pending watermark config detected on normal boot - recovering");
-    match watermark_setup::process_watermark_config() {
+    let pending_level = match watermark_setup::process_watermark_config() {
         watermark_setup::WatermarkResult::Configured { chain_name, level } => {
-            log::info!("Recovered watermarks: {chain_name} at level {level}");
+            log::info!("Recovered chain info: {chain_name}, staged floor level {level}");
+            Some(level)
         }
         watermark_setup::WatermarkResult::NotFound => {
             log::info!("No watermark config found during recovery");
+            None
         }
         watermark_setup::WatermarkResult::Error(e) => {
             log::error!("Watermark config recovery failed (continuing): {e}");
+            None
         }
-    }
+    };
 
     // Order is load-bearing: consume with /keys writable, then remount it
     // read-only and drop privileges before the signer thread can start.
@@ -878,23 +903,26 @@ fn recover_watermark_config(device: &mut Device, is_first_boot: bool) {
     if let Err(e) = storage::drop_privileges() {
         fatal_error(device, "SECURITY ERROR", &e);
     }
+    pending_level
 }
 
-fn apply_watermark_config(device: &mut Device) {
-    match watermark_setup::process_watermark_config() {
+fn apply_watermark_config(app: &mut App, device: &mut Device) {
+    app.pending_watermark_level = match watermark_setup::process_watermark_config() {
         watermark_setup::WatermarkResult::Configured { chain_name, level } => {
-            log::info!("Watermarks configured: {chain_name} at level {level}");
+            log::info!("Chain info recorded: {chain_name}, staged floor level {level}");
+            Some(level)
         }
         watermark_setup::WatermarkResult::NotFound => {
             log::info!(
                 "No watermark config found - signer will reject signing until watermarks are set"
             );
+            None
         }
         watermark_setup::WatermarkResult::Error(e) => {
             log::error!("Watermark config error: {e}");
             fatal_error(device, "WATERMARK ERROR", &e);
         }
-    }
+    };
 }
 
 fn apply_verify_storage(device: &mut Device) {

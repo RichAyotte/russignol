@@ -4,10 +4,11 @@
 //! multiple blocks or attestations at the same level/round, which would
 //! constitute double-signing (slashable offense in Tenderbake consensus).
 //!
-//! Watermarks are stored as 40-byte binary files (level + round + Blake3)
-//! and fdatasynced to disk before any signature is returned. If a watermark
-//! file is corrupt on load, the signer refuses to operate and requires
-//! manual re-initialization.
+//! Watermarks are stored as 72-byte binary files (level + round + Blake3 +
+//! a PIN-derived keyed MAC) and fdatasynced to disk before any signature is
+//! returned. Only the PIN-unlocked device holds the per-key MAC key, so a mark
+//! that fails to verify (forged, corrupt, or legacy) is treated as absent and
+//! the on-device recovery re-establishes an authenticated floor.
 //!
 //! Watermarks are tracked per-key, so each public key hash has independent
 //! watermark state. This supports companion key signing (DAL) where both
@@ -685,6 +686,27 @@ impl HighWatermark {
         Ok(())
     }
 
+    /// Establish an authenticated floor at `level`, unless an existing valid
+    /// mark already sits at or above it.
+    ///
+    /// Consumes a staged config level after unlock: the device is the sole
+    /// producer of authenticated marks, and a recovery boot may already hold a
+    /// higher floor that must never be lowered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is unknown or disk I/O fails.
+    pub fn seed_floor(&mut self, chain_id: ChainId, pkh: &PublicKeyHash, level: u32) -> Result<()> {
+        self.ensure_key(pkh)?;
+        if self
+            .get_max_level(pkh)
+            .is_some_and(|existing| existing >= level)
+        {
+            return Ok(());
+        }
+        self.update_to_level(chain_id, pkh, level)
+    }
+
     /// Get entry for a specific key and operation type (test-only)
     #[cfg(test)]
     pub(crate) fn get_entry(
@@ -1228,6 +1250,52 @@ mod tests {
 
         let hwm = new_watermark(temp_dir.path(), &[pkh]).unwrap();
         assert!(hwm.get_max_level(&pkh).is_none());
+    }
+
+    /// Seeding a floor for a key with no prior mark establishes an authenticated
+    /// floor that reloads under the same MAC key.
+    #[test]
+    fn seed_floor_establishes_when_absent() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = default_test_chain_id();
+        let (pkh, _pk, _sk) = generate_key(Some(&[42u8; 32])).unwrap();
+
+        let mut hwm = new_watermark(temp_dir.path(), &[pkh]).unwrap();
+        assert!(hwm.get_max_level(&pkh).is_none());
+
+        hwm.seed_floor(chain_id, &pkh, 1_000).unwrap();
+        assert_eq!(hwm.get_max_level(&pkh), Some(1_000));
+
+        let hwm2 = new_watermark(temp_dir.path(), &[pkh]).unwrap();
+        assert_eq!(hwm2.get_max_level(&pkh), Some(1_000));
+    }
+
+    /// Seeding never lowers a higher existing floor.
+    #[test]
+    fn seed_floor_preserves_higher_existing() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = default_test_chain_id();
+        let (pkh, _pk, _sk) = generate_key(Some(&[42u8; 32])).unwrap();
+
+        preinit_watermarks(temp_dir.path(), &pkh, 2_000);
+        let mut hwm = new_watermark(temp_dir.path(), &[pkh]).unwrap();
+
+        hwm.seed_floor(chain_id, &pkh, 1_000).unwrap();
+        assert_eq!(hwm.get_max_level(&pkh), Some(2_000));
+    }
+
+    /// Seeding raises a lower existing floor to the proposed level.
+    #[test]
+    fn seed_floor_raises_below_existing() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = default_test_chain_id();
+        let (pkh, _pk, _sk) = generate_key(Some(&[42u8; 32])).unwrap();
+
+        preinit_watermarks(temp_dir.path(), &pkh, 500);
+        let mut hwm = new_watermark(temp_dir.path(), &[pkh]).unwrap();
+
+        hwm.seed_floor(chain_id, &pkh, 1_000).unwrap();
+        assert_eq!(hwm.get_max_level(&pkh), Some(1_000));
     }
 
     #[test]

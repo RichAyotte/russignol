@@ -179,6 +179,9 @@ pub struct App {
     pub signing_activity: Arc<Mutex<signing_activity::SigningActivity>>,
     pub start_signer_tx: Sender<Secret<String>>,
     pub watermark: Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>>,
+    /// Floor level staged by a consumed boot-partition config, applied as an
+    /// authenticated mark after PIN unlock. `None` once seeded or absent.
+    pub pending_watermark_level: Option<u32>,
     pub needs_animation: bool,
     pub animation_interval: Duration,
 }
@@ -207,6 +210,7 @@ impl App {
             signing_activity,
             start_signer_tx,
             watermark,
+            pending_watermark_level: None,
             needs_animation: false,
             animation_interval: Duration::from_secs(1),
         }
