@@ -98,18 +98,17 @@ pub fn prefetch_chain_info(config: &RussignolConfig) -> Result<ChainInfo> {
         .map_err(|_| anyhow::anyhow!("Invalid blocks_per_cycle value: {blocks_per_cycle_i64}"))?;
 
     // Look up human-readable network name (optional, non-fatal if fails)
-    let human_name = lookup_human_name(&config.rpc_endpoint);
+    let name = resolve_chain_name(&header.chain_id, lookup_human_name(&config.rpc_endpoint));
 
     success(&format!(
-        "Node OK: {} at level {}",
-        human_name.as_deref().unwrap_or(&header.chain_id),
+        "Node OK: {name} at level {}",
         format_with_separators(header.level)
     ));
 
     Ok(ChainInfo {
-        id: header.chain_id.clone(),
+        id: header.chain_id,
         level: header.level,
-        name: human_name.unwrap_or(header.chain_id),
+        name,
         blocks_per_cycle,
     })
 }
@@ -127,10 +126,7 @@ pub fn write_watermark_config(device: &Path, chain_info: &ChainInfo) -> Result<(
     let mount_point = mount_partition(&boot_partition, "vfat", false)?;
 
     // Generate and write config
-    let wm_config = WatermarkConfig {
-        created: chrono::Utc::now().to_rfc3339(),
-        chain: chain_info.clone(),
-    };
+    let wm_config = watermark_config_for(chain_info);
     let config_path = mount_point.join(CONFIG_FILENAME);
 
     if let Err(e) = write_config_file(&config_path, &wm_config) {
@@ -170,7 +166,12 @@ pub fn read_watermark_config(device: &Path) -> Result<WatermarkConfig> {
     result
 }
 
-/// Standalone watermark init command with strict verifications
+/// Standalone watermark init command with strict verifications.
+///
+/// Derives the chain info through the same `prefetch_chain_info` producer the
+/// flash path uses, then persists it with the same `write_watermark_config` /
+/// `read_back_and_verify` pair — so the level written by `watermark init` and
+/// the level written during flashing cannot drift.
 pub fn cmd_watermark_init(
     device: Option<PathBuf>,
     auto_confirm: bool,
@@ -183,20 +184,50 @@ pub fn cmd_watermark_init(
     let device = detect_and_verify_device(device)?;
     let boot_partition = get_boot_partition_path(&device);
     verify_boot_partition(&boot_partition)?;
-    let mount_point = mount_partition(&boot_partition, "vfat", false)?;
+    verify_russignol_card(&boot_partition)?;
 
-    // All operations after mounting need cleanup on error
-    let result = do_watermark_init(&device, &boot_partition, &mount_point, auto_confirm, config);
+    // Single canonical producer (includes the node sync check). Fetching before
+    // the write keeps an unsynced node's stale level from ever reaching the card.
+    let chain_info = prefetch_chain_info(config)?;
 
-    // Always try to unmount
-    if result.is_err() {
-        warn_if_err(
-            unmount_partition(&mount_point, &boot_partition),
-            "Failed to unmount after a failed watermark init",
-        );
+    display_watermark_summary(&device, &chain_info);
+
+    if !auto_confirm {
+        let confirmed = Confirm::new("Write watermark configuration to this SD card?")
+            .with_default(true)
+            .with_render_config(create_orange_theme())
+            .prompt()
+            .context("Failed to get confirmation")?;
+
+        if !confirmed {
+            info("Watermark configuration cancelled");
+            return Ok(());
+        }
     }
 
-    result
+    write_watermark_config(&device, &chain_info)?;
+    let written = read_back_and_verify(&device)?;
+
+    println!();
+    success("Watermark configuration written successfully!");
+    println!();
+    println!(
+        "  Chain:       {} ({})",
+        written.chain.name.cyan(),
+        written.chain.id.cyan()
+    );
+    println!(
+        "  Head Level:  {}",
+        format_with_separators(written.chain.level).cyan()
+    );
+    println!();
+    println!("  Next steps:");
+    println!("  1. Safely eject the SD card");
+    println!("  2. Insert into your russignol device");
+    println!("  3. Boot the device - watermarks will be configured automatically");
+    println!();
+
+    Ok(())
 }
 
 fn detect_and_verify_device(device: Option<PathBuf>) -> Result<PathBuf> {
@@ -219,138 +250,39 @@ fn detect_and_verify_device(device: Option<PathBuf>) -> Result<PathBuf> {
     Ok(device)
 }
 
-fn do_watermark_init(
-    device: &Path,
-    boot_partition: &Path,
-    mount_point: &Path,
-    auto_confirm: bool,
-    config: &RussignolConfig,
-) -> Result<()> {
-    if let Err(e) = verify_russignol_image(mount_point) {
-        bail!(
+/// Confirm the card carries a russignol image before touching the node or
+/// writing. Mounts the boot partition read-only, checks the expected boot
+/// files, and always unmounts.
+fn verify_russignol_card(boot_partition: &Path) -> Result<()> {
+    let mount_point = mount_partition(boot_partition, "vfat", true)?;
+    let result = verify_russignol_image(&mount_point);
+    warn_if_err(
+        unmount_partition(&mount_point, boot_partition),
+        "Failed to unmount after verifying the russignol image",
+    );
+    result.map_err(|e| {
+        anyhow::anyhow!(
             "SD card verification failed: {e}. This doesn't appear to be a valid russignol image."
-        );
-    }
-
-    let (header, blocks_per_cycle, human_name) = fetch_and_validate_chain_info(config)?;
-
-    display_watermark_summary(device, &header, human_name.as_ref(), blocks_per_cycle);
-
-    validate_level_bounds(header.level)?;
-
-    if !auto_confirm {
-        let confirmed = Confirm::new("Write watermark configuration to this SD card?")
-            .with_default(true)
-            .with_render_config(create_orange_theme())
-            .prompt()
-            .context("Failed to get confirmation")?;
-
-        if !confirmed {
-            info("Watermark configuration cancelled");
-            warn_if_err(
-                unmount_partition(mount_point, boot_partition),
-                "Failed to unmount after cancelling watermark init",
-            );
-            return Ok(());
-        }
-    }
-
-    write_watermark_config_and_cleanup(
-        device,
-        mount_point,
-        boot_partition,
-        &header,
-        human_name.as_deref(),
-        blocks_per_cycle,
-    )
+        )
+    })
 }
 
-fn fetch_and_validate_chain_info(
-    config: &RussignolConfig,
-) -> Result<(BlockHeader, u32, Option<String>)> {
-    info(&format!("Querying node: {}", config.rpc_endpoint));
-
-    let header = fetch_block_header(&config.rpc_endpoint)
-        .map_err(|e| anyhow::anyhow!("Failed to query node: {e}. Is your node running?"))?;
-
-    let blocks_per_cycle_i64 = blockchain::get_blocks_per_cycle(config)
-        .ok_or_else(|| anyhow::anyhow!("Failed to fetch blocks_per_cycle from node"))?;
-    let blocks_per_cycle = u32::try_from(blocks_per_cycle_i64)
-        .map_err(|_| anyhow::anyhow!("Invalid blocks_per_cycle value: {blocks_per_cycle_i64}"))?;
-
-    if !header.chain_id.starts_with("Net") {
-        bail!(
-            "Invalid chain ID format: {} (expected to start with 'Net')",
-            header.chain_id
-        );
-    }
-
-    let human_name = lookup_human_name(&config.rpc_endpoint);
-
-    Ok((header, blocks_per_cycle, human_name))
-}
-
-fn display_watermark_summary(
-    device: &Path,
-    header: &BlockHeader,
-    human_name: Option<&String>,
-    blocks_per_cycle: u32,
-) {
+fn display_watermark_summary(device: &Path, chain: &ChainInfo) {
     println!();
     println!("  Device:      {}", device.display().to_string().cyan());
-    println!("  Chain ID:    {}", header.chain_id.cyan());
-    if let Some(name) = human_name {
-        println!("  Network:     {}", name.cyan());
+    println!("  Chain ID:    {}", chain.id.cyan());
+    if chain.name != chain.id {
+        println!("  Network:     {}", chain.name.cyan());
     }
     println!(
         "  Head Level:  {}",
-        format_with_separators(header.level).cyan()
+        format_with_separators(chain.level).cyan()
     );
     println!(
         "  Blocks/Cycle: {}",
-        format_with_separators(blocks_per_cycle).cyan()
+        format_with_separators(chain.blocks_per_cycle).cyan()
     );
     println!();
-}
-
-fn validate_level_bounds(level: u32) -> Result<()> {
-    if level == 0 {
-        bail!("Level 0 is invalid - node may not be synced");
-    }
-    if level > 1_000_000_000 {
-        bail!("Level {level} exceeds maximum allowed. Verify your node is on the correct network.");
-    }
-    Ok(())
-}
-
-fn write_watermark_config_and_cleanup(
-    device: &Path,
-    mount_point: &Path,
-    boot_partition: &Path,
-    header: &BlockHeader,
-    human_name: Option<&str>,
-    blocks_per_cycle: u32,
-) -> Result<()> {
-    let wm_config =
-        create_watermark_config(&header.chain_id, human_name, header.level, blocks_per_cycle);
-    let config_path = mount_point.join(CONFIG_FILENAME);
-    write_config_file(&config_path, &wm_config)?;
-
-    unmount_partition(mount_point, boot_partition)?;
-
-    // Read the config back off the card to confirm the write landed.
-    read_back_and_verify(device)?;
-
-    println!();
-    success("Watermark configuration written successfully!");
-    println!();
-    println!("  Next steps:");
-    println!("  1. Safely eject the SD card");
-    println!("  2. Insert into your russignol device");
-    println!("  3. Boot the device - watermarks will be configured automatically");
-    println!();
-
-    Ok(())
 }
 
 // =============================================================================
@@ -420,20 +352,19 @@ fn lookup_human_name(rpc_endpoint: &str) -> Option<String> {
     crate::network::human_name_for_chain(&chain_name, &crate::network::fetch_public_networks())
 }
 
-fn create_watermark_config(
-    chain_id: &str,
-    human_name: Option<&str>,
-    level: u32,
-    blocks_per_cycle: u32,
-) -> WatermarkConfig {
+/// Resolve the display name for a chain: the human-readable network name when
+/// known, otherwise the chain id itself.
+fn resolve_chain_name(chain_id: &str, human_name: Option<String>) -> String {
+    human_name.unwrap_or_else(|| chain_id.to_string())
+}
+
+/// Wrap a produced `ChainInfo` into the on-card config, stamping the write time.
+/// The single place `ChainInfo` becomes a `WatermarkConfig`, shared by every
+/// write path.
+fn watermark_config_for(chain: &ChainInfo) -> WatermarkConfig {
     WatermarkConfig {
         created: chrono::Utc::now().to_rfc3339(),
-        chain: ChainInfo {
-            id: chain_id.to_string(),
-            level,
-            name: human_name.unwrap_or(chain_id).to_string(),
-            blocks_per_cycle,
-        },
+        chain: chain.clone(),
     }
 }
 
@@ -581,27 +512,38 @@ mod tests {
     }
 
     #[test]
-    fn test_config_serialization_with_name() {
-        let config = create_watermark_config("NetXdQprcVkpaWU", Some("Mainnet"), 7_500_123, 24576);
-
-        let json = serde_json::to_string_pretty(&config).unwrap();
-        assert!(json.contains("NetXdQprcVkpaWU"));
-        assert!(json.contains("\"name\": \"Mainnet\""));
-        assert!(json.contains("\"level\": 7500123"));
-        assert!(json.contains("\"blocks_per_cycle\": 24576"));
-        // Config should NOT contain any PKH - device will use its own keys
-        assert!(!json.contains("tz4"));
+    fn resolve_chain_name_prefers_human_name() {
+        assert_eq!(
+            resolve_chain_name("NetXdQprcVkpaWU", Some("Mainnet".to_string())),
+            "Mainnet"
+        );
     }
 
     #[test]
-    fn test_config_serialization_without_name() {
-        // When human_name is None, chain_id is used as the name
-        let config = create_watermark_config("NetXe8DbhW9A1eS", None, 515_000, 8192);
+    fn resolve_chain_name_falls_back_to_chain_id() {
+        assert_eq!(
+            resolve_chain_name("NetXe8DbhW9A1eS", None),
+            "NetXe8DbhW9A1eS"
+        );
+    }
+
+    #[test]
+    fn test_config_serialization() {
+        let chain = ChainInfo {
+            id: "NetXdQprcVkpaWU".to_string(),
+            level: 7_500_123,
+            name: "Mainnet".to_string(),
+            blocks_per_cycle: 24576,
+        };
+        let config = watermark_config_for(&chain);
 
         let json = serde_json::to_string_pretty(&config).unwrap();
-        assert!(json.contains("\"id\": \"NetXe8DbhW9A1eS\""));
-        assert!(json.contains("\"name\": \"NetXe8DbhW9A1eS\"")); // Falls back to chain_id
-        assert!(json.contains("\"level\": 515000"));
-        assert!(json.contains("\"blocks_per_cycle\": 8192"));
+        assert!(json.contains("\"id\": \"NetXdQprcVkpaWU\""));
+        assert!(json.contains("\"name\": \"Mainnet\""));
+        assert!(json.contains("\"level\": 7500123"));
+        assert!(json.contains("\"blocks_per_cycle\": 24576"));
+        assert!(json.contains("\"created\":"));
+        // Config should NOT contain any PKH - device will use its own keys
+        assert!(!json.contains("tz4"));
     }
 }
