@@ -37,7 +37,7 @@ pub struct WatermarkConfig {
     pub chain: ChainInfo,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainInfo {
     pub id: String,
     pub level: u32,

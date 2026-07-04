@@ -191,6 +191,10 @@ pub enum Severity {
 pub enum Remedy {
     /// Repairable in place with the card in a host reader.
     HostDirect,
+    /// Repairable by staging a boot config the device applies on its next boot,
+    /// the fallback when the host cannot mount f2fs to repair the keys and data
+    /// partitions directly.
+    FatStage,
     /// A node endpoint is required before this can be resolved or even judged.
     NeedsNode,
     /// The doctor does not change this; the user or device must act.
@@ -205,6 +209,7 @@ pub enum IssueKind {
     KeysRoleMissing,
     MigrationPending,
     F2fsNotInspected,
+    FatStageAvailable,
     WatermarkDirMissing,
     WatermarkFileMissing,
     WatermarkCorrupt,
@@ -242,6 +247,10 @@ pub enum RepairAction {
     TruncatePanicLog,
     /// Delete a stale `watermark-config.json` from the boot partition.
     DeleteBootConfig,
+    /// Stage a `watermark-config.json` on the boot partition; the device
+    /// configures watermarks and `chain_info` from it on its next boot. The
+    /// fallback used when the host cannot mount f2fs to repair in place.
+    StageBootConfig(ChainInfo),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +320,28 @@ pub fn classify(state: &CardState, node: Option<&ChainInfo>) -> Vec<Issue> {
             action: None,
             message: message.to_string(),
         });
+        // The keys and data partitions can't be repaired in place on this host,
+        // but with a node a boot config can be staged for the device to apply on
+        // its next boot. A failed mount is a card fault to investigate, not a
+        // case for a blind staged config, so this is offered only when the host
+        // simply lacks f2fs support.
+        if state.inspection == Inspection::NotCapable
+            && let Some(n) = node
+        {
+            issues.push(Issue {
+                kind: IssueKind::FatStageAvailable,
+                severity: Severity::Info,
+                partition: Partition::Boot,
+                remedy: Remedy::FatStage,
+                action: Some(RepairAction::StageBootConfig(n.clone())),
+                message: format!(
+                    "the host cannot mount f2fs to repair the keys and data partitions \
+                     directly; a watermark-config.json can be staged so the device \
+                     configures watermarks and chain_info at level {} on its next boot",
+                    n.level
+                ),
+            });
+        }
         return issues;
     }
 
@@ -669,12 +700,16 @@ pub fn plan_repairs(issues: &[Issue]) -> Vec<RepairAction> {
         })
         .collect();
     let rewrites_chain_info = actions.contains(&RepairAction::WriteChainInfo);
+    let stages_boot_config = actions
+        .iter()
+        .any(|a| matches!(a, RepairAction::StageBootConfig(_)));
 
     let mut planned: Vec<RepairAction> = Vec::new();
     for action in actions {
         let superseded = match &action {
             RepairAction::ChownWatermarks { pkh } => rewritten_keys.contains(pkh),
             RepairAction::ChmodChainInfo | RepairAction::ChownChainInfo => rewrites_chain_info,
+            RepairAction::DeleteBootConfig => stages_boot_config,
             _ => false,
         };
         if !superseded && !planned.contains(&action) {
@@ -958,8 +993,17 @@ fn report(issues: &[Issue]) {
         .iter()
         .filter(|i| i.remedy == Remedy::HostDirect)
         .count();
+    let stageable = issues
+        .iter()
+        .filter(|i| i.remedy == Remedy::FatStage)
+        .count();
+    let stage_note = if stageable > 0 {
+        format!("; {stageable} stageable for the next boot")
+    } else {
+        String::new()
+    };
     info(&format!(
-        "{critical} critical, {warnings} warning(s); {fixable} fixable in place."
+        "{critical} critical, {warnings} warning(s); {fixable} fixable in place{stage_note}."
     ));
 }
 
@@ -990,6 +1034,7 @@ fn partition_label(partition: Partition) -> &'static str {
 fn remedy_tag(remedy: Remedy) -> colored::ColoredString {
     match remedy {
         Remedy::HostDirect => "fixable".green(),
+        Remedy::FatStage => "fat-stage".blue(),
         Remedy::NeedsNode => "needs-node".yellow(),
         Remedy::Manual => "manual".dimmed(),
     }
@@ -1008,7 +1053,7 @@ fn action_partition(action: &RepairAction) -> Partition {
         RepairAction::WriteChainInfo
         | RepairAction::ChmodChainInfo
         | RepairAction::ChownChainInfo => Partition::Keys,
-        RepairAction::DeleteBootConfig => Partition::Boot,
+        RepairAction::DeleteBootConfig | RepairAction::StageBootConfig(_) => Partition::Boot,
     }
 }
 
@@ -1032,6 +1077,11 @@ fn describe_action(action: &RepairAction) -> String {
         RepairAction::DeleteBootConfig => {
             "delete the stale watermark-config.json from the boot partition".to_string()
         }
+        RepairAction::StageBootConfig(chain_info) => format!(
+            "stage a watermark-config.json so the device configures watermarks and \
+             chain_info at level {} on its next boot",
+            chain_info.level
+        ),
     }
 }
 
@@ -1106,6 +1156,14 @@ fn execute_repairs(
 ) -> Result<()> {
     utils::ensure_mount_capability();
 
+    // Staging writes the boot partition through a self-mounting helper, so it
+    // runs outside the per-partition mount loop below.
+    for action in actions {
+        if let RepairAction::StageBootConfig(chain_info) = action {
+            stage_boot_config(device, chain_info)?;
+        }
+    }
+
     for (partition, part_num, fs_type) in [
         (Partition::Keys, 3u8, "f2fs"),
         (Partition::Data, 4u8, "f2fs"),
@@ -1113,6 +1171,7 @@ fn execute_repairs(
     ] {
         let group: Vec<&RepairAction> = actions
             .iter()
+            .filter(|a| !matches!(a, RepairAction::StageBootConfig(_)))
             .filter(|a| action_partition(a) == partition)
             .collect();
         if group.is_empty() {
@@ -1125,6 +1184,21 @@ fn execute_repairs(
             Ok(())
         })?;
     }
+    Ok(())
+}
+
+/// Stage a `watermark-config.json` on the boot partition and verify the write.
+/// The device consumes it on its next boot, configuring watermarks and
+/// `chain_info` without lowering a valid floor.
+fn stage_boot_config(device: &Path, chain_info: &ChainInfo) -> Result<()> {
+    crate::watermark::write_watermark_config(device, chain_info)
+        .context("failed to stage watermark-config.json on the boot partition")?;
+    let written = crate::watermark::read_back_and_verify(device)
+        .context("failed to verify the staged watermark-config.json")?;
+    success(&format!(
+        "Staged watermark-config.json (chain {}, level {}); the device applies it on its next boot",
+        written.chain.id, written.chain.level
+    ));
     Ok(())
 }
 
@@ -1188,6 +1262,11 @@ fn apply_action(mount: &Path, node: Option<&ChainInfo>, action: &RepairAction) -
             std::fs::remove_file(&cfg)
                 .with_context(|| format!("failed to delete {}", cfg.display()))?;
             success("Deleted the stale watermark-config.json");
+        }
+        // Staging self-mounts the boot partition, so `execute_repairs` applies it
+        // outside the mount loop and it never reaches here.
+        RepairAction::StageBootConfig(_) => {
+            bail!("StageBootConfig must be applied at the device level, not on a mount")
         }
     }
     Ok(())
@@ -1788,27 +1867,104 @@ mod tests {
     }
 
     #[test]
-    fn host_direct_issue_carries_an_action_and_others_do_not() {
-        let mut state = healthy_state();
-        state.watermarks[0].dir_present = false;
-        state.watermarks[1].files[0].owner = Some((0, 0));
-        state.chain_info = ChainInfoState::Present {
+    fn actionable_issue_carries_an_action_and_others_do_not() {
+        let mut inspected = healthy_state();
+        inspected.watermarks[0].dir_present = false;
+        inspected.watermarks[1].files[0].owner = Some((0, 0));
+        inspected.chain_info = ChainInfoState::Present {
             id: "NetXwrong".to_string(),
             mode: Some(0o644),
             owner: Some((0, 0)),
         };
-        state.panic_log_size = Some(PANIC_LOG_MAX_BYTES + 1);
-        state.boot_config = Some(BootConfigState {
+        inspected.panic_log_size = Some(PANIC_LOG_MAX_BYTES + 1);
+        inspected.boot_config = Some(BootConfigState {
             chain_id: "NetXold".to_string(),
             level: 1,
         });
-        state.migration_pending = true;
-        for i in &classify(&state, Some(&node())) {
+        inspected.migration_pending = true;
+
+        // The FAT-stage path is the other action-carrying remedy.
+        let not_capable = uninspected_state(Inspection::NotCapable, None);
+
+        let issues: Vec<Issue> = classify(&inspected, Some(&node()))
+            .into_iter()
+            .chain(classify(&not_capable, Some(&node())))
+            .collect();
+
+        for i in &issues {
+            let actionable = matches!(i.remedy, Remedy::HostDirect | Remedy::FatStage);
             assert_eq!(
-                i.remedy == Remedy::HostDirect,
+                actionable,
                 i.action.is_some(),
                 "remedy and action disagree: {i:?}"
             );
         }
+    }
+
+    // -- FAT-stage fallback -------------------------------------------------
+
+    #[test]
+    fn fat_stage_offered_when_f2fs_not_capable_with_node() {
+        let state = uninspected_state(Inspection::NotCapable, None);
+        let issues = classify(&state, Some(&node()));
+        let issue = find(&issues, IssueKind::FatStageAvailable).expect("fat-stage issue");
+        assert_eq!(issue.remedy, Remedy::FatStage);
+        assert_eq!(
+            issue.action,
+            Some(RepairAction::StageBootConfig(node())),
+            "the staged config carries the node snapshot verbatim"
+        );
+        assert!(plan_repairs(&issues).contains(&RepairAction::StageBootConfig(node())));
+    }
+
+    #[test]
+    fn fat_stage_not_offered_without_a_node() {
+        let state = uninspected_state(Inspection::NotCapable, None);
+        let issues = classify(&state, None);
+        assert!(find(&issues, IssueKind::FatStageAvailable).is_none());
+        assert!(
+            plan_repairs(&issues).is_empty(),
+            "no node means nothing to stage"
+        );
+    }
+
+    #[test]
+    fn fat_stage_not_offered_when_f2fs_inspected() {
+        let plan = plan_repairs(&classify(&healthy_state(), Some(&node())));
+        assert!(
+            !plan
+                .iter()
+                .any(|a| matches!(a, RepairAction::StageBootConfig(_))),
+            "an f2fs-capable host repairs in place, not via staging: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn fat_stage_not_offered_when_mount_failed() {
+        // A capable host whose mount failed is a card or permission fault to
+        // investigate, not a case for a blind staged config.
+        let state = uninspected_state(Inspection::Failed, None);
+        let issues = classify(&state, Some(&node()));
+        assert!(find(&issues, IssueKind::FatStageAvailable).is_none());
+    }
+
+    #[test]
+    fn plan_stage_supersedes_delete_of_a_stale_boot_config() {
+        let state = uninspected_state(
+            Inspection::NotCapable,
+            Some(BootConfigState {
+                chain_id: "NetXold".to_string(),
+                level: 1,
+            }),
+        );
+        let plan = plan_repairs(&classify(&state, Some(&node())));
+        assert!(
+            plan.iter()
+                .any(|a| matches!(a, RepairAction::StageBootConfig(_)))
+        );
+        assert!(
+            !plan.contains(&RepairAction::DeleteBootConfig),
+            "staging overwrites the same file, so the delete is dropped: {plan:?}"
+        );
     }
 }
