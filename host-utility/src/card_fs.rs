@@ -55,13 +55,31 @@ pub fn write_chain_info(keys_mount: &Path, chain_info: &ChainInfo) -> Result<()>
     });
     let contents =
         serde_json::to_string_pretty(&json).context("failed to serialize chain_info.json")?;
+    // A prior chain_info.json is left at 0o400 (owner read-only), so a truncating
+    // write is denied unless the owner first restores write permission. The
+    // doctor rewrites a stale one unprivileged, so make an existing file writable
+    // before overwriting; the mode is reset to 0o400 below.
+    if path.exists() {
+        let mut perms = fs::metadata(&path)
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms)
+            .with_context(|| format!("failed to make {} writable", path.display()))?;
+    }
     fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    set_chain_info_mode(&path)?;
+    Ok(())
+}
 
-    let mut perms = fs::metadata(&path)
+/// Set `chain_info.json` to its device mode (`0o400`, owner read-only). Shared
+/// by the writer and the doctor's mode-drift repair so the mode has one home.
+pub fn set_chain_info_mode(path: &Path) -> Result<()> {
+    let mut perms = fs::metadata(path)
         .with_context(|| format!("failed to stat {}", path.display()))?
         .permissions();
     perms.set_mode(CHAIN_INFO_MODE);
-    fs::set_permissions(&path, perms)
+    fs::set_permissions(path, perms)
         .with_context(|| format!("failed to set mode on {}", path.display()))?;
     Ok(())
 }
@@ -84,6 +102,36 @@ mod tests {
             assert_eq!(level, 4242);
             assert_eq!(round, 0);
         }
+    }
+
+    #[test]
+    fn chain_info_rewrites_over_an_existing_read_only_file() {
+        // The device and restore path leave chain_info.json at 0o400 (owner
+        // read-only). The doctor rewrites a stale one over that existing file
+        // while running unprivileged, where a plain truncating write is denied.
+        let dir = tempfile::tempdir().unwrap();
+        let stale = ChainInfo {
+            id: "NetXstale".to_string(),
+            level: 1,
+            name: "Stale".to_string(),
+            blocks_per_cycle: 8,
+        };
+        write_chain_info(dir.path(), &stale).unwrap();
+
+        let fresh = ChainInfo {
+            id: "NetXfresh".to_string(),
+            level: 2,
+            name: "Fresh".to_string(),
+            blocks_per_cycle: 16,
+        };
+        write_chain_info(dir.path(), &fresh).expect("rewrite over 0o400 file must succeed");
+
+        let path = dir.path().join(CHAIN_INFO_FILENAME);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["id"], "NetXfresh");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, CHAIN_INFO_MODE);
     }
 
     #[test]

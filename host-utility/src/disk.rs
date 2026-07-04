@@ -8,14 +8,14 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use colored::Colorize;
 use russignol_signer_lib::KeyManager;
 use russignol_signer_lib::server::KEY_ROLES;
 use russignol_storage::watermark;
 
-use crate::card_fs::{CHAIN_INFO_MODE, DEVICE_GID, DEVICE_UID};
+use crate::card_fs::{self, CHAIN_INFO_MODE, DEVICE_GID, DEVICE_UID};
 use crate::utils::{self, get_partition_path, info, print_title_bar, success, warning};
 use crate::watermark::ChainInfo;
 use crate::{config, network};
@@ -27,7 +27,7 @@ const PANIC_LOG_MAX_BYTES: u64 = 1024 * 1024;
 /// Disk subcommands
 #[derive(Subcommand, Debug)]
 pub enum DiskCommands {
-    /// Diagnose a signer SD card and report every detectable issue
+    /// Diagnose a signer SD card and repair fixable issues on confirmation
     Doctor {
         /// Target device (e.g. /dev/sdc or /dev/mmcblk0); auto-detected if omitted
         #[arg(long, short)]
@@ -221,12 +221,37 @@ pub enum IssueKind {
     PanicLogOversized,
 }
 
+/// A concrete, confirmable repair the doctor applies to a card in a host reader.
+///
+/// Produced alongside the issue that motivates it, so the executor consumes the
+/// planned repair rather than re-deriving one from the card state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairAction {
+    /// Rewrite the full watermark set for a key at `level`, then restore
+    /// `1000:1000` ownership. `level` never lowers an existing valid floor.
+    WriteWatermarks { pkh: String, level: u32 },
+    /// Restore `1000:1000` ownership on a key's watermark directory.
+    ChownWatermarks { pkh: String },
+    /// Rewrite `chain_info.json` from the node (content, mode, owner).
+    WriteChainInfo,
+    /// Set `chain_info.json` mode to `0o400`.
+    ChmodChainInfo,
+    /// Restore `1000:1000` ownership on `chain_info.json`.
+    ChownChainInfo,
+    /// Truncate an oversized `panic.log`.
+    TruncatePanicLog,
+    /// Delete a stale `watermark-config.json` from the boot partition.
+    DeleteBootConfig,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Issue {
     pub kind: IssueKind,
     pub severity: Severity,
     pub partition: Partition,
     pub remedy: Remedy,
+    /// The in-place repair for this issue, present iff `remedy` is `HostDirect`.
+    pub action: Option<RepairAction>,
     pub message: String,
 }
 
@@ -239,6 +264,19 @@ fn node_backed_remedy(node: Option<&ChainInfo>) -> Remedy {
     } else {
         Remedy::NeedsNode
     }
+}
+
+/// The level to rewrite a key's watermark set at: the node head raised to any
+/// existing valid floor the key still has, so a valid higher floor is never
+/// lowered (slashing guard). Called only when a node is present.
+fn repair_level_for_key(key: &KeyWatermarks, node_level: u32) -> u32 {
+    key.files
+        .iter()
+        .filter_map(|f| match f.status {
+            WatermarkFileStatus::Valid { level } => Some(level),
+            _ => None,
+        })
+        .fold(node_level, u32::max)
 }
 
 fn owner_ok(owner: Option<(u32, u32)>) -> bool {
@@ -270,6 +308,7 @@ pub fn classify(state: &CardState, node: Option<&ChainInfo>) -> Vec<Issue> {
             severity: Severity::Warning,
             partition: Partition::Keys,
             remedy: Remedy::Manual,
+            action: None,
             message: message.to_string(),
         });
         return issues;
@@ -282,6 +321,7 @@ pub fn classify(state: &CardState, node: Option<&ChainInfo>) -> Vec<Issue> {
             severity: Severity::Info,
             partition: Partition::Keys,
             remedy: Remedy::Manual,
+            action: None,
             message: "a pending v1->v2 PIN-blob migration is present; the device \
                       completes it on boot and the doctor leaves it untouched"
                 .to_string(),
@@ -294,6 +334,7 @@ pub fn classify(state: &CardState, node: Option<&ChainInfo>) -> Vec<Issue> {
             severity: Severity::Info,
             partition: Partition::Keys,
             remedy: Remedy::Manual,
+            action: None,
             message: "first-boot setup has not completed (.setup_complete absent); \
                       the device generates its keys, watermarks, and chain_info on \
                       first boot"
@@ -320,6 +361,7 @@ fn classify_boot_config(state: &CardState, node: Option<&ChainInfo>, issues: &mu
             severity: Severity::Warning,
             partition: Partition::Boot,
             remedy: Remedy::HostDirect,
+            action: Some(RepairAction::DeleteBootConfig),
             message: format!(
                 "a staged watermark-config.json targets chain {} at level {}, which \
                  differs from the node's chain {}; it is stale and can be deleted",
@@ -331,6 +373,7 @@ fn classify_boot_config(state: &CardState, node: Option<&ChainInfo>, issues: &mu
             severity: Severity::Info,
             partition: Partition::Boot,
             remedy: Remedy::Manual,
+            action: None,
             message: format!(
                 "a staged watermark-config.json is present (chain {} at level {}); the \
                  device consumes it on the next boot, so it is left in place",
@@ -347,6 +390,7 @@ fn classify_keys(state: &CardState, issues: &mut Vec<Issue>) {
             severity: Severity::Critical,
             partition: Partition::Keys,
             remedy: Remedy::Manual,
+            action: None,
             message: "public_key_hashs is missing; the card has no keys and cannot \
                       sign — restore keys or re-run setup"
                 .to_string(),
@@ -356,6 +400,7 @@ fn classify_keys(state: &CardState, issues: &mut Vec<Issue>) {
             severity: Severity::Critical,
             partition: Partition::Keys,
             remedy: Remedy::Manual,
+            action: None,
             message: "public_key_hashs is present but could not be parsed or is empty".to_string(),
         }),
         KeysState::Parsed { aliases, .. } => {
@@ -366,6 +411,7 @@ fn classify_keys(state: &CardState, issues: &mut Vec<Issue>) {
                         severity: Severity::Warning,
                         partition: Partition::Keys,
                         remedy: Remedy::Manual,
+                        action: None,
                         message: format!(
                             "expected key role '{role}' was not found among the card's \
                              key aliases"
@@ -378,12 +424,15 @@ fn classify_keys(state: &CardState, issues: &mut Vec<Issue>) {
 }
 
 fn classify_chain_info(state: &CardState, node: Option<&ChainInfo>, issues: &mut Vec<Issue>) {
+    // A rewrite is only possible, and only makes sense, when a node is present.
+    let write_action = node.is_some().then_some(RepairAction::WriteChainInfo);
     match &state.chain_info {
         ChainInfoState::Missing => issues.push(Issue {
             kind: IssueKind::ChainInfoMissing,
             severity: Severity::Critical,
             partition: Partition::Keys,
             remedy: node_backed_remedy(node),
+            action: write_action,
             message: "chain_info.json is missing; the device cannot resolve the chain \
                       it signs for until it is rewritten from a node"
                 .to_string(),
@@ -393,6 +442,7 @@ fn classify_chain_info(state: &CardState, node: Option<&ChainInfo>, issues: &mut
             severity: Severity::Critical,
             partition: Partition::Keys,
             remedy: node_backed_remedy(node),
+            action: write_action,
             message: "chain_info.json is present but is not valid JSON or is missing \
                       required fields"
                 .to_string(),
@@ -404,6 +454,7 @@ fn classify_chain_info(state: &CardState, node: Option<&ChainInfo>, issues: &mut
                     severity: Severity::Warning,
                     partition: Partition::Keys,
                     remedy: Remedy::HostDirect,
+                    action: Some(RepairAction::WriteChainInfo),
                     message: format!(
                         "chain_info.json records chain {id}, but the node reports {}; \
                          it is stale and should be rewritten",
@@ -416,6 +467,7 @@ fn classify_chain_info(state: &CardState, node: Option<&ChainInfo>, issues: &mut
                     severity: Severity::Info,
                     partition: Partition::Keys,
                     remedy: Remedy::NeedsNode,
+                    action: None,
                     message: "chain_info.json freshness cannot be checked without a \
                               node endpoint"
                         .to_string(),
@@ -428,6 +480,7 @@ fn classify_chain_info(state: &CardState, node: Option<&ChainInfo>, issues: &mut
                     severity: Severity::Critical,
                     partition: Partition::Keys,
                     remedy: Remedy::HostDirect,
+                    action: Some(RepairAction::ChownChainInfo),
                     message: format!(
                         "chain_info.json is owned {u}:{g}, but the device runs as \
                          {DEVICE_UID}:{DEVICE_GID} and cannot read it"
@@ -442,6 +495,7 @@ fn classify_chain_info(state: &CardState, node: Option<&ChainInfo>, issues: &mut
                     severity: Severity::Warning,
                     partition: Partition::Keys,
                     remedy: Remedy::HostDirect,
+                    action: Some(RepairAction::ChmodChainInfo),
                     message: format!(
                         "chain_info.json mode is {m:04o}, expected {CHAIN_INFO_MODE:04o}"
                     ),
@@ -463,6 +517,7 @@ fn classify_watermarks(state: &CardState, node: Option<&ChainInfo>, issues: &mut
             severity: Severity::Info,
             partition: Partition::Data,
             remedy: Remedy::NeedsNode,
+            action: None,
             message: "watermark floors cannot be compared to the node head without a \
                       node endpoint"
                 .to_string(),
@@ -477,12 +532,19 @@ fn classify_key_watermarks(
     any_valid: &mut bool,
 ) {
     let remedy = node_backed_remedy(node);
+    // Every watermark-content fault for this key is repaired by the same
+    // rewrite-the-set action, at a level that never lowers a valid floor.
+    let write_action = node.map(|n| RepairAction::WriteWatermarks {
+        pkh: key.pkh.clone(),
+        level: repair_level_for_key(key, n.level),
+    });
     if !key.dir_present {
         issues.push(Issue {
             kind: IssueKind::WatermarkDirMissing,
             severity: Severity::Critical,
             partition: Partition::Data,
             remedy,
+            action: write_action,
             message: format!("the watermark directory for key {} is missing", key.pkh),
         });
         return;
@@ -500,6 +562,7 @@ fn classify_key_watermarks(
                 severity: Severity::Critical,
                 partition: Partition::Data,
                 remedy,
+                action: write_action.clone(),
                 message: format!(
                     "watermark file {} for key {} is missing",
                     file.name, key.pkh
@@ -510,6 +573,7 @@ fn classify_key_watermarks(
                 severity: Severity::Critical,
                 partition: Partition::Data,
                 remedy,
+                action: write_action.clone(),
                 message: format!(
                     "watermark file {} for key {} failed to decode",
                     file.name, key.pkh
@@ -530,6 +594,7 @@ fn classify_key_watermarks(
             severity: Severity::Warning,
             partition: Partition::Data,
             remedy,
+            action: write_action.clone(),
             message: format!(
                 "the watermark floor for key {} is level {level}, below the node head {}",
                 key.pkh, n.level
@@ -543,6 +608,9 @@ fn classify_key_watermarks(
             severity: Severity::Critical,
             partition: Partition::Data,
             remedy: Remedy::HostDirect,
+            action: Some(RepairAction::ChownWatermarks {
+                pkh: key.pkh.clone(),
+            }),
             message: format!(
                 "watermark files for key {} are not owned {DEVICE_UID}:{DEVICE_GID}; the \
                  device cannot update them",
@@ -559,6 +627,7 @@ fn classify_logs(state: &CardState, issues: &mut Vec<Issue>) {
             severity: Severity::Info,
             partition: Partition::Data,
             remedy: Remedy::Manual,
+            action: None,
             message: "/data/logs is missing; the device recreates it on boot".to_string(),
         });
     }
@@ -570,12 +639,49 @@ fn classify_logs(state: &CardState, issues: &mut Vec<Issue>) {
             severity: Severity::Warning,
             partition: Partition::Data,
             remedy: Remedy::HostDirect,
+            action: Some(RepairAction::TruncatePanicLog),
             message: format!(
                 "panic.log is {size} bytes, over the {PANIC_LOG_MAX_BYTES}-byte cap; it \
                  can be truncated"
             ),
         });
     }
+}
+
+// =============================================================================
+// Repair planning (pure)
+// =============================================================================
+
+/// The confirmable repairs implied by a classified issue list.
+///
+/// Consumes the `action` each issue carries — the executor never re-derives a
+/// fix from the card state. Drops actions superseded by a broader one on the
+/// same target (a full rewrite already restores ownership and mode) and dedups
+/// identical actions (one key's several watermark faults share one rewrite).
+pub fn plan_repairs(issues: &[Issue]) -> Vec<RepairAction> {
+    let actions: Vec<RepairAction> = issues.iter().filter_map(|i| i.action.clone()).collect();
+
+    let rewritten_keys: std::collections::HashSet<String> = actions
+        .iter()
+        .filter_map(|a| match a {
+            RepairAction::WriteWatermarks { pkh, .. } => Some(pkh.clone()),
+            _ => None,
+        })
+        .collect();
+    let rewrites_chain_info = actions.contains(&RepairAction::WriteChainInfo);
+
+    let mut planned: Vec<RepairAction> = Vec::new();
+    for action in actions {
+        let superseded = match &action {
+            RepairAction::ChownWatermarks { pkh } => rewritten_keys.contains(pkh),
+            RepairAction::ChmodChainInfo | RepairAction::ChownChainInfo => rewrites_chain_info,
+            _ => false,
+        };
+        if !superseded && !planned.contains(&action) {
+            planned.push(action);
+        }
+    }
+    planned
 }
 
 // =============================================================================
@@ -855,7 +961,6 @@ fn report(issues: &[Issue]) {
     info(&format!(
         "{critical} critical, {warnings} warning(s); {fixable} fixable in place."
     ));
-    info("Diagnosis only — no changes were made to the card.");
 }
 
 fn severity_header(severity: Severity, count: usize) -> colored::ColoredString {
@@ -888,6 +993,204 @@ fn remedy_tag(remedy: Remedy) -> colored::ColoredString {
         Remedy::NeedsNode => "needs-node".yellow(),
         Remedy::Manual => "manual".dimmed(),
     }
+}
+
+// =============================================================================
+// Repair execution (IO at the edges; exercised on-device, not in CI)
+// =============================================================================
+
+/// The partition a repair touches, so the executor mounts each one once.
+fn action_partition(action: &RepairAction) -> Partition {
+    match action {
+        RepairAction::WriteWatermarks { .. }
+        | RepairAction::ChownWatermarks { .. }
+        | RepairAction::TruncatePanicLog => Partition::Data,
+        RepairAction::WriteChainInfo
+        | RepairAction::ChmodChainInfo
+        | RepairAction::ChownChainInfo => Partition::Keys,
+        RepairAction::DeleteBootConfig => Partition::Boot,
+    }
+}
+
+/// One-line human description of a repair, for the confirmation prompt.
+fn describe_action(action: &RepairAction) -> String {
+    match action {
+        RepairAction::WriteWatermarks { pkh, level } => {
+            format!("rewrite the watermark set for {pkh} at level {level}")
+        }
+        RepairAction::ChownWatermarks { pkh } => {
+            format!("restore {DEVICE_UID}:{DEVICE_GID} ownership of the watermarks for {pkh}")
+        }
+        RepairAction::WriteChainInfo => "rewrite chain_info.json from the node".to_string(),
+        RepairAction::ChmodChainInfo => {
+            format!("set chain_info.json mode to {CHAIN_INFO_MODE:04o}")
+        }
+        RepairAction::ChownChainInfo => {
+            format!("restore {DEVICE_UID}:{DEVICE_GID} ownership of chain_info.json")
+        }
+        RepairAction::TruncatePanicLog => "truncate the oversized panic.log".to_string(),
+        RepairAction::DeleteBootConfig => {
+            "delete the stale watermark-config.json from the boot partition".to_string()
+        }
+    }
+}
+
+/// Prompt for each planned repair unless `--yes` auto-confirms them all.
+fn confirm_actions(actions: &[RepairAction], yes: bool) -> Result<Vec<RepairAction>> {
+    if yes {
+        return Ok(actions.to_vec());
+    }
+    let mut confirmed = Vec::new();
+    for action in actions {
+        let ok = inquire::Confirm::new(&format!("Apply repair: {}?", describe_action(action)))
+            .with_default(false)
+            .with_render_config(utils::create_orange_theme())
+            .prompt()
+            .context("failed to read repair confirmation")?;
+        if ok {
+            confirmed.push(action.clone());
+        }
+    }
+    Ok(confirmed)
+}
+
+fn owned_by_device(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.uid() == DEVICE_UID && m.gid() == DEVICE_GID)
+}
+
+/// Whether a directory and all its immediate entries are device-owned. Watermark
+/// key directories are flat, so one level is enough.
+fn tree_owned_by_device(dir: &Path) -> bool {
+    owned_by_device(dir)
+        && std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .filter_map(std::result::Result::ok)
+                .all(|e| owned_by_device(&e.path()))
+        })
+}
+
+/// Chown a path to `1000:1000` via sudo, skipping when it is already correct so
+/// the common (host uid 1000) case needs no privilege prompt.
+fn ensure_device_owned(path: &Path, recursive: bool) -> Result<()> {
+    let already = if recursive {
+        tree_owned_by_device(path)
+    } else {
+        owned_by_device(path)
+    };
+    if already {
+        return Ok(());
+    }
+    let spec = format!("{DEVICE_UID}:{DEVICE_GID}");
+    let path_str = path.to_string_lossy();
+    let args: Vec<&str> = if recursive {
+        vec!["-R", &spec, &path_str]
+    } else {
+        vec![&spec, &path_str]
+    };
+    let output = utils::sudo_command("chown", &args).context("failed to run chown")?;
+    if !output.status.success() {
+        bail!(
+            "chown of {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Apply every confirmed repair, mounting each partition read-write once.
+fn execute_repairs(
+    device: &Path,
+    node: Option<&ChainInfo>,
+    actions: &[RepairAction],
+) -> Result<()> {
+    utils::ensure_mount_capability();
+
+    for (partition, part_num, fs_type) in [
+        (Partition::Keys, 3u8, "f2fs"),
+        (Partition::Data, 4u8, "f2fs"),
+        (Partition::Boot, 1u8, "vfat"),
+    ] {
+        let group: Vec<&RepairAction> = actions
+            .iter()
+            .filter(|a| action_partition(a) == partition)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        apply_on_partition(device, part_num, fs_type, |mount| {
+            for action in &group {
+                apply_action(mount, node, action)?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Mount a partition read-write, run `apply`, then always sync and unmount.
+fn apply_on_partition(
+    device: &Path,
+    part_num: u8,
+    fs_type: &str,
+    apply: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let part = get_partition_path(device, part_num);
+    let mount = utils::mount_partition(&part, fs_type, false)
+        .with_context(|| format!("failed to mount partition {part_num} read-write for repair"))?;
+    let result = apply(&mount);
+    utils::run_best_effort("sync", &[], "Failed to sync after repair");
+    utils::warn_if_err(
+        utils::unmount_partition(&mount, &part),
+        "failed to unmount partition after repair",
+    );
+    result
+}
+
+fn apply_action(mount: &Path, node: Option<&ChainInfo>, action: &RepairAction) -> Result<()> {
+    match action {
+        RepairAction::WriteWatermarks { pkh, level } => {
+            let key_dir = mount.join("watermarks").join(pkh);
+            card_fs::write_watermark_file_set(&key_dir, *level)?;
+            ensure_device_owned(&key_dir, true)?;
+            success(&format!("Rewrote watermarks for {pkh} at level {level}"));
+        }
+        RepairAction::ChownWatermarks { pkh } => {
+            let key_dir = mount.join("watermarks").join(pkh);
+            ensure_device_owned(&key_dir, true)?;
+            success(&format!("Restored ownership of watermarks for {pkh}"));
+        }
+        RepairAction::WriteChainInfo => {
+            let node = node.context("chain_info repair requires a node endpoint")?;
+            card_fs::write_chain_info(mount, node)?;
+            ensure_device_owned(&mount.join(card_fs::CHAIN_INFO_FILENAME), false)?;
+            success("Rewrote chain_info.json from the node");
+        }
+        RepairAction::ChmodChainInfo => {
+            card_fs::set_chain_info_mode(&mount.join(card_fs::CHAIN_INFO_FILENAME))?;
+            success("Reset chain_info.json mode");
+        }
+        RepairAction::ChownChainInfo => {
+            ensure_device_owned(&mount.join(card_fs::CHAIN_INFO_FILENAME), false)?;
+            success("Restored ownership of chain_info.json");
+        }
+        RepairAction::TruncatePanicLog => {
+            let log = mount.join("logs").join("panic.log");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&log)
+                .with_context(|| format!("failed to truncate {}", log.display()))?;
+            success("Truncated panic.log");
+        }
+        RepairAction::DeleteBootConfig => {
+            let cfg = mount.join(crate::watermark::CONFIG_FILENAME);
+            std::fs::remove_file(&cfg)
+                .with_context(|| format!("failed to delete {}", cfg.display()))?;
+            success("Deleted the stale watermark-config.json");
+        }
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -937,6 +1240,28 @@ fn run_doctor(
     let state = gather_card_state(&device);
     let issues = classify(&state, node.as_ref());
     report(&issues);
+
+    let actions = plan_repairs(&issues);
+    if actions.is_empty() {
+        info("No in-place repairs are available for this card.");
+        return Ok(());
+    }
+    if dry_run {
+        info(&format!(
+            "{} repair(s) available; re-run without --dry-run to apply.",
+            actions.len()
+        ));
+        return Ok(());
+    }
+
+    println!();
+    let confirmed = confirm_actions(&actions, yes)?;
+    if confirmed.is_empty() {
+        info("No repairs applied — the card is unchanged.");
+        return Ok(());
+    }
+    execute_repairs(&device, node.as_ref(), &confirmed)?;
+    success(&format!("Applied {} repair(s).", confirmed.len()));
     Ok(())
 }
 
@@ -1313,5 +1638,177 @@ mod tests {
         let issue = find(&issues, IssueKind::OwnershipDrift).expect("ownership issue");
         assert_eq!(issue.severity, Severity::Critical);
         assert_eq!(issue.partition, Partition::Data);
+    }
+
+    // -- repair planning ----------------------------------------------------
+
+    fn wm_file(status: WatermarkFileStatus) -> WatermarkFile {
+        WatermarkFile {
+            name: "block_watermark".to_string(),
+            status,
+            owner: Some((DEVICE_UID, DEVICE_GID)),
+        }
+    }
+
+    #[test]
+    fn repair_level_never_lowers_a_valid_floor() {
+        let key = KeyWatermarks {
+            pkh: CONSENSUS_PKH.to_string(),
+            dir_present: true,
+            dir_owner: Some((DEVICE_UID, DEVICE_GID)),
+            files: vec![
+                wm_file(WatermarkFileStatus::Valid { level: 2_000 }),
+                wm_file(WatermarkFileStatus::Corrupt),
+            ],
+        };
+        // Node head below the surviving valid floor: keep the floor.
+        assert_eq!(repair_level_for_key(&key, 1_000), 2_000);
+        // Node head above the floor: raise to the head.
+        assert_eq!(repair_level_for_key(&key, 3_000), 3_000);
+    }
+
+    #[test]
+    fn repair_level_uses_node_head_when_no_valid_floor_survives() {
+        let key = KeyWatermarks {
+            pkh: CONSENSUS_PKH.to_string(),
+            dir_present: true,
+            dir_owner: Some((DEVICE_UID, DEVICE_GID)),
+            files: vec![wm_file(WatermarkFileStatus::Missing)],
+        };
+        assert_eq!(repair_level_for_key(&key, 1_234), 1_234);
+    }
+
+    #[test]
+    fn corrupt_sibling_rewrites_at_the_surviving_higher_floor() {
+        // Slashing guard end to end: one file corrupt, its siblings valid at
+        // 2_000, node head 1_000 — the rewrite must use 2_000, never the head.
+        let mut state = healthy_state();
+        for f in &mut state.watermarks[0].files {
+            f.status = WatermarkFileStatus::Valid { level: 2_000 };
+        }
+        state.watermarks[0].files[0].status = WatermarkFileStatus::Corrupt;
+        let mut n = node();
+        n.level = 1_000;
+        let plan = plan_repairs(&classify(&state, Some(&n)));
+        assert!(plan.contains(&RepairAction::WriteWatermarks {
+            pkh: CONSENSUS_PKH.to_string(),
+            level: 2_000,
+        }));
+    }
+
+    #[test]
+    fn below_head_rewrite_targets_the_node_head() {
+        let mut n = node();
+        n.level = 5_000; // both keys' 1_000 floors are below the head
+        let plan = plan_repairs(&classify(&healthy_state(), Some(&n)));
+        assert!(plan.contains(&RepairAction::WriteWatermarks {
+            pkh: CONSENSUS_PKH.to_string(),
+            level: 5_000,
+        }));
+    }
+
+    #[test]
+    fn plan_dedups_watermark_rewrite_for_one_key() {
+        let mut state = healthy_state();
+        state.watermarks[0].files[0].status = WatermarkFileStatus::Missing;
+        state.watermarks[0].files[1].status = WatermarkFileStatus::Corrupt;
+        let plan = plan_repairs(&classify(&state, Some(&node())));
+        let writes = plan
+            .iter()
+            .filter(
+                |a| matches!(a, RepairAction::WriteWatermarks { pkh, .. } if pkh == CONSENSUS_PKH),
+            )
+            .count();
+        assert_eq!(writes, 1, "expected one rewrite for the key, got {plan:?}");
+    }
+
+    #[test]
+    fn plan_write_supersedes_chown_for_the_same_key() {
+        let mut state = healthy_state();
+        state.watermarks[0].files[0].status = WatermarkFileStatus::Corrupt;
+        state.watermarks[0].files[1].owner = Some((0, 0));
+        let plan = plan_repairs(&classify(&state, Some(&node())));
+        assert!(plan.iter().any(
+            |a| matches!(a, RepairAction::WriteWatermarks { pkh, .. } if pkh == CONSENSUS_PKH)
+        ));
+        assert!(
+            !plan.iter().any(
+                |a| matches!(a, RepairAction::ChownWatermarks { pkh } if pkh == CONSENSUS_PKH)
+            ),
+            "the rewrite already restores ownership: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn plan_keeps_chown_for_a_key_without_a_rewrite() {
+        let mut state = healthy_state();
+        state.watermarks[0].files[0].status = WatermarkFileStatus::Corrupt; // key0 rewrite
+        state.watermarks[1].files[0].owner = Some((0, 0)); // key1 chown only
+        let plan = plan_repairs(&classify(&state, Some(&node())));
+        assert!(
+            plan.iter().any(
+                |a| matches!(a, RepairAction::ChownWatermarks { pkh } if pkh == COMPANION_PKH)
+            )
+        );
+    }
+
+    #[test]
+    fn plan_write_chain_info_supersedes_mode_and_owner() {
+        let mut state = healthy_state();
+        state.chain_info = ChainInfoState::Present {
+            id: "NetXwrong".to_string(),
+            mode: Some(0o644),
+            owner: Some((0, 0)),
+        };
+        let plan = plan_repairs(&classify(&state, Some(&node())));
+        assert!(plan.contains(&RepairAction::WriteChainInfo));
+        assert!(!plan.contains(&RepairAction::ChmodChainInfo));
+        assert!(!plan.contains(&RepairAction::ChownChainInfo));
+    }
+
+    #[test]
+    fn plan_is_empty_for_a_healthy_card() {
+        let plan = plan_repairs(&classify(&healthy_state(), Some(&node())));
+        assert!(
+            plan.is_empty(),
+            "healthy card needs no repair, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn plan_omits_node_backed_repairs_without_a_node() {
+        let mut state = healthy_state();
+        state.watermarks[0].dir_present = false;
+        state.chain_info = ChainInfoState::Missing;
+        let plan = plan_repairs(&classify(&state, None));
+        assert!(
+            plan.is_empty(),
+            "node-backed repairs cannot be planned without a node, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn host_direct_issue_carries_an_action_and_others_do_not() {
+        let mut state = healthy_state();
+        state.watermarks[0].dir_present = false;
+        state.watermarks[1].files[0].owner = Some((0, 0));
+        state.chain_info = ChainInfoState::Present {
+            id: "NetXwrong".to_string(),
+            mode: Some(0o644),
+            owner: Some((0, 0)),
+        };
+        state.panic_log_size = Some(PANIC_LOG_MAX_BYTES + 1);
+        state.boot_config = Some(BootConfigState {
+            chain_id: "NetXold".to_string(),
+            level: 1,
+        });
+        state.migration_pending = true;
+        for i in &classify(&state, Some(&node())) {
+            assert_eq!(
+                i.remedy == Remedy::HostDirect,
+                i.action.is_some(),
+                "remedy and action disagree: {i:?}"
+            );
+        }
     }
 }
