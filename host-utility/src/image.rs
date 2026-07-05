@@ -801,7 +801,7 @@ fn cmd_flash(
         image_version: None,
         channel: None,
     };
-    finish_normal_flash(
+    let view = finish_normal_flash(
         image,
         &target_device.path,
         None,
@@ -809,7 +809,8 @@ fn cmd_flash(
         skip_verify,
         &metadata,
         node_check.as_ref().map(|nc| &nc.chain_info),
-    )
+    )?;
+    conclude_flash(&target_device.path, view, yes)
 }
 
 /// Shared tail of both normal (non-keyed) flash paths: write the image, read it
@@ -823,18 +824,31 @@ fn finish_normal_flash(
     skip_verify: bool,
     metadata: &FlashMetadata,
     chain_info: Option<&watermark::ChainInfo>,
-) -> Result<()> {
+) -> Result<HostPartitionView> {
     flash_image_to_device(image, device, expected_size, privilege)?;
 
     // Read the card back and confirm it matches before declaring success.
     verify_flash_or_note_skip(image, device, skip_verify)?;
 
-    // Re-read partition table so kernel sees new partitions
-    reread_partition_table(device);
+    // Refresh the kernel's partition table where possible; a non-root run leaves
+    // it stale and reports so, so the optional verify below can drive a re-plug.
+    let view = reread_partition_table(device);
 
+    // The manifest and config only touch p1, whose offset is unchanged by the
+    // flash, so they write correctly regardless of the stale view above.
     write_flash_manifest(device, metadata).context("Failed to write flash manifest")?;
 
-    finalize_flash(device, chain_info)
+    finalize_flash(device, chain_info)?;
+    Ok(view)
+}
+
+/// Shared conclusion for both normal flash paths: offer the optional structural
+/// verify, then point the user at the Pi. One place so the two entry points end
+/// identically.
+fn conclude_flash(device: &Path, view: HostPartitionView, yes: bool) -> Result<()> {
+    offer_structural_verify(device, view, yes)?;
+    println!("  You can now insert the SD card into your Raspberry Pi Zero 2W.");
+    Ok(())
 }
 
 /// Write watermark config (if available), verify it, and print flash success message
@@ -857,13 +871,11 @@ fn finalize_flash(device: &Path, chain_info: Option<&watermark::ChainInfo>) -> R
             format_with_separators(written.chain.level).cyan()
         );
         println!();
-        println!("  You can now insert the SD card into your Raspberry Pi Zero 2W.");
     } else {
         utils::success(
             "Flash complete! (no watermark config - run 'russignol watermark init' later)",
         );
         println!();
-        println!("  You can now insert the SD card into your Raspberry Pi Zero 2W.");
     }
 
     Ok(())
@@ -1041,7 +1053,7 @@ fn cmd_download_and_flash(
         image_version: dl.version,
         channel: dl.channel,
     };
-    finish_normal_flash(
+    let view = finish_normal_flash(
         &image_path,
         &target_device.path,
         dl.uncompressed_size,
@@ -1049,7 +1061,8 @@ fn cmd_download_and_flash(
         skip_verify,
         &metadata,
         node_check.as_ref().map(|nc| &nc.chain_info),
-    )
+    )?;
+    conclude_flash(&target_device.path, view, yes)
 }
 
 fn cmd_list(include_prerelease: bool) -> Result<()> {
@@ -2220,37 +2233,239 @@ fn flash_image_linux(
     Ok(())
 }
 
-/// Re-read partition table after flashing so kernel sees new partitions
+/// Whether the running process can re-read the partition table in place, or must
+/// defer to a physical re-plug of the card.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartitionReread {
+    /// Root: attempt the re-scan via partprobe/blockdev.
+    Attempt,
+    /// Non-root: the kernel re-scan (`BLKRRPART`) needs `CAP_SYS_ADMIN`, which
+    /// disk-group access to the device node does not grant, so a re-plug is the
+    /// only unprivileged way to make the kernel adopt the new table.
+    DeferToReplug,
+}
+
+/// The re-scan needs `CAP_SYS_ADMIN`, so without root the tools can only fail;
+/// spawn them only when they can succeed, and otherwise ask for a re-plug.
+#[cfg(target_os = "linux")]
+fn partition_reread_plan(is_root: bool) -> PartitionReread {
+    if is_root {
+        PartitionReread::Attempt
+    } else {
+        PartitionReread::DeferToReplug
+    }
+}
+
+/// The host kernel's view of the card's partition table after a flash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPartitionView {
+    /// The kernel holds the newly written table (re-read succeeded, or the OS
+    /// refreshes it on its own).
+    Current,
+    /// The kernel still holds the pre-flash table; a physical re-plug is needed
+    /// before the new partitions are visible on this host.
+    Stale,
+}
+
+/// Re-read the partition table after flashing so the kernel sees the new
+/// partitions, returning whether the host view ended up current.
 ///
-/// This is needed because after dd writes a new image, the kernel's cached
-/// partition table is stale. Without this, mounting may fail.
-pub(crate) fn reread_partition_table(device: &Path) {
+/// After `dd` writes a new image the kernel's cached table is stale. Re-reading
+/// it (`BLKRRPART`, behind partprobe/blockdev) needs `CAP_SYS_ADMIN`, so a
+/// non-root run cannot refresh it in place and reports [`HostPartitionView::Stale`];
+/// the caller decides whether to drive a re-plug.
+pub(crate) fn reread_partition_table(device: &Path) -> HostPartitionView {
     #[cfg(target_os = "linux")]
     {
+        if partition_reread_plan(nix::unistd::Uid::effective().is_root())
+            == PartitionReread::DeferToReplug
+        {
+            return HostPartitionView::Stale;
+        }
+
         let dev = device.to_string_lossy();
 
-        // partprobe (parted) and blockdev --rereadpt (util-linux) can each
-        // legitimately return non-zero (e.g. EBUSY) yet the other still
-        // refreshes the table, so these are best-effort — but a failure must
-        // surface rather than vanish, since a stale table corrupts later reads.
-        utils::run_best_effort("partprobe", &[&dev], "Partition table re-read (partprobe)");
-        utils::run_best_effort(
+        // partprobe (parted) and blockdev --rereadpt (util-linux) both re-read
+        // the table; either can return non-zero (e.g. EBUSY) while the other
+        // still refreshes it, so fall back to the second only when the first
+        // does not succeed. Both live in /sbin or /usr/sbin, routinely absent
+        // from a user's PATH, so resolve them by location rather than spawning
+        // by bare name.
+        let refreshed = utils::run_resolved_best_effort(
+            "partprobe",
+            &[&dev],
+            "Partition table re-read (partprobe)",
+        ) || utils::run_resolved_best_effort(
             "blockdev",
             &["--rereadpt", &dev],
             "Partition table re-read (blockdev)",
         );
+
         utils::run_best_effort(
             "udevadm",
             &["settle", "--timeout=3"],
             "Waiting for udev to settle",
         );
+
+        if refreshed {
+            HostPartitionView::Current
+        } else {
+            // Root yet still no re-read (e.g. a busy device): surface it, since a
+            // stale table silently corrupts later host-side partition reads.
+            utils::warning(
+                "Partition table not re-read; re-plug the card before accessing \
+                 its partitions on this host.",
+            );
+            HostPartitionView::Stale
+        }
     }
 
     #[cfg(target_os = "macos")]
     {
         // macOS handles this automatically via diskutil
         let _ = device;
+        HostPartitionView::Current
     }
+}
+
+/// One partition's structural observation: whether its node exists and whether
+/// it mounts cleanly.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartitionCheck {
+    present: bool,
+    mounts: bool,
+}
+
+/// Verdict of a structural check of a freshly flashed card.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StructuralVerdict {
+    Sound,
+    Faulty(Vec<String>),
+}
+
+/// Judge a flashed card's structure from its boot (p1) and rootfs (p2) checks.
+///
+/// The image lays down exactly p1 (vfat boot) and p2 (f2fs rootfs); p3/p4 are
+/// created by the device on first boot, so this deliberately does not require
+/// them — their absence here is expected, not a fault.
+#[cfg(target_os = "linux")]
+fn evaluate_structural(boot: PartitionCheck, rootfs: PartitionCheck) -> StructuralVerdict {
+    let mut faults = Vec::new();
+    note_partition_fault(&mut faults, "boot partition (p1)", boot);
+    note_partition_fault(&mut faults, "rootfs partition (p2)", rootfs);
+    if faults.is_empty() {
+        StructuralVerdict::Sound
+    } else {
+        StructuralVerdict::Faulty(faults)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn note_partition_fault(faults: &mut Vec<String>, label: &str, check: PartitionCheck) {
+    if !check.present {
+        faults.push(format!("{label} is missing"));
+    } else if !check.mounts {
+        faults.push(format!("{label} did not mount"));
+    }
+}
+
+/// Observe one partition: whether its node exists and whether it mounts
+/// read-only. A mount failure leaves the card untouched (mounted read-only,
+/// then unmounted).
+#[cfg(target_os = "linux")]
+fn check_partition(device: &Path, part_num: u8, fs_type: &str) -> PartitionCheck {
+    let path = utils::get_partition_path(device, part_num);
+    if !path.exists() {
+        return PartitionCheck {
+            present: false,
+            mounts: false,
+        };
+    }
+    match utils::mount_partition(&path, fs_type, true) {
+        Ok(mount) => {
+            utils::warn_if_err(
+                utils::unmount_partition(&mount, &path),
+                "Failed to unmount after structural check",
+            );
+            PartitionCheck {
+                present: true,
+                mounts: true,
+            }
+        }
+        Err(_) => PartitionCheck {
+            present: true,
+            mounts: false,
+        },
+    }
+}
+
+/// Structurally verify a freshly flashed card: p1 (vfat boot) and p2 (f2fs
+/// rootfs) must be present and mount cleanly. When the host view is stale the
+/// card is re-plugged first (the kernel re-scans on re-insertion), which is how
+/// a non-root run gets the new partitions without `CAP_SYS_ADMIN`.
+fn verify_flashed_card(device: &Path, view: HostPartitionView) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        if view == HostPartitionView::Stale {
+            utils::info("Remove and re-insert the card to reveal the new partitions.");
+            restore_keys::wait_for_card_swap(device)?;
+        }
+
+        let spinner = crate::progress::create_spinner("Verifying card structure...");
+        let boot = check_partition(device, 1, "vfat");
+        let rootfs = check_partition(device, 2, "f2fs");
+        spinner.finish_and_clear();
+
+        match evaluate_structural(boot, rootfs) {
+            StructuralVerdict::Sound => utils::success(
+                "Card structure verified: boot and rootfs partitions are present and mount cleanly",
+            ),
+            StructuralVerdict::Faulty(faults) => {
+                utils::warning("Card structure check found problems:");
+                for fault in faults {
+                    println!("    - {fault}");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (device, view);
+    }
+
+    Ok(())
+}
+
+/// After a flash, offer a structural verification of the card. Declined by
+/// default and skipped under `--yes`, so it never blocks the common "insert
+/// into the Pi" path.
+fn offer_structural_verify(
+    device: &Path,
+    view: HostPartitionView,
+    auto_confirm: bool,
+) -> Result<()> {
+    if auto_confirm {
+        return Ok(());
+    }
+    let verify = inquire::Confirm::new("Verify the flashed card?")
+        .with_default(false)
+        .with_render_config(create_orange_theme())
+        .prompt()
+        .context("Failed to read verification choice")?;
+    if verify {
+        // The flash itself already succeeded and was read-back verified, so a
+        // verification hiccup (e.g. the re-plug wait timing out) is reported, not
+        // fatal.
+        utils::warn_if_err(
+            verify_flashed_card(device, view),
+            "Card verification did not complete",
+        );
+    }
+    Ok(())
 }
 
 /// Run sync with a spinner, optionally eject (macOS), then show success message
@@ -2423,6 +2638,71 @@ fn div_with_tenths(value: u64, divisor: u64) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn partition_reread_defers_to_replug_without_root() {
+        // A non-root process cannot run BLKRRPART, so it must not spawn the
+        // re-read tools — it asks for a re-plug instead.
+        assert_eq!(partition_reread_plan(false), PartitionReread::DeferToReplug);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn partition_reread_attempts_as_root() {
+        assert_eq!(partition_reread_plan(true), PartitionReread::Attempt);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ok_check() -> PartitionCheck {
+        PartitionCheck {
+            present: true,
+            mounts: true,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn structural_sound_when_boot_and_rootfs_mount() {
+        assert_eq!(
+            evaluate_structural(ok_check(), ok_check()),
+            StructuralVerdict::Sound
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn structural_faults_a_missing_boot_partition() {
+        let missing = PartitionCheck {
+            present: false,
+            mounts: false,
+        };
+        let StructuralVerdict::Faulty(faults) = evaluate_structural(missing, ok_check()) else {
+            panic!("expected a fault for a missing boot partition");
+        };
+        assert!(
+            faults
+                .iter()
+                .any(|f| f.contains("boot partition (p1) is missing"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn structural_faults_a_rootfs_that_does_not_mount() {
+        let unmountable = PartitionCheck {
+            present: true,
+            mounts: false,
+        };
+        let StructuralVerdict::Faulty(faults) = evaluate_structural(ok_check(), unmountable) else {
+            panic!("expected a fault for an unmountable rootfs");
+        };
+        assert!(
+            faults
+                .iter()
+                .any(|f| f.contains("rootfs partition (p2) did not mount"))
+        );
+    }
 
     #[test]
     fn hash_reader_prefix_hashes_only_the_requested_prefix() {

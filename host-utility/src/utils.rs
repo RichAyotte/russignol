@@ -80,9 +80,9 @@ pub fn warn_if_err<T, E: std::fmt::Display>(res: Result<T, E>, context: &str) ->
 ///
 /// For side-effecting commands (sync, partition re-read, service reload) whose
 /// failure should be reported but should not abort the caller.
-pub fn run_best_effort(program: &str, args: &[&str], context: &str) {
+pub fn run_best_effort(program: &str, args: &[&str], context: &str) -> bool {
     match Command::new(program).args(args).output() {
-        Ok(output) if output.status.success() => {}
+        Ok(output) if output.status.success() => true,
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let trimmed = stderr.trim();
@@ -94,9 +94,27 @@ pub fn run_best_effort(program: &str, args: &[&str], context: &str) {
             } else {
                 warning(&format!("{context}: {trimmed}"));
             }
+            false
         }
-        Err(e) => warning(&format!("{context}: failed to run {program}: {e}")),
+        Err(e) => {
+            warning(&format!("{context}: failed to run {program}: {e}"));
+            false
+        }
     }
+}
+
+/// Resolve `name` (PATH, then /sbin, /usr/sbin) and run it best-effort,
+/// returning whether it succeeded. Admin tools such as `partprobe` and
+/// `blockdev` live in sbin, routinely absent from a user's PATH, so spawning
+/// them by bare name spuriously fails with "not found".
+pub fn run_resolved_best_effort(name: &str, args: &[&str], context: &str) -> bool {
+    let Some(path) = resolve_tool(name) else {
+        warning(&format!(
+            "{context}: {name} not found in PATH, /sbin, or /usr/sbin"
+        ));
+        return false;
+    };
+    run_best_effort(&path.to_string_lossy(), args, context)
 }
 
 /// Create orange-themed render config for inquire prompts
@@ -789,6 +807,23 @@ mod tests {
     fn warn_if_err_reports_only_on_error() {
         assert!(!warn_if_err(Ok::<_, String>(()), "ok path"));
         assert!(warn_if_err(Err::<(), _>("boom"), "err path"));
+    }
+
+    #[test]
+    fn resolved_best_effort_runs_a_resolvable_tool() {
+        // `true` resolves on PATH and exits 0, so the run reports success.
+        assert!(run_resolved_best_effort("true", &[], "resolvable tool"));
+    }
+
+    #[test]
+    fn resolved_best_effort_reports_a_missing_tool() {
+        // A name that resolves nowhere (PATH, /sbin, /usr/sbin) fails cleanly
+        // rather than being spawned by bare name and vanishing.
+        assert!(!run_resolved_best_effort(
+            "russignol-no-such-tool-xyz",
+            &[],
+            "missing tool"
+        ));
     }
 
     #[cfg(target_os = "linux")]

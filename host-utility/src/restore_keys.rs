@@ -1105,7 +1105,7 @@ fn describe_card(device: &Path) -> String {
 /// Wait for a card swap in a card reader, expecting the **target** card.
 ///
 /// Equivalent to `wait_for_card_swap_labeled(device, "target")`.
-fn wait_for_card_swap(device: &Path) -> Result<()> {
+pub(crate) fn wait_for_card_swap(device: &Path) -> Result<()> {
     wait_for_card_swap_labeled(device, "target")
 }
 
