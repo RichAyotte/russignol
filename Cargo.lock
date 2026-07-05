@@ -3019,6 +3019,7 @@ dependencies = [
  "regex",
  "russignol-storage",
  "sha2 0.11.0",
+ "tempfile",
  "which",
 ]
 

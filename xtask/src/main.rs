@@ -1206,13 +1206,6 @@ fn build_component_artifacts(component: ReleaseComponent, mut step: usize) -> Re
         ReleaseComponent::All => {
             println!(
                 "\n{}",
-                format!("Step {step}: Build RPi Signer").cyan().bold()
-            );
-            build_rpi_signer(false)?;
-            step += 1;
-
-            println!(
-                "\n{}",
                 format!("Step {step}: Build Host Utility").cyan().bold()
             );
             cmd_host_utility(Arch::All, false, false)?;
@@ -1233,13 +1226,6 @@ fn build_component_artifacts(component: ReleaseComponent, mut step: usize) -> Re
             step += 1;
         }
         ReleaseComponent::Signer => {
-            println!(
-                "\n{}",
-                format!("Step {step}: Build RPi Signer").cyan().bold()
-            );
-            build_rpi_signer(false)?;
-            step += 1;
-
             println!(
                 "\n{}",
                 format!("Step {step}: Build SD Card Image").cyan().bold()

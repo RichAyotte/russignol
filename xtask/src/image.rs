@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use std::path::{Path, PathBuf};
 
-use crate::build::get_signer_binary_path;
+use crate::build::{build_rpi_signer, get_signer_binary_path};
 use crate::utils::{
     clear_host_compiler_flags, compress_image, copy_binary_to_rootfs, get_config_name,
     run_buildroot_make, run_cmd_in_dir,
@@ -68,17 +68,39 @@ fn validate_and_prepare_build(
         bail!("Configuration not found: {}", config_path.display());
     }
 
-    // Get binary path and copy to rootfs overlay
+    // Build the signer from current sources, then package the produced binary.
     println!("Preparing binary for image...");
-    let signer_binary = get_signer_binary_path(is_dev)?;
-    println!("  Found signer: {}", signer_binary.display());
-
     let rootfs_overlay = external_tree.join("rootfs-overlay-common");
-    copy_binary_to_rootfs(&signer_binary, "russignol-signer", &rootfs_overlay)?;
-    println!("  {} Binary copied to rootfs overlay", "✓".green());
+    let signer_binary = prepare_signer_binary(
+        is_dev,
+        &rootfs_overlay,
+        build_rpi_signer,
+        get_signer_binary_path,
+    )?;
+    println!(
+        "  {} Signer built and copied to rootfs overlay: {}",
+        "✓".green(),
+        signer_binary.display()
+    );
     println!();
 
     Ok(())
+}
+
+/// Build the signer from the current sources, then copy the produced binary
+/// into the rootfs overlay, returning its path. Building here — rather than
+/// packaging whatever binary happens to sit in `target/` — is what keeps the
+/// image from ever shipping a signer that predates the current sources.
+fn prepare_signer_binary(
+    is_dev: bool,
+    rootfs_overlay: &Path,
+    build: impl Fn(bool) -> Result<()>,
+    locate: impl Fn(bool) -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    build(is_dev)?;
+    let signer_binary = locate(is_dev)?;
+    copy_binary_to_rootfs(&signer_binary, "russignol-signer", rootfs_overlay)?;
+    Ok(signer_binary)
 }
 
 fn run_build(config_name: &str, force_clean: bool, external_tree: &Path) -> Result<()> {
@@ -586,5 +608,40 @@ mod tests {
                 .is_some()
         );
         assert!(shell_opts_mismatch(expected, "f", "nothing here").is_some());
+    }
+
+    /// The signer must be built before it is located and copied, so a binary
+    /// predating the current sources can never be packaged into the image.
+    #[test]
+    fn prepare_signer_builds_before_packaging() {
+        use std::cell::RefCell;
+
+        let calls = RefCell::new(Vec::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let built = tmp.path().join("russignol-signer");
+        std::fs::write(&built, b"fresh-binary").unwrap();
+        let overlay = tmp.path().join("overlay");
+        let built_for_locate = built.clone();
+
+        let signer = prepare_signer_binary(
+            true,
+            &overlay,
+            |_dev| {
+                calls.borrow_mut().push("build");
+                Ok(())
+            },
+            |_dev| {
+                calls.borrow_mut().push("locate");
+                Ok(built_for_locate.clone())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*calls.borrow(), vec!["build", "locate"]);
+        assert_eq!(signer, built);
+        assert_eq!(
+            std::fs::read(overlay.join("bin/russignol-signer")).unwrap(),
+            b"fresh-binary"
+        );
     }
 }

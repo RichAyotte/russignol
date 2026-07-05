@@ -25,3 +25,6 @@ regex = "1"
 chrono = "0.4.45"
 hex = "0.4.3"
 russignol-storage = { version = "0.1.0", path = "../libs/storage" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
