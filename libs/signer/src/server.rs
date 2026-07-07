@@ -447,6 +447,13 @@ impl RequestHandler {
         #[cfg(feature = "perf-trace")]
         log::info!("[PERF] Magic byte check: {:?}", t.elapsed());
 
+        // A key the signer does not hold can never be signed, and the watermark
+        // checks below would otherwise offer recovery for it. Reject it here so
+        // the missing-watermark dialog is reserved for keys we can actually sign.
+        if self.keys.read()?.get_key_name(&pkh).is_none() {
+            return Err(Error::KeyNotFound(pkh.to_b58check()));
+        }
+
         // 2. Check high watermark
         #[cfg(feature = "perf-trace")]
         let t = std::time::Instant::now();
@@ -1560,6 +1567,67 @@ mod tests {
             call_count.load(Ordering::SeqCst),
             1,
             "Missing watermark callback should fire exactly once"
+        );
+    }
+
+    #[test]
+    fn test_unknown_key_rejected_before_watermark_recovery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp_dir = TempDir::new().unwrap();
+        let (known_pkh, _pk, _sk) = generate_key(Some(&[42u8; 32])).unwrap();
+        let known_signer = Unencrypted::generate(Some(&[42u8; 32])).unwrap();
+        let (unknown_pkh, _pk2, _sk2) = generate_key(Some(&[7u8; 32])).unwrap();
+
+        let mut mgr = KeyManager::new();
+        mgr.add_signer(known_pkh, known_signer, "known".to_string());
+
+        let hwm = Arc::new(RwLock::new(
+            new_watermark(temp_dir.path(), &[known_pkh]).unwrap(),
+        ));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+
+        let handler = RequestHandler::new(
+            Arc::new(RwLock::new(mgr)),
+            Some(Arc::clone(&hwm)),
+            Some(vec![0x11, 0x12, 0x13]),
+            true,
+            true,
+        )
+        .with_watermark_missing_callback(Arc::new(move |_pkh, _chain_id, _requested| {
+            call_count_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // Block data at level 600 for a key the signer does not hold.
+        let mut data = vec![0x11];
+        data.extend_from_slice(&[0, 0, 0, 1]); // chain_id
+        data.extend_from_slice(&600u32.to_be_bytes()); // level
+        data.push(0); // proto
+        data.extend_from_slice(&[0u8; 32]); // predecessor
+        data.extend_from_slice(&[0u8; 8]); // timestamp
+        data.push(0); // validation_pass
+        data.extend_from_slice(&[0u8; 32]); // operations_hash
+        data.extend_from_slice(&8u32.to_be_bytes()); // fitness_length
+        data.extend_from_slice(&0u32.to_be_bytes()); // round
+
+        let result = handler.handle_request(SignerRequest::Sign {
+            pkh: (unknown_pkh, 0),
+            data,
+            signature: None,
+        });
+
+        // An unknown key rejects as KeyNotFound, before any watermark work.
+        assert!(
+            matches!(result.unwrap_err(), Error::KeyNotFound(_)),
+            "an unheld key must reject as KeyNotFound, not surface watermark recovery"
+        );
+        // Watermark recovery must never be offered for a key we cannot sign.
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "missing-watermark callback must not fire for an unknown key"
         );
     }
 
