@@ -98,8 +98,13 @@ pub enum KeysState {
 pub enum ChainInfoState {
     /// file absent.
     Missing,
-    /// present but invalid JSON or missing required fields.
-    Unreadable,
+    /// Present (stat succeeded) but no valid chain info could be read — either
+    /// the bytes were unreadable (wrong ownership/permissions) or the content
+    /// was invalid. `owner`/`mode` let the classifier tell the two apart.
+    Unreadable {
+        owner: Option<(u32, u32)>,
+        mode: Option<u32>,
+    },
     /// present and parseable.
     Present {
         id: String,
@@ -489,7 +494,24 @@ fn classify_chain_info(state: &CardState, node: Option<&ChainInfo>, issues: &mut
                       it signs for until it is rewritten from a node"
                 .to_string(),
         }),
-        ChainInfoState::Unreadable => issues.push(Issue {
+        ChainInfoState::Unreadable { owner, mode: _ } if !owner_ok(*owner) => {
+            // Wrong owner is why the bytes could not be read; that is the fault
+            // to name, not invalid content — the device (uid 1000) simply lacks
+            // read access. A host-direct chown makes it readable again.
+            let (u, g) = owner.unwrap_or_default();
+            issues.push(Issue {
+                kind: IssueKind::OwnershipDrift,
+                severity: Severity::Critical,
+                partition: Partition::Keys,
+                remedy: Remedy::HostDirect,
+                action: Some(RepairAction::ChownChainInfo),
+                message: format!(
+                    "chain_info.json is owned {u}:{g}, but the device runs as \
+                     {DEVICE_UID}:{DEVICE_GID} and cannot read it"
+                ),
+            });
+        }
+        ChainInfoState::Unreadable { .. } => issues.push(Issue {
             kind: IssueKind::ChainInfoUnreadable,
             severity: Severity::Critical,
             partition: Partition::Keys,
@@ -915,7 +937,7 @@ fn read_chain_info_state(mount: &Path) -> ChainInfoState {
             mode,
             owner,
         },
-        None => ChainInfoState::Unreadable,
+        None => ChainInfoState::Unreadable { owner, mode },
     }
 }
 
@@ -1597,10 +1619,30 @@ mod tests {
 
     #[test]
     fn chain_info_unreadable_is_critical() {
+        // Owned correctly but the content is invalid: a genuine content fault.
         let mut state = healthy_state();
-        state.chain_info = ChainInfoState::Unreadable;
+        state.chain_info = ChainInfoState::Unreadable {
+            owner: Some((DEVICE_UID, DEVICE_GID)),
+            mode: Some(CHAIN_INFO_MODE),
+        };
         let issues = classify(&state, Some(&node()));
         assert!(find(&issues, IssueKind::ChainInfoUnreadable).is_some());
+        assert!(find(&issues, IssueKind::OwnershipDrift).is_none());
+    }
+
+    #[test]
+    fn chain_info_unreadable_by_ownership_is_reported_as_ownership_drift() {
+        // Root-owned so the unprivileged device (uid 1000) cannot read it; the
+        // fault is ownership, not invalid content.
+        let mut state = healthy_state();
+        state.chain_info = ChainInfoState::Unreadable {
+            owner: Some((0, 0)),
+            mode: Some(CHAIN_INFO_MODE),
+        };
+        let issues = classify(&state, Some(&node()));
+        let issue = find(&issues, IssueKind::OwnershipDrift).expect("ownership-drift issue");
+        assert_eq!(issue.action, Some(RepairAction::ChownChainInfo));
+        assert!(find(&issues, IssueKind::ChainInfoUnreadable).is_none());
     }
 
     #[test]
