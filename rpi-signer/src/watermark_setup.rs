@@ -18,6 +18,11 @@ use std::process::Command;
 /// Config file name on boot partition
 const CONFIG_FILENAME: &str = "watermark-config.json";
 
+/// russignol's uid/gid on the device; the signer runs under it after the
+/// privilege drop and must be able to read what setup writes as root.
+const RUSSIGNOL_UID: u32 = 1000;
+const RUSSIGNOL_GID: u32 = 1000;
+
 /// Watermark config file structure (matches host-utility output)
 ///
 /// Note: This config does NOT include the PKH. The device reads its own
@@ -190,8 +195,14 @@ fn save_chain_info(config: &WatermarkConfig) -> Result<(), String> {
 
     fs::write(CHAIN_INFO_FILE, json).map_err(|e| format!("Failed to write chain info: {e}"))?;
 
-    // Set read-only permissions (we already own the file as russignol)
+    // This runs as root before the privilege drop; the signer later reads the
+    // file as russignol (uid 1000). The staged-config recovery path has no
+    // later chown step, so the writer must give russignol ownership itself
+    // rather than rely on one — otherwise the file stays root-owned and the
+    // signer cannot read the chain id it binds watermarks to.
     let path = Path::new(CHAIN_INFO_FILE);
+    std::os::unix::fs::chown(path, Some(RUSSIGNOL_UID), Some(RUSSIGNOL_GID))
+        .map_err(|e| format!("Failed to set chain info owner: {e}"))?;
     let mut perms = fs::metadata(path)
         .map_err(|e| format!("Failed to get chain info metadata: {e}"))?
         .permissions();
