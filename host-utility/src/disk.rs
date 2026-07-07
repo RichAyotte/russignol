@@ -756,9 +756,27 @@ struct DataPartitionState {
     panic_log_size: Option<u64>,
 }
 
-fn host_f2fs_capable() -> bool {
+/// Whether f2fs is registered in the running kernel right now, read from
+/// `/proc/filesystems`. Meaningful only *after* a mount attempt: the mount
+/// syscall autoloads the module on demand, so f2fs still absent once a mount has
+/// failed means the kernel has no f2fs to offer, while its presence means the
+/// module loaded and the failure lies with the partition, not the host.
+fn f2fs_registered() -> bool {
     std::fs::read_to_string("/proc/filesystems")
         .is_ok_and(|contents| proc_filesystems_has_f2fs(&contents))
+}
+
+/// Classify a failed keys-partition mount into [`Inspection::NotCapable`] (the
+/// kernel has no f2fs support) or [`Inspection::Failed`] (f2fs is available but
+/// this card's partition could not be mounted). The mount attempt has already
+/// forced the on-demand autoload, so `f2fs_registered` is an accurate signal by
+/// the time this is consulted.
+fn inspection_from_failed_mount(f2fs_registered: bool) -> Inspection {
+    if f2fs_registered {
+        Inspection::Failed
+    } else {
+        Inspection::NotCapable
+    }
 }
 
 /// Placeholder state used when the f2fs partitions cannot be read; only
@@ -782,15 +800,16 @@ fn gather_card_state(device: &Path) -> CardState {
     utils::ensure_mount_capability();
     let boot_config = gather_boot_config(device);
 
-    if !host_f2fs_capable() {
-        return uninspected_state(Inspection::NotCapable, boot_config);
-    }
-
+    // Attempt the mount instead of pre-checking /proc/filesystems: the mount
+    // syscall autoloads f2fs on demand, so a pre-check would false-negative a
+    // kernel whose f2fs module is merely unloaded. Only if the attempt fails do
+    // we read the now-post-autoload registration to phrase the failure.
     let keys_part = match gather_keys_partition(device) {
         Ok(state) => state,
         Err(e) => {
             warning(&format!("{e:#}"));
-            return uninspected_state(Inspection::Failed, boot_config);
+            let inspection = inspection_from_failed_mount(f2fs_registered());
+            return uninspected_state(inspection, boot_config);
         }
     };
 
@@ -799,6 +818,8 @@ fn gather_card_state(device: &Path) -> CardState {
         _ => Vec::new(),
     };
 
+    // p3 mounted, so f2fs is available on this host; a p4 failure is a genuine
+    // mount/read fault, never a capability gap.
     let data_part = match gather_data_partition(device, &pkhs) {
         Ok(state) => state,
         Err(e) => {
@@ -1386,6 +1407,20 @@ mod tests {
         // real f2fs line must be matched on the whole field, not a substring.
         let contents = "nodev\txf2fsy\n\text4\n";
         assert!(!proc_filesystems_has_f2fs(contents));
+    }
+
+    #[test]
+    fn failed_mount_with_f2fs_registered_is_a_mount_failure() {
+        // f2fs registered after the attempt means its module loaded, so the
+        // mount failed on the partition itself — not host capability.
+        assert_eq!(inspection_from_failed_mount(true), Inspection::Failed);
+    }
+
+    #[test]
+    fn failed_mount_without_f2fs_is_not_capable() {
+        // The mount attempt autoloads f2fs on demand; still unregistered
+        // afterward means the kernel has no f2fs module to offer.
+        assert_eq!(inspection_from_failed_mount(false), Inspection::NotCapable);
     }
 
     // -- classifier ---------------------------------------------------------
