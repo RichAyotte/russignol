@@ -33,32 +33,6 @@ pub fn decode(buf: &[u8; FILE_SIZE]) -> Option<(u32, u32)> {
     Some((level, round))
 }
 
-/// Resolve what to write for a watermark slot given existing data and a minimum level.
-///
-/// - Existing data at or above `min_level`: preserved unchanged
-/// - Existing data below `min_level`, corrupt, or wrong size: replaced with `encode(min_level, 0)`
-/// - No existing data with a `min_level`: fresh `encode(min_level, 0)`
-/// - No existing data and no minimum: `None` (nothing to write)
-#[must_use]
-pub fn effective_watermark(data: Option<&[u8]>, min_level: Option<u32>) -> Option<Vec<u8>> {
-    match (data, min_level) {
-        (Some(bytes), Some(min)) => {
-            let level = bytes
-                .try_into()
-                .ok()
-                .and_then(|buf: &[u8; FILE_SIZE]| decode(buf))
-                .map(|(l, _)| l);
-            match level {
-                Some(l) if l >= min => Some(bytes.to_vec()),
-                _ => Some(encode(min, 0).to_vec()),
-            }
-        }
-        (Some(bytes), None) => Some(bytes.to_vec()),
-        (None, Some(min)) => Some(encode(min, 0).to_vec()),
-        (None, None) => None,
-    }
-}
-
 /// Size of an authenticated watermark file: the 40-byte record plus a 32-byte
 /// keyed MAC.
 pub const AUTH_FILE_SIZE: usize = FILE_SIZE + 32;
@@ -190,55 +164,5 @@ mod tests {
         let mut buf = encode(100, 5);
         buf[39] ^= 0xFF;
         assert!(decode(&buf).is_none(), "Bad hash should be rejected");
-    }
-
-    #[test]
-    fn effective_watermark_preserves_data_above_min() {
-        let data = encode(200_000, 5).to_vec();
-        let result = effective_watermark(Some(&data), Some(100_000));
-        assert_eq!(result.as_ref().unwrap().as_slice(), data.as_slice());
-    }
-
-    #[test]
-    fn effective_watermark_replaces_data_below_min() {
-        let data = encode(100_000, 5).to_vec();
-        let result = effective_watermark(Some(&data), Some(200_000)).unwrap();
-        let buf: &[u8; FILE_SIZE] = result.as_slice().try_into().unwrap();
-        assert_eq!(decode(buf), Some((200_000, 0)));
-    }
-
-    #[test]
-    fn effective_watermark_creates_from_min_when_missing() {
-        let result = effective_watermark(None, Some(150_000)).unwrap();
-        let buf: &[u8; FILE_SIZE] = result.as_slice().try_into().unwrap();
-        assert_eq!(decode(buf), Some((150_000, 0)));
-    }
-
-    #[test]
-    fn effective_watermark_none_when_both_absent() {
-        assert!(effective_watermark(None, None).is_none());
-    }
-
-    #[test]
-    fn effective_watermark_replaces_corrupt_data() {
-        let mut data = encode(100_000, 0).to_vec();
-        data[39] ^= 0xFF;
-        let result = effective_watermark(Some(&data), Some(150_000)).unwrap();
-        let buf: &[u8; FILE_SIZE] = result.as_slice().try_into().unwrap();
-        assert_eq!(decode(buf), Some((150_000, 0)));
-    }
-
-    #[test]
-    fn effective_watermark_replaces_wrong_size_data() {
-        let result = effective_watermark(Some(&[1, 2, 3]), Some(150_000)).unwrap();
-        let buf: &[u8; FILE_SIZE] = result.as_slice().try_into().unwrap();
-        assert_eq!(decode(buf), Some((150_000, 0)));
-    }
-
-    #[test]
-    fn effective_watermark_passes_through_without_min() {
-        let data = encode(100_000, 5).to_vec();
-        let result = effective_watermark(Some(&data), None);
-        assert_eq!(result.as_ref().unwrap().as_slice(), data.as_slice());
     }
 }

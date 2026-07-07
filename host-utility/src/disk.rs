@@ -232,9 +232,6 @@ pub enum IssueKind {
 /// planned repair rather than re-deriving one from the card state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepairAction {
-    /// Rewrite the full watermark set for a key at `level`, then restore
-    /// `1000:1000` ownership. `level` never lowers an existing valid floor.
-    WriteWatermarks { pkh: String, level: u32 },
     /// Restore `1000:1000` ownership on a key's watermark directory.
     ChownWatermarks { pkh: String },
     /// Rewrite `chain_info.json` from the node (content, mode, owner).
@@ -273,19 +270,6 @@ fn node_backed_remedy(node: Option<&ChainInfo>) -> Remedy {
     } else {
         Remedy::NeedsNode
     }
-}
-
-/// The level to rewrite a key's watermark set at: the node head raised to any
-/// existing valid floor the key still has, so a valid higher floor is never
-/// lowered (slashing guard). Called only when a node is present.
-fn repair_level_for_key(key: &KeyWatermarks, node_level: u32) -> u32 {
-    key.files
-        .iter()
-        .filter_map(|f| match f.status {
-            WatermarkFileStatus::Valid { level } => Some(level),
-            _ => None,
-        })
-        .fold(node_level, u32::max)
 }
 
 fn owner_ok(owner: Option<(u32, u32)>) -> bool {
@@ -599,20 +583,23 @@ fn classify_key_watermarks(
     issues: &mut Vec<Issue>,
     any_valid: &mut bool,
 ) {
-    let remedy = node_backed_remedy(node);
-    // Every watermark-content fault for this key is repaired by the same
-    // rewrite-the-set action, at a level that never lowers a valid floor.
-    let write_action = node.map(|n| RepairAction::WriteWatermarks {
-        pkh: key.pkh.clone(),
-        level: repair_level_for_key(key, n.level),
-    });
+    // The host cannot produce an authenticated mark, so a watermark-content
+    // fault is repaired by staging a boot config the PIN-unlocked device applies
+    // (never-lower) on its next boot. Without a node there is nothing to stage,
+    // so the fault is reported for the device to recover at signing time.
+    let remedy = if node.is_some() {
+        Remedy::FatStage
+    } else {
+        Remedy::NeedsNode
+    };
+    let stage_action = node.map(|n| RepairAction::StageBootConfig(n.clone()));
     if !key.dir_present {
         issues.push(Issue {
             kind: IssueKind::WatermarkDirMissing,
             severity: Severity::Critical,
             partition: Partition::Data,
             remedy,
-            action: write_action,
+            action: stage_action,
             message: format!("the watermark directory for key {} is missing", key.pkh),
         });
         return;
@@ -630,7 +617,7 @@ fn classify_key_watermarks(
                 severity: Severity::Critical,
                 partition: Partition::Data,
                 remedy,
-                action: write_action.clone(),
+                action: stage_action.clone(),
                 message: format!(
                     "watermark file {} for key {} is missing",
                     file.name, key.pkh
@@ -641,7 +628,7 @@ fn classify_key_watermarks(
                 severity: Severity::Critical,
                 partition: Partition::Data,
                 remedy,
-                action: write_action.clone(),
+                action: stage_action.clone(),
                 message: format!(
                     "watermark file {} for key {} failed to decode",
                     file.name, key.pkh
@@ -662,7 +649,7 @@ fn classify_key_watermarks(
             severity: Severity::Warning,
             partition: Partition::Data,
             remedy,
-            action: write_action.clone(),
+            action: stage_action.clone(),
             message: format!(
                 "the watermark floor for key {} is level {level}, more than \
                  {LARGE_GAP_CYCLES} cycles behind the node head {}",
@@ -725,18 +712,12 @@ fn classify_logs(state: &CardState, issues: &mut Vec<Issue>) {
 ///
 /// Consumes the `action` each issue carries — the executor never re-derives a
 /// fix from the card state. Drops actions superseded by a broader one on the
-/// same target (a full rewrite already restores ownership and mode) and dedups
-/// identical actions (one key's several watermark faults share one rewrite).
+/// same target (a full `chain_info` rewrite already restores its mode and owner;
+/// a staged boot config supersedes deleting one) and dedups identical actions
+/// (one key's several watermark faults share one staged config).
 pub fn plan_repairs(issues: &[Issue]) -> Vec<RepairAction> {
     let actions: Vec<RepairAction> = issues.iter().filter_map(|i| i.action.clone()).collect();
 
-    let rewritten_keys: std::collections::HashSet<String> = actions
-        .iter()
-        .filter_map(|a| match a {
-            RepairAction::WriteWatermarks { pkh, .. } => Some(pkh.clone()),
-            _ => None,
-        })
-        .collect();
     let rewrites_chain_info = actions.contains(&RepairAction::WriteChainInfo);
     let stages_boot_config = actions
         .iter()
@@ -745,7 +726,6 @@ pub fn plan_repairs(issues: &[Issue]) -> Vec<RepairAction> {
     let mut planned: Vec<RepairAction> = Vec::new();
     for action in actions {
         let superseded = match &action {
-            RepairAction::ChownWatermarks { pkh } => rewritten_keys.contains(pkh),
             RepairAction::ChmodChainInfo | RepairAction::ChownChainInfo => rewrites_chain_info,
             RepairAction::DeleteBootConfig => stages_boot_config,
             _ => false,
@@ -967,18 +947,29 @@ fn read_key_watermarks(wm_dir: &Path, pkh: &str) -> KeyWatermarks {
     }
 }
 
+/// Classify a watermark file's bytes by its shared 40-byte prefix (level, round,
+/// BLAKE3 checksum), which the authenticated 72-byte record and the legacy
+/// 40-byte record carry identically. The host holds no MAC key, so it reports
+/// the level and corruption only; authenticity is confirmed on the device.
+fn decode_watermark_prefix(bytes: &[u8]) -> WatermarkFileStatus {
+    if bytes.len() != watermark::FILE_SIZE && bytes.len() != watermark::AUTH_FILE_SIZE {
+        return WatermarkFileStatus::WrongSize;
+    }
+    let prefix: [u8; watermark::FILE_SIZE] = bytes[..watermark::FILE_SIZE]
+        .try_into()
+        .expect("checked length covers the prefix");
+    match watermark::decode(&prefix) {
+        Some((level, _)) => WatermarkFileStatus::Valid { level },
+        None => WatermarkFileStatus::Corrupt,
+    }
+}
+
 fn read_watermark_file(key_dir: &Path, name: &str) -> WatermarkFile {
     let path = key_dir.join(name);
     let owner = std::fs::metadata(&path).ok().map(|m| (m.uid(), m.gid()));
     let status = match std::fs::read(&path) {
         Err(_) => WatermarkFileStatus::Missing,
-        Ok(bytes) => match <[u8; watermark::FILE_SIZE]>::try_from(bytes.as_slice()) {
-            Err(_) => WatermarkFileStatus::WrongSize,
-            Ok(buf) => match watermark::decode(&buf) {
-                Some((level, _)) => WatermarkFileStatus::Valid { level },
-                None => WatermarkFileStatus::Corrupt,
-            },
-        },
+        Ok(bytes) => decode_watermark_prefix(&bytes),
     };
     WatermarkFile {
         name: name.to_string(),
@@ -1085,9 +1076,7 @@ fn remedy_tag(remedy: Remedy) -> colored::ColoredString {
 /// The partition a repair touches, so the executor mounts each one once.
 fn action_partition(action: &RepairAction) -> Partition {
     match action {
-        RepairAction::WriteWatermarks { .. }
-        | RepairAction::ChownWatermarks { .. }
-        | RepairAction::TruncatePanicLog => Partition::Data,
+        RepairAction::ChownWatermarks { .. } | RepairAction::TruncatePanicLog => Partition::Data,
         RepairAction::WriteChainInfo
         | RepairAction::ChmodChainInfo
         | RepairAction::ChownChainInfo => Partition::Keys,
@@ -1098,9 +1087,6 @@ fn action_partition(action: &RepairAction) -> Partition {
 /// One-line human description of a repair, for the confirmation prompt.
 fn describe_action(action: &RepairAction) -> String {
     match action {
-        RepairAction::WriteWatermarks { pkh, level } => {
-            format!("rewrite the watermark set for {pkh} at level {level}")
-        }
         RepairAction::ChownWatermarks { pkh } => {
             format!("restore {DEVICE_UID}:{DEVICE_GID} ownership of the watermarks for {pkh}")
         }
@@ -1261,12 +1247,6 @@ fn apply_on_partition(
 
 fn apply_action(mount: &Path, node: Option<&ChainInfo>, action: &RepairAction) -> Result<()> {
     match action {
-        RepairAction::WriteWatermarks { pkh, level } => {
-            let key_dir = mount.join("watermarks").join(pkh);
-            card_fs::write_watermark_file_set(&key_dir, *level)?;
-            ensure_device_owned(&key_dir, true)?;
-            success(&format!("Rewrote watermarks for {pkh} at level {level}"));
-        }
         RepairAction::ChownWatermarks { pkh } => {
             let key_dir = mount.join("watermarks").join(pkh);
             ensure_device_owned(&key_dir, true)?;
@@ -1489,14 +1469,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_watermark_dir_is_critical_and_host_direct_with_node() {
+    fn missing_watermark_dir_is_critical_and_fat_stage_with_node() {
         let mut state = healthy_state();
         state.watermarks[0].dir_present = false;
         let issues = classify(&state, Some(&node()));
         let issue = find(&issues, IssueKind::WatermarkDirMissing).expect("dir-missing issue");
         assert_eq!(issue.severity, Severity::Critical);
         assert_eq!(issue.partition, Partition::Data);
-        assert_eq!(issue.remedy, Remedy::HostDirect);
+        assert_eq!(issue.remedy, Remedy::FatStage);
+        assert_eq!(issue.action, Some(RepairAction::StageBootConfig(node())));
     }
 
     #[test]
@@ -1545,7 +1526,7 @@ mod tests {
         let issues = classify(&healthy_state(), Some(&n));
         let issue = find(&issues, IssueKind::WatermarkBelowHead).expect("below-head issue");
         assert_eq!(issue.severity, Severity::Warning);
-        assert_eq!(issue.remedy, Remedy::HostDirect);
+        assert_eq!(issue.remedy, Remedy::FatStage);
     }
 
     #[test]
@@ -1802,109 +1783,108 @@ mod tests {
         assert_eq!(issue.partition, Partition::Data);
     }
 
-    // -- repair planning ----------------------------------------------------
-
-    fn wm_file(status: WatermarkFileStatus) -> WatermarkFile {
-        WatermarkFile {
-            name: "block_watermark".to_string(),
-            status,
-            owner: Some((DEVICE_UID, DEVICE_GID)),
-        }
-    }
-
     #[test]
-    fn repair_level_never_lowers_a_valid_floor() {
-        let key = KeyWatermarks {
-            pkh: CONSENSUS_PKH.to_string(),
-            dir_present: true,
-            dir_owner: Some((DEVICE_UID, DEVICE_GID)),
-            files: vec![
-                wm_file(WatermarkFileStatus::Valid { level: 2_000 }),
-                wm_file(WatermarkFileStatus::Corrupt),
-            ],
-        };
-        // Node head below the surviving valid floor: keep the floor.
-        assert_eq!(repair_level_for_key(&key, 1_000), 2_000);
-        // Node head above the floor: raise to the head.
-        assert_eq!(repair_level_for_key(&key, 3_000), 3_000);
-    }
-
-    #[test]
-    fn repair_level_uses_node_head_when_no_valid_floor_survives() {
-        let key = KeyWatermarks {
-            pkh: CONSENSUS_PKH.to_string(),
-            dir_present: true,
-            dir_owner: Some((DEVICE_UID, DEVICE_GID)),
-            files: vec![wm_file(WatermarkFileStatus::Missing)],
-        };
-        assert_eq!(repair_level_for_key(&key, 1_234), 1_234);
-    }
-
-    #[test]
-    fn corrupt_sibling_rewrites_at_the_surviving_higher_floor() {
-        // Slashing guard end to end: one file corrupt, its siblings valid at
-        // 2_000, node head 1_000 — the rewrite must use 2_000, never the head.
-        let mut state = healthy_state();
-        for f in &mut state.watermarks[0].files {
-            f.status = WatermarkFileStatus::Valid { level: 2_000 };
-        }
-        state.watermarks[0].files[0].status = WatermarkFileStatus::Corrupt;
-        let mut n = node();
-        n.level = 1_000;
-        let plan = plan_repairs(&classify(&state, Some(&n)));
-        assert!(plan.contains(&RepairAction::WriteWatermarks {
-            pkh: CONSENSUS_PKH.to_string(),
-            level: 2_000,
-        }));
-    }
-
-    #[test]
-    fn below_head_rewrite_targets_the_node_head() {
-        let mut n = node();
-        n.level = 500_000; // both keys' 1_000 floors are well beyond 4 cycles behind
-        let plan = plan_repairs(&classify(&healthy_state(), Some(&n)));
-        assert!(plan.contains(&RepairAction::WriteWatermarks {
-            pkh: CONSENSUS_PKH.to_string(),
-            level: 500_000,
-        }));
-    }
-
-    #[test]
-    fn plan_dedups_watermark_rewrite_for_one_key() {
-        let mut state = healthy_state();
-        state.watermarks[0].files[0].status = WatermarkFileStatus::Missing;
-        state.watermarks[0].files[1].status = WatermarkFileStatus::Corrupt;
-        let plan = plan_repairs(&classify(&state, Some(&node())));
-        let writes = plan
-            .iter()
-            .filter(
-                |a| matches!(a, RepairAction::WriteWatermarks { pkh, .. } if pkh == CONSENSUS_PKH),
-            )
-            .count();
-        assert_eq!(writes, 1, "expected one rewrite for the key, got {plan:?}");
-    }
-
-    #[test]
-    fn plan_write_supersedes_chown_for_the_same_key() {
-        let mut state = healthy_state();
-        state.watermarks[0].files[0].status = WatermarkFileStatus::Corrupt;
-        state.watermarks[0].files[1].owner = Some((0, 0));
-        let plan = plan_repairs(&classify(&state, Some(&node())));
-        assert!(plan.iter().any(
-            |a| matches!(a, RepairAction::WriteWatermarks { pkh, .. } if pkh == CONSENSUS_PKH)
-        ));
-        assert!(
-            !plan.iter().any(
-                |a| matches!(a, RepairAction::ChownWatermarks { pkh } if pkh == CONSENSUS_PKH)
-            ),
-            "the rewrite already restores ownership: {plan:?}"
+    fn decode_prefix_accepts_authenticated_72_byte_record() {
+        let buf = watermark::encode_authenticated(&[0u8; 32], b"", 4242, 0);
+        assert_eq!(
+            decode_watermark_prefix(&buf),
+            WatermarkFileStatus::Valid { level: 4242 }
         );
     }
 
     #[test]
-    fn plan_keeps_chown_for_a_key_without_a_rewrite() {
+    fn decode_prefix_accepts_legacy_40_byte_record() {
+        let buf = watermark::encode(4242, 0);
+        assert_eq!(
+            decode_watermark_prefix(&buf),
+            WatermarkFileStatus::Valid { level: 4242 }
+        );
+    }
+
+    #[test]
+    fn decode_prefix_rejects_an_unexpected_size() {
+        assert_eq!(
+            decode_watermark_prefix(&[0u8; 8]),
+            WatermarkFileStatus::WrongSize
+        );
+    }
+
+    #[test]
+    fn decode_prefix_flags_a_bad_checksum() {
+        let mut buf = watermark::encode_authenticated(&[0u8; 32], b"", 4242, 0);
+        buf[39] ^= 0xFF; // corrupt the BLAKE3 prefix checksum
+        assert_eq!(decode_watermark_prefix(&buf), WatermarkFileStatus::Corrupt);
+    }
+
+    // -- repair planning ----------------------------------------------------
+
+    #[test]
+    fn corrupt_watermark_stages_a_boot_config() {
+        // The host cannot author an authenticated mark, so a content fault is
+        // repaired by staging a boot config; the device applies the never-lower
+        // floor itself on its next boot.
         let mut state = healthy_state();
-        state.watermarks[0].files[0].status = WatermarkFileStatus::Corrupt; // key0 rewrite
+        state.watermarks[0].files[0].status = WatermarkFileStatus::Corrupt;
+        let plan = plan_repairs(&classify(&state, Some(&node())));
+        assert!(plan.contains(&RepairAction::StageBootConfig(node())));
+    }
+
+    #[test]
+    fn below_head_floor_stages_a_boot_config() {
+        let mut n = node();
+        n.level = 500_000; // both keys' 1_000 floors are well beyond 4 cycles behind
+        let plan = plan_repairs(&classify(&healthy_state(), Some(&n)));
+        assert!(plan.contains(&RepairAction::StageBootConfig(n)));
+    }
+
+    #[test]
+    fn watermark_fault_without_a_node_is_report_only() {
+        // No node to source a floor from: the fault is reported with no action;
+        // the device re-establishes the floor at signing time.
+        let mut state = healthy_state();
+        state.watermarks[0].files[0].status = WatermarkFileStatus::Corrupt;
+        let issues = classify(&state, None);
+        let issue = find(&issues, IssueKind::WatermarkCorrupt).expect("corrupt issue");
+        assert_eq!(issue.remedy, Remedy::NeedsNode);
+        assert!(issue.action.is_none());
+    }
+
+    #[test]
+    fn plan_dedups_boot_config_stage_across_faults() {
+        // Several watermark faults across keys collapse to a single staged config.
+        let mut state = healthy_state();
+        state.watermarks[0].files[0].status = WatermarkFileStatus::Missing;
+        state.watermarks[0].files[1].status = WatermarkFileStatus::Corrupt;
+        state.watermarks[1].files[0].status = WatermarkFileStatus::Corrupt;
+        let plan = plan_repairs(&classify(&state, Some(&node())));
+        let stages = plan
+            .iter()
+            .filter(|a| matches!(a, RepairAction::StageBootConfig(_)))
+            .count();
+        assert_eq!(stages, 1, "expected one staged config, got {plan:?}");
+    }
+
+    #[test]
+    fn plan_keeps_chown_alongside_a_staged_config() {
+        // A content fault stages a boot config; an independent ownership drift on
+        // the same key is still repaired in place. The two coexist.
+        let mut state = healthy_state();
+        state.watermarks[0].files[0].status = WatermarkFileStatus::Corrupt;
+        state.watermarks[0].files[1].owner = Some((0, 0));
+        let plan = plan_repairs(&classify(&state, Some(&node())));
+        assert!(plan.contains(&RepairAction::StageBootConfig(node())));
+        assert!(
+            plan.iter().any(
+                |a| matches!(a, RepairAction::ChownWatermarks { pkh } if pkh == CONSENSUS_PKH)
+            ),
+            "ownership drift is repaired independently of staging: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn plan_keeps_chown_for_a_key_with_only_ownership_drift() {
+        let mut state = healthy_state();
+        state.watermarks[0].files[0].status = WatermarkFileStatus::Corrupt; // key0 stages a config
         state.watermarks[1].files[0].owner = Some((0, 0)); // key1 chown only
         let plan = plan_repairs(&classify(&state, Some(&node())));
         assert!(

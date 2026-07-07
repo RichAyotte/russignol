@@ -4,7 +4,7 @@
 //! on the host. The `SourceBackup` struct derives `ZeroizeOnDrop` for defense-in-depth
 //! erasure of already-encrypted data.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use std::fs;
 use std::io::Write;
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use russignol_storage::{self, F2FS_FORMAT_FEATURES, MIN_ALIGNMENT, SECTOR_SIZE, watermark};
+use russignol_storage::{self, F2FS_FORMAT_FEATURES, MIN_ALIGNMENT, SECTOR_SIZE};
 
 use crate::card_fs;
 use crate::device_access::{self, FlashPrivilege};
@@ -577,17 +577,16 @@ fn reclaim_mount_ownership(mount: &Path, privilege: FlashPrivilege) -> Result<()
 
 /// Write backup data to target device partitions
 ///
-/// Chain info and watermarks are derived from the node, not the source card.
-/// Watermark directories are created for each key found in `public_key_hashs`.
+/// Chain info is derived from the node, not the source card. The watermark floor
+/// is not written here: a boot config is staged at the node level and the device
+/// authenticates the floor itself on its next boot.
 pub fn write_backup_to_target(
     device: &Path,
     backup: &SourceBackup,
-    keys: &[NamedKey],
     chain_info: &crate::watermark::ChainInfo,
     privilege: FlashPrivilege,
 ) -> Result<()> {
     let p3_path = get_partition_path(device, 3);
-    let p4_path = get_partition_path(device, 4);
 
     // Mount keys partition (p3) read-write
     utils::info("Writing keys to target...");
@@ -620,32 +619,13 @@ pub fn write_backup_to_target(
     }
     utils::unmount_partition(&p3_mount, &p3_path)?;
 
-    // Mount data partition (p4) read-write
-    utils::info("Writing watermarks to target...");
-    let p4_mount = utils::mount_partition(&p4_path, "f2fs", false)
-        .context("Failed to mount target data partition")?;
-    reclaim_mount_ownership(&p4_mount, privilege)?;
-
-    let p4_result = (|| {
-        let watermarks_dir = p4_mount.join("watermarks");
-        for key in keys {
-            let key_dir = watermarks_dir.join(&key.address);
-            card_fs::write_watermark_file_set(&key_dir, chain_info.level)
-                .with_context(|| format!("Failed to seed watermarks for {}", key.address))?;
-        }
-        Ok(())
-    })();
-
-    // Always sync and unmount p4, even on write error
-    utils::run_best_effort("sync", &[], "Syncing data partition");
-    if let Err(e) = p4_result {
-        utils::warn_if_err(
-            utils::unmount_partition(&p4_mount, &p4_path),
-            "Failed to unmount data partition after a write error",
-        );
-        return Err(e);
-    }
-    utils::unmount_partition(&p4_mount, &p4_path)?;
+    // The host cannot produce an authenticated watermark, so instead of seeding
+    // marks on the data partition it stages a boot config at the node level. The
+    // device establishes the authenticated floor (never-lower) on its first
+    // unlock, using the `.setup_complete` normal-boot recovery path.
+    utils::info("Staging watermark config for the device...");
+    crate::watermark::write_watermark_config(device, chain_info)
+        .context("Failed to stage watermark-config.json on the boot partition")?;
 
     Ok(())
 }
@@ -698,30 +678,10 @@ fn verify_keys_partition(keys_mount: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Assert the target data partition (p4) has a valid watermark set for every key.
-fn verify_watermarks_partition(data_mount: &Path, addresses: &[String]) -> Result<()> {
-    let wm_dir = data_mount.join("watermarks");
-    for addr in addresses {
-        let key_dir = wm_dir.join(addr);
-        for filename in &watermark::FILENAMES {
-            let bytes = fs::read(key_dir.join(filename))
-                .with_context(|| format!("missing watermark {filename} for {addr}"))?;
-            let buf: [u8; watermark::FILE_SIZE] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow!("watermark {filename} for {addr} has wrong size"))?;
-            if watermark::decode(&buf).is_none() {
-                bail!("watermark {filename} for {addr} failed to decode");
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Re-mount the freshly written partitions read-only and confirm the flash
 /// produced a bootable card. Cheap insurance against a silently truncated or
 /// mis-formatted write before the user walks the card to the device.
-fn verify_target(device: &Path, keys: &[NamedKey]) -> Result<()> {
+fn verify_target(device: &Path) -> Result<()> {
     utils::info("Verifying flashed card...");
 
     let p3_path = get_partition_path(device, 3);
@@ -731,13 +691,10 @@ fn verify_target(device: &Path, keys: &[NamedKey]) -> Result<()> {
     utils::unmount_partition(&p3_mount, &p3_path)?;
     keys_result?;
 
-    let addresses: Vec<String> = keys.iter().map(|k| k.address.clone()).collect();
-    let p4_path = get_partition_path(device, 4);
-    let p4_mount = utils::mount_partition(&p4_path, "f2fs", true)
-        .context("failed to mount target data partition for verification")?;
-    let wm_result = verify_watermarks_partition(&p4_mount, &addresses);
-    utils::unmount_partition(&p4_mount, &p4_path)?;
-    wm_result?;
+    // The floor is not on the card yet; confirm the staged boot config the
+    // device applies on its first boot is present and well-formed.
+    crate::watermark::read_back_and_verify(device)
+        .context("staged watermark-config.json failed verification")?;
 
     utils::success("Flashed card verified");
     Ok(())
@@ -1325,18 +1282,12 @@ pub fn run_single_reader_restore(
     image::reread_partition_table(restore_from);
 
     create_and_format_partitions(restore_from, privilege)?;
-    write_backup_to_target(
-        restore_from,
-        &backup,
-        &named_keys,
-        job.chain_info,
-        privilege,
-    )?;
+    write_backup_to_target(restore_from, &backup, job.chain_info, privilege)?;
 
     image::write_flash_manifest(restore_from, job.metadata)
         .context("Failed to write flash manifest")?;
 
-    verify_target(restore_from, &named_keys)?;
+    verify_target(restore_from)?;
 
     print_restore_success(source.noun());
     Ok(())
@@ -1370,12 +1321,12 @@ pub fn run_dual_reader_restore(
 
     // Step 2: Create partitions and write backup
     create_and_format_partitions(&target.path, privilege)?;
-    write_backup_to_target(&target.path, backup, &named_keys, job.chain_info, privilege)?;
+    write_backup_to_target(&target.path, backup, job.chain_info, privilege)?;
 
     image::write_flash_manifest(&target.path, job.metadata)
         .context("Failed to write flash manifest")?;
 
-    verify_target(&target.path, &named_keys)?;
+    verify_target(&target.path)?;
 
     print_restore_success(noun);
     Ok(())
@@ -1482,47 +1433,6 @@ mod tests {
         )
         .unwrap();
         assert!(verify_keys_partition(dir.path()).is_err());
-    }
-
-    fn write_valid_watermarks(root: &Path, addr: &str) {
-        let key_dir = root.join("watermarks").join(addr);
-        fs::create_dir_all(&key_dir).unwrap();
-        let buf = watermark::encode(100, 0);
-        for f in &watermark::FILENAMES {
-            fs::write(key_dir.join(f), buf).unwrap();
-        }
-    }
-
-    #[test]
-    fn verify_watermarks_partition_accepts_valid_set() {
-        let dir = tempfile::tempdir().unwrap();
-        write_valid_watermarks(dir.path(), "tz4Example");
-        assert!(verify_watermarks_partition(dir.path(), &["tz4Example".into()]).is_ok());
-    }
-
-    #[test]
-    fn verify_watermarks_partition_rejects_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        write_valid_watermarks(dir.path(), "tz4Example");
-        fs::remove_file(
-            dir.path()
-                .join("watermarks")
-                .join("tz4Example")
-                .join(watermark::FILENAMES[1]),
-        )
-        .unwrap();
-        assert!(verify_watermarks_partition(dir.path(), &["tz4Example".into()]).is_err());
-    }
-
-    #[test]
-    fn verify_watermarks_partition_rejects_wrong_size() {
-        let dir = tempfile::tempdir().unwrap();
-        let key_dir = dir.path().join("watermarks").join("tz4Example");
-        fs::create_dir_all(&key_dir).unwrap();
-        for f in &watermark::FILENAMES {
-            fs::write(key_dir.join(f), b"short").unwrap();
-        }
-        assert!(verify_watermarks_partition(dir.path(), &["tz4Example".into()]).is_err());
     }
 
     #[test]

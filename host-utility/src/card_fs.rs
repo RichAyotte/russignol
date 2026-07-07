@@ -1,17 +1,17 @@
-//! Shared writers for the device-owned files a signer card must carry.
+//! Shared writers for the device-owned files a host may write onto a signer card.
 //!
-//! The device reads `chain_info.json` and the per-key watermark files, so a host
-//! that writes them (restoring a card, or repairing one with `disk doctor`) must
-//! produce byte- and mode-identical artifacts. Both callers route through these
-//! helpers so the encoding, JSON shape, and permissions live in one place and
-//! cannot drift apart.
+//! The device reads `chain_info.json`, so a host that writes it (restoring a
+//! card, or repairing one with `disk doctor`) must produce a byte- and
+//! mode-identical artifact. Watermark files are not written here: only the
+//! PIN-unlocked device can authenticate a mark, so the host stages a boot config
+//! and the device establishes the floor itself. Both callers route through these
+//! helpers so the JSON shape and permissions live in one place and cannot drift.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use russignol_storage::watermark;
 
 use crate::watermark::ChainInfo;
 
@@ -27,20 +27,6 @@ pub const CHAIN_INFO_MODE: u32 = 0o400;
 
 /// Basename of the chain-info file on the keys partition.
 pub const CHAIN_INFO_FILENAME: &str = "chain_info.json";
-
-/// Write the three watermark files for one key at `level`, round 0, creating the
-/// key directory if absent. `level` is the floor the device will refuse to sign
-/// below.
-pub fn write_watermark_file_set(key_dir: &Path, level: u32) -> Result<()> {
-    fs::create_dir_all(key_dir)
-        .with_context(|| format!("failed to create watermark directory {}", key_dir.display()))?;
-    let buf = watermark::encode(level, 0);
-    for name in &watermark::FILENAMES {
-        fs::write(key_dir.join(name), buf)
-            .with_context(|| format!("failed to write watermark file {name}"))?;
-    }
-    Ok(())
-}
 
 /// Write `chain_info.json` into a mounted keys partition and set its device mode.
 ///
@@ -87,22 +73,6 @@ pub fn set_chain_info_mode(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn watermark_file_set_round_trips_at_level() {
-        let dir = tempfile::tempdir().unwrap();
-        let key_dir = dir.path().join("tz4Example");
-        write_watermark_file_set(&key_dir, 4242).unwrap();
-        for name in &watermark::FILENAMES {
-            let bytes = fs::read(key_dir.join(name))
-                .unwrap_or_else(|e| panic!("watermark {name} not written: {e}"));
-            let buf: [u8; watermark::FILE_SIZE] =
-                bytes.as_slice().try_into().expect("wrong watermark size");
-            let (level, round) = watermark::decode(&buf).expect("watermark decodes");
-            assert_eq!(level, 4242);
-            assert_eq!(round, 0);
-        }
-    }
 
     #[test]
     fn chain_info_rewrites_over_an_existing_read_only_file() {
