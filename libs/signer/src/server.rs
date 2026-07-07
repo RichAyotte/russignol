@@ -1142,7 +1142,7 @@ impl Server {
 mod tests {
     use super::*;
     use crate::bls::generate_key;
-    use crate::test_utils::preinit_watermarks;
+    use crate::test_utils::{new_watermark, preinit_watermarks};
     use tempfile::TempDir;
 
     #[test]
@@ -1245,7 +1245,7 @@ mod tests {
 
         // Pre-initialize watermarks BEFORE creating HighWatermark
         preinit_watermarks(temp_dir.path(), &pkh, 99);
-        let hwm = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+        let hwm = new_watermark(temp_dir.path(), &[pkh]).unwrap();
 
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
@@ -1313,9 +1313,7 @@ mod tests {
 
         // Pre-initialize watermarks BEFORE creating HighWatermark
         preinit_watermarks(temp_dir.path(), &pkh, 99);
-        let hwm = Arc::new(RwLock::new(
-            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-        ));
+        let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
 
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
@@ -1351,7 +1349,7 @@ mod tests {
         // Verify watermark was persisted: reload from disk.
         // Disk has either the actual value (100) or the ceiling (101) depending
         // on whether the background ceiling thread has run yet.
-        let hwm2 = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+        let hwm2 = new_watermark(temp_dir.path(), &[pkh]).unwrap();
         let chain_id = ChainId::from_bytes(&{
             let mut b = [0u8; 32];
             b[..4].copy_from_slice(&[0, 0, 0, 1]);
@@ -1382,9 +1380,7 @@ mod tests {
 
         // Pre-initialize watermarks BEFORE creating HighWatermark
         preinit_watermarks(temp_dir.path(), &pkh, 100);
-        let hwm = Arc::new(RwLock::new(
-            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-        ));
+        let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
 
         // Track if callback was triggered
         let callback_triggered = Arc::new(AtomicBool::new(false));
@@ -1459,9 +1455,7 @@ mod tests {
 
         // Pre-initialize watermarks BEFORE creating HighWatermark
         preinit_watermarks(temp_dir.path(), &pkh, 100);
-        let hwm = Arc::new(RwLock::new(
-            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-        ));
+        let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
 
         // With blocks_per_cycle=100, threshold = 4 * 100 = 400 blocks
         let handler = RequestHandler::new(
@@ -1516,9 +1510,7 @@ mod tests {
         mgr.add_signer(pkh, signer, "test_key".to_string());
 
         // No preinit: the key has no watermark files, so it is uninitialized.
-        let hwm = Arc::new(RwLock::new(
-            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-        ));
+        let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = Arc::clone(&call_count);
@@ -1583,9 +1575,7 @@ mod tests {
 
         // Initialize the key's watermark at level 100.
         preinit_watermarks(temp_dir.path(), &pkh, 100);
-        let hwm = Arc::new(RwLock::new(
-            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-        ));
+        let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
 
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
@@ -1633,9 +1623,7 @@ mod tests {
         mgr.add_signer(pkh, signer, "test_key".to_string());
 
         preinit_watermarks(temp_dir.path(), &pkh, 99);
-        let hwm = Arc::new(RwLock::new(
-            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-        ));
+        let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
 
         // Inject write error
         hwm.write().unwrap().force_write_error = true;
@@ -1703,9 +1691,7 @@ mod tests {
 
         // Pre-initialize watermarks BEFORE creating HighWatermark
         preinit_watermarks(temp_dir.path(), &pkh, 100);
-        let hwm = Arc::new(RwLock::new(
-            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-        ));
+        let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
 
         // Track if callback was triggered (it should NOT be triggered with blocks_per_cycle=0)
         let callback_triggered = Arc::new(AtomicBool::new(false));

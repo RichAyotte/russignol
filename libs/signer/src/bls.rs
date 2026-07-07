@@ -492,6 +492,17 @@ pub fn deterministic_nonce(sk: &SecretKey, msg: &[u8]) -> [u8; 32] {
     nonce
 }
 
+/// Derive the per-key watermark MAC key from a signing secret.
+///
+/// The result authenticates that key's watermark files: only a holder of the
+/// PIN-decrypted secret can reproduce it, so a card thief cannot forge an
+/// acceptable mark. Domain-separated from any other use of the secret via the
+/// BLAKE3 keyed-hash context bytes.
+#[must_use]
+pub fn watermark_mac_key(sk: &SecretKey) -> [u8; 32] {
+    *blake3::keyed_hash(&sk.to_bytes(), b"russignol-watermark-mac-v1").as_bytes()
+}
+
 /// Compute deterministic nonce hash using `Blake2B`
 /// Corresponds to: `src/lib_crypto/bls.ml:377-378` - `deterministic_nonce_hash`
 #[must_use]

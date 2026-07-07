@@ -9,8 +9,8 @@
 //! double-signing by construction.
 
 use russignol_signer_lib::bls::generate_key;
-use russignol_signer_lib::high_watermark::{ChainId, HighWatermark};
-use russignol_signer_lib::test_utils::{create_block_data, preinit_watermarks};
+use russignol_signer_lib::high_watermark::ChainId;
+use russignol_signer_lib::test_utils::{create_block_data, new_watermark, preinit_watermarks};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, RwLock};
 use std::thread;
@@ -32,9 +32,7 @@ fn test_concurrent_signing_serialization() {
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
     preinit_watermarks(temp_dir.path(), &pkh, 99);
-    let hwm = Arc::new(RwLock::new(
-        HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-    ));
+    let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
 
     // Set watermark to level 100
     {
@@ -102,9 +100,7 @@ fn test_independent_operation_types() {
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
     preinit_watermarks(temp_dir.path(), &pkh, 0);
-    let hwm = Arc::new(RwLock::new(
-        HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-    ));
+    let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
     let barrier = Arc::new(Barrier::new(2));
 
     // Thread 1: Sign blocks at levels 1, 2, 3
@@ -145,7 +141,7 @@ fn test_independent_operation_types() {
     attest_thread.join().unwrap();
 
     // Reload from disk and verify persistence
-    let hwm_reload = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+    let hwm_reload = new_watermark(temp_dir.path(), &[pkh]).unwrap();
     let (block, _preattest, attest) = hwm_reload.get_current_levels(chain_id, &pkh).unwrap();
 
     assert_eq!(block, 3, "Block watermark should be at level 3");
@@ -161,9 +157,7 @@ fn test_stress_concurrent_watermarks() {
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
     preinit_watermarks(temp_dir.path(), &pkh, 0);
-    let hwm = Arc::new(RwLock::new(
-        HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-    ));
+    let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
     let num_threads = 8;
     let ops_per_thread = 50;
     let barrier = Arc::new(Barrier::new(num_threads));
@@ -245,9 +239,7 @@ fn test_toctou_exploit_attempt() {
 
     for _ in 0..iterations {
         preinit_watermarks(temp_dir.path(), &pkh, 99);
-        let hwm = Arc::new(RwLock::new(
-            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-        ));
+        let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
 
         // Set initial watermark to level 100
         {
@@ -320,9 +312,7 @@ fn test_concurrent_same_level_different_rounds_disk_consistency() {
     for _ in 0..iterations {
         let temp_dir = TempDir::new().unwrap();
         preinit_watermarks(temp_dir.path(), &pkh, 99);
-        let hwm = Arc::new(RwLock::new(
-            HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-        ));
+        let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
 
         // Set initial watermark to level 100, round 0
         {
@@ -363,7 +353,7 @@ fn test_concurrent_same_level_different_rounds_disk_consistency() {
         t2.join().unwrap();
 
         // Reload from disk — the file must have the highest round (6)
-        let hwm_reload = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+        let hwm_reload = new_watermark(temp_dir.path(), &[pkh]).unwrap();
         let (block_level, _, _) = hwm_reload.get_current_levels(chain_id, &pkh).unwrap();
         assert_eq!(block_level, 101, "Disk should have level 101");
 
@@ -399,9 +389,7 @@ fn test_rollback_disk_watermark_after_sign_failure() {
     let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
 
     preinit_watermarks(temp_dir.path(), &pkh, 99);
-    let hwm = Arc::new(RwLock::new(
-        HighWatermark::new(temp_dir.path(), &[pkh]).unwrap(),
-    ));
+    let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
 
     // Advance to level 100, round 0 (baseline)
     {
@@ -435,7 +423,7 @@ fn test_rollback_disk_watermark_after_sign_failure() {
     }
 
     // Reload from disk — should also be level 100, round 0
-    let hwm_reload = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+    let hwm_reload = new_watermark(temp_dir.path(), &[pkh]).unwrap();
     let (block_level, _, _) = hwm_reload.get_current_levels(chain_id, &pkh).unwrap();
     assert_eq!(block_level, 100, "Disk should be rolled back to level 100");
 

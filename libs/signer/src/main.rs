@@ -4,8 +4,10 @@
 
 use clap::{Parser, Subcommand};
 use russignol_signer_lib::{
-    HighWatermark, RequestHandler, ServerKeyManager, server, signer, wallet::KeyManager,
+    ChainId, HighWatermark, RequestHandler, ServerKeyManager, bls::watermark_mac_key, server,
+    signer, wallet::KeyManager,
 };
+use std::collections::HashMap;
 use std::fs;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
@@ -180,6 +182,44 @@ struct SocketSignerOptions {
 }
 
 /// Launch socket signer daemon
+/// Parse the CLI wallet's stored keys into a server key manager, the loaded
+/// public key hashes, and their per-key watermark MAC keys.
+fn load_cli_signers(
+    keys: &HashMap<String, russignol_signer_lib::wallet::StoredKey>,
+) -> (
+    ServerKeyManager,
+    Vec<russignol_signer_lib::bls::PublicKeyHash>,
+    HashMap<russignol_signer_lib::bls::PublicKeyHash, [u8; 32]>,
+) {
+    let mut server_key_mgr = ServerKeyManager::new();
+    let mut loaded_pkhs = Vec::new();
+    let mut mac_keys = HashMap::new();
+
+    for (alias, stored_key) in keys {
+        if let Some(sk_b58) = &stored_key.secret_key {
+            match signer::Unencrypted::from_b58check(sk_b58) {
+                Ok(signer) => {
+                    // Now that we handle little-endian correctly, the derived PKH matches OCaml
+                    let derived_pkh = *signer.public_key_hash();
+                    let derived_pkh_b58 = derived_pkh.to_b58check();
+                    mac_keys.insert(derived_pkh, watermark_mac_key(signer.secret_key()));
+                    server_key_mgr.add_signer(derived_pkh, signer, alias.clone());
+                    loaded_pkhs.push(derived_pkh);
+                    let json_pkh = &stored_key.public_key_hash;
+                    println!(
+                        "  ✓ Loaded key: {alias} (JSON: {json_pkh}, Derived: {derived_pkh_b58})"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  ✗ Failed to load key '{alias}': {e}");
+                }
+            }
+        }
+    }
+
+    (server_key_mgr, loaded_pkhs, mac_keys)
+}
+
 fn launch_socket_signer(
     cli_key_manager: &KeyManager,
     opts: &SocketSignerOptions,
@@ -204,35 +244,17 @@ fn launch_socket_signer(
     let key_count = keys.len();
     println!("Loading {key_count} key(s)...");
 
-    // Create server key manager and load signers
-    let mut server_key_mgr = ServerKeyManager::new();
-    let mut loaded_pkhs = Vec::new();
-
-    for (alias, stored_key) in &keys {
-        if let Some(sk_b58) = &stored_key.secret_key {
-            match signer::Unencrypted::from_b58check(sk_b58) {
-                Ok(signer) => {
-                    // Now that we handle little-endian correctly, the derived PKH matches OCaml
-                    let derived_pkh = *signer.public_key_hash();
-                    let derived_pkh_b58 = derived_pkh.to_b58check();
-                    server_key_mgr.add_signer(derived_pkh, signer, alias.clone());
-                    loaded_pkhs.push(derived_pkh);
-                    let json_pkh = &stored_key.public_key_hash;
-                    println!(
-                        "  ✓ Loaded key: {alias} (JSON: {json_pkh}, Derived: {derived_pkh_b58})"
-                    );
-                }
-                Err(e) => {
-                    eprintln!("  ✗ Failed to load key '{alias}': {e}");
-                }
-            }
-        }
-    }
+    let (server_key_mgr, loaded_pkhs, mac_keys) = load_cli_signers(&keys);
 
     // Setup high watermark if enabled
     let watermark = if opts.check_high_watermark {
-        let hwm = HighWatermark::new(cli_key_manager.base_dir(), &loaded_pkhs)
-            .map_err(|e| format!("Failed to create high watermark: {e}"))?;
+        let hwm = HighWatermark::new(
+            cli_key_manager.base_dir(),
+            &loaded_pkhs,
+            mac_keys,
+            ChainId::from_bytes(&[0u8; 32]),
+        )
+        .map_err(|e| format!("Failed to create high watermark: {e}"))?;
 
         println!("✓ High watermark protection enabled");
         let storage_path = cli_key_manager.base_dir().display();

@@ -4,9 +4,12 @@
 //! Run with: cargo run --example `tcp_server_demo`
 
 use russignol_signer_lib::{
-    HighWatermark, RequestHandler, ServerKeyManager, bls::generate_key,
-    high_watermark::seed_watermarks, server, signer,
+    ChainId, HighWatermark, RequestHandler, ServerKeyManager,
+    bls::{generate_key, watermark_mac_key},
+    high_watermark::seed_watermarks,
+    server, signer,
 };
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -26,6 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signer1 = signer::Unencrypted::generate(Some(&seed1))?;
     let signer2 = signer::Unencrypted::generate(Some(&seed2))?;
 
+    let mac1 = watermark_mac_key(signer1.secret_key());
+    let mac2 = watermark_mac_key(signer2.secret_key());
+    let demo_chain = ChainId::from_bytes(&[0u8; 32]);
+
     println!("  ✓ Key 1: {}", pkh1.to_b58check());
     println!("  ✓ Key 2: {}", pkh2.to_b58check());
 
@@ -39,9 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Watermarks must exist before the first signature, so seed level 0 for
     // both keys; signing then succeeds at any level >= 1.
     let temp_dir = TempDir::new()?;
-    seed_watermarks(temp_dir.path(), &pkh1, 0)?;
-    seed_watermarks(temp_dir.path(), &pkh2, 0)?;
-    let watermark = HighWatermark::new(temp_dir.path(), &[pkh1, pkh2])?;
+    seed_watermarks(temp_dir.path(), &pkh1, 0, &mac1, demo_chain)?;
+    seed_watermarks(temp_dir.path(), &pkh2, 0, &mac2, demo_chain)?;
+    let mac_keys = HashMap::from([(pkh1, mac1), (pkh2, mac2)]);
+    let watermark = HighWatermark::new(temp_dir.path(), &[pkh1, pkh2], mac_keys, demo_chain)?;
     println!("📊 High watermark protection enabled");
     println!("  Storage: {}\n", temp_dir.path().display());
 

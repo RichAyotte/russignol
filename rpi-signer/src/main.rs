@@ -564,8 +564,11 @@ fn apply_effects(
             Effect::SendKeys(json) => {
                 let _ = app.start_signer_tx.send(json);
             }
-            Effect::InitWatermark { context } => {
-                apply_init_watermark(app, device, &context)?;
+            Effect::InitWatermark {
+                context,
+                secret_keys,
+            } => {
+                apply_init_watermark(app, device, &context, &secret_keys)?;
             }
             Effect::SpawnKeygen { pin } => spawn_keygen(app.tx.clone(), pin, cpu_boost),
             Effect::SpawnPinVerify { pin } => spawn_pin_verify(app.tx.clone(), pin, cpu_boost),
@@ -691,6 +694,7 @@ fn apply_init_watermark(
     app: &mut App,
     device: &mut Device,
     context: &str,
+    secret_keys: &Secret<String>,
 ) -> epd_2in13_v4::EpdResult<()> {
     log::info!("Creating high watermark tracker...");
     // Watermarks live on /data; if the init script failed to mount it,
@@ -707,7 +711,27 @@ fn apply_init_watermark(
         .iter()
         .filter_map(|k| PublicKeyHash::from_b58check(&k.value).ok())
         .collect();
-    let hwm = signer_server::create_high_watermark(&config, &pkhs)
+
+    // Per-key MAC keys authenticate the watermark; the device is their sole
+    // producer. Derive them from the just-unlocked secrets.
+    let mac_keys = match signer_server::derive_watermark_mac_keys(secret_keys.as_str()) {
+        Ok(keys) => keys,
+        Err(e) => fatal_error(
+            device,
+            "WATERMARK KEY ERROR",
+            &format!("Failed to derive watermark keys: {e}"),
+        ),
+    };
+
+    // A mark is bound to its chain. If chain_info is absent, an unrelated chain
+    // id yields marks that fail to verify, which the missing-watermark recovery
+    // then re-establishes.
+    let chain_id = chain_info::read_chain_info()
+        .ok()
+        .and_then(|info| ChainId::from_b58check(&info.id))
+        .unwrap_or_else(|| ChainId::from_bytes(&[0u8; 32]));
+
+    let hwm = signer_server::create_high_watermark(&config, &pkhs, mac_keys, chain_id)
         .map_err(|e| std::io::Error::other(format!("Failed to create watermark: {e}")))?;
     let Ok(mut wm_lock) = app.watermark.write() else {
         fatal_error(

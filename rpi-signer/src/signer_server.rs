@@ -1,9 +1,11 @@
 use log::{error, info};
 use russignol_signer_lib::{
-    ChainId, HighWatermark, RequestHandler, ServerKeyManager, SigningActivity, server, signer,
+    ChainId, HighWatermark, RequestHandler, ServerKeyManager, SigningActivity,
+    bls::watermark_mac_key, server, signer,
 };
 use serde::Deserialize;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -87,6 +89,38 @@ fn parse_secret_keys(secret_keys_json: &str) -> Result<ServerKeyManager, String>
     Ok(key_manager)
 }
 
+/// Derive the per-key watermark MAC keys from the decrypted secret keys.
+///
+/// The device is the sole producer of authenticated marks; these keys let the
+/// `HighWatermark` verify existing marks and stamp new ones. Parses the same
+/// JSON as [`parse_secret_keys`] and derives each key's MAC key from its BLS
+/// secret ([`watermark_mac_key`]).
+///
+/// # Errors
+///
+/// Returns an error if the JSON cannot be parsed or a key fails to load.
+pub fn derive_watermark_mac_keys(
+    secret_keys_json: &str,
+) -> Result<HashMap<PublicKeyHash, [u8; 32]>, String> {
+    let entries: Vec<BorrowedKeyEntry<'_>> = serde_json::from_str(secret_keys_json)
+        .map_err(|e| format!("Failed to parse secret_keys JSON: {e}"))?;
+
+    let mut mac_keys = HashMap::new();
+    for entry in entries {
+        let sk_b58 = entry
+            .value
+            .strip_prefix("unencrypted:")
+            .unwrap_or(entry.value);
+        let signer = signer::Unencrypted::from_b58check(sk_b58)
+            .map_err(|e| format!("Failed to load key '{}': {e}", entry.name))?;
+        mac_keys.insert(
+            *signer.public_key_hash(),
+            watermark_mac_key(signer.secret_key()),
+        );
+    }
+    Ok(mac_keys)
+}
+
 use russignol_signer_lib::bls::PublicKeyHash;
 
 /// Type alias for watermark error callback
@@ -124,13 +158,15 @@ pub struct SignerCallbacks {
 pub fn create_high_watermark(
     config: &SignerConfig,
     pkhs: &[PublicKeyHash],
+    mac_keys: HashMap<PublicKeyHash, [u8; 32]>,
+    chain_id: ChainId,
 ) -> Result<Option<Arc<RwLock<HighWatermark>>>, String> {
     if config.check_high_watermark {
         let hwm_dir = PathBuf::from(&config.watermark_dir);
         fs::create_dir_all(&hwm_dir)
             .map_err(|e| format!("Failed to create watermark directory: {e}"))?;
 
-        let hwm = HighWatermark::new(&hwm_dir, pkhs)
+        let hwm = HighWatermark::new(&hwm_dir, pkhs, mac_keys, chain_id)
             .map_err(|e| format!("Failed to create high watermark: {e}"))?;
 
         info!(

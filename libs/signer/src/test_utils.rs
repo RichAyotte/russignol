@@ -5,9 +5,10 @@
 //! Tenderbake consensus protocol specifications.
 
 use crate::bls::PublicKeyHash;
-use crate::high_watermark::ChainId;
+use crate::high_watermark::{ChainId, HighWatermark};
 use crate::protocol::encoding::{decode_response, encode_request};
 use crate::protocol::{SignerRequest, SignerResponse};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -142,6 +143,30 @@ pub fn ghostnet_chain_id() -> ChainId {
     create_chain_id(&GHOSTNET_CHAIN_ID)
 }
 
+/// Deterministic per-key MAC key for tests.
+///
+/// A fixed function of the pkh so seeding and loading agree; not the production
+/// derivation (which is keyed by the BLS secret, tested separately in `bls`).
+#[must_use]
+pub fn test_mac_key(pkh: &PublicKeyHash) -> [u8; 32] {
+    *blake3::keyed_hash(&[0xAB; 32], pkh.to_bytes()).as_bytes()
+}
+
+/// Build the per-key MAC key map for the given keys.
+#[must_use]
+pub fn test_mac_keys(pkhs: &[PublicKeyHash]) -> HashMap<PublicKeyHash, [u8; 32]> {
+    pkhs.iter().map(|p| (*p, test_mac_key(p))).collect()
+}
+
+/// Construct a `HighWatermark` with the shared test MAC keys and default chain.
+///
+/// # Errors
+///
+/// Returns an error if loading watermark files fails.
+pub fn new_watermark(base_dir: &Path, pkhs: &[PublicKeyHash]) -> std::io::Result<HighWatermark> {
+    HighWatermark::new(base_dir, pkhs, test_mac_keys(pkhs), default_test_chain_id())
+}
+
 /// Pre-initialize watermark files, panicking on I/O failure.
 ///
 /// Test convenience wrapper around
@@ -152,8 +177,14 @@ pub fn ghostnet_chain_id() -> ChainId {
 ///
 /// Panics on I/O failure.
 pub fn preinit_watermarks(base_dir: &Path, pkh: &PublicKeyHash, level: u32) {
-    crate::high_watermark::seed_watermarks(base_dir, pkh, level)
-        .expect("failed to seed watermark files");
+    crate::high_watermark::seed_watermarks(
+        base_dir,
+        pkh,
+        level,
+        &test_mac_key(pkh),
+        default_test_chain_id(),
+    )
+    .expect("failed to seed watermark files");
 }
 
 /// Send a request over a TCP stream and receive the response

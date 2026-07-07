@@ -3,12 +3,12 @@
 //! These tests verify the TCP server works correctly with real network connections.
 
 use russignol_signer_lib::{
-    HighWatermark, RequestHandler, ServerKeyManager,
+    RequestHandler, ServerKeyManager,
     bls::generate_key,
     high_watermark::ChainId,
     protocol::{SignerRequest, SignerResponse},
     server, signer,
-    test_utils::{preinit_watermarks, send_request},
+    test_utils::{new_watermark, preinit_watermarks, send_request},
 };
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, RwLock};
@@ -122,7 +122,7 @@ fn test_tcp_server_sign_with_watermark() {
     let mut key_mgr = ServerKeyManager::new();
     key_mgr.add_signer(pkh, signer, "test_key".to_string());
 
-    let watermark = HighWatermark::new(temp_dir.path(), &[pkh]).unwrap();
+    let watermark = new_watermark(temp_dir.path(), &[pkh]).unwrap();
 
     let handler = RequestHandler::new(
         Arc::new(RwLock::new(key_mgr)),

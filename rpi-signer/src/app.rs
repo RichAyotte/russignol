@@ -137,6 +137,8 @@ pub enum Effect {
     SendKeys(Secret<String>),
     InitWatermark {
         context: String,
+        /// Decrypted secret keys, used to derive the per-key watermark MAC keys.
+        secret_keys: Secret<String>,
     },
     SpawnKeygen {
         pin: Secret<Vec<u8>>,
@@ -338,6 +340,7 @@ impl App {
                     Effect::DropPrivileges,
                     Effect::InitWatermark {
                         context: "first boot setup".into(),
+                        secret_keys: secret_keys_json.clone(),
                     },
                 ]);
                 self.state = AppState::Active {
@@ -550,6 +553,7 @@ impl App {
         }
         effects.push(Effect::InitWatermark {
             context: "PIN entry".into(),
+            secret_keys: json.clone(),
         });
         effects.push(Effect::Emit(AppEvent::KeysDecrypted(json)));
     }
@@ -1354,6 +1358,7 @@ mod tests {
             Effect::DropPrivileges,
             Effect::InitWatermark {
                 context: "first boot setup".into(),
+                secret_keys: json("{}"),
             },
             Effect::Emit(AppEvent::KeysDecrypted(json("{}"))),
         ];
