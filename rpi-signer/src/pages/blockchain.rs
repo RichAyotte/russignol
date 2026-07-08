@@ -16,16 +16,6 @@ use u8g2_fonts::{
     types::{FontColor, HorizontalAlignment, VerticalPosition},
 };
 
-/// Truncate a key hash for display.
-/// Shows first 10 and last 6 characters: "tz4HVR43NN...op287Z"
-fn truncate_key(key: &str) -> String {
-    if key.len() <= 19 {
-        key.to_string()
-    } else {
-        format!("{}...{}", &key[..10], &key[key.len() - 6..])
-    }
-}
-
 pub struct Page {
     app_sender: Sender<AppEvent>,
     chain_name: String,
@@ -141,7 +131,10 @@ fn draw_key_row<D: DrawTarget<Color = BinaryColor>>(
     let text_font = FontRenderer::new::<fonts::FONT_MONO_SMALL>();
     let icon_font = FontRenderer::new::<fonts::ICON_KEY>();
 
-    let key_display = pkh.map_or_else(|| "Not found".to_string(), truncate_key);
+    let key_display = pkh.map_or_else(
+        || "Not found".to_string(),
+        |key| crate::text::truncate_middle(key, 10, 6),
+    );
 
     let icon_width = icon_font
         .get_rendered_dimensions(icon_char, Point::zero(), VerticalPosition::Center)

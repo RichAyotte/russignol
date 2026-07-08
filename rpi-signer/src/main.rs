@@ -1,4 +1,5 @@
 mod app;
+mod banner;
 mod chain_info;
 mod constants;
 mod cpu_freq;
@@ -12,6 +13,7 @@ mod secret;
 mod setup;
 mod signer_server;
 mod storage;
+mod text;
 mod tezos_encrypt;
 mod tezos_signer;
 mod util;
@@ -80,6 +82,7 @@ struct SignerEventCallbacks {
     signing: Arc<dyn Fn() + Send + Sync>,
     large_gap: signer_server::LargeGapCallback,
     missing_watermark: signer_server::MissingWatermarkCallback,
+    unknown_key: signer_server::UnknownKeyCallback,
 }
 
 fn build_signer_event_callbacks(app_tx: &Sender<AppEvent>) -> SignerEventCallbacks {
@@ -131,11 +134,19 @@ fn build_signer_event_callbacks(app_tx: &Sender<AppEvent>) -> SignerEventCallbac
             });
         });
 
+    let tx_for_unknown = app_tx.clone();
+    let unknown_key: signer_server::UnknownKeyCallback = Arc::new(move |pkh| {
+        let _ = tx_for_unknown.send(AppEvent::UnknownKeyRequested {
+            pkh: pkh.to_b58check(),
+        });
+    });
+
     SignerEventCallbacks {
         watermark_error,
         signing,
         large_gap,
         missing_watermark,
+        unknown_key,
     }
 }
 
@@ -165,6 +176,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
     let signing_callback_for_signer = Some(event_callbacks.signing);
     let large_gap_callback_for_signer = Some(event_callbacks.large_gap);
     let missing_watermark_callback_for_signer = Some(event_callbacks.missing_watermark);
+    let unknown_key_callback_for_signer = Some(event_callbacks.unknown_key);
     let tx_for_signer = app_tx.clone();
 
     let cpu_boost = init_cpu_freq_control();
@@ -204,6 +216,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
                 signing: signing_callback_for_signer,
                 large_gap: large_gap_callback_for_signer,
                 missing_watermark: missing_watermark_callback_for_signer,
+                unknown_key: unknown_key_callback_for_signer,
                 pre_sign: pre_sign_callback,
                 post_sign: post_sign_callback,
             };
@@ -339,8 +352,7 @@ fn run_ui_loop(
             }
             AppEvent::DirtyDisplay => {
                 if !app.is_screensaver_active() {
-                    current_page.show(&mut device.display)?;
-                    device.display.update()?;
+                    render_page(&app, &mut device, &mut current_page)?;
                 }
                 continue;
             }
@@ -373,14 +385,31 @@ fn run_ui_loop(
     Ok(())
 }
 
+/// Draw the current page, overlay the unknown-key banner when one is active
+/// and the page is not modal, then push the frame to the panel. Every page
+/// repaint goes through here so the banner survives page changes.
+fn render_page(
+    app: &App,
+    device: &mut Device,
+    current_page: &mut Box<dyn Page<Display>>,
+) -> epd_2in13_v4::EpdResult<()> {
+    current_page.show(&mut device.display)?;
+    if !app.current_page_modal
+        && let Some(content) = app.unknown_keys.active()
+    {
+        banner::draw(&mut device.display, &content)?;
+    }
+    device.display.update()?;
+    Ok(())
+}
+
 fn handle_timeout(
     app: &mut App,
     device: &mut Device,
     current_page: &mut Box<dyn Page<Display>>,
 ) -> epd_2in13_v4::EpdResult<()> {
     if app.needs_animation && !app.is_screensaver_active() {
-        current_page.show(&mut device.display)?;
-        device.display.update()?;
+        render_page(app, device, current_page)?;
     }
     Ok(())
 }
@@ -403,10 +432,7 @@ fn sleep_with_animation(
             return Ok(());
         }
         if app.needs_animation && !app.is_screensaver_active() {
-            if let Err(e) = current_page.show(&mut device.display) {
-                log::warn!("display update during sleep: {e}");
-            }
-            if let Err(e) = device.display.update() {
+            if let Err(e) = render_page(app, device, current_page) {
                 log::warn!("display update during sleep: {e}");
             }
             std::thread::sleep(app.animation_interval.min(remaining));
@@ -424,10 +450,19 @@ fn handle_touch(
 ) {
     if app.is_screensaver_active() {
         let _ = app.tx.send(AppEvent::DeactivateScreensaver);
+        return;
+    }
+    // The banner overlays the top of non-modal pages, so it owns touches in
+    // that region while an alert is showing: tapping it dismisses the alert.
+    if !app.current_page_modal
+        && app.unknown_keys.active().is_some()
+        && touch_point.y < banner::HEIGHT
+    {
+        let _ = app.tx.send(AppEvent::UnknownKeyDismissed);
     } else {
         current_page.handle_touch(touch_point);
-        let _ = screensaver_reset_tx.send(());
     }
+    let _ = screensaver_reset_tx.send(());
 }
 
 fn screensaver_timer(
@@ -618,8 +653,7 @@ fn apply_effects(
                     app.current_page_modal = page.is_modal();
                     app.needs_animation = false;
                     *current_page = page;
-                    current_page.show(&mut device.display)?;
-                    device.display.update()?;
+                    render_page(app, device, current_page)?;
                 }
             }
             Effect::FatalError { title, message } => fatal_error(device, &title, &message),
@@ -658,8 +692,7 @@ fn apply_show_page(
         app.current_page_modal = page.is_modal();
         app.needs_animation = false;
         *current_page = page;
-        current_page.show(&mut device.display)?;
-        device.display.update()?;
+        render_page(app, device, current_page)?;
     }
     Ok(())
 }
@@ -686,8 +719,7 @@ fn apply_show_progress(
         app.needs_animation = false;
         *current_page = Box::new(progress);
     }
-    current_page.show(&mut device.display)?;
-    device.display.update()?;
+    render_page(app, device, current_page)?;
     Ok(())
 }
 
@@ -985,8 +1017,7 @@ fn apply_watermark_update(
         ));
         app.current_page_modal = true;
         *current_page = page;
-        current_page.show(&mut device.display)?;
-        device.display.update()?;
+        render_page(app, device, current_page)?;
     }
     Ok(())
 }

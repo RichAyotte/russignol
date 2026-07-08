@@ -44,6 +44,80 @@ fn push_migration_notice(
     }));
 }
 
+/// Retained distinct unknown pkhs; the requesting peer is untrusted network
+/// input, so alert state must stay fixed-size no matter how many keys it
+/// invents.
+const UNKNOWN_KEY_CAP: usize = 8;
+
+/// Content of an active unknown-key alert, produced by
+/// [`UnknownKeyAlert::active`]. The banner and touch handling consume this
+/// value as-is; nothing re-derives counts from the underlying state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlertContent<'a> {
+    /// The most recently retained unknown pkh.
+    pub pkh: &'a str,
+    /// How many other distinct unknown pkhs are retained.
+    pub others: usize,
+    /// Whether unknown pkhs beyond the retention cap were seen.
+    pub overflow: bool,
+}
+
+/// Bounded record of signing requests for keys the device does not hold.
+///
+/// Retains at most [`UNKNOWN_KEY_CAP`] distinct pkhs for dedup; past the cap
+/// only a one-shot overflow marker changes, so between dismissals a flooding
+/// peer gets at most cap + 1 repaints no matter how many keys it invents.
+#[derive(Debug, Default)]
+pub struct UnknownKeyAlert {
+    /// Distinct pkhs retained for dedup, in arrival order.
+    pkhs: Vec<String>,
+    /// Whether unknown pkhs beyond the retention cap were seen.
+    overflow: bool,
+    /// Whether the banner is showing; dismissal hides it without forgetting.
+    active: bool,
+}
+
+impl UnknownKeyAlert {
+    /// Record a requested unknown pkh. Returns true when the alert content
+    /// changed in a way worth a repaint: a newly retained pkh, or the first
+    /// pkh past the cap. Repeats of retained pkhs and everything after the
+    /// overflow flip return false; non-retained pkhs are never stored, so
+    /// dedup is lossy past the cap.
+    pub fn record(&mut self, pkh: &str) -> bool {
+        if self.pkhs.iter().any(|p| p == pkh) {
+            return false;
+        }
+        if self.pkhs.len() < UNKNOWN_KEY_CAP {
+            self.pkhs.push(pkh.to_string());
+        } else if self.overflow {
+            return false;
+        } else {
+            self.overflow = true;
+        }
+        self.active = true;
+        true
+    }
+
+    /// Hide the banner. Retained pkhs and the overflow marker survive, so
+    /// acknowledged keys never re-alert while a genuinely new key still does.
+    pub fn dismiss(&mut self) {
+        self.active = false;
+    }
+
+    /// The banner content, when an alert is active.
+    pub fn active(&self) -> Option<AlertContent<'_>> {
+        if !self.active {
+            return None;
+        }
+        let pkh = self.pkhs.last()?;
+        Some(AlertContent {
+            pkh,
+            others: self.pkhs.len() - 1,
+            overflow: self.overflow,
+        })
+    }
+}
+
 /// Maximum failed PIN attempts before lockout
 const MAX_FAILED_ATTEMPTS: u32 = 5;
 /// Lockout duration after max failed attempts (5 minutes)
@@ -182,6 +256,9 @@ pub struct App {
     /// Floor level staged by a consumed boot-partition config, applied as an
     /// authenticated mark after PIN unlock. `None` once seeded or absent.
     pub pending_watermark_level: Option<u32>,
+    /// Signing requests for keys the device does not hold, rendered as a
+    /// non-blocking banner over non-modal pages.
+    pub unknown_keys: UnknownKeyAlert,
     pub needs_animation: bool,
     pub animation_interval: Duration,
 }
@@ -211,6 +288,7 @@ impl App {
             start_signer_tx,
             watermark,
             pending_watermark_level: None,
+            unknown_keys: UnknownKeyAlert::default(),
             needs_animation: false,
             animation_interval: Duration::from_secs(1),
         }
@@ -641,6 +719,13 @@ impl App {
             } if !self.current_page_modal => {
                 effects.extend(self.watermark_missing_effects(pkh, chain_id, requested_level));
             }
+            AppEvent::UnknownKeyRequested { pkh } => {
+                effects.extend(self.unknown_key_requested_effects(&pkh));
+            }
+            AppEvent::UnknownKeyDismissed => {
+                self.unknown_keys.dismiss();
+                effects.push(Effect::Emit(AppEvent::DirtyDisplay));
+            }
             AppEvent::UpdateWatermarkToLevel {
                 pkh,
                 chain_id,
@@ -669,6 +754,30 @@ impl App {
         (LoopAction::Proceed, effects)
     }
 
+    /// Record an unknown-key request and, when it is newly retained, refresh
+    /// the display so the banner appears. Repaint effects are bounded by
+    /// [`UnknownKeyAlert::record`]; a modal page defers the banner to its own
+    /// dismissal repaint.
+    fn unknown_key_requested_effects(&mut self, pkh: &str) -> Vec<Effect> {
+        if !self.unknown_keys.record(pkh) {
+            return vec![];
+        }
+        log::warn!(
+            "Signing request for unknown key {pkh}: the baker is signing for keys this device does not hold"
+        );
+        if self.current_page_modal {
+            return vec![];
+        }
+        let wake = self.wake_from_screensaver_effects();
+        if wake.is_empty() {
+            // The rebuild in the wake path already repaints; only a lit
+            // display needs an explicit refresh.
+            vec![Effect::Emit(AppEvent::DirtyDisplay)]
+        } else {
+            wake
+        }
+    }
+
     fn watermark_error_effects(
         &mut self,
         pkh: String,
@@ -682,12 +791,7 @@ impl App {
             return vec![];
         };
         let mut effects = self.wake_from_screensaver_effects();
-        let chain_id_str = chain_id.to_b58check();
-        let chain_short = if chain_id_str.len() > 12 {
-            format!("{}...", &chain_id_str[..12])
-        } else {
-            chain_id_str
-        };
+        let chain_short = crate::text::truncate_middle(&chain_id.to_b58check(), 12, 0);
         effects.push(Effect::ShowPage(PageSpec::Confirmation {
             message: format!(
                 "Watermark test failed.\nChain: {chain_short}\nCurrent level: {current}"
@@ -743,11 +847,7 @@ impl App {
     ) -> Vec<Effect> {
         let mut effects = self.wake_from_screensaver_effects();
         log::warn!("Missing watermark for {pkh}: offering recovery to level {requested_level}");
-        let pkh_short = if pkh.len() > 6 {
-            format!("{}…", &pkh[..6])
-        } else {
-            pkh.clone()
-        };
+        let pkh_short = crate::text::truncate_middle(&pkh, 6, 0);
         effects.push(Effect::ShowPage(PageSpec::Confirmation {
             message: format!(
                 "Missing: {pkh_short} set {requested_level}?\nRun russignol watermark init\nthen reboot on host."
@@ -1477,6 +1577,193 @@ mod tests {
                 new_level: 600,
             }
         );
+    }
+
+    // === Unknown-key alert tests ===
+
+    /// Feed `UnknownKeyRequested` for `pkh` and return the effects.
+    fn request_unknown_key(app: &mut App, pkh: &str) -> Vec<Effect> {
+        let (_action, effects) =
+            app.handle_event(AppEvent::UnknownKeyRequested { pkh: pkh.into() });
+        effects
+    }
+
+    fn alert_content(pkh: &str, others: usize, overflow: bool) -> AlertContent<'_> {
+        AlertContent {
+            pkh,
+            others,
+            overflow,
+        }
+    }
+
+    #[test]
+    fn unknown_key_requested_records_state_and_requests_refresh() {
+        let mut app = active_app();
+        let effects = request_unknown_key(&mut app, "tz4wrong1");
+        assert_eq!(
+            app.unknown_keys.active(),
+            Some(alert_content("tz4wrong1", 0, false)),
+            "the requested pkh must be recorded"
+        );
+        assert!(
+            has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
+            "a newly seen unknown key must request a display refresh"
+        );
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::ShowPage(_))),
+            "the alert must not push a page"
+        );
+        assert!(
+            !app.current_page_modal,
+            "the alert must not make the current page modal"
+        );
+    }
+
+    #[test]
+    fn unknown_key_repeat_does_not_realert() {
+        let mut app = active_app();
+        request_unknown_key(&mut app, "tz4wrong1");
+        let effects = request_unknown_key(&mut app, "tz4wrong1");
+        assert!(
+            effects.is_empty(),
+            "a repeated pkh must not re-alert: {effects:?}"
+        );
+        assert_eq!(
+            app.unknown_keys.active(),
+            Some(alert_content("tz4wrong1", 0, false))
+        );
+    }
+
+    #[test]
+    fn unknown_key_alert_is_bounded_at_cap() {
+        let mut app = active_app();
+        for i in 1..=UNKNOWN_KEY_CAP {
+            let effects = request_unknown_key(&mut app, &format!("tz4wrong{i}"));
+            assert!(
+                has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
+                "pkh {i} is within the cap and must refresh"
+            );
+        }
+        // One past the cap: flips the overflow marker — one final repaint.
+        let effects = request_unknown_key(&mut app, "tz4over1");
+        assert!(
+            has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
+            "the overflow flip is the last state change and must refresh"
+        );
+        // Beyond that, nothing changes: new pkhs and repeats of non-retained
+        // pkhs produce no effects — a flooding peer cannot drive the display.
+        for pkh in ["tz4over2", "tz4over3", "tz4over1"] {
+            let effects = request_unknown_key(&mut app, pkh);
+            assert!(
+                effects.is_empty(),
+                "past the overflow flip no refresh may fire for {pkh}: {effects:?}"
+            );
+        }
+        let last_retained = format!("tz4wrong{UNKNOWN_KEY_CAP}");
+        assert_eq!(
+            app.unknown_keys.active(),
+            Some(alert_content(&last_retained, UNKNOWN_KEY_CAP - 1, true)),
+            "the banner reports the retained keys plus the overflow marker"
+        );
+        assert_eq!(
+            app.unknown_keys.pkhs.len(),
+            UNKNOWN_KEY_CAP,
+            "retained set must stay at the cap"
+        );
+    }
+
+    #[test]
+    fn unknown_key_dismiss_retains_dedup() {
+        let mut app = active_app();
+        request_unknown_key(&mut app, "tz4wrong1");
+        app.handle_event(AppEvent::UnknownKeyDismissed);
+        let effects = request_unknown_key(&mut app, "tz4wrong1");
+        assert!(
+            effects.is_empty(),
+            "an acknowledged pkh must not re-alert: {effects:?}"
+        );
+        assert_eq!(
+            app.unknown_keys.active(),
+            None,
+            "the alert must stay dismissed for an acknowledged pkh"
+        );
+    }
+
+    #[test]
+    fn unknown_key_new_key_realerts_after_dismiss() {
+        let mut app = active_app();
+        request_unknown_key(&mut app, "tz4wrong1");
+        app.handle_event(AppEvent::UnknownKeyDismissed);
+        let effects = request_unknown_key(&mut app, "tz4wrong2");
+        assert!(
+            has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
+            "a genuinely new pkh must re-alert after dismissal"
+        );
+        assert_eq!(
+            app.unknown_keys.active(),
+            Some(alert_content("tz4wrong2", 1, false))
+        );
+    }
+
+    #[test]
+    fn only_dismiss_deactivates_unknown_key_alert() {
+        let mut app = active_app();
+        request_unknown_key(&mut app, "tz4wrong1");
+        // A successful signature (the signing callback sends DirtyDisplay)
+        // says nothing about the unheld key in a mixed one-held/one-unheld
+        // config, so it must not clear the alert.
+        app.handle_event(AppEvent::DirtyDisplay);
+        app.handle_event(AppEvent::ShowMenu);
+        assert_eq!(
+            app.unknown_keys.active(),
+            Some(alert_content("tz4wrong1", 0, false)),
+            "no event other than dismiss may deactivate the alert"
+        );
+        app.handle_event(AppEvent::UnknownKeyDismissed);
+        assert_eq!(app.unknown_keys.active(), None);
+    }
+
+    #[test]
+    fn unknown_key_dismissed_clears_alert() {
+        let mut app = active_app();
+        request_unknown_key(&mut app, "tz4wrong1");
+        let (_action, effects) = app.handle_event(AppEvent::UnknownKeyDismissed);
+        assert_eq!(app.unknown_keys.active(), None);
+        assert!(
+            has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
+            "dismissal must refresh the display to drop the banner"
+        );
+    }
+
+    #[test]
+    fn unknown_key_requested_when_modal_records_without_refresh() {
+        let mut app = active_app();
+        app.current_page_modal = true;
+        let effects = request_unknown_key(&mut app, "tz4wrong1");
+        assert!(
+            effects.is_empty(),
+            "no repaint may land over a modal page: {effects:?}"
+        );
+        assert_eq!(
+            app.unknown_keys.active(),
+            Some(alert_content("tz4wrong1", 0, false)),
+            "the alert must still be recorded for after the modal"
+        );
+    }
+
+    #[test]
+    fn unknown_key_requested_during_screensaver_wakes_display() {
+        let mut app = active_screensaver_app();
+        let (_action, effects) = app.handle_event(AppEvent::UnknownKeyRequested {
+            pkh: "tz4wrong1".into(),
+        });
+        assert!(has_effect(&effects, &Effect::WakeDisplay));
+        assert!(has_effect(&effects, &Effect::RebuildSavedPage));
+        assert!(
+            !has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
+            "the rebuild already repaints; a second refresh would double-flash e-paper"
+        );
+        assert!(!app.is_screensaver_active());
     }
 
     #[test]

@@ -69,6 +69,10 @@ pub enum AppEvent {
         chain_id: ChainId,
         requested_level: u32,
     }, // Signing request hit a key with no watermark, offer on-device recovery
+    UnknownKeyRequested {
+        pkh: String,
+    }, // Signing request named a key the device does not hold
+    UnknownKeyDismissed,   // User dismissed the unknown-key alert banner
     UpdateWatermarkToLevel {
         pkh: String,
         chain_id: ChainId,
