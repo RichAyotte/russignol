@@ -28,9 +28,12 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use russignol_storage::watermark::{
-    AUTH_FILE_SIZE, FILE_SIZE, FILENAMES, decode as decode_prefix, decode_authenticated,
-    encode_authenticated,
+    AUTH_FILE_SIZE, FILENAMES, decode_authenticated, encode_authenticated,
 };
+// The keyless prefix decode is only used by the debug/test read-back path; the
+// release load path verifies the full authenticated record instead.
+#[cfg(any(debug_assertions, test))]
+use russignol_storage::watermark::{FILE_SIZE, decode as decode_prefix};
 
 /// Chain identifier (32 bytes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -817,6 +820,9 @@ pub fn seed_watermarks(
 }
 
 /// Decode a 40-byte prefix into a watermark entry, validating the Blake3 checksum.
+/// Only the debug/test read-back path (`load_entry_from_file`) reads a prefix
+/// this way, so it shares that cfg and is absent from release builds.
+#[cfg(any(debug_assertions, test))]
 fn decode_entry(buf: &[u8; FILE_SIZE]) -> Option<WatermarkEntry> {
     let (level, round) = decode_prefix(buf)?;
     Some(WatermarkEntry { level, round })
