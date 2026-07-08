@@ -321,8 +321,7 @@ fn run_ui_loop(
         log::info!("Normal boot - showing PIN verification");
         Box::new(pin::Page::new(tx.clone(), "Enter\n PIN", pin::Mode::Verify))
     };
-    current_page.show(&mut device.display)?;
-    device.display.update()?;
+    render_page(&app, &mut device, &mut current_page)?;
 
     loop {
         let timeout = app.recv_timeout();
@@ -644,8 +643,7 @@ fn apply_effects(
             }
             Effect::DropCurrentPage => {
                 *current_page = Box::new(screensaver::Page::new());
-                current_page.show(&mut device.display)?;
-                device.display.update()?;
+                render_page(app, device, current_page)?;
             }
             Effect::RebuildSavedPage => {
                 if let Some(spec) = app.current_page_spec.clone() {

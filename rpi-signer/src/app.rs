@@ -317,10 +317,18 @@ impl App {
         }
     }
 
+    /// Effects to wake a sleeping display, when the screensaver is active.
+    /// Waking always restarts the inactivity clock: the screensaver timer
+    /// thread parks in `reset_rx.recv()` after firing and only
+    /// `Effect::ResetActivity` re-arms it.
     fn wake_from_screensaver_effects(&mut self) -> Vec<Effect> {
         if self.is_screensaver_active() {
             self.set_screensaver(false);
-            return vec![Effect::WakeDisplay, Effect::RebuildSavedPage];
+            return vec![
+                Effect::WakeDisplay,
+                Effect::RebuildSavedPage,
+                Effect::ResetActivity,
+            ];
         }
         vec![]
     }
@@ -677,12 +685,7 @@ impl App {
             }
             AppEvent::DeactivateScreensaver if self.is_screensaver_active() => {
                 log::info!("Deactivating screensaver");
-                self.set_screensaver(false);
-                effects.extend([
-                    Effect::WakeDisplay,
-                    Effect::RebuildSavedPage,
-                    Effect::ResetActivity,
-                ]);
+                effects.extend(self.wake_from_screensaver_effects());
             }
             AppEvent::WatermarkError {
                 pkh,
@@ -1383,6 +1386,10 @@ mod tests {
             requested_level: Some(50),
         });
         assert!(has_effect(&effects, &Effect::WakeDisplay));
+        assert!(
+            has_effect(&effects, &Effect::ResetActivity),
+            "every wake must restart the inactivity clock"
+        );
     }
 
     #[test]
@@ -1395,6 +1402,10 @@ mod tests {
             requested_level: 200,
         });
         assert!(has_effect(&effects, &Effect::WakeDisplay));
+        assert!(
+            has_effect(&effects, &Effect::ResetActivity),
+            "every wake must restart the inactivity clock"
+        );
     }
 
     #[test]
@@ -1418,6 +1429,10 @@ mod tests {
             requested_level: 600,
         });
         assert!(has_effect(&effects, &Effect::WakeDisplay));
+        assert!(
+            has_effect(&effects, &Effect::ResetActivity),
+            "every wake must restart the inactivity clock"
+        );
     }
 
     #[test]
@@ -1444,6 +1459,11 @@ mod tests {
         let effects = app.wake_from_screensaver_effects();
         assert!(has_effect(&effects, &Effect::WakeDisplay));
         assert!(has_effect(&effects, &Effect::RebuildSavedPage));
+        assert!(
+            has_effect(&effects, &Effect::ResetActivity),
+            "every wake must restart the inactivity clock, or the \
+             screensaver timer thread stays parked forever"
+        );
         assert!(!app.is_screensaver_active());
     }
 
@@ -1759,6 +1779,10 @@ mod tests {
         });
         assert!(has_effect(&effects, &Effect::WakeDisplay));
         assert!(has_effect(&effects, &Effect::RebuildSavedPage));
+        assert!(
+            has_effect(&effects, &Effect::ResetActivity),
+            "every wake must restart the inactivity clock"
+        );
         assert!(
             !has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
             "the rebuild already repaints; a second refresh would double-flash e-paper"
