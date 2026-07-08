@@ -329,6 +329,22 @@ impl App {
         )
     }
 
+    /// Whether a `DirtyDisplay` (a page repainting itself, e.g. PIN entry dots
+    /// on each touch) should render. Suppressed only by the screensaver; a modal
+    /// page must still repaint its own touch feedback.
+    pub fn should_repaint_on_dirty(&self) -> bool {
+        !self.is_screensaver_active()
+    }
+
+    /// Whether a `SigningActivity` refresh (the signer's background per-signature
+    /// callback) should repaint the current page. Suppressed while a modal is up
+    /// (e.g. the unknown-key notice): a held-key signing burst emits one refresh
+    /// per signature, which would flash the modal on the bistable panel each
+    /// time. The screensaver has nothing to repaint.
+    pub fn should_repaint_on_signing_activity(&self) -> bool {
+        !self.is_screensaver_active() && !self.current_page_modal
+    }
+
     pub fn recv_timeout(&self) -> Duration {
         self.animation_interval
     }
@@ -1417,6 +1433,64 @@ mod tests {
         assert!(effects.is_empty());
     }
 
+    // === DirtyDisplay repaint gate ===
+
+    #[test]
+    fn dirty_display_repaints_non_modal_page() {
+        let app = active_app();
+        assert!(
+            app.should_repaint_on_dirty(),
+            "a page's own repaint must render on a non-modal page"
+        );
+    }
+
+    #[test]
+    fn dirty_display_repaints_while_modal() {
+        let mut app = active_app();
+        app.current_page_modal = true;
+        assert!(
+            app.should_repaint_on_dirty(),
+            "a modal page (e.g. PIN entry) must still repaint its own touch feedback"
+        );
+    }
+
+    #[test]
+    fn dirty_display_suppressed_during_screensaver() {
+        let app = active_screensaver_app();
+        assert!(
+            !app.should_repaint_on_dirty(),
+            "screensaver has nothing to repaint"
+        );
+    }
+
+    #[test]
+    fn signing_activity_refreshes_non_modal_page() {
+        let app = active_app();
+        assert!(
+            app.should_repaint_on_signing_activity(),
+            "signing activity must refresh a non-modal page"
+        );
+    }
+
+    #[test]
+    fn signing_activity_suppressed_while_modal() {
+        let mut app = active_app();
+        app.current_page_modal = true;
+        assert!(
+            !app.should_repaint_on_signing_activity(),
+            "a signing burst must not flash the modal on every signature"
+        );
+    }
+
+    #[test]
+    fn signing_activity_suppressed_during_screensaver() {
+        let app = active_screensaver_app();
+        assert!(
+            !app.should_repaint_on_signing_activity(),
+            "screensaver has nothing to repaint"
+        );
+    }
+
     // === Screensaver tests ===
 
     #[test]
@@ -1969,10 +2043,10 @@ mod tests {
     fn only_dismiss_deactivates_unknown_key_alert() {
         let mut app = active_app();
         request_unknown_key(&mut app, "tz4wrong1");
-        // A successful signature (the signing callback sends DirtyDisplay)
+        // A successful signature (the signing callback sends SigningActivity)
         // says nothing about the unheld key in a mixed one-held/one-unheld
         // config, so it must not clear the alert.
-        app.handle_event(AppEvent::DirtyDisplay);
+        app.handle_event(AppEvent::SigningActivity);
         app.handle_event(AppEvent::ShowMenu);
         assert_eq!(
             app.unknown_keys.active(),

@@ -109,7 +109,7 @@ fn build_signer_event_callbacks(app_tx: &Sender<AppEvent>) -> SignerEventCallbac
 
     let tx_for_signing = app_tx.clone();
     let signing: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        let _ = tx_for_signing.send(AppEvent::DirtyDisplay);
+        let _ = tx_for_signing.send(AppEvent::SigningActivity);
     });
 
     let tx_for_large_gap = app_tx.clone();
@@ -349,7 +349,13 @@ fn run_ui_loop(
                 continue;
             }
             AppEvent::DirtyDisplay => {
-                if !app.is_screensaver_active() {
+                if app.should_repaint_on_dirty() {
+                    render_page(&mut device, &mut current_page)?;
+                }
+                continue;
+            }
+            AppEvent::SigningActivity => {
+                if app.should_repaint_on_signing_activity() {
                     render_page(&mut device, &mut current_page)?;
                 }
                 continue;

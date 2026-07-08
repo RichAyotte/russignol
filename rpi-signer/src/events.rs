@@ -42,7 +42,12 @@ pub enum AppEvent {
     PinVerificationFailed,         // PIN verification failed (wrong PIN)
     DeviceLocked,                  // Too many failed PIN attempts, device locked
     KeysDecrypted(Secret<String>), // Keys decrypted, carries secret_keys JSON for signer
+    /// A page repainting itself (e.g. PIN entry dots on each touch). Renders
+    /// unless the screensaver is active — including on a modal page.
     DirtyDisplay,
+    /// The signer's per-signature background callback. Renders the current page
+    /// unless a modal is up, so a held-key signing burst never flashes a modal.
+    SigningActivity,
     Touch(Point),
     PinEntered(Secret<Vec<u8>>),
     ActivateScreensaver,   // Trigger screensaver after inactivity
