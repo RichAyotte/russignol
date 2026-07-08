@@ -1,5 +1,4 @@
 mod app;
-mod banner;
 mod chain_info;
 mod constants;
 mod cpu_freq;
@@ -321,7 +320,7 @@ fn run_ui_loop(
         log::info!("Normal boot - showing PIN verification");
         Box::new(pin::Page::new(tx.clone(), "Enter\n PIN", pin::Mode::Verify))
     };
-    render_page(&app, &mut device, &mut current_page)?;
+    render_page(&mut device, &mut current_page)?;
 
     loop {
         let timeout = app.recv_timeout();
@@ -351,7 +350,7 @@ fn run_ui_loop(
             }
             AppEvent::DirtyDisplay => {
                 if !app.is_screensaver_active() {
-                    render_page(&app, &mut device, &mut current_page)?;
+                    render_page(&mut device, &mut current_page)?;
                 }
                 continue;
             }
@@ -384,20 +383,12 @@ fn run_ui_loop(
     Ok(())
 }
 
-/// Draw the current page, overlay the unknown-key banner when one is active
-/// and the page is not modal, then push the frame to the panel. Every page
-/// repaint goes through here so the banner survives page changes.
+/// Draw the current page and push the frame to the panel.
 fn render_page(
-    app: &App,
     device: &mut Device,
     current_page: &mut Box<dyn Page<Display>>,
 ) -> epd_2in13_v4::EpdResult<()> {
     current_page.show(&mut device.display)?;
-    if !app.current_page_modal
-        && let Some(content) = app.unknown_keys.active()
-    {
-        banner::draw(&mut device.display, &content)?;
-    }
     device.display.update()?;
     Ok(())
 }
@@ -408,7 +399,7 @@ fn handle_timeout(
     current_page: &mut Box<dyn Page<Display>>,
 ) -> epd_2in13_v4::EpdResult<()> {
     if app.needs_animation && !app.is_screensaver_active() {
-        render_page(app, device, current_page)?;
+        render_page(device, current_page)?;
     }
     Ok(())
 }
@@ -431,7 +422,7 @@ fn sleep_with_animation(
             return Ok(());
         }
         if app.needs_animation && !app.is_screensaver_active() {
-            if let Err(e) = render_page(app, device, current_page) {
+            if let Err(e) = render_page(device, current_page) {
                 log::warn!("display update during sleep: {e}");
             }
             std::thread::sleep(app.animation_interval.min(remaining));
@@ -451,16 +442,7 @@ fn handle_touch(
         let _ = app.tx.send(AppEvent::DeactivateScreensaver);
         return;
     }
-    // The banner overlays the top of non-modal pages, so it owns touches in
-    // that region while an alert is showing: tapping it dismisses the alert.
-    if !app.current_page_modal
-        && app.unknown_keys.active().is_some()
-        && touch_point.y < banner::HEIGHT
-    {
-        let _ = app.tx.send(AppEvent::UnknownKeyDismissed);
-    } else {
-        current_page.handle_touch(touch_point);
-    }
+    current_page.handle_touch(touch_point);
     let _ = screensaver_reset_tx.send(());
 }
 
@@ -643,7 +625,7 @@ fn apply_effects(
             }
             Effect::DropCurrentPage => {
                 *current_page = Box::new(screensaver::Page::new());
-                render_page(app, device, current_page)?;
+                render_page(device, current_page)?;
             }
             Effect::RebuildSavedPage => {
                 if let Some(spec) = app.current_page_spec.clone() {
@@ -651,7 +633,7 @@ fn apply_effects(
                     app.current_page_modal = page.is_modal();
                     app.needs_animation = false;
                     *current_page = page;
-                    render_page(app, device, current_page)?;
+                    render_page(device, current_page)?;
                 }
             }
             Effect::FatalError { title, message } => fatal_error(device, &title, &message),
@@ -690,7 +672,7 @@ fn apply_show_page(
         app.current_page_modal = page.is_modal();
         app.needs_animation = false;
         *current_page = page;
-        render_page(app, device, current_page)?;
+        render_page(device, current_page)?;
     }
     Ok(())
 }
@@ -717,7 +699,7 @@ fn apply_show_progress(
         app.needs_animation = false;
         *current_page = Box::new(progress);
     }
-    render_page(app, device, current_page)?;
+    render_page(device, current_page)?;
     Ok(())
 }
 
@@ -1015,7 +997,7 @@ fn apply_watermark_update(
         ));
         app.current_page_modal = true;
         *current_page = page;
-        render_page(app, device, current_page)?;
+        render_page(device, current_page)?;
     }
     Ok(())
 }

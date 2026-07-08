@@ -50,7 +50,7 @@ fn push_migration_notice(
 const UNKNOWN_KEY_CAP: usize = 8;
 
 /// Content of an active unknown-key alert, produced by
-/// [`UnknownKeyAlert::active`]. The banner and touch handling consume this
+/// [`UnknownKeyAlert::active`]. The modal notice message is built from this
 /// value as-is; nothing re-derives counts from the underlying state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AlertContent<'a> {
@@ -73,7 +73,7 @@ pub struct UnknownKeyAlert {
     pkhs: Vec<String>,
     /// Whether unknown pkhs beyond the retention cap were seen.
     overflow: bool,
-    /// Whether the banner is showing; dismissal hides it without forgetting.
+    /// Whether the alert modal is showing; dismissal hides it without forgetting.
     active: bool,
 }
 
@@ -98,13 +98,13 @@ impl UnknownKeyAlert {
         true
     }
 
-    /// Hide the banner. Retained pkhs and the overflow marker survive, so
+    /// Hide the alert. Retained pkhs and the overflow marker survive, so
     /// acknowledged keys never re-alert while a genuinely new key still does.
     pub fn dismiss(&mut self) {
         self.active = false;
     }
 
-    /// The banner content, when an alert is active.
+    /// The alert content, when an alert is active.
     pub fn active(&self) -> Option<AlertContent<'_>> {
         if !self.active {
             return None;
@@ -116,6 +116,31 @@ impl UnknownKeyAlert {
             overflow: self.overflow,
         })
     }
+}
+
+/// Title of the unknown-key modal, sized for the notice title band.
+const UNKNOWN_KEY_TITLE: &str = "Unknown Key";
+
+/// Fixed guidance naming the problem and the fix. Wraps to two lines in the
+/// notice's message font; the pkh line above it plus these two lines fill the
+/// three-line message box (`pages::notice::MESSAGE_BOX_HEIGHT`).
+const UNKNOWN_KEY_GUIDANCE: &str =
+    "This device lacks this key. Fix the baker's signer config and restart it.";
+
+/// Body of the unknown-key modal: the offending pkh truncated head+tail with an
+/// ASCII marker, a compact `+N` count when other distinct unknown keys were
+/// seen (`+N+` marks the count as a lower bound past the retention cap), then
+/// the guidance. The count stays compact so the pkh keeps to one line. All
+/// ASCII: the display fonts (`libs/ui/src/fonts.rs`) cover only ISO-8859-1 and
+/// have no U+2026 glyph, so truncation uses `crate::text::truncate_middle`.
+fn unknown_key_message(content: &AlertContent) -> String {
+    let pkh = crate::text::truncate_middle(content.pkh, 8, 6);
+    let suffix = match (content.others, content.overflow) {
+        (0, false) => String::new(),
+        (n, false) => format!(" +{n}"),
+        (n, true) => format!(" +{n}+"),
+    };
+    format!("{pkh}{suffix}\n{UNKNOWN_KEY_GUIDANCE}")
 }
 
 /// Maximum failed PIN attempts before lockout
@@ -256,8 +281,8 @@ pub struct App {
     /// Floor level staged by a consumed boot-partition config, applied as an
     /// authenticated mark after PIN unlock. `None` once seeded or absent.
     pub pending_watermark_level: Option<u32>,
-    /// Signing requests for keys the device does not hold, rendered as a
-    /// non-blocking banner over non-modal pages.
+    /// Signing requests for keys the device does not hold, surfaced as a
+    /// modal acknowledge dialog.
     pub unknown_keys: UnknownKeyAlert,
     pub needs_animation: bool,
     pub animation_interval: Duration,
@@ -317,20 +342,31 @@ impl App {
         }
     }
 
-    /// Effects to wake a sleeping display, when the screensaver is active.
-    /// Waking always restarts the inactivity clock: the screensaver timer
-    /// thread parks in `reset_rx.recv()` after firing and only
-    /// `Effect::ResetActivity` re-arms it.
-    fn wake_from_screensaver_effects(&mut self) -> Vec<Effect> {
+    /// Effects to wake a sleeping display without repainting the saved page,
+    /// when the screensaver is active. For callers that paint the display
+    /// themselves (a `ShowPage` renders its own frame); rebuilding the saved
+    /// page first would paint it and then immediately overpaint it, a double
+    /// e-paper flash. Waking always restarts the inactivity clock: the
+    /// screensaver timer thread parks in `reset_rx.recv()` after firing and
+    /// only `Effect::ResetActivity` re-arms it.
+    fn wake_without_rebuild_effects(&mut self) -> Vec<Effect> {
         if self.is_screensaver_active() {
             self.set_screensaver(false);
-            return vec![
-                Effect::WakeDisplay,
-                Effect::RebuildSavedPage,
-                Effect::ResetActivity,
-            ];
+            return vec![Effect::WakeDisplay, Effect::ResetActivity];
         }
         vec![]
+    }
+
+    /// Effects to wake a sleeping display and repaint the saved page, when the
+    /// screensaver is active. For callers with no frame of their own to paint.
+    fn wake_from_screensaver_effects(&mut self) -> Vec<Effect> {
+        let mut effects = self.wake_without_rebuild_effects();
+        if !effects.is_empty() {
+            // Between waking the panel and re-arming the timer: the panel must
+            // be awake before the rebuild paints.
+            effects.insert(1, Effect::RebuildSavedPage);
+        }
+        effects
     }
 
     pub fn handle_event(&mut self, event: AppEvent) -> (LoopAction, Vec<Effect>) {
@@ -727,7 +763,7 @@ impl App {
             }
             AppEvent::UnknownKeyDismissed => {
                 self.unknown_keys.dismiss();
-                effects.push(Effect::Emit(AppEvent::DirtyDisplay));
+                effects.push(Effect::ShowPage(PageSpec::Menu));
             }
             AppEvent::UpdateWatermarkToLevel {
                 pkh,
@@ -757,28 +793,36 @@ impl App {
         (LoopAction::Proceed, effects)
     }
 
-    /// Record an unknown-key request and, when it is newly retained, refresh
-    /// the display so the banner appears. Repaint effects are bounded by
-    /// [`UnknownKeyAlert::record`]; a modal page defers the banner to its own
-    /// dismissal repaint.
+    /// Record an unknown-key request and, when it is newly retained, raise a
+    /// modal acknowledge dialog naming the pkh. Repaints are bounded by
+    /// [`UnknownKeyAlert::record`].
+    ///
+    /// Guard before record: a request arriving while any modal is up is neither
+    /// recorded nor shown, so the untrusted peer can never stack a page over an
+    /// open dialog. The misconfigured baker repeats the request every block, so
+    /// the alert self-corrects once the blocking modal clears.
     fn unknown_key_requested_effects(&mut self, pkh: &str) -> Vec<Effect> {
+        if self.current_page_modal {
+            return vec![];
+        }
         if !self.unknown_keys.record(pkh) {
             return vec![];
         }
         log::warn!(
             "Signing request for unknown key {pkh}: the baker is signing for keys this device does not hold"
         );
-        if self.current_page_modal {
-            return vec![];
-        }
-        let wake = self.wake_from_screensaver_effects();
-        if wake.is_empty() {
-            // The rebuild in the wake path already repaints; only a lit
-            // display needs an explicit refresh.
-            vec![Effect::Emit(AppEvent::DirtyDisplay)]
-        } else {
-            wake
-        }
+        let message = self
+            .unknown_keys
+            .active()
+            .map(|content| unknown_key_message(&content))
+            .expect("record returned true, so the alert is active");
+        let mut effects = self.wake_without_rebuild_effects();
+        effects.push(Effect::ShowPage(PageSpec::Notice {
+            title: UNKNOWN_KEY_TITLE.into(),
+            message,
+            on_dismiss: AppEvent::UnknownKeyDismissed,
+        }));
+        effects
     }
 
     fn watermark_error_effects(
@@ -1601,6 +1645,9 @@ mod tests {
 
     // === Unknown-key alert tests ===
 
+    /// A maximum-length (36-char) tz4 pkh, the widest the modal must fit.
+    const MAX_TZ4_PKH: &str = "tz4HVR43NNbNhLGTHUNCGWEUjYmDT1RGcNjZ";
+
     /// Feed `UnknownKeyRequested` for `pkh` and return the effects.
     fn request_unknown_key(app: &mut App, pkh: &str) -> Vec<Effect> {
         let (_action, effects) =
@@ -1616,26 +1663,165 @@ mod tests {
         }
     }
 
+    /// The message of the first `ShowPage(Notice)` in `effects`, if any.
+    fn notice_message(effects: &[Effect]) -> Option<&str> {
+        effects.iter().find_map(|e| match e {
+            Effect::ShowPage(PageSpec::Notice { message, .. }) => Some(message.as_str()),
+            _ => None,
+        })
+    }
+
+    // --- Message-builder tests ---
+
     #[test]
-    fn unknown_key_requested_records_state_and_requests_refresh() {
+    fn unknown_key_message_single_key_has_no_count_suffix() {
+        let msg = unknown_key_message(&alert_content(MAX_TZ4_PKH, 0, false));
+        assert!(
+            msg.contains("tz4HVR43...RGcNjZ"),
+            "the pkh must appear truncated head+tail: {msg}"
+        );
+        assert!(
+            !msg.contains(" +"),
+            "a lone key carries no count suffix: {msg}"
+        );
+        assert!(
+            msg.contains(UNKNOWN_KEY_GUIDANCE),
+            "the message must carry the guidance line: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_message_counts_other_keys_compactly() {
+        let msg = unknown_key_message(&alert_content(MAX_TZ4_PKH, 1, false));
+        assert!(msg.contains("tz4HVR43...RGcNjZ +1"), "{msg}");
+        let msg = unknown_key_message(&alert_content(MAX_TZ4_PKH, 5, false));
+        assert!(msg.contains("tz4HVR43...RGcNjZ +5"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_key_message_overflow_marks_lower_bound() {
+        let msg = unknown_key_message(&alert_content(MAX_TZ4_PKH, 7, true));
+        assert!(msg.contains("tz4HVR43...RGcNjZ +7+"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_key_message_truncates_pkh_with_ascii_marker() {
+        let msg = unknown_key_message(&alert_content(MAX_TZ4_PKH, 0, false));
+        assert!(
+            msg.contains("..."),
+            "the pkh must be truncated with an ASCII marker: {msg}"
+        );
+        assert!(
+            !msg.contains(MAX_TZ4_PKH),
+            "the full-length pkh must not appear: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_message_is_pure_ascii() {
+        for content in [
+            alert_content(MAX_TZ4_PKH, 0, false),
+            alert_content(MAX_TZ4_PKH, 1, false),
+            alert_content(MAX_TZ4_PKH, 5, false),
+            alert_content(MAX_TZ4_PKH, 7, true),
+        ] {
+            let msg = unknown_key_message(&content);
+            assert!(msg.is_ascii(), "the message must be pure ASCII: {msg}");
+        }
+    }
+
+    /// The display fonts cover only ISO-8859-1, and `render_aligned` aborts
+    /// mid-string at a missing glyph, so every string the modal renders must be
+    /// renderable in the font it renders with: the title in `FONT_PROPORTIONAL`,
+    /// the message body in `FONT_MEDIUM`.
+    #[test]
+    fn font_covers_every_unknown_key_string() {
+        use embedded_graphics::prelude::Point;
+        use u8g2_fonts::{FontRenderer, types::VerticalPosition};
+
+        let title_font = FontRenderer::new::<crate::fonts::FONT_PROPORTIONAL>();
+        let message_font = FontRenderer::new::<crate::fonts::FONT_MEDIUM>();
+        let renders = |font: &FontRenderer, s: &str| {
+            font.get_rendered_dimensions(s, Point::zero(), VerticalPosition::Baseline)
+                .is_ok()
+        };
+        assert!(
+            renders(&title_font, UNKNOWN_KEY_TITLE),
+            "the title contains a glyph FONT_PROPORTIONAL cannot render"
+        );
+        for content in [
+            alert_content(MAX_TZ4_PKH, 0, false),
+            alert_content(MAX_TZ4_PKH, 1, false),
+            alert_content(MAX_TZ4_PKH, 7, false),
+            alert_content(MAX_TZ4_PKH, 7, true),
+        ] {
+            let msg = unknown_key_message(&content);
+            assert!(
+                renders(&message_font, &msg),
+                "message {msg:?} contains a glyph FONT_MEDIUM cannot render"
+            );
+        }
+    }
+
+    /// The notice message box clips whole rows that overflow, so the widest,
+    /// most-suffixed unknown-key message must render within it or the operator
+    /// loses the pkh or the guidance.
+    #[test]
+    fn unknown_key_message_fits_notice_box() {
+        for content in [
+            alert_content(MAX_TZ4_PKH, 0, false),
+            alert_content(MAX_TZ4_PKH, 7, false),
+            alert_content(MAX_TZ4_PKH, 7, true),
+        ] {
+            let msg = unknown_key_message(&content);
+            let height = crate::pages::notice::measure_message_height(&msg);
+            assert!(
+                height <= crate::pages::notice::MESSAGE_BOX_HEIGHT.cast_unsigned(),
+                "message {msg:?} needs {height}px but the notice box is {}px",
+                crate::pages::notice::MESSAGE_BOX_HEIGHT,
+            );
+        }
+    }
+
+    // --- Show / state-machine tests ---
+
+    #[test]
+    fn wake_without_rebuild_omits_page_rebuild() {
+        let mut app = active_screensaver_app();
+        let effects = app.wake_without_rebuild_effects();
+        assert!(has_effect(&effects, &Effect::WakeDisplay));
+        assert!(
+            has_effect(&effects, &Effect::ResetActivity),
+            "every wake must restart the inactivity clock"
+        );
+        assert!(
+            !has_effect(&effects, &Effect::RebuildSavedPage),
+            "the no-rebuild wake must not repaint the saved page"
+        );
+        assert!(!app.is_screensaver_active());
+    }
+
+    #[test]
+    fn unknown_key_requested_shows_modal_notice() {
         let mut app = active_app();
         let effects = request_unknown_key(&mut app, "tz4wrong1");
+        let message = notice_message(&effects).expect("an unknown key must raise a Notice modal");
+        assert!(
+            message.contains("tz4wrong1"),
+            "the notice must name the pkh: {message}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::ShowPage(PageSpec::Notice { on_dismiss, .. })
+                    if *on_dismiss == AppEvent::UnknownKeyDismissed
+            )),
+            "the notice must dismiss to the acknowledge event"
+        );
         assert_eq!(
             app.unknown_keys.active(),
             Some(alert_content("tz4wrong1", 0, false)),
             "the requested pkh must be recorded"
-        );
-        assert!(
-            has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
-            "a newly seen unknown key must request a display refresh"
-        );
-        assert!(
-            !effects.iter().any(|e| matches!(e, Effect::ShowPage(_))),
-            "the alert must not push a page"
-        );
-        assert!(
-            !app.current_page_modal,
-            "the alert must not make the current page modal"
         );
     }
 
@@ -1655,20 +1841,57 @@ mod tests {
     }
 
     #[test]
+    fn unknown_key_requested_when_modal_does_not_record() {
+        let mut app = active_app();
+        app.current_page_modal = true;
+        let effects = request_unknown_key(&mut app, "tz4wrong1");
+        assert!(
+            effects.is_empty(),
+            "no page may land over a modal: {effects:?}"
+        );
+        assert_eq!(
+            app.unknown_keys.active(),
+            None,
+            "a request arriving under a modal is neither shown nor recorded"
+        );
+    }
+
+    #[test]
+    fn unknown_key_requested_during_screensaver_wakes_and_shows_modal() {
+        let mut app = active_screensaver_app();
+        let effects = request_unknown_key(&mut app, "tz4wrong1");
+        assert!(has_effect(&effects, &Effect::WakeDisplay));
+        assert!(
+            has_effect(&effects, &Effect::ResetActivity),
+            "every wake must restart the inactivity clock"
+        );
+        assert!(
+            notice_message(&effects).is_some_and(|m| m.contains("tz4wrong1")),
+            "the alert modal must be shown after waking: {effects:?}"
+        );
+        assert!(
+            !has_effect(&effects, &Effect::RebuildSavedPage),
+            "ShowPage(Notice) paints the modal itself; rebuilding the saved page \
+             first would double-flash e-paper"
+        );
+        assert!(!app.is_screensaver_active());
+    }
+
+    #[test]
     fn unknown_key_alert_is_bounded_at_cap() {
         let mut app = active_app();
         for i in 1..=UNKNOWN_KEY_CAP {
             let effects = request_unknown_key(&mut app, &format!("tz4wrong{i}"));
             assert!(
-                has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
-                "pkh {i} is within the cap and must refresh"
+                notice_message(&effects).is_some(),
+                "pkh {i} is within the cap and must show the modal"
             );
         }
-        // One past the cap: flips the overflow marker — one final repaint.
+        // One past the cap: flips the overflow marker — one final modal.
         let effects = request_unknown_key(&mut app, "tz4over1");
         assert!(
-            has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
-            "the overflow flip is the last state change and must refresh"
+            notice_message(&effects).is_some(),
+            "the overflow flip is the last state change and must show the modal"
         );
         // Beyond that, nothing changes: new pkhs and repeats of non-retained
         // pkhs produce no effects — a flooding peer cannot drive the display.
@@ -1676,14 +1899,14 @@ mod tests {
             let effects = request_unknown_key(&mut app, pkh);
             assert!(
                 effects.is_empty(),
-                "past the overflow flip no refresh may fire for {pkh}: {effects:?}"
+                "past the overflow flip no modal may fire for {pkh}: {effects:?}"
             );
         }
         let last_retained = format!("tz4wrong{UNKNOWN_KEY_CAP}");
         assert_eq!(
             app.unknown_keys.active(),
             Some(alert_content(&last_retained, UNKNOWN_KEY_CAP - 1, true)),
-            "the banner reports the retained keys plus the overflow marker"
+            "the alert reports the retained keys plus the overflow marker"
         );
         assert_eq!(
             app.unknown_keys.pkhs.len(),
@@ -1716,12 +1939,29 @@ mod tests {
         app.handle_event(AppEvent::UnknownKeyDismissed);
         let effects = request_unknown_key(&mut app, "tz4wrong2");
         assert!(
-            has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
-            "a genuinely new pkh must re-alert after dismissal"
+            notice_message(&effects).is_some_and(|m| m.contains("tz4wrong2")),
+            "a genuinely new pkh must re-raise the modal after dismissal: {effects:?}"
         );
         assert_eq!(
             app.unknown_keys.active(),
             Some(alert_content("tz4wrong2", 1, false))
+        );
+    }
+
+    #[test]
+    fn unknown_key_dismissed_acks_to_menu() {
+        let mut app = active_app();
+        request_unknown_key(&mut app, "tz4wrong1");
+        let (_action, effects) = app.handle_event(AppEvent::UnknownKeyDismissed);
+        assert_eq!(
+            app.unknown_keys.active(),
+            None,
+            "ack clears the active alert"
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::ShowPage(PageSpec::Menu)],
+            "ack returns to the menu"
         );
     }
 
@@ -1741,53 +1981,6 @@ mod tests {
         );
         app.handle_event(AppEvent::UnknownKeyDismissed);
         assert_eq!(app.unknown_keys.active(), None);
-    }
-
-    #[test]
-    fn unknown_key_dismissed_clears_alert() {
-        let mut app = active_app();
-        request_unknown_key(&mut app, "tz4wrong1");
-        let (_action, effects) = app.handle_event(AppEvent::UnknownKeyDismissed);
-        assert_eq!(app.unknown_keys.active(), None);
-        assert!(
-            has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
-            "dismissal must refresh the display to drop the banner"
-        );
-    }
-
-    #[test]
-    fn unknown_key_requested_when_modal_records_without_refresh() {
-        let mut app = active_app();
-        app.current_page_modal = true;
-        let effects = request_unknown_key(&mut app, "tz4wrong1");
-        assert!(
-            effects.is_empty(),
-            "no repaint may land over a modal page: {effects:?}"
-        );
-        assert_eq!(
-            app.unknown_keys.active(),
-            Some(alert_content("tz4wrong1", 0, false)),
-            "the alert must still be recorded for after the modal"
-        );
-    }
-
-    #[test]
-    fn unknown_key_requested_during_screensaver_wakes_display() {
-        let mut app = active_screensaver_app();
-        let (_action, effects) = app.handle_event(AppEvent::UnknownKeyRequested {
-            pkh: "tz4wrong1".into(),
-        });
-        assert!(has_effect(&effects, &Effect::WakeDisplay));
-        assert!(has_effect(&effects, &Effect::RebuildSavedPage));
-        assert!(
-            has_effect(&effects, &Effect::ResetActivity),
-            "every wake must restart the inactivity clock"
-        );
-        assert!(
-            !has_effect(&effects, &Effect::Emit(AppEvent::DirtyDisplay)),
-            "the rebuild already repaints; a second refresh would double-flash e-paper"
-        );
-        assert!(!app.is_screensaver_active());
     }
 
     #[test]

@@ -72,7 +72,7 @@ pub enum AppEvent {
     UnknownKeyRequested {
         pkh: String,
     }, // Signing request named a key the device does not hold
-    UnknownKeyDismissed,   // User dismissed the unknown-key alert banner
+    UnknownKeyDismissed,   // User acknowledged the unknown-key alert modal
     UpdateWatermarkToLevel {
         pkh: String,
         chain_id: ChainId,
