@@ -226,6 +226,9 @@ type LargeGapCallback = Arc<dyn Fn(PublicKeyHash, ChainId, u32, u32) + Send + Sy
 /// Type alias for missing watermark callback (pkh, `chain_id`, `requested_level`)
 type MissingWatermarkCallback = Arc<dyn Fn(PublicKeyHash, ChainId, u32) + Send + Sync>;
 
+/// Type alias for unknown-key callback (the requested pkh the signer does not hold)
+type UnknownKeyCallback = Arc<dyn Fn(PublicKeyHash) + Send + Sync>;
+
 /// Type alias for signing notification callback (called after each successful signature)
 type SigningNotifyCallback = Arc<dyn Fn() + Send + Sync>;
 
@@ -259,6 +262,8 @@ pub struct RequestHandler {
     large_gap_callback: Option<LargeGapCallback>,
     /// Callback for missing (uninitialized) watermark detection
     missing_watermark_callback: Option<MissingWatermarkCallback>,
+    /// Callback for signing requests naming a key the signer does not hold
+    unknown_key_callback: Option<UnknownKeyCallback>,
     /// Blocks per cycle (chain-specific, used for gap threshold calculation)
     blocks_per_cycle: Option<u32>,
     /// Callback invoked before each sign request (e.g., CPU frequency boost)
@@ -287,6 +292,7 @@ impl RequestHandler {
             signing_notify_callback: None,
             large_gap_callback: None,
             missing_watermark_callback: None,
+            unknown_key_callback: None,
             blocks_per_cycle: None,
             pre_sign_callback: None,
             post_sign_callback: None,
@@ -347,6 +353,18 @@ impl RequestHandler {
         self
     }
 
+    /// Set unknown-key detection callback.
+    ///
+    /// When a signing request names a key the signer does not hold, the
+    /// callback is invoked so the UI can alert the operator that the baker
+    /// is signing for the wrong keys. Signing still fails with `KeyNotFound`;
+    /// the callback only supplies the requested pkh.
+    #[must_use]
+    pub fn with_unknown_key_callback(mut self, callback: UnknownKeyCallback) -> Self {
+        self.unknown_key_callback = Some(callback);
+        self
+    }
+
     /// Set pre-sign callback (called at the start of each sign request)
     #[must_use]
     pub fn with_pre_sign_callback(mut self, callback: Arc<dyn Fn() + Send + Sync>) -> Self {
@@ -373,6 +391,23 @@ impl RequestHandler {
         if let Some(ref callback) = self.post_sign_callback {
             callback();
         }
+    }
+
+    /// Resolve a pkh to its signer, firing the unknown-key callback when the
+    /// signer does not hold the key.
+    ///
+    /// Every pkh-bearing request path must resolve through here so a baker
+    /// misconfigured with an unheld key is surfaced no matter which request
+    /// type arrives first — public-key and proof-of-possession lookups at
+    /// baker startup, not just Sign.
+    fn get_signer_or_alert(&self, pkh: &PublicKeyHash) -> Result<Unencrypted> {
+        let result = self.keys.read()?.get_signer(pkh).cloned();
+        if matches!(result, Err(Error::KeyNotFound(_)))
+            && let Some(ref callback) = self.unknown_key_callback
+        {
+            callback(*pkh);
+        }
+        result
     }
 
     /// Handle a signer request
@@ -450,9 +485,7 @@ impl RequestHandler {
         // A key the signer does not hold can never be signed, and the watermark
         // checks below would otherwise offer recovery for it. Reject it here so
         // the missing-watermark dialog is reserved for keys we can actually sign.
-        if self.keys.read()?.get_key_name(&pkh).is_none() {
-            return Err(Error::KeyNotFound(pkh.to_b58check()));
-        }
+        self.get_signer_or_alert(&pkh)?;
 
         // 2. Check high watermark
         #[cfg(feature = "perf-trace")]
@@ -730,8 +763,7 @@ impl RequestHandler {
 
     /// Handle public key request
     fn handle_public_key(&self, pkh: PublicKeyHash) -> Result<SignerResponse> {
-        let keys = self.keys.read()?;
-        let signer = keys.get_signer(&pkh)?;
+        let signer = self.get_signer_or_alert(&pkh)?;
         Ok(SignerResponse::PublicKey(signer.public_key().clone()))
     }
 
@@ -748,10 +780,9 @@ impl RequestHandler {
         pkh: PublicKeyHash,
         data: &[u8],
     ) -> Result<SignerResponse> {
-        let keys = self.keys.read()?;
-        let signer = keys.get_signer(&pkh)?;
+        let signer = self.get_signer_or_alert(&pkh)?;
 
-        let handler = Handler::new(signer.clone(), None);
+        let handler = Handler::new(signer, None);
 
         // Generate nonce directly (requests are serial)
         let nonce = handler.deterministic_nonce(data);
@@ -765,10 +796,9 @@ impl RequestHandler {
         pkh: PublicKeyHash,
         data: &[u8],
     ) -> Result<SignerResponse> {
-        let keys = self.keys.read()?;
-        let signer = keys.get_signer(&pkh)?;
+        let signer = self.get_signer_or_alert(&pkh)?;
 
-        let handler = Handler::new(signer.clone(), None);
+        let handler = Handler::new(signer, None);
 
         // Generate nonce hash directly (requests are serial)
         let nonce_hash = handler.deterministic_nonce_hash(data);
@@ -778,12 +808,8 @@ impl RequestHandler {
 
     /// Handle supports deterministic nonces request
     fn handle_supports_deterministic_nonces(&self, pkh: PublicKeyHash) -> Result<SignerResponse> {
-        let keys = self
-            .keys
-            .read()
-            .map_err(|e| Error::Internal(format!("Lock poisoned: {e}")))?;
         // Check if key exists
-        let _ = keys.get_signer(&pkh)?;
+        self.get_signer_or_alert(&pkh)?;
 
         // All BLS signers support deterministic nonces
         Ok(SignerResponse::Bool(true))
@@ -814,10 +840,9 @@ impl RequestHandler {
                     .to_string(),
             ));
         }
-        let keys = self.keys.read()?;
-        let signer = keys.get_signer(&pkh)?;
+        let signer = self.get_signer_or_alert(&pkh)?;
 
-        let handler = Handler::new(signer.clone(), None);
+        let handler = Handler::new(signer, None);
         let proof = handler.bls_prove_possession(override_pk)?;
 
         Ok(SignerResponse::Signature(proof))
@@ -1628,6 +1653,164 @@ mod tests {
             call_count.load(Ordering::SeqCst),
             0,
             "missing-watermark callback must not fire for an unknown key"
+        );
+    }
+
+    #[test]
+    fn test_unknown_key_callback_fires_once_and_still_rejects() {
+        use std::sync::Mutex;
+
+        let temp_dir = TempDir::new().unwrap();
+        let (known_pkh, _pk, _sk) = generate_key(Some(&[42u8; 32])).unwrap();
+        let known_signer = Unencrypted::generate(Some(&[42u8; 32])).unwrap();
+        let (unknown_pkh, _pk2, _sk2) = generate_key(Some(&[7u8; 32])).unwrap();
+
+        let mut mgr = KeyManager::new();
+        mgr.add_signer(known_pkh, known_signer, "known".to_string());
+
+        let hwm = Arc::new(RwLock::new(
+            new_watermark(temp_dir.path(), &[known_pkh]).unwrap(),
+        ));
+
+        let seen: Arc<Mutex<Vec<PublicKeyHash>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+
+        let handler = RequestHandler::new(
+            Arc::new(RwLock::new(mgr)),
+            Some(Arc::clone(&hwm)),
+            Some(vec![0x11, 0x12, 0x13]),
+            true,
+            true,
+        )
+        .with_unknown_key_callback(Arc::new(move |pkh| {
+            seen_clone.lock().unwrap().push(pkh);
+        }));
+
+        // Block data at level 600 for a key the signer does not hold.
+        let mut data = vec![0x11];
+        data.extend_from_slice(&[0, 0, 0, 1]); // chain_id
+        data.extend_from_slice(&600u32.to_be_bytes()); // level
+        data.push(0); // proto
+        data.extend_from_slice(&[0u8; 32]); // predecessor
+        data.extend_from_slice(&[0u8; 8]); // timestamp
+        data.push(0); // validation_pass
+        data.extend_from_slice(&[0u8; 32]); // operations_hash
+        data.extend_from_slice(&8u32.to_be_bytes()); // fitness_length
+        data.extend_from_slice(&0u32.to_be_bytes()); // round
+
+        let result = handler.handle_request(SignerRequest::Sign {
+            pkh: (unknown_pkh, 0),
+            data,
+            signature: None,
+        });
+
+        // The rejection is unchanged by the callback.
+        assert!(
+            matches!(result.unwrap_err(), Error::KeyNotFound(_)),
+            "an unheld key must still reject as KeyNotFound"
+        );
+        // The callback fired exactly once, with the requested pkh. (Dedup is
+        // app-side; this layer fires per request.)
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            &[unknown_pkh],
+            "unknown-key callback must fire exactly once with the requested pkh"
+        );
+    }
+
+    /// Build a handler holding one key, an unheld pkh to request, and a log
+    /// of every unknown-key callback invocation.
+    fn handler_with_unknown_key_recording() -> (
+        RequestHandler,
+        PublicKeyHash,
+        Arc<std::sync::Mutex<Vec<PublicKeyHash>>>,
+    ) {
+        let (known_pkh, _pk, _sk) = generate_key(Some(&[42u8; 32])).unwrap();
+        let known_signer = Unencrypted::generate(Some(&[42u8; 32])).unwrap();
+        let (unknown_pkh, _pk2, _sk2) = generate_key(Some(&[7u8; 32])).unwrap();
+
+        let mut mgr = KeyManager::new();
+        mgr.add_signer(known_pkh, known_signer, "known".to_string());
+
+        let seen: Arc<std::sync::Mutex<Vec<PublicKeyHash>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+
+        let handler = RequestHandler::new(Arc::new(RwLock::new(mgr)), None, None, true, true)
+            .with_unknown_key_callback(Arc::new(move |pkh| {
+                seen_clone.lock().unwrap().push(pkh);
+            }));
+
+        (handler, unknown_pkh, seen)
+    }
+
+    #[test]
+    fn test_unknown_key_callback_fires_on_every_pkh_bearing_request() {
+        type MakeRequest = fn(PublicKeyHash) -> SignerRequest;
+        let requests: [(&str, MakeRequest); 5] = [
+            ("PublicKey", |pkh| SignerRequest::PublicKey { pkh }),
+            ("DeterministicNonce", |pkh| {
+                SignerRequest::DeterministicNonce {
+                    pkh: (pkh, 0),
+                    data: vec![0x01, 0x02, 0x03],
+                    signature: None,
+                }
+            }),
+            ("DeterministicNonceHash", |pkh| {
+                SignerRequest::DeterministicNonceHash {
+                    pkh: (pkh, 0),
+                    data: vec![0x01, 0x02, 0x03],
+                    signature: None,
+                }
+            }),
+            ("SupportsDeterministicNonces", |pkh| {
+                SignerRequest::SupportsDeterministicNonces { pkh }
+            }),
+            ("BlsProveRequest", |pkh| SignerRequest::BlsProveRequest {
+                pkh,
+                override_pk: None,
+            }),
+        ];
+
+        for (name, make_request) in requests {
+            let (handler, unknown_pkh, seen) = handler_with_unknown_key_recording();
+
+            let result = handler.handle_request(make_request(unknown_pkh));
+
+            assert!(
+                matches!(result.unwrap_err(), Error::KeyNotFound(_)),
+                "{name}: an unheld key must reject as KeyNotFound"
+            );
+            assert_eq!(
+                seen.lock().unwrap().as_slice(),
+                &[unknown_pkh],
+                "{name}: unknown-key callback must fire exactly once with the requested pkh"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_key_callback_fires_per_request_without_dedup() {
+        let (handler, unknown_pkh, seen) = handler_with_unknown_key_recording();
+
+        for _ in 0..2 {
+            let result = handler.handle_request(SignerRequest::Sign {
+                pkh: (unknown_pkh, 0),
+                data: vec![0x11, 0x01, 0x02],
+                signature: None,
+            });
+            assert!(
+                matches!(result.unwrap_err(), Error::KeyNotFound(_)),
+                "an unheld key must reject as KeyNotFound"
+            );
+        }
+
+        // Dedup is app-side; this layer fires per request.
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[unknown_pkh, unknown_pkh],
+            "identical requests must each fire the unknown-key callback"
         );
     }
 
