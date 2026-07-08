@@ -42,6 +42,11 @@ russignol image flash buildroot/output/images/sdcard.img.xz
 
 The host utility handles device auto-detection, mount/safety checks, decompression, and post-write partition re-read that a bare `dd` skips.
 
+# Inspecting a card on the host (no sudo)
+
+- **Mount**: `udisksctl mount -b /dev/sdXN` / `udisksctl unmount -b /dev/sdXN`. polkit auto-authorizes an active local session to mount removable media, so the root `udisks2` daemon performs the mount (lands under `/run/media/$USER/`). The `mount` command itself needs root; `udisksctl` does not. Works for the vfat boot partition and the f2fs keys/data partitions.
+- **Raw read/write**: `disk`-group membership grants read+write on `/dev/sdX*`, so `strings`/`dd` can inspect a partition without mounting (e.g. read a staged `watermark-config.json`, confirm a build feature is compiled in). The `disk` group does not grant `mount(2)` (needs `CAP_SYS_ADMIN`) — hence mounting goes through `udisksctl`, not `mount`.
+
 # Pre-commit
 
 ```sh
