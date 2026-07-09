@@ -39,5 +39,6 @@ russignol-storage = { version = "0.1.0", path = "../libs/storage" }
 hex = "0.4.3"
 russignol-crypto = { version = "0.1.2", path = "../libs/crypto" }
 russignol-signer-lib = { version = "0.6.4", path = "../libs/signer" }
+russignol-release-signature = { version = "0.1.0", path = "../libs/release-signature" }
 
 [dev-dependencies]

@@ -44,6 +44,10 @@ pub struct ImageInfo {
     pub min_sd_size_gb: u64,
     /// Asset download URL as reported by the GitHub API
     pub download_url: String,
+    /// Detached maintainer signature (hex) over the image SHA-256, when the
+    /// release publishes a `<filename>.sig` asset
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 /// GitHub API response for a release
@@ -144,6 +148,54 @@ fn fetch_checksums(agent: &ureq::Agent, assets: &[GitHubAsset]) -> HashMap<Strin
     checksums
 }
 
+/// Parse the content of a detached `.sig` asset into the signature hex.
+///
+/// The signer writes a single hex line with a trailing newline, so the content
+/// is trimmed. Empty or whitespace-only content yields `None`.
+fn parse_signature_content(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Fetch detached `<asset>.sig` signatures from release assets.
+///
+/// Returns a `HashMap` mapping the signed asset's name -> signature hex.
+/// A missing `.sig` asset or a failed fetch simply leaves that asset out —
+/// an unsigned release must keep working.
+fn fetch_signatures(agent: &ureq::Agent, assets: &[GitHubAsset]) -> HashMap<String, String> {
+    let mut signatures = HashMap::new();
+    for asset in assets {
+        let Some(signed_name) = asset.name.strip_suffix(".sig") else {
+            continue;
+        };
+
+        let response = match agent.get(&asset.browser_download_url).call() {
+            Ok(resp) => resp,
+            Err(e) => {
+                log::warn!("Failed to fetch {}: {e}", asset.name);
+                continue;
+            }
+        };
+
+        let content = match response.into_body().read_to_string() {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Failed to read {}: {e}", asset.name);
+                continue;
+            }
+        };
+
+        if let Some(signature) = parse_signature_content(&content) {
+            signatures.insert(signed_name.to_string(), signature);
+        }
+    }
+    signatures
+}
+
 /// Release asset class a caller needs; release selection only considers
 /// releases that carry it
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,8 +259,13 @@ fn select_latest_release(
         .map(|(_, r)| r)
 }
 
-/// Build `VersionInfo` from a selected release and its fetched checksums
-fn build_version_info(release: &GitHubRelease, checksums: &HashMap<String, String>) -> VersionInfo {
+/// Build `VersionInfo` from a selected release, its fetched checksums, and its
+/// fetched signatures (keyed by the signed asset's name)
+fn build_version_info(
+    release: &GitHubRelease,
+    checksums: &HashMap<String, String>,
+    signatures: &HashMap<String, String>,
+) -> VersionInfo {
     // Parse version from tag (strip prefix)
     let version = release
         .tag_name
@@ -259,6 +316,7 @@ fn build_version_info(release: &GitHubRelease, checksums: &HashMap<String, Strin
                     compressed_size_bytes: asset.size,
                     min_sd_size_gb: 8,
                     download_url: asset.browser_download_url.clone(),
+                    signature: signatures.get(&asset.name).cloned(),
                 },
             );
         }
@@ -299,7 +357,10 @@ pub fn fetch_latest_version(
     // Fetch checksums from checksums.txt (if available)
     let checksums = fetch_checksums(&agent, &release.assets);
 
-    Ok(build_version_info(release, &checksums))
+    // Fetch detached signatures published alongside the assets (if any)
+    let signatures = fetch_signatures(&agent, &release.assets);
+
+    Ok(build_version_info(release, &checksums, &signatures))
 }
 
 /// Get download URL for a specific architecture
@@ -560,11 +621,55 @@ def456  file2
     }
 
     #[test]
+    fn parse_signature_content_trims_the_trailing_newline() {
+        // The signer writes a single hex line with a trailing newline
+        assert_eq!(
+            parse_signature_content("abc123def456\n"),
+            Some("abc123def456".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_signature_content_empty_is_none() {
+        assert_eq!(parse_signature_content(""), None);
+        assert_eq!(parse_signature_content("  \n"), None);
+    }
+
+    #[test]
+    fn image_signature_populated_from_fetched_sig() {
+        let release = make_release_with_assets(
+            "v0.25.0",
+            false,
+            &["russignol-pi-zero.img.xz", "russignol-pi-zero.img.xz.sig"],
+        );
+        let signatures = HashMap::from([(
+            "russignol-pi-zero.img.xz".to_string(),
+            "abc123def456".to_string(),
+        )]);
+
+        let info = build_version_info(&release, &HashMap::new(), &signatures);
+
+        assert_eq!(
+            info.images["pi-zero"].signature,
+            Some("abc123def456".to_string())
+        );
+    }
+
+    #[test]
+    fn image_signature_absent_when_release_has_none() {
+        let release = make_release_with_assets("v0.25.0", false, &["russignol-pi-zero.img.xz"]);
+
+        let info = build_version_info(&release, &HashMap::new(), &HashMap::new());
+
+        assert_eq!(info.images["pi-zero"].signature, None);
+    }
+
+    #[test]
     fn test_download_url_comes_from_release_asset() {
         let release =
             make_release_with_assets("host-utility-v0.26.0-beta.1", true, &["russignol-amd64"]);
 
-        let info = build_version_info(&release, &HashMap::new());
+        let info = build_version_info(&release, &HashMap::new(), &HashMap::new());
         let url = get_download_url(&info, "amd64").unwrap();
 
         assert_eq!(
@@ -579,7 +684,7 @@ def456  file2
         release.assets[0].browser_download_url =
             "https://cdn.example.com/russignol-pi-zero.img.xz".to_string();
 
-        let info = build_version_info(&release, &HashMap::new());
+        let info = build_version_info(&release, &HashMap::new(), &HashMap::new());
         let url = get_image_download_url(&info, "pi-zero").unwrap();
 
         assert_eq!(url, "https://cdn.example.com/russignol-pi-zero.img.xz");

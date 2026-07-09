@@ -28,6 +28,7 @@ mod phase3;
 mod phase5;
 mod progress;
 mod purge;
+mod release_signature;
 mod restore_keys;
 mod rotate_keys;
 mod status;

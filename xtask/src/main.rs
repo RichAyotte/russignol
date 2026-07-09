@@ -14,6 +14,7 @@ mod clean;
 mod config;
 mod deploy;
 mod image;
+mod maintainer_key;
 mod upgrade;
 mod utils;
 mod watermark_test;
@@ -252,6 +253,13 @@ enum Commands {
         publish: PublishTargets,
     },
 
+    /// Generate a maintainer signing key, sealing its seed behind a passphrase
+    MaintainerKeygen {
+        /// Where to write the sealed seed (default: ~/.config/russignol/maintainer-key)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
     /// Generate code coverage report
     Coverage {
         /// Open HTML report in browser
@@ -458,6 +466,7 @@ fn try_main() -> Result<()> {
         Commands::Clean { buildroot, deep } => do_clean(buildroot, deep),
         Commands::Validate => cmd_validate(),
         Commands::Publish { component, publish } => cmd_publish(component, &publish),
+        Commands::MaintainerKeygen { output } => maintainer_key::cmd_maintainer_keygen(output),
         Commands::Coverage { open, lcov } => cmd_coverage(open, lcov),
         Commands::Deploy { skip_build, dev } => deploy::deploy(skip_build, dev),
         Commands::WatermarkTest {
@@ -854,6 +863,51 @@ fn cmd_github_release(component: ReleaseComponent) -> Result<()> {
     Ok(())
 }
 
+/// Path of the built release image and its detached maintainer signature.
+const RELEASE_IMAGE: &str = "target/russignol-pi-zero.img.xz";
+const RELEASE_IMAGE_SIG: &str = "target/russignol-pi-zero.img.xz.sig";
+
+/// Sign the built release image with the maintainer key, writing a detached
+/// signature beside it. Skips silently when the image was not built, and leaves
+/// the release unsigned (as before) when no maintainer key is present.
+fn sign_release_image() -> Result<()> {
+    sign_release_image_at(
+        Path::new(RELEASE_IMAGE),
+        Path::new(RELEASE_IMAGE_SIG),
+        &maintainer_key::default_key_path()?,
+    )
+}
+
+fn sign_release_image_at(image: &Path, sig_path: &Path, key_path: &Path) -> Result<()> {
+    // A signature left over from a prior build belongs to a different image;
+    // shipped together they can only fail verification. Remove it up front so a
+    // .sig exists only when this run produced it.
+    if sig_path.exists() {
+        std::fs::remove_file(sig_path)
+            .with_context(|| format!("Failed to remove stale {}", sig_path.display()))?;
+    }
+
+    if !image.exists() {
+        return Ok(());
+    }
+
+    if !key_path.exists() {
+        println!(
+            "  {} No maintainer key at {} — release image left unsigned",
+            "⚠".yellow(),
+            key_path.display()
+        );
+        return Ok(());
+    }
+
+    let digest = compute_sha256(image)?;
+    let signature = maintainer_key::sign_digest_with_sealed_key(key_path, &digest)?;
+    std::fs::write(sig_path, format!("{signature}\n"))
+        .with_context(|| format!("Failed to write {}", sig_path.display()))?;
+    println!("    {} russignol-pi-zero.img.xz.sig", "✓".green());
+    Ok(())
+}
+
 /// Collect release assets based on the component being released
 fn collect_release_assets(component: ReleaseComponent) -> Vec<String> {
     let asset_names: &[&str] = match component {
@@ -861,9 +915,14 @@ fn collect_release_assets(component: ReleaseComponent) -> Vec<String> {
             "russignol-amd64",
             "russignol-aarch64",
             "russignol-pi-zero.img.xz",
+            "russignol-pi-zero.img.xz.sig",
             "checksums.txt",
         ],
-        ReleaseComponent::Signer => &["russignol-pi-zero.img.xz", "checksums.txt"],
+        ReleaseComponent::Signer => &[
+            "russignol-pi-zero.img.xz",
+            "russignol-pi-zero.img.xz.sig",
+            "checksums.txt",
+        ],
         ReleaseComponent::HostUtility => &["russignol-amd64", "russignol-aarch64", "checksums.txt"],
         // Libraries don't have binary assets
         ReleaseComponent::SignerLib
@@ -941,6 +1000,16 @@ fn cmd_release(opts: &ReleaseOptions) -> Result<()> {
 
     // 4. Component-specific build steps
     step = build_component_artifacts(component, step)?;
+
+    // 5. Sign the release image (components that ship one)
+    if matches!(component, ReleaseComponent::All | ReleaseComponent::Signer) {
+        println!(
+            "\n{}",
+            format!("Step {step}: Sign Release Image").cyan().bold()
+        );
+        sign_release_image()?;
+        step += 1;
+    }
 
     // Create GitHub release (optional)
     if publish.github {
@@ -1613,6 +1682,39 @@ mod tests {
         assert_eq!(
             host_zig_target("aarch64-unknown-linux-gnu"),
             "aarch64-unknown-linux-gnu.2.28"
+        );
+    }
+
+    #[test]
+    fn unsigned_release_removes_stale_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image.img.xz");
+        let sig = dir.path().join("image.img.xz.sig");
+        let key = dir.path().join("no-such-key");
+        std::fs::write(&image, b"fresh image").unwrap();
+        std::fs::write(&sig, "stale signature\n").unwrap();
+
+        sign_release_image_at(&image, &sig, &key).unwrap();
+
+        assert!(
+            !sig.exists(),
+            "a signature from a prior build must not survive an unsigned release"
+        );
+    }
+
+    #[test]
+    fn skipped_image_removes_stale_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image.img.xz");
+        let sig = dir.path().join("image.img.xz.sig");
+        let key = dir.path().join("no-such-key");
+        std::fs::write(&sig, "stale signature\n").unwrap();
+
+        sign_release_image_at(&image, &sig, &key).unwrap();
+
+        assert!(
+            !sig.exists(),
+            "a signature must not outlive the image it was made for"
         );
     }
 

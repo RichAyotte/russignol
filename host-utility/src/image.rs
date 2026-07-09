@@ -32,6 +32,42 @@ struct DownloadInfo {
     uncompressed_size: Option<u64>,
     version: Option<String>,
     channel: Option<String>,
+    /// Detached maintainer signature (hex) over the image SHA-256
+    signature: Option<String>,
+}
+
+impl DownloadInfo {
+    /// Metadata for a custom `--url` download: no release info is available,
+    /// so everything beyond the URL is unknown.
+    fn from_custom_url(url: String) -> Self {
+        Self {
+            url,
+            checksum: None,
+            compressed_size: None,
+            uncompressed_size: None,
+            version: None,
+            channel: None,
+            signature: None,
+        }
+    }
+
+    /// Metadata for a release download, mapped from the fetched image info
+    fn from_release(url: String, version: &str, image: &version::ImageInfo) -> Self {
+        let channel = if version.contains('-') {
+            "beta"
+        } else {
+            "stable"
+        };
+        Self {
+            url,
+            checksum: Some(image.sha256.clone()),
+            compressed_size: Some(image.compressed_size_bytes),
+            uncompressed_size: Some(image.size_bytes),
+            version: Some(version.to_string()),
+            channel: Some(channel.to_string()),
+            signature: image.signature.clone(),
+        }
+    }
 }
 
 /// Image provenance metadata threaded through flash pipelines
@@ -218,6 +254,16 @@ pub enum ImageCommands {
         /// Skip the post-flash read-back verification (faster, not recommended)
         #[arg(long)]
         skip_verify: bool,
+
+        /// Path to the image's detached maintainer signature (.sig). Defaults
+        /// to a `<image>.sig` sidecar next to the image when present.
+        #[arg(long)]
+        signature: Option<PathBuf>,
+
+        /// Flash an image with no verifiable maintainer signature (e.g. a
+        /// self-built or dev image). Ignored while no maintainer key is embedded.
+        #[arg(long)]
+        allow_unsigned: bool,
     },
 
     /// Download and flash in one step
@@ -265,6 +311,11 @@ pub enum ImageCommands {
         /// Skip the post-flash read-back verification (faster, not recommended)
         #[arg(long)]
         skip_verify: bool,
+
+        /// Flash an image with no verifiable maintainer signature (e.g. a
+        /// self-built or dev image). Ignored while no maintainer key is embedded.
+        #[arg(long)]
+        allow_unsigned: bool,
     },
 
     /// List available images
@@ -290,6 +341,7 @@ impl ImageCommands {
             companion_key: None,
             beta: false,
             skip_verify: false,
+            allow_unsigned: false,
         }
     }
 }
@@ -354,6 +406,8 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
             consensus_key,
             companion_key,
             skip_verify,
+            signature,
+            allow_unsigned,
         } => cmd_flash(
             &image,
             device,
@@ -365,7 +419,11 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
                 consensus_key: consensus_key.as_deref(),
                 companion_key: companion_key.as_deref(),
             },
-            skip_verify,
+            signature.as_deref(),
+            FlashVerification {
+                skip_readback: skip_verify,
+                allow_unsigned,
+            },
         ),
         ImageCommands::DownloadAndFlash {
             url,
@@ -378,6 +436,7 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
             companion_key,
             beta,
             skip_verify,
+            allow_unsigned,
         } => cmd_download_and_flash(
             url,
             device,
@@ -390,7 +449,10 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
                 companion_key: companion_key.as_deref(),
             },
             beta,
-            skip_verify,
+            FlashVerification {
+                skip_readback: skip_verify,
+                allow_unsigned,
+            },
         ),
         ImageCommands::List { beta } => cmd_list(beta),
     }
@@ -669,6 +731,15 @@ struct KeySourceArgs<'a> {
     companion_key: Option<&'a str>,
 }
 
+/// Write-time verification policy for a flash: whether to skip the post-flash
+/// read-back, and whether to permit an image that carries no maintainer
+/// signature.
+#[derive(Clone, Copy)]
+struct FlashVerification {
+    skip_readback: bool,
+    allow_unsigned: bool,
+}
+
 /// Reject `--restore-keys` and `--migrate-keys` used together: each selects a
 /// different key source for the same flash, so only one may be given.
 fn check_key_source_exclusive(
@@ -708,13 +779,73 @@ fn resolve_key_source(
     }
 }
 
+/// Enforce the maintainer release-signature policy before any destructive
+/// write. With no maintainer key embedded yet, this proceeds silently; once a
+/// key is embedded it verifies the image's signature and refuses on mismatch,
+/// requiring `--allow-unsigned` to flash an image that carries no signature.
+fn enforce_release_signature(
+    image_sha256: &str,
+    signature: Option<&str>,
+    allow_unsigned: bool,
+) -> Result<()> {
+    use crate::release_signature::{MAINTAINER_PUBKEY, SignatureVerdict, check_release_signature};
+
+    match check_release_signature(
+        MAINTAINER_PUBKEY.as_ref(),
+        image_sha256,
+        signature,
+        allow_unsigned,
+    ) {
+        Ok(SignatureVerdict::Verified) => {
+            utils::success("Maintainer release signature verified");
+            Ok(())
+        }
+        // No production key embedded yet — nothing to verify against.
+        Ok(SignatureVerdict::Unavailable) => Ok(()),
+        Ok(SignatureVerdict::UnsignedAllowed) => {
+            utils::warning("Flashing an unsigned image (--allow-unsigned)");
+            Ok(())
+        }
+        Err(e) => bail!("Refusing to flash: {e}"),
+    }
+}
+
+/// Resolve the detached maintainer signature for a locally-supplied image: an
+/// explicit `--signature` path wins; otherwise a `<image>.sig` sidecar next to
+/// the image is used when present; otherwise there is no signature.
+///
+/// The signer writes a single hex line with a trailing newline, so the content
+/// is trimmed.
+///
+/// # Errors
+///
+/// Fails when a signature file that should exist cannot be read: an explicit
+/// path (the operator claimed a signature exists) or a present sidecar.
+fn resolve_local_signature(image: &Path, explicit: Option<&Path>) -> Result<Option<String>> {
+    let path = if let Some(path) = explicit {
+        path.to_path_buf()
+    } else {
+        let mut sidecar = image.as_os_str().to_os_string();
+        sidecar.push(".sig");
+        let sidecar = PathBuf::from(sidecar);
+        if !sidecar.exists() {
+            return Ok(None);
+        }
+        sidecar
+    };
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read signature file {}", path.display()))?;
+    Ok(Some(content.trim().to_string()))
+}
+
 fn cmd_flash(
     image: &Path,
     device: Option<PathBuf>,
     endpoint: Option<&str>,
     yes: bool,
     keys: KeySourceArgs<'_>,
-    skip_verify: bool,
+    signature_path: Option<&Path>,
+    verification: FlashVerification,
 ) -> Result<()> {
     check_key_source_exclusive(keys.restore_keys, keys.migrate_keys)?;
 
@@ -730,9 +861,18 @@ fn cmd_flash(
     {
         bail!("Device not found: {}", dev.display());
     }
+    let signature = resolve_local_signature(image, signature_path)?;
+
     // Compute image hash for manifest
     utils::info("Computing image hash...");
     let image_sha256 = compute_file_sha256(image)?;
+
+    // Runs before device selection so nothing is written on refusal.
+    enforce_release_signature(
+        &image_sha256,
+        signature.as_deref(),
+        verification.allow_unsigned,
+    )?;
 
     // Check node FIRST - fail fast if node is unavailable
     let node_check = check_node_for_watermarks(endpoint, yes)?;
@@ -806,7 +946,7 @@ fn cmd_flash(
         &target_device.path,
         None,
         privilege,
-        skip_verify,
+        verification.skip_readback,
         &metadata,
         node_check.as_ref().map(|nc| &nc.chain_info),
     )?;
@@ -885,14 +1025,7 @@ fn finalize_flash(device: &Path, chain_info: Option<&watermark::ChainInfo>) -> R
 fn resolve_download_info(url: Option<String>, include_prerelease: bool) -> Result<DownloadInfo> {
     if let Some(custom_url) = url {
         utils::info(&format!("Using custom URL: {custom_url}"));
-        Ok(DownloadInfo {
-            url: custom_url,
-            checksum: None,
-            compressed_size: None,
-            uncompressed_size: None,
-            version: None,
-            channel: None,
-        })
+        Ok(DownloadInfo::from_custom_url(custom_url))
     } else {
         utils::info("Fetching latest version info...");
         let version_info =
@@ -911,21 +1044,39 @@ fn resolve_download_info(url: Option<String>, include_prerelease: bool) -> Resul
             format_bytes(image_info.compressed_size_bytes)
         ));
 
-        let channel = if version_info.version.contains('-') {
-            "beta"
-        } else {
-            "stable"
-        };
-
-        Ok(DownloadInfo {
+        Ok(DownloadInfo::from_release(
             url,
-            checksum: Some(image_info.sha256.clone()),
-            compressed_size: Some(image_info.compressed_size_bytes),
-            uncompressed_size: Some(image_info.size_bytes),
-            version: Some(version_info.version.clone()),
-            channel: Some(channel.to_string()),
-        })
+            &version_info.version,
+            image_info,
+        ))
     }
+}
+
+/// Shared trust gate of both `download-and-flash` paths: download the image
+/// with its release checksum, verify the downloaded file's hash against it,
+/// and enforce the maintainer signature policy. Returns the cached image path
+/// and its verified SHA-256. Kept in one place so the two entry points cannot
+/// diverge.
+fn download_and_verify_release_image(
+    dl: &DownloadInfo,
+    allow_unsigned: bool,
+) -> Result<(PathBuf, String)> {
+    let checksum = dl.checksum.as_deref().filter(|s| !s.is_empty()).context(
+        "Checksum not available for this release. Cannot safely flash without verification.",
+    )?;
+    let image_path = download_with_cache(&dl.url, Some(checksum), dl.compressed_size)?;
+
+    // Compute hash from the downloaded file and verify against release checksum
+    utils::info("Computing image hash...");
+    let image_sha256 = compute_file_sha256(&image_path)?;
+    if image_sha256 != checksum {
+        bail!(
+            "Image hash mismatch after download!\n  Expected: {checksum}\n  Got:      {image_sha256}"
+        );
+    }
+
+    enforce_release_signature(&image_sha256, dl.signature.as_deref(), allow_unsigned)?;
+    Ok((image_path, image_sha256))
 }
 
 fn cmd_download_and_flash(
@@ -935,7 +1086,7 @@ fn cmd_download_and_flash(
     yes: bool,
     keys: KeySourceArgs<'_>,
     include_prerelease: bool,
-    skip_verify: bool,
+    verification: FlashVerification,
 ) -> Result<()> {
     check_key_source_exclusive(keys.restore_keys, keys.migrate_keys)?;
 
@@ -967,19 +1118,8 @@ fn cmd_download_and_flash(
 
         // Download first (can happen before touching cards)
         let dl = resolve_download_info(url, include_prerelease)?;
-        let checksum = dl.checksum.as_deref().filter(|s| !s.is_empty()).context(
-            "Checksum not available for this release. Cannot safely flash without verification.",
-        )?;
-        let image_path = download_with_cache(&dl.url, Some(checksum), dl.compressed_size)?;
-
-        // Compute hash from the downloaded file and verify against release checksum
-        utils::info("Computing image hash...");
-        let image_sha256 = compute_file_sha256(&image_path)?;
-        if image_sha256 != checksum {
-            bail!(
-                "Image hash mismatch after download!\n  Expected: {checksum}\n  Got:      {image_sha256}"
-            );
-        }
+        let (image_path, image_sha256) =
+            download_and_verify_release_image(&dl, verification.allow_unsigned)?;
 
         let metadata = FlashMetadata {
             image_sha256,
@@ -1033,19 +1173,8 @@ fn cmd_download_and_flash(
     }
 
     // Download with caching and resume support (checksum required for flash)
-    let checksum = dl.checksum.as_deref().filter(|s| !s.is_empty()).context(
-        "Checksum not available for this release. Cannot safely flash without verification.",
-    )?;
-    let image_path = download_with_cache(&dl.url, Some(checksum), dl.compressed_size)?;
-
-    // Compute hash from the downloaded file and verify against release checksum
-    utils::info("Computing image hash...");
-    let image_sha256 = compute_file_sha256(&image_path)?;
-    if image_sha256 != checksum {
-        bail!(
-            "Image hash mismatch after download!\n  Expected: {checksum}\n  Got:      {image_sha256}"
-        );
-    }
+    let (image_path, image_sha256) =
+        download_and_verify_release_image(&dl, verification.allow_unsigned)?;
 
     // Flash the downloaded image
     let metadata = FlashMetadata {
@@ -1058,7 +1187,7 @@ fn cmd_download_and_flash(
         &target_device.path,
         dl.uncompressed_size,
         privilege,
-        skip_verify,
+        verification.skip_readback,
         &metadata,
         node_check.as_ref().map(|nc| &nc.chain_info),
     )?;
@@ -2702,6 +2831,118 @@ mod tests {
                 .iter()
                 .any(|f| f.contains("rootfs partition (p2) did not mount"))
         );
+    }
+
+    fn signed_image_info() -> version::ImageInfo {
+        version::ImageInfo {
+            filename: "russignol-pi-zero.img.xz".to_string(),
+            sha256: "abc123".to_string(),
+            size_bytes: 4096,
+            compressed_size_bytes: 1024,
+            min_sd_size_gb: 8,
+            download_url: "https://example.com/russignol-pi-zero.img.xz".to_string(),
+            signature: Some("deadbeef".to_string()),
+        }
+    }
+
+    #[test]
+    fn release_download_info_carries_the_image_signature() {
+        let info = DownloadInfo::from_release(
+            "https://example.com/russignol-pi-zero.img.xz".to_string(),
+            "0.25.0",
+            &signed_image_info(),
+        );
+
+        assert_eq!(info.signature, Some("deadbeef".to_string()));
+    }
+
+    #[test]
+    fn custom_url_download_info_has_no_signature() {
+        let info = DownloadInfo::from_custom_url("https://example.com/custom.img.xz".to_string());
+
+        assert_eq!(info.signature, None);
+    }
+
+    #[test]
+    fn local_signature_explicit_path_wins_over_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("test.img.xz");
+        std::fs::write(&image, b"image").unwrap();
+        std::fs::write(dir.path().join("test.img.xz.sig"), "sidecar\n").unwrap();
+        let explicit = dir.path().join("elsewhere.sig");
+        std::fs::write(&explicit, "explicit\n").unwrap();
+
+        let sig = resolve_local_signature(&image, Some(&explicit)).unwrap();
+
+        assert_eq!(sig, Some("explicit".to_string()));
+    }
+
+    #[test]
+    fn local_signature_falls_back_to_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("test.img.xz");
+        std::fs::write(&image, b"image").unwrap();
+        std::fs::write(dir.path().join("test.img.xz.sig"), "deadbeef\n").unwrap();
+
+        let sig = resolve_local_signature(&image, None).unwrap();
+
+        assert_eq!(sig, Some("deadbeef".to_string()));
+    }
+
+    #[test]
+    fn local_signature_none_when_no_sidecar_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("test.img.xz");
+        std::fs::write(&image, b"image").unwrap();
+
+        let sig = resolve_local_signature(&image, None).unwrap();
+
+        assert_eq!(sig, None);
+    }
+
+    /// End-to-end over the local flash path's trust decision, no device
+    /// needed: a sidecar `.sig` written the way the release signer writes it
+    /// (hex line, trailing newline) resolves and verifies against the image's
+    /// actual SHA-256.
+    #[test]
+    fn resolved_sidecar_signature_verifies_against_the_image_hash() {
+        use crate::release_signature::{SignatureVerdict, check_release_signature};
+        use russignol_release_signature::{public_key, sign};
+
+        // A deterministic seed — a test fixture, never a production key.
+        let seed = [7u8; 32];
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("test.img.xz");
+        std::fs::write(&image, b"release image bytes").unwrap();
+        let image_sha256 = compute_file_sha256(&image).unwrap();
+
+        let sig = sign(&seed, &image_sha256).unwrap();
+        std::fs::write(dir.path().join("test.img.xz.sig"), format!("{sig}\n")).unwrap();
+
+        let resolved = resolve_local_signature(&image, None).unwrap();
+
+        assert_eq!(
+            check_release_signature(
+                Some(&public_key(&seed)),
+                &image_sha256,
+                resolved.as_deref(),
+                false,
+            ),
+            Ok(SignatureVerdict::Verified)
+        );
+    }
+
+    #[test]
+    fn local_signature_explicit_unreadable_path_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("test.img.xz");
+        std::fs::write(&image, b"image").unwrap();
+        let missing = dir.path().join("does-not-exist.sig");
+
+        let result = resolve_local_signature(&image, Some(&missing));
+
+        assert!(result.is_err(), "a missing explicit path must be an error");
     }
 
     #[test]
