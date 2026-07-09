@@ -34,7 +34,7 @@ use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::{DrawTarget, Point};
 use epd_2in13_v4::display::Display;
 use epd_2in13_v4::{Device, device};
-use events::AppEvent;
+use events::{AppEvent, ConfigPresence};
 use pages::{
     Page, about, blockchain, confirmation, dialog, greeting, menu, notice, pin, screensaver,
     signatures, status, watermarks,
@@ -618,6 +618,7 @@ fn apply_effects(
                 }
             }
             Effect::ProcessWatermarkConfig => apply_watermark_config(app, device),
+            Effect::ValidateWatermarkConfig => apply_validate_watermark_config(app),
             Effect::VerifyStorage => apply_verify_storage(device),
             Effect::UpdateWatermark {
                 pkh,
@@ -941,6 +942,27 @@ fn apply_watermark_config(app: &mut App, device: &mut Device) {
             fatal_error(device, "WATERMARK ERROR", &e);
         }
     };
+}
+
+/// Validate the staged watermark config before key generation without consuming
+/// it, and report the outcome so the setup gate can branch. The consuming pass
+/// (`apply_watermark_config`) runs later, after keygen.
+fn apply_validate_watermark_config(app: &App) {
+    let presence = match watermark_setup::validate_watermark_config() {
+        watermark_setup::WatermarkResult::Configured { chain_name, level } => {
+            log::info!("Watermark config staged and valid: {chain_name}, floor level {level}");
+            ConfigPresence::Present
+        }
+        watermark_setup::WatermarkResult::NotFound => {
+            log::warn!("No watermark config staged for the pre-keygen check");
+            ConfigPresence::Missing
+        }
+        watermark_setup::WatermarkResult::Error(e) => {
+            log::warn!("Staged watermark config failed the pre-keygen check: {e}");
+            ConfigPresence::Invalid
+        }
+    };
+    let _ = app.tx.send(AppEvent::WatermarkConfigChecked(presence));
 }
 
 fn apply_verify_storage(device: &mut Device) {

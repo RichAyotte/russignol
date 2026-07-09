@@ -3,7 +3,7 @@ use russignol_signer_lib::{ChainId, HighWatermark, signing_activity};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::events::AppEvent;
+use crate::events::{AppEvent, ConfigPresence};
 use crate::secret::Secret;
 use crate::setup;
 use crate::tezos_encrypt::MigrationEvent;
@@ -143,6 +143,46 @@ fn unknown_key_message(content: &AlertContent) -> String {
     format!("{pkh}{suffix}\n{UNKNOWN_KEY_GUIDANCE}")
 }
 
+/// Policy for the config-presence gate before key generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatePolicy {
+    /// Refuse key generation unless a valid config is staged. A wrong or absent
+    /// watermark floor is a slashing risk, so an unprovisioned card must not
+    /// commit key material it can never validly sign from.
+    HardFail,
+    /// Proceed regardless; the config is consumed post-keygen as before.
+    WarnAndContinue,
+}
+
+/// Active gate policy. A node-connected flash always stages the config, so a
+/// hard gate is invisible on the normal path; it blocks only an offline flash
+/// that could not stage one. The `warn-only-gate` build feature selects the
+/// warn-and-continue policy for offline-flash images.
+const KEYGEN_GATE_POLICY: GatePolicy = if cfg!(feature = "warn-only-gate") {
+    GatePolicy::WarnAndContinue
+} else {
+    GatePolicy::HardFail
+};
+
+/// Whether the setup flow may proceed to key generation, given the config-
+/// presence check and the gate policy.
+fn should_proceed_to_keygen(presence: ConfigPresence, policy: GatePolicy) -> bool {
+    match policy {
+        GatePolicy::WarnAndContinue => true,
+        GatePolicy::HardFail => presence == ConfigPresence::Present,
+    }
+}
+
+/// Title of the pre-keygen config-gate notice.
+const CONFIG_GATE_TITLE: &str = "Card Not Ready";
+
+/// Shown when key generation is blocked because no valid watermark config is
+/// staged. Directs the operator to provision the card on a node-connected host,
+/// the only source of chain id and watermark floor. Wraps to three lines in the
+/// notice message font (`pages::notice::MESSAGE_BOX_HEIGHT`).
+const CONFIG_GATE_MESSAGE: &str =
+    "No watermark config.\nPrepare on the host with\nrussignol disk doctor.";
+
 /// Maximum failed PIN attempts before lockout
 const MAX_FAILED_ATTEMPTS: u32 = 5;
 /// Lockout duration after max failed attempts (5 minutes)
@@ -252,6 +292,7 @@ pub enum Effect {
     WriteSetupMarker,
     SetKeyPermissions,
     ProcessWatermarkConfig,
+    ValidateWatermarkConfig,
     VerifyStorage,
     UpdateWatermark {
         pkh: String,
@@ -439,9 +480,24 @@ impl App {
                 });
             }
             AppEvent::StorageSetupComplete => {
-                log::info!("Storage setup complete, verifying partitions...");
+                log::info!("Storage setup complete, verifying partitions and checking config...");
                 effects.push(Effect::VerifyStorage);
-                effects.push(Effect::ShowPage(PageSpec::PinCreate));
+                effects.push(Effect::ValidateWatermarkConfig);
+            }
+            AppEvent::WatermarkConfigChecked(presence) => {
+                if should_proceed_to_keygen(presence, KEYGEN_GATE_POLICY) {
+                    effects.push(Effect::ShowPage(PageSpec::PinCreate));
+                } else {
+                    log::warn!("Key generation blocked: no valid watermark config staged");
+                    // Dead-end for this boot: the card can only be provisioned on
+                    // a node-connected host. Dismissing re-shows the notice (the
+                    // presence was fixed at check time) rather than advancing.
+                    effects.push(Effect::ShowPage(PageSpec::Notice {
+                        title: CONFIG_GATE_TITLE.into(),
+                        message: CONFIG_GATE_MESSAGE.into(),
+                        on_dismiss: AppEvent::WatermarkConfigChecked(presence),
+                    }));
+                }
             }
             AppEvent::StorageSetupFailed(e) => {
                 effects.push(Effect::FatalError {
@@ -1008,11 +1064,73 @@ mod tests {
     // === State transition tests ===
 
     #[test]
-    fn setup_storage_complete_shows_pin_create() {
+    fn setup_storage_complete_validates_config_before_pin() {
         let mut app = first_boot_app();
         let (action, effects) = app.handle_event(AppEvent::StorageSetupComplete);
         assert_eq!(action, LoopAction::Proceed);
+        assert!(
+            has_effect(&effects, &Effect::ValidateWatermarkConfig),
+            "storage completion must trigger the config-presence check"
+        );
+        assert!(
+            !has_show_page(&effects, &PageSpec::PinCreate),
+            "PIN creation must wait for the config check, not fire on storage completion"
+        );
+    }
+
+    #[test]
+    fn config_present_proceeds_to_pin_create() {
+        let mut app = first_boot_app();
+        let (_action, effects) =
+            app.handle_event(AppEvent::WatermarkConfigChecked(ConfigPresence::Present));
         assert!(has_show_page(&effects, &PageSpec::PinCreate));
+    }
+
+    #[test]
+    fn config_missing_blocks_keygen_with_notice() {
+        let mut app = first_boot_app();
+        let (_action, effects) =
+            app.handle_event(AppEvent::WatermarkConfigChecked(ConfigPresence::Missing));
+        assert!(
+            notice_message(&effects).is_some(),
+            "a missing config must raise a blocking notice"
+        );
+        assert!(
+            !has_show_page(&effects, &PageSpec::PinCreate),
+            "a blocked card must never reach PIN creation"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SpawnKeygen { .. })),
+            "a blocked card must never spawn keygen"
+        );
+    }
+
+    #[test]
+    fn config_invalid_blocks_keygen_with_notice() {
+        let mut app = first_boot_app();
+        let (_action, effects) =
+            app.handle_event(AppEvent::WatermarkConfigChecked(ConfigPresence::Invalid));
+        assert!(
+            notice_message(&effects).is_some(),
+            "an invalid config must raise a blocking notice"
+        );
+        assert!(!has_show_page(&effects, &PageSpec::PinCreate));
+    }
+
+    #[test]
+    fn keygen_gate_truth_table() {
+        use ConfigPresence::*;
+        use GatePolicy::*;
+        // Hard-fail: only a present, valid config proceeds to keygen.
+        assert!(should_proceed_to_keygen(Present, HardFail));
+        assert!(!should_proceed_to_keygen(Missing, HardFail));
+        assert!(!should_proceed_to_keygen(Invalid, HardFail));
+        // Warn-and-continue: never blocks.
+        assert!(should_proceed_to_keygen(Present, WarnAndContinue));
+        assert!(should_proceed_to_keygen(Missing, WarnAndContinue));
+        assert!(should_proceed_to_keygen(Invalid, WarnAndContinue));
     }
 
     #[test]
@@ -1855,6 +1973,18 @@ mod tests {
                 crate::pages::notice::MESSAGE_BOX_HEIGHT,
             );
         }
+    }
+
+    /// The config-gate notice shares the clip-prone notice box; its message
+    /// must render within it or the operator loses the provisioning guidance.
+    #[test]
+    fn config_gate_message_fits_notice_box() {
+        let height = crate::pages::notice::measure_message_height(CONFIG_GATE_MESSAGE);
+        assert!(
+            height <= crate::pages::notice::MESSAGE_BOX_HEIGHT.cast_unsigned(),
+            "config-gate message needs {height}px but the notice box is {}px",
+            crate::pages::notice::MESSAGE_BOX_HEIGHT,
+        );
     }
 
     // --- Show / state-machine tests ---

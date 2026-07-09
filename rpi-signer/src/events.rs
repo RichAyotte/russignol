@@ -5,6 +5,19 @@ use std::time::Duration;
 use crate::secret::Secret;
 use crate::tezos_encrypt::MigrationEvent;
 
+/// Outcome of the pre-keygen watermark-config presence check, carried by
+/// [`AppEvent::WatermarkConfigChecked`]. The setup gate maps it to a
+/// proceed-to-keygen vs block decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigPresence {
+    /// A valid, node-staged config is present on the boot partition.
+    Present,
+    /// No config is staged.
+    Missing,
+    /// A config is staged but failed validation.
+    Invalid,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEvent {
     // === First-boot setup events ===
@@ -15,6 +28,7 @@ pub enum AppEvent {
         message: String,
         percent: u8,
     }, // Progress update during storage setup
+    WatermarkConfigChecked(ConfigPresence), // Result of the pre-keygen config-presence check
     FirstPinEntered(Secret<Vec<u8>>), // First PIN entered during creation
     PinMismatch,                // PINs don't match during confirmation
     KeyGenSuccess(Secret<String>), // Key generation completed, carries secret_keys JSON

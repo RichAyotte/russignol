@@ -9,6 +9,13 @@ license = "MIT"
 [lints]
 workspace = true
 
+[features]
+# Downgrade the first-boot config-presence gate from hard-fail (default) to
+# warn-and-continue, for building an image meant to be flashed offline without
+# staging a watermark config. Default off: a wrong or absent watermark floor is
+# a slashing risk, so a normally-flashed card must gate hard.
+warn-only-gate = []
+
 [[bin]]
 name = "russignol-signer"
 path = "src/main.rs"

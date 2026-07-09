@@ -40,6 +40,17 @@ pub struct ChainInfo {
     pub blocks_per_cycle: u32,
 }
 
+impl WatermarkConfig {
+    /// The `Configured` result for this config — the chain name and staged
+    /// floor level surfaced to the setup flow.
+    fn configured(&self) -> WatermarkResult {
+        WatermarkResult::Configured {
+            chain_name: self.chain.name.clone(),
+            level: self.chain.level,
+        }
+    }
+}
+
 /// Result of watermark processing
 pub enum WatermarkResult {
     /// Config found and processed successfully
@@ -62,26 +73,37 @@ pub enum WatermarkResult {
 pub fn process_watermark_config() -> WatermarkResult {
     log::info!("Checking for watermark configuration...");
 
-    // Mount boot partition
     if let Err(e) = mount_boot_partition() {
         return WatermarkResult::Error(format!("Failed to mount boot partition: {e}"));
     }
 
     let config_path = Path::new(BOOT_MOUNT).join(CONFIG_FILENAME);
+    let result = match read_and_validate_config(&config_path) {
+        Ok(config) => consume_config(&config, &config_path),
+        Err(result) => result,
+    };
 
-    // Check if config exists
-    if !config_path.exists() {
-        log::info!("No watermark config found on boot partition");
-        let _ = unmount_boot_partition();
-        return WatermarkResult::NotFound;
+    // Always unmount, even on error.
+    let _ = unmount_boot_partition();
+
+    result
+}
+
+/// Validate the staged config without consuming it: mount the boot partition,
+/// classify the config, unmount, and leave the file in place. The pre-keygen
+/// gate uses this so a card is never provisioned with key material before a
+/// valid watermark floor is staged; the consuming pass
+/// ([`process_watermark_config`]) runs later, after keygen.
+pub fn validate_watermark_config() -> WatermarkResult {
+    log::info!("Validating watermark configuration (non-consuming)...");
+
+    if let Err(e) = mount_boot_partition() {
+        return WatermarkResult::Error(format!("Failed to mount boot partition: {e}"));
     }
 
-    log::info!("Found watermark config: {}", config_path.display());
+    let config_path = Path::new(BOOT_MOUNT).join(CONFIG_FILENAME);
+    let result = classify_config(&config_path);
 
-    // Read and parse config
-    let result = process_config_file(&config_path);
-
-    // Always unmount, even on error
     let _ = unmount_boot_partition();
 
     result
@@ -121,41 +143,49 @@ fn unmount_boot_partition() -> Result<(), String> {
     Ok(())
 }
 
-fn process_config_file(config_path: &Path) -> WatermarkResult {
-    // Read config file
-    let content = match fs::read_to_string(config_path) {
-        Ok(c) => c,
-        Err(e) => return WatermarkResult::Error(format!("Failed to read config: {e}")),
-    };
+/// Read, parse, and validate the config at `config_path`. Returns the validated
+/// config, or the `WatermarkResult` describing why it is unusable (`NotFound`
+/// when absent, `Error` on read/parse/validation failure). No side effects; the
+/// file is left untouched. Sole read-and-validate site — both the non-consuming
+/// gate and the consuming path go through it, so they classify identically.
+fn read_and_validate_config(config_path: &Path) -> Result<WatermarkConfig, WatermarkResult> {
+    if !config_path.exists() {
+        return Err(WatermarkResult::NotFound);
+    }
+    let content = fs::read_to_string(config_path)
+        .map_err(|e| WatermarkResult::Error(format!("Failed to read config: {e}")))?;
+    let config: WatermarkConfig = serde_json::from_str(&content)
+        .map_err(|e| WatermarkResult::Error(format!("Invalid JSON: {e}")))?;
+    validate_config(&config).map_err(WatermarkResult::Error)?;
+    Ok(config)
+}
 
-    // Parse JSON
-    let config: WatermarkConfig = match serde_json::from_str(&content) {
-        Ok(c) => c,
-        Err(e) => return WatermarkResult::Error(format!("Invalid JSON: {e}")),
-    };
+/// Classify the config at `config_path` without consuming it: `NotFound` when
+/// absent, `Configured` when valid, `Error` otherwise. No side effects — the
+/// file is left in place.
+fn classify_config(config_path: &Path) -> WatermarkResult {
+    match read_and_validate_config(config_path) {
+        Ok(config) => config.configured(),
+        Err(result) => result,
+    }
+}
 
-    // Validate config
-    if let Err(e) = validate_config(&config) {
+/// Record chain info and delete the one-time config, returning `Configured`.
+/// Called only after [`read_and_validate_config`] accepts the file, so the
+/// file is deleted only for a valid config.
+fn consume_config(config: &WatermarkConfig, config_path: &Path) -> WatermarkResult {
+    if let Err(e) = save_chain_info(config) {
         return WatermarkResult::Error(e);
     }
 
-    // Save chain info for status page display
-    if let Err(e) = save_chain_info(&config) {
-        return WatermarkResult::Error(e);
-    }
-
-    // Delete config file (one-time use)
     if let Err(e) = fs::remove_file(config_path) {
         log::warn!("Failed to delete config file: {e}");
-        // Continue anyway - watermarks were created
+        // Continue anyway - chain info was recorded.
     } else {
         log::info!("Deleted config file after processing");
     }
 
-    WatermarkResult::Configured {
-        chain_name: config.chain.name.clone(),
-        level: config.chain.level,
-    }
+    config.configured()
 }
 
 fn validate_config(config: &WatermarkConfig) -> Result<(), String> {
@@ -222,6 +252,53 @@ fn save_chain_info(config: &WatermarkConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    const VALID_CONFIG_JSON: &str =
+        r#"{"chain":{"id":"NetXtest","level":1000,"name":"test","blocks_per_cycle":8192}}"#;
+    const BAD_PREFIX_CONFIG_JSON: &str =
+        r#"{"chain":{"id":"BadPrefix","level":1000,"name":"test","blocks_per_cycle":8192}}"#;
+
+    #[test]
+    fn classify_valid_config_is_configured_and_keeps_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+        fs::write(&path, VALID_CONFIG_JSON).unwrap();
+        let result = classify_config(&path);
+        assert!(
+            matches!(result, WatermarkResult::Configured { level, .. } if level == 1_000),
+            "valid config must classify as Configured"
+        );
+        assert!(path.exists(), "classification must not consume the file");
+    }
+
+    #[test]
+    fn classify_missing_config_is_not_found() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+        assert!(matches!(classify_config(&path), WatermarkResult::NotFound));
+    }
+
+    #[test]
+    fn classify_invalid_json_is_error_and_keeps_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+        fs::write(&path, "not json").unwrap();
+        assert!(matches!(classify_config(&path), WatermarkResult::Error(_)));
+        assert!(
+            path.exists(),
+            "a failed classification must not consume the file"
+        );
+    }
+
+    #[test]
+    fn classify_invalid_config_is_error_and_keeps_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+        fs::write(&path, BAD_PREFIX_CONFIG_JSON).unwrap();
+        assert!(matches!(classify_config(&path), WatermarkResult::Error(_)));
+        assert!(path.exists());
+    }
 
     #[test]
     fn rejects_config_without_net_prefix() {
