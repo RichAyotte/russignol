@@ -7,12 +7,63 @@ use embedded_graphics::{Drawable, pixelcolor::BinaryColor, prelude::*, primitive
 use embedded_text::{
     TextBox,
     alignment::{HorizontalAlignment, VerticalAlignment},
-    style::TextBoxStyleBuilder,
+    style::{TextBoxStyle, TextBoxStyleBuilder},
 };
 use u8g2_fonts::{
     FontRenderer, U8g2TextStyle,
     types::{FontColor, HorizontalAlignment as U8g2HAlign, VerticalPosition},
 };
+
+const ICON_MARGIN: i32 = 10;
+const ICON_SIZE: i32 = 21; // Streamline icons are 21x21
+const TEXT_MARGIN: i32 = 5;
+const BUTTON_HEIGHT: i32 = 40;
+const TEXT_BUTTON_GAP: i32 = 6;
+
+/// Width of the icon column: a margin each side of the icon, or nothing when
+/// no icon is shown.
+const fn left_column_width(show_alert_icon: bool) -> i32 {
+    if show_alert_icon {
+        ICON_MARGIN + ICON_SIZE + ICON_MARGIN
+    } else {
+        0
+    }
+}
+
+/// Width left for the message beside the (optional) icon column.
+const fn text_area_width(display_width: i32, show_alert_icon: bool) -> i32 {
+    display_width - left_column_width(show_alert_icon) - TEXT_MARGIN
+}
+
+/// Height available for the message above the buttons. The text box clips
+/// whole rows that do not fit, so a message taller than this loses rows;
+/// callers keep messages within it by checking [`measure_message_height`].
+#[cfg(test)]
+pub(crate) const MESSAGE_MAX_HEIGHT: i32 =
+    crate::pages::DISPLAY_HEIGHT - BUTTON_HEIGHT - TEXT_BUTTON_GAP;
+
+fn message_char_style() -> U8g2TextStyle<BinaryColor> {
+    U8g2TextStyle::new(fonts::FONT_PROPORTIONAL, BinaryColor::Off)
+}
+
+fn message_textbox_style() -> TextBoxStyle {
+    TextBoxStyleBuilder::new()
+        .alignment(HorizontalAlignment::Center)
+        .vertical_alignment(VerticalAlignment::Middle)
+        .build()
+}
+
+/// Rendered height of `message` wrapped to the message column on the 250x122
+/// panel, in the font and layout [`Page::draw`] uses. Callers assert it fits
+/// [`MESSAGE_MAX_HEIGHT`] so no line is clipped.
+#[cfg(test)]
+pub(crate) fn measure_message_height(message: &str, show_alert_icon: bool) -> u32 {
+    message_textbox_style().measure_text_height(
+        &message_char_style(),
+        message,
+        text_area_width(crate::pages::DISPLAY_WIDTH, show_alert_icon).cast_unsigned(),
+    )
+}
 
 static CONFIRMATION_PAGE_COUNTER: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
@@ -109,41 +160,34 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         let display_width = display_bounds.size.width.cast_signed();
         let display_height = display_bounds.size.height.cast_signed();
 
-        // Layout constants
-        let icon_margin = 10; // Margin around icon
-        let text_margin = 5;
-        let button_height = 40;
-        let icon_size = 21; // Streamline icons are 21x21
-        let text_button_gap = 6;
-        // FONT_PROPORTIONAL (helvR12): ascent=12, bbox_height=20, TextBox line_height=21
-        // For TextBox rendering, use the font's actual line_height (21)
         // For manual baseline rendering (key-value pairs), 16px between baselines is fine
-        let textbox_line_height = 21;
         let manual_line_height = 16;
 
         // Split layout: narrow left column for icon, right side for text+buttons
-        let left_column_width = if self.show_alert_icon {
-            icon_margin + icon_size + icon_margin
-        } else {
-            0
-        };
-        let right_start = left_column_width;
-        let right_width = display_width - right_start - text_margin;
+        let right_start = left_column_width(self.show_alert_icon);
+        let right_width = text_area_width(display_width, self.show_alert_icon);
 
         // Calculate text block height based on content
         let text_block_height = if let Some(ref pairs) = self.key_value_pairs {
             // Title line + pair lines (manual baseline positioning)
             (i32::try_from(pairs.len()).unwrap_or(0) + 1) * manual_line_height
         } else {
-            // TextBox uses the font's actual line height
-            let line_count = i32::try_from(self.message.lines().count().max(1)).unwrap_or(1);
-            line_count * textbox_line_height
+            // The message word-wraps, so budget its measured wrapped height —
+            // counting manual newlines undercounts and the text box would clip
+            // the overflow rows.
+            message_textbox_style()
+                .measure_text_height(
+                    &message_char_style(),
+                    &self.message,
+                    right_width.cast_unsigned(),
+                )
+                .cast_signed()
         };
 
         // Center the entire block (text + gap + buttons) vertically
-        let block_height = text_block_height + text_button_gap + button_height;
+        let block_height = text_block_height + TEXT_BUTTON_GAP + BUTTON_HEIGHT;
         let content_top = (display_height - block_height) / 2;
-        let button_top_y = content_top + block_height - button_height;
+        let button_top_y = content_top + block_height - BUTTON_HEIGHT;
 
         let text_top = content_top;
 
@@ -153,7 +197,7 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
             let text_center_y = text_top + text_block_height / 2;
             let _ = icon_font.render_aligned(
                 '0',
-                Point::new(icon_margin + icon_size / 2, text_center_y),
+                Point::new(ICON_MARGIN + ICON_SIZE / 2, text_center_y),
                 VerticalPosition::Center,
                 U8g2HAlign::Center,
                 FontColor::Transparent(BinaryColor::Off),
@@ -162,7 +206,7 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         }
 
         // TextBox gets full space above buttons for VerticalAlignment::Middle centering
-        let textbox_height = button_top_y - text_button_gap;
+        let textbox_height = button_top_y - TEXT_BUTTON_GAP;
         let text_bounds = Rectangle::new(
             Point::new(right_start, 0),
             Size::new(right_width.cast_unsigned(), textbox_height.cast_unsigned()),
@@ -231,14 +275,13 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
             }
         } else {
             // Draw message text with word-wrapping, centered in text area
-            let character_style = U8g2TextStyle::new(fonts::FONT_PROPORTIONAL, BinaryColor::Off);
-            let textbox_style = TextBoxStyleBuilder::new()
-                .alignment(HorizontalAlignment::Center)
-                .vertical_alignment(VerticalAlignment::Middle)
-                .build();
-
-            TextBox::with_textbox_style(&self.message, text_bounds, character_style, textbox_style)
-                .draw(display)?;
+            TextBox::with_textbox_style(
+                &self.message,
+                text_bounds,
+                message_char_style(),
+                message_textbox_style(),
+            )
+            .draw(display)?;
         }
 
         // === BUTTONS: Centered on full display width at bottom ===

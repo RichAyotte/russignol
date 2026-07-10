@@ -180,8 +180,7 @@ const CONFIG_GATE_TITLE: &str = "Card Not Ready";
 /// staged. Directs the operator to provision the card on a node-connected host,
 /// the only source of chain id and watermark floor. The fatal page word-wraps,
 /// so the text carries no manual line breaks.
-const CONFIG_GATE_MESSAGE: &str =
-    "No watermark config is staged on this card. Prepare it on the host with: russignol disk doctor";
+const CONFIG_GATE_MESSAGE: &str = "No watermark config is staged on this card. Prepare it on the host with: russignol disk doctor";
 
 /// Maximum failed PIN attempts before lockout
 const MAX_FAILED_ATTEMPTS: u32 = 5;
@@ -967,8 +966,11 @@ impl App {
         log::warn!("Missing watermark for {pkh}: offering recovery to level {requested_level}");
         let pkh_short = crate::text::truncate_middle(&pkh, 6, 0);
         effects.push(Effect::ShowPage(PageSpec::Confirmation {
+            // The requested level rides on the confirm button ("Set level to
+            // N"), not here: with it the message overflows the page's three
+            // wrapped rows and the text box clips the overflow.
             message: format!(
-                "Missing: {pkh_short} set {requested_level}?\nRun russignol watermark init\nthen reboot on host."
+                "No watermark: {pkh_short}\nOr run russignol watermark init then reboot on host."
             ),
             on_confirm: AppEvent::UpdateWatermarkToLevel {
                 pkh,
@@ -1841,6 +1843,65 @@ mod tests {
                 chain_id,
                 new_level: 600,
             }
+        );
+    }
+
+    /// The produced dialog message and icon flag, for asserting the message
+    /// fits the confirmation page's clip-prone text column.
+    fn confirmation_dialog(effects: &[Effect]) -> (&String, bool) {
+        effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::ShowPage(PageSpec::Confirmation {
+                    message, warning, ..
+                }) => Some((message, *warning)),
+                _ => None,
+            })
+            .expect("expected a Confirmation dialog")
+    }
+
+    /// The confirmation page clips whole rows that overflow its text column,
+    /// so the widest missing-watermark message — a maximum-length pkh with the
+    /// largest possible level — must render within it, or the operator is
+    /// asked to confirm a watermark change without seeing which key and level
+    /// it applies to.
+    #[test]
+    fn missing_watermark_message_fits_confirmation_page() {
+        let mut app = active_app();
+        let (_action, effects) = app.handle_event(AppEvent::WatermarkMissing {
+            pkh: MAX_TZ4_PKH.into(),
+            chain_id: test_chain_id(),
+            requested_level: u32::MAX,
+        });
+
+        let (message, warning) = confirmation_dialog(&effects);
+        let height = crate::pages::confirmation::measure_message_height(message, warning);
+        assert!(
+            height <= crate::pages::confirmation::MESSAGE_MAX_HEIGHT.cast_unsigned(),
+            "message {message:?} needs {height}px but the confirmation page fits {}px",
+            crate::pages::confirmation::MESSAGE_MAX_HEIGHT,
+        );
+    }
+
+    /// The watermark-error dialog shares the clip-prone confirmation page; its
+    /// widest message — the largest possible level — must render within it.
+    #[test]
+    fn watermark_error_message_fits_confirmation_page() {
+        let mut app = active_app();
+        let (_action, effects) = app.handle_event(AppEvent::WatermarkError {
+            pkh: MAX_TZ4_PKH.into(),
+            chain_id: test_chain_id(),
+            error_message: "watermark test failed".into(),
+            current_level: Some(u32::MAX - 1),
+            requested_level: Some(u32::MAX),
+        });
+
+        let (message, warning) = confirmation_dialog(&effects);
+        let height = crate::pages::confirmation::measure_message_height(message, warning);
+        assert!(
+            height <= crate::pages::confirmation::MESSAGE_MAX_HEIGHT.cast_unsigned(),
+            "message {message:?} needs {height}px but the confirmation page fits {}px",
+            crate::pages::confirmation::MESSAGE_MAX_HEIGHT,
         );
     }
 
