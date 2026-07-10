@@ -1278,13 +1278,14 @@ pub fn run_single_reader_restore(
     }
 
     // Step 3: Flash, partition, and write keys
-    image::flash_image_to_device(job.image, restore_from, job.uncompressed_size, privilege)?;
+    let rootfs_sha256 =
+        image::flash_image_to_device(job.image, restore_from, job.uncompressed_size, privilege)?;
     image::reread_partition_table(restore_from);
 
     create_and_format_partitions(restore_from, privilege)?;
     write_backup_to_target(restore_from, &backup, job.chain_info, privilege)?;
 
-    image::write_flash_manifest(restore_from, job.metadata)
+    image::write_flash_manifest(restore_from, job.metadata, rootfs_sha256)
         .context("Failed to write flash manifest")?;
 
     verify_target(restore_from)?;
@@ -1316,14 +1317,15 @@ pub fn run_dual_reader_restore(
     }
 
     // Step 1: Flash target card
-    image::flash_image_to_device(job.image, &target.path, job.uncompressed_size, privilege)?;
+    let rootfs_sha256 =
+        image::flash_image_to_device(job.image, &target.path, job.uncompressed_size, privilege)?;
     image::reread_partition_table(&target.path);
 
     // Step 2: Create partitions and write backup
     create_and_format_partitions(&target.path, privilege)?;
     write_backup_to_target(&target.path, backup, job.chain_info, privilege)?;
 
-    image::write_flash_manifest(&target.path, job.metadata)
+    image::write_flash_manifest(&target.path, job.metadata, rootfs_sha256)
         .context("Failed to write flash manifest")?;
 
     verify_target(&target.path)?;

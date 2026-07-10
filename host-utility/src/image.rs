@@ -23,6 +23,7 @@ use crate::utils::{
 };
 use crate::version;
 use crate::watermark;
+use russignol_flash_manifest::{FlashManifest, MANIFEST_FILENAME};
 
 /// Download metadata resolved from URL or release info
 struct DownloadInfo {
@@ -77,22 +78,6 @@ pub struct FlashMetadata {
     pub channel: Option<String>,
 }
 
-/// Flash manifest written to the boot partition (p1) as `flash-manifest.json`
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct FlashManifest {
-    pub card_id: String,
-    pub flashed_at: String,
-    pub host_version: String,
-    pub image_sha256: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub channel: Option<String>,
-}
-
-/// Manifest filename on boot partition
-pub const MANIFEST_FILENAME: &str = "flash-manifest.json";
-
 /// Generate a 128-bit random card ID as a 32-character hex string
 pub fn generate_card_id() -> Result<String> {
     let mut buf = [0u8; 16];
@@ -132,7 +117,13 @@ pub fn compute_file_sha256(path: &Path) -> Result<String> {
 ///
 /// Generates a unique `card_id`, builds the manifest with current timestamp
 /// and host version, writes it as JSON, and returns the `card_id`.
-pub fn write_flash_manifest(device: &Path, metadata: &FlashMetadata) -> Result<String> {
+/// `rootfs_sha256` is the hash teed off the flash's write stream, so the
+/// manifest records the bytes that actually went to the card.
+pub fn write_flash_manifest(
+    device: &Path,
+    metadata: &FlashMetadata,
+    rootfs_sha256: Option<String>,
+) -> Result<String> {
     let boot_partition = utils::get_partition_path(device, 1);
     let mount_point = utils::mount_partition(&boot_partition, "vfat", false)?;
 
@@ -144,6 +135,7 @@ pub fn write_flash_manifest(device: &Path, metadata: &FlashMetadata) -> Result<S
         image_sha256: metadata.image_sha256.clone(),
         image_version: metadata.image_version.clone(),
         channel: metadata.channel.clone(),
+        rootfs_sha256,
     };
 
     let json =
@@ -877,6 +869,13 @@ fn cmd_flash(
     // Check node FIRST - fail fast if node is unavailable
     let node_check = check_node_for_watermarks(endpoint, yes)?;
 
+    // A local image carries no release metadata beyond its own hash.
+    let metadata = FlashMetadata {
+        image_sha256,
+        image_version: None,
+        channel: None,
+    };
+
     // Keyed path: restore or migrate (mutually exclusive, checked above)
     if let Some((source, source_device)) =
         resolve_key_source(keys, node_check.as_ref().map(|nc| &nc.config))?
@@ -888,11 +887,6 @@ fn cmd_flash(
             "restore"
         };
         print_title_bar(&format!("💾 Flash SD Card (with key {suffix})"));
-        let metadata = FlashMetadata {
-            image_sha256,
-            image_version: None,
-            channel: None,
-        };
         let node_check = node_check.as_ref().context(
             "Node check required to write keys but no configuration found.\n  \
              Run 'russignol config' first, or use --endpoint to specify your node.",
@@ -936,11 +930,6 @@ fn cmd_flash(
     }
 
     // Perform the flash (no size hint for local files)
-    let metadata = FlashMetadata {
-        image_sha256,
-        image_version: None,
-        channel: None,
-    };
     let view = finish_normal_flash(
         image,
         &target_device.path,
@@ -965,7 +954,7 @@ fn finish_normal_flash(
     metadata: &FlashMetadata,
     chain_info: Option<&watermark::ChainInfo>,
 ) -> Result<HostPartitionView> {
-    flash_image_to_device(image, device, expected_size, privilege)?;
+    let rootfs_sha256 = flash_image_to_device(image, device, expected_size, privilege)?;
 
     // Read the card back and confirm it matches before declaring success.
     verify_flash_or_note_skip(image, device, skip_verify)?;
@@ -976,7 +965,8 @@ fn finish_normal_flash(
 
     // The manifest and config only touch p1, whose offset is unchanged by the
     // flash, so they write correctly regardless of the stale view above.
-    write_flash_manifest(device, metadata).context("Failed to write flash manifest")?;
+    write_flash_manifest(device, metadata, rootfs_sha256)
+        .context("Failed to write flash manifest")?;
 
     finalize_flash(device, chain_info)?;
     Ok(view)
@@ -1052,15 +1042,32 @@ fn resolve_download_info(url: Option<String>, include_prerelease: bool) -> Resul
     }
 }
 
+/// Resolve the rootfs hash teed off the flash's write stream, or warn and
+/// record nothing. The hash only feeds the device's advisory integrity check,
+/// so a nonstandard image (e.g. an experimental layout) must still flash.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rootfs_hash_or_warn(hash: Result<String>) -> Option<String> {
+    match hash {
+        Ok(hash) => Some(hash),
+        Err(e) => {
+            utils::warning(&format!(
+                "Could not compute the rootfs hash ({e}); \
+                 the device will skip its rootfs integrity check"
+            ));
+            None
+        }
+    }
+}
+
 /// Shared trust gate of both `download-and-flash` paths: download the image
 /// with its release checksum, verify the downloaded file's hash against it,
 /// and enforce the maintainer signature policy. Returns the cached image path
-/// and its verified SHA-256. Kept in one place so the two entry points cannot
-/// diverge.
+/// and the flash metadata built from the verified download. Kept in one place
+/// so the two entry points cannot diverge.
 fn download_and_verify_release_image(
     dl: &DownloadInfo,
     allow_unsigned: bool,
-) -> Result<(PathBuf, String)> {
+) -> Result<(PathBuf, FlashMetadata)> {
     let checksum = dl.checksum.as_deref().filter(|s| !s.is_empty()).context(
         "Checksum not available for this release. Cannot safely flash without verification.",
     )?;
@@ -1076,7 +1083,13 @@ fn download_and_verify_release_image(
     }
 
     enforce_release_signature(&image_sha256, dl.signature.as_deref(), allow_unsigned)?;
-    Ok((image_path, image_sha256))
+
+    let metadata = FlashMetadata {
+        image_sha256,
+        image_version: dl.version.clone(),
+        channel: dl.channel.clone(),
+    };
+    Ok((image_path, metadata))
 }
 
 fn cmd_download_and_flash(
@@ -1118,14 +1131,8 @@ fn cmd_download_and_flash(
 
         // Download first (can happen before touching cards)
         let dl = resolve_download_info(url, include_prerelease)?;
-        let (image_path, image_sha256) =
+        let (image_path, metadata) =
             download_and_verify_release_image(&dl, verification.allow_unsigned)?;
-
-        let metadata = FlashMetadata {
-            image_sha256,
-            image_version: dl.version,
-            channel: dl.channel,
-        };
 
         let node_check = node_check.as_ref().context(
             "Node check required to write keys but no configuration found.\n  \
@@ -1173,15 +1180,10 @@ fn cmd_download_and_flash(
     }
 
     // Download with caching and resume support (checksum required for flash)
-    let (image_path, image_sha256) =
+    let (image_path, metadata) =
         download_and_verify_release_image(&dl, verification.allow_unsigned)?;
 
     // Flash the downloaded image
-    let metadata = FlashMetadata {
-        image_sha256,
-        image_version: dl.version,
-        channel: dl.channel,
-    };
     let view = finish_normal_flash(
         &image_path,
         &target_device.path,
@@ -2013,32 +2015,39 @@ impl Write for HashCounter {
     }
 }
 
-/// Hash the decompressed contents of `image`, returning `(sha256_hex, len)`.
-///
-/// This is the reference the post-flash read-back compares against: the exact
-/// byte stream `dd` receives, so the comparison covers decompression as well as
-/// the write itself.
-fn hash_decompressed_source(image: &Path) -> Result<(String, u64)> {
+/// Stream the decompressed contents of `image` into `sink` — the exact byte
+/// stream `dd` receives when the image is flashed.
+fn stream_decompressed_to<W: Write>(image: &Path, sink: &mut W) -> Result<()> {
     use lzma_rs::xz_decompress;
 
-    let mut sink = HashCounter::new();
     match image.extension().and_then(|e| e.to_str()) {
         Some("xz") => {
             let file = std::fs::File::open(image)
                 .with_context(|| format!("Failed to open image: {}", image.display()))?;
             let mut reader = BufReader::new(file);
-            xz_decompress(&mut reader, &mut sink).context("Failed to decompress XZ image")?;
+            xz_decompress(&mut reader, sink).context("Failed to decompress XZ image")?;
         }
         Some("img") => {
             let mut file = std::fs::File::open(image)
                 .with_context(|| format!("Failed to open image: {}", image.display()))?;
-            std::io::copy(&mut file, &mut sink).context("Failed to read image data")?;
+            std::io::copy(&mut file, sink).context("Failed to read image data")?;
         }
         _ => bail!(
             "Unsupported image format: {}\n Supported formats: .img.xz, .img",
             image.display()
         ),
     }
+    Ok(())
+}
+
+/// Hash the decompressed contents of `image`, returning `(sha256_hex, len)`.
+///
+/// This is the reference the post-flash read-back compares against: the exact
+/// byte stream `dd` receives, so the comparison covers decompression as well as
+/// the write itself.
+fn hash_decompressed_source(image: &Path) -> Result<(String, u64)> {
+    let mut sink = HashCounter::new();
+    stream_decompressed_to(image, &mut sink)?;
     Ok(sink.finish())
 }
 
@@ -2124,12 +2133,15 @@ fn verify_flash_or_note_skip(image: &Path, device: &Path, skip_verify: bool) -> 
     }
 }
 
+/// Write the image to the device, returning the rootfs-region hash teed off
+/// the write stream (`None`, with a warning, when the stream carried no
+/// hashable rootfs partition).
 pub(crate) fn flash_image_to_device(
     image: &Path,
     device: &Path,
     expected_size: Option<u64>,
     privilege: FlashPrivilege,
-) -> Result<()> {
+) -> Result<Option<String>> {
     #[cfg(target_os = "linux")]
     {
         flash_image_linux(image, device, expected_size, privilege)
@@ -2275,7 +2287,7 @@ fn flash_image_linux(
     device: &Path,
     expected_size: Option<u64>,
     privilege: FlashPrivilege,
-) -> Result<()> {
+) -> Result<Option<String>> {
     use lzma_rs::xz_decompress;
 
     let extension = image.extension().and_then(|e| e.to_str());
@@ -2303,7 +2315,8 @@ fn flash_image_linux(
         .context("Failed to start dd")?;
 
     let stdin = dd.stdin.take().context("Failed to get dd stdin")?;
-    let mut progress_writer = ProgressWriter::new(stdin, total_size);
+    let mut writer =
+        crate::rootfs::RootfsHashingWriter::new(ProgressWriter::new(stdin, total_size));
 
     // Stream decompressed data to dd
     let write_result = match extension {
@@ -2312,14 +2325,13 @@ fn flash_image_linux(
                 .with_context(|| format!("Failed to open image: {}", image.display()))?;
             let mut reader = BufReader::new(file);
 
-            xz_decompress(&mut reader, &mut progress_writer)
-                .context("Failed to decompress XZ image")
+            xz_decompress(&mut reader, &mut writer).context("Failed to decompress XZ image")
         }
         Some("img") => {
             let mut file = std::fs::File::open(image)
                 .with_context(|| format!("Failed to open image: {}", image.display()))?;
 
-            std::io::copy(&mut file, &mut progress_writer)
+            std::io::copy(&mut file, &mut writer)
                 .context("Failed to write image data")
                 .map(|_| ())
         }
@@ -2333,6 +2345,7 @@ fn flash_image_linux(
     };
 
     // Finish progress bar and close stdin
+    let (progress_writer, rootfs_hash) = writer.finish();
     progress_writer.finish();
 
     // Wait for dd to complete
@@ -2359,7 +2372,7 @@ fn flash_image_linux(
     // Sync to ensure all data is written
     sync_with_spinner(None)?;
 
-    Ok(())
+    Ok(rootfs_hash_or_warn(rootfs_hash))
 }
 
 /// Whether the running process can re-read the partition table in place, or must
@@ -2631,7 +2644,11 @@ fn sync_with_spinner(eject_device: Option<&Path>) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn flash_image_macos(image: &Path, device: &Path, expected_size: Option<u64>) -> Result<()> {
+fn flash_image_macos(
+    image: &Path,
+    device: &Path,
+    expected_size: Option<u64>,
+) -> Result<Option<String>> {
     use lzma_rs::xz_decompress;
 
     // Use raw device for faster writes
@@ -2664,7 +2681,8 @@ fn flash_image_macos(image: &Path, device: &Path, expected_size: Option<u64>) ->
         .context("Failed to start dd. Are you running with sudo?")?;
 
     let stdin = dd.stdin.take().context("Failed to get dd stdin")?;
-    let mut progress_writer = ProgressWriter::new(stdin, total_size);
+    let mut writer =
+        crate::rootfs::RootfsHashingWriter::new(ProgressWriter::new(stdin, total_size));
 
     let write_result = match extension {
         Some("xz") => {
@@ -2672,14 +2690,13 @@ fn flash_image_macos(image: &Path, device: &Path, expected_size: Option<u64>) ->
                 .with_context(|| format!("Failed to open image: {}", image.display()))?;
             let mut reader = BufReader::new(file);
 
-            xz_decompress(&mut reader, &mut progress_writer)
-                .context("Failed to decompress XZ image")
+            xz_decompress(&mut reader, &mut writer).context("Failed to decompress XZ image")
         }
         Some("img") => {
             let mut file = std::fs::File::open(image)
                 .with_context(|| format!("Failed to open image: {}", image.display()))?;
 
-            std::io::copy(&mut file, &mut progress_writer)
+            std::io::copy(&mut file, &mut writer)
                 .context("Failed to write image data")
                 .map(|_| ())
         }
@@ -2692,6 +2709,7 @@ fn flash_image_macos(image: &Path, device: &Path, expected_size: Option<u64>) ->
         }
     };
 
+    let (progress_writer, rootfs_hash) = writer.finish();
     progress_writer.finish();
 
     let output = dd.wait_with_output().context("Failed to wait for dd")?;
@@ -2715,7 +2733,7 @@ fn flash_image_macos(image: &Path, device: &Path, expected_size: Option<u64>) ->
     // Sync and eject
     sync_with_spinner(Some(device))?;
 
-    Ok(())
+    Ok(rootfs_hash_or_warn(rootfs_hash))
 }
 
 /// Extract dd error lines from stderr, filtering out transfer statistics.
@@ -3164,36 +3182,5 @@ mod tests {
             hash,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
-    }
-
-    #[test]
-    fn test_flash_manifest_serialization() {
-        let manifest = FlashManifest {
-            card_id: "a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8".to_string(),
-            flashed_at: "2026-03-06T12:34:56Z".to_string(),
-            host_version: "0.20.0-beta.1".to_string(),
-            image_sha256: "abc123".to_string(),
-            image_version: Some("0.20.0-beta.1".to_string()),
-            channel: Some("beta".to_string()),
-        };
-        let json = serde_json::to_string_pretty(&manifest).unwrap();
-        assert!(json.contains("\"card_id\""));
-        assert!(json.contains("\"image_version\""));
-        assert!(json.contains("\"channel\""));
-    }
-
-    #[test]
-    fn test_flash_manifest_serialization_skips_none() {
-        let manifest = FlashManifest {
-            card_id: "a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8".to_string(),
-            flashed_at: "2026-03-06T12:34:56Z".to_string(),
-            host_version: "0.20.0-beta.1".to_string(),
-            image_sha256: "abc123".to_string(),
-            image_version: None,
-            channel: None,
-        };
-        let json = serde_json::to_string_pretty(&manifest).unwrap();
-        assert!(!json.contains("image_version"));
-        assert!(!json.contains("channel"));
     }
 }

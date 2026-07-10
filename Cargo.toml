@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "libs/crypto",
+    "libs/flash-manifest",
     "libs/release-signature",
     "libs/signer",
     "libs/storage",

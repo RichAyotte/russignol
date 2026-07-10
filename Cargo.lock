@@ -2050,6 +2050,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "russignol-flash-manifest"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "russignol-release-signature"
 version = "0.1.0"
 dependencies = [
@@ -2077,6 +2085,7 @@ dependencies = [
  "lzma-rs",
  "nix 0.31.3",
  "russignol-crypto",
+ "russignol-flash-manifest",
  "russignol-release-signature",
  "russignol-signer-lib",
  "russignol-storage",

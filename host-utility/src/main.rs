@@ -30,6 +30,7 @@ mod progress;
 mod purge;
 mod release_signature;
 mod restore_keys;
+mod rootfs;
 mod rotate_keys;
 mod status;
 mod system;
