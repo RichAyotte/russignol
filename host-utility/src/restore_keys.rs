@@ -1540,10 +1540,10 @@ mod tests {
                 / SECTOR_SIZE;
         assert_eq!(layout.keys_start_sector, expected_keys_start);
 
-        // keys_size = 64MB / 512 = 131072 sectors
+        // keys_size = 64 MiB / 512 = 131072 sectors
         assert_eq!(
             layout.keys_size_sectors,
-            russignol_storage::F2FS_PARTITION_SIZE / SECTOR_SIZE
+            russignol_storage::KEYS_PARTITION_SIZE / SECTOR_SIZE
         );
 
         // data_start = keys_start + keys_size
@@ -1551,9 +1551,10 @@ mod tests {
             layout.data_start_sector,
             layout.keys_start_sector + layout.keys_size_sectors
         );
+        // data_size = 256 MiB / 512 = 524288 sectors
         assert_eq!(
             layout.data_size_sectors,
-            russignol_storage::F2FS_PARTITION_SIZE / SECTOR_SIZE
+            russignol_storage::DATA_PARTITION_SIZE / SECTOR_SIZE
         );
     }
 

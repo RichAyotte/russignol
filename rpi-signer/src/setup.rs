@@ -5,9 +5,10 @@
 //! - Files created are already owned by russignol (no chown needed)
 //! - Partition remount is handled by the init script on next boot
 //!
-//! Partition layout (created at first boot by storage module):
-//! - Partition 3 (keys): 64MB F2FS, holds encrypted keys
-//! - Partition 4 (data): 64MB F2FS, holds watermarks and logs
+//! Partition layout (created at first boot by storage module; sizes come
+//! from the `russignol_storage` partition constants):
+//! - Partition 3 (keys): F2FS, holds encrypted keys
+//! - Partition 4 (data): F2FS, holds watermarks and logs
 
 use std::path::Path;
 

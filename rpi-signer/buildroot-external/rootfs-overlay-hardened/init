@@ -4,9 +4,9 @@
 # Platform: Raspberry Pi Zero 2W
 # Function: Network Gadget, Hardware Init, Partition Setup, Process Supervision
 #
-# Partition Layout:
-# - p3 (keys): Created at first boot, 64MB for encrypted keys (becomes RO after key gen)
-# - p4 (data): Created at first boot, 64MB for watermarks and logs
+# Partition Layout (sizes come from the russignol-storage partition constants):
+# - p3 (keys): Created at first boot, holds encrypted keys (becomes RO after key gen)
+# - p4 (data): Created at first boot, holds watermarks and logs
 #
 # IMPORTANT: This file is for the HARDENED build only.
 # The DEV build uses SysV init scripts instead:

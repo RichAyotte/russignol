@@ -5,8 +5,15 @@ use core::fmt;
 /// 16 MB minimum alignment for partition boundaries
 pub const MIN_ALIGNMENT: u64 = 16 * 1024 * 1024;
 
-/// 64 MB for each F2FS partition (keys, data)
-pub const F2FS_PARTITION_SIZE: u64 = 64 * 1024 * 1024;
+/// 64 MiB keys partition (p3) — key material is tiny, and a small partition
+/// bounds the blast radius of any corruption
+pub const KEYS_PARTITION_SIZE: u64 = 64 * 1024 * 1024;
+
+/// 256 MiB data partition (p4). f2fs reserves roughly half of a 64 MiB
+/// partition for its own segments, leaving little working room for logs;
+/// the card's unpartitioned remainder still gives the controller ample
+/// spare area for wear leveling.
+pub const DATA_PARTITION_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Standard sector size
 pub const SECTOR_SIZE: u64 = 512;
@@ -62,7 +69,7 @@ pub fn align_up(value: u64, alignment: u64) -> u64 {
 ///
 /// Given the byte offset where partition 2 (rootfs) ends, the alignment
 /// to use, and the total disk size in bytes, computes sector-based start
-/// and size values for two 64 MB F2FS partitions.
+/// and size values for the keys and data F2FS partitions.
 ///
 /// # Errors
 ///
@@ -73,11 +80,11 @@ pub fn calculate_partition_layout(
     disk_size_bytes: u64,
 ) -> Result<PartitionLayout, InsufficientSpace> {
     let keys_start_bytes = align_up(p2_end_bytes, alignment);
-    let keys_size_bytes = align_up(F2FS_PARTITION_SIZE, alignment);
+    let keys_size_bytes = align_up(KEYS_PARTITION_SIZE, alignment);
     let keys_end_bytes = keys_start_bytes + keys_size_bytes;
 
     let data_start_bytes = keys_end_bytes;
-    let data_size_bytes = align_up(F2FS_PARTITION_SIZE, alignment);
+    let data_size_bytes = align_up(DATA_PARTITION_SIZE, alignment);
     let data_end_bytes = data_start_bytes + data_size_bytes;
 
     if data_end_bytes > disk_size_bytes {
@@ -135,12 +142,14 @@ mod tests {
 
         let expected_keys_start = align_up(p2_end_bytes, MIN_ALIGNMENT) / SECTOR_SIZE;
         assert_eq!(layout.keys_start_sector, expected_keys_start);
-        assert_eq!(layout.keys_size_sectors, F2FS_PARTITION_SIZE / SECTOR_SIZE);
+        // 64 MiB keys, 256 MiB data — pinned as sector literals so a size
+        // regression cannot hide behind the constants
+        assert_eq!(layout.keys_size_sectors, 131_072);
         assert_eq!(
             layout.data_start_sector,
             layout.keys_start_sector + layout.keys_size_sectors
         );
-        assert_eq!(layout.data_size_sectors, F2FS_PARTITION_SIZE / SECTOR_SIZE);
+        assert_eq!(layout.data_size_sectors, 524_288);
     }
 
     #[test]
