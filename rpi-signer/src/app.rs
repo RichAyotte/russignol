@@ -173,15 +173,15 @@ fn should_proceed_to_keygen(presence: ConfigPresence, policy: GatePolicy) -> boo
     }
 }
 
-/// Title of the pre-keygen config-gate notice.
+/// Title of the pre-keygen config-gate fatal page.
 const CONFIG_GATE_TITLE: &str = "Card Not Ready";
 
 /// Shown when key generation is blocked because no valid watermark config is
 /// staged. Directs the operator to provision the card on a node-connected host,
-/// the only source of chain id and watermark floor. Wraps to three lines in the
-/// notice message font (`pages::notice::MESSAGE_BOX_HEIGHT`).
+/// the only source of chain id and watermark floor. The fatal page word-wraps,
+/// so the text carries no manual line breaks.
 const CONFIG_GATE_MESSAGE: &str =
-    "No watermark config.\nPrepare on the host with\nrussignol disk doctor.";
+    "No watermark config is staged on this card. Prepare it on the host with: russignol disk doctor";
 
 /// Maximum failed PIN attempts before lockout
 const MAX_FAILED_ATTEMPTS: u32 = 5;
@@ -490,13 +490,12 @@ impl App {
                 } else {
                     log::warn!("Key generation blocked: no valid watermark config staged");
                     // Dead-end for this boot: the card can only be provisioned on
-                    // a node-connected host. Dismissing re-shows the notice (the
-                    // presence was fixed at check time) rather than advancing.
-                    effects.push(Effect::ShowPage(PageSpec::Notice {
+                    // a node-connected host, so end on the button-less fatal page
+                    // (the supervisor keeps it visible until power-off).
+                    effects.push(Effect::FatalError {
                         title: CONFIG_GATE_TITLE.into(),
                         message: CONFIG_GATE_MESSAGE.into(),
-                        on_dismiss: AppEvent::WatermarkConfigChecked(presence),
-                    }));
+                    });
                 }
             }
             AppEvent::StorageSetupFailed(e) => {
@@ -1086,17 +1085,23 @@ mod tests {
         assert!(has_show_page(&effects, &PageSpec::PinCreate));
     }
 
-    #[test]
-    fn config_missing_blocks_keygen_with_notice() {
-        let mut app = first_boot_app();
-        let (_action, effects) =
-            app.handle_event(AppEvent::WatermarkConfigChecked(ConfigPresence::Missing));
+    /// The gate ends the boot on the button-less fatal-error page — a
+    /// dismissable notice would pretend the dead-end is interactive.
+    fn assert_config_gate_is_fatal(effects: &[Effect]) {
         assert!(
-            notice_message(&effects).is_some(),
-            "a missing config must raise a blocking notice"
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::FatalError { title, message }
+                    if title == CONFIG_GATE_TITLE && message == CONFIG_GATE_MESSAGE
+            )),
+            "a blocked config check must end the boot on the fatal-error page"
         );
         assert!(
-            !has_show_page(&effects, &PageSpec::PinCreate),
+            notice_message(effects).is_none(),
+            "the dead-end must not be presented as a dismissable notice"
+        );
+        assert!(
+            !has_show_page(effects, &PageSpec::PinCreate),
             "a blocked card must never reach PIN creation"
         );
         assert!(
@@ -1108,15 +1113,19 @@ mod tests {
     }
 
     #[test]
-    fn config_invalid_blocks_keygen_with_notice() {
+    fn config_missing_blocks_keygen_fatally() {
+        let mut app = first_boot_app();
+        let (_action, effects) =
+            app.handle_event(AppEvent::WatermarkConfigChecked(ConfigPresence::Missing));
+        assert_config_gate_is_fatal(&effects);
+    }
+
+    #[test]
+    fn config_invalid_blocks_keygen_fatally() {
         let mut app = first_boot_app();
         let (_action, effects) =
             app.handle_event(AppEvent::WatermarkConfigChecked(ConfigPresence::Invalid));
-        assert!(
-            notice_message(&effects).is_some(),
-            "an invalid config must raise a blocking notice"
-        );
-        assert!(!has_show_page(&effects, &PageSpec::PinCreate));
+        assert_config_gate_is_fatal(&effects);
     }
 
     #[test]
