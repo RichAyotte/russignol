@@ -894,35 +894,28 @@ fn sign_release_image() -> Result<()> {
 }
 
 fn sign_release_image_at(image: &Path, key_path: &Path) -> Result<()> {
-    // A signature left over from a prior build belongs to a different image;
-    // shipped together they can only fail verification. Remove it up front so a
-    // .sig exists only when this run produced it.
-    let sig_path = russignol_release_signature::sidecar_path(image);
-    if sig_path.exists() {
-        std::fs::remove_file(&sig_path)
-            .with_context(|| format!("Failed to remove stale {}", sig_path.display()))?;
+    match maintainer_key::sign_image_with_prompt(image, key_path) {
+        Ok(sidecar) => {
+            println!(
+                "    {} {}",
+                "✓".green(),
+                sidecar.file_name().unwrap_or_default().display()
+            );
+            Ok(())
+        }
+        Err(err) => match err.downcast_ref::<maintainer_key::MissingSigningInput>() {
+            Some(maintainer_key::MissingSigningInput::Image(_)) => Ok(()),
+            Some(maintainer_key::MissingSigningInput::Key(path)) => {
+                println!(
+                    "  {} No maintainer key at {} — release image left unsigned",
+                    "⚠".yellow(),
+                    path.display()
+                );
+                Ok(())
+            }
+            None => Err(err),
+        },
     }
-
-    if !image.exists() {
-        return Ok(());
-    }
-
-    if !key_path.exists() {
-        println!(
-            "  {} No maintainer key at {} — release image left unsigned",
-            "⚠".yellow(),
-            key_path.display()
-        );
-        return Ok(());
-    }
-
-    let sidecar = maintainer_key::sign_image_with_prompt(image, key_path)?;
-    println!(
-        "    {} {}",
-        "✓".green(),
-        sidecar.file_name().unwrap_or_default().display()
-    );
-    Ok(())
 }
 
 /// Collect release assets based on the component being released

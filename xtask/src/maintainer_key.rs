@@ -192,34 +192,71 @@ pub fn sign_image_with_prompt(image: &Path, key_path: &Path) -> Result<PathBuf> 
     sign_image(image, key_path, prompt_passphrase)
 }
 
+/// A signing input that was absent. Typed so callers can apply their own
+/// missing-input policy: `maintainer-sign` fails, a release build skips the
+/// unbuilt image or warns and ships unsigned.
+#[derive(Debug)]
+pub enum MissingSigningInput {
+    /// No image at the given path.
+    Image(PathBuf),
+    /// No sealed maintainer key at the given path.
+    Key(PathBuf),
+}
+
+impl std::fmt::Display for MissingSigningInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Image(path) => write!(f, "image not found: {}", path.display()),
+            Self::Key(path) => write!(
+                f,
+                "no maintainer key at {}; generate one with `cargo xtask maintainer-keygen`",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MissingSigningInput {}
+
 /// Digest `image`, sign it with the sealed key at `key_path`, and write the
 /// signature (hex plus a trailing newline) to the image's sidecar path,
-/// returning that path. `passphrase` is invoked only after the image and key
-/// are known to exist, so a prompting supplier never wastes an entry on an
-/// invocation that cannot sign.
+/// returning that path. Any sidecar already present is removed up front —
+/// whatever it signed, it was not produced by this run — so a `.sig` exists
+/// only when this run signed the image beside it. `passphrase` is invoked only
+/// after the image and key are known to exist, so a prompting supplier never
+/// wastes an entry on an invocation that cannot sign.
 ///
 /// # Errors
 ///
-/// Returns an error if the image or key does not exist, the passphrase
-/// supplier fails, unsealing fails (wrong passphrase or tampered file), or
-/// the sidecar cannot be written.
+/// Returns [`MissingSigningInput`] if the image or key does not exist, and an
+/// opaque error if a stale sidecar cannot be removed, an existence check
+/// fails, the passphrase supplier fails, unsealing fails (wrong passphrase or
+/// tampered file), or the sidecar cannot be written.
 fn sign_image(
     image: &Path,
     key_path: &Path,
     passphrase: impl FnOnce() -> Result<Zeroizing<String>>,
 ) -> Result<PathBuf> {
-    if !image.exists() {
-        bail!("image not found: {}", image.display());
+    let sidecar = russignol_release_signature::sidecar_path(image);
+    if let Err(err) = fs::remove_file(&sidecar)
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        return Err(err).with_context(|| format!("failed to remove stale {}", sidecar.display()));
     }
-    if !key_path.exists() {
-        bail!(
-            "no maintainer key at {}; generate one with `cargo xtask maintainer-keygen`",
-            key_path.display()
-        );
+    if !image
+        .try_exists()
+        .with_context(|| format!("failed to check for image {}", image.display()))?
+    {
+        return Err(MissingSigningInput::Image(image.to_path_buf()).into());
+    }
+    if !key_path
+        .try_exists()
+        .with_context(|| format!("failed to check for key {}", key_path.display()))?
+    {
+        return Err(MissingSigningInput::Key(key_path.to_path_buf()).into());
     }
     let digest = crate::compute_sha256(image)?;
     let signature = sign_digest(key_path, passphrase()?.as_bytes(), &digest)?;
-    let sidecar = russignol_release_signature::sidecar_path(image);
     std::fs::write(&sidecar, format!("{signature}\n"))
         .with_context(|| format!("failed to write {}", sidecar.display()))?;
     Ok(sidecar)
@@ -242,11 +279,9 @@ mod tests {
     const SEED: [u8; 32] = [0x11; 32];
     const PASS: &[u8] = b"correct horse battery staple";
 
-    /// A prompt-free passphrase supplier for [`sign_image`].
-    fn pass_supplier() -> Result<Zeroizing<String>> {
-        Ok(Zeroizing::new(
-            String::from_utf8(PASS.to_vec()).expect("test passphrase is UTF-8"),
-        ))
+    /// The test passphrase in the form [`sign_image`]'s supplier yields it.
+    fn test_passphrase() -> Zeroizing<String> {
+        Zeroizing::new(String::from_utf8(PASS.to_vec()).expect("test passphrase is UTF-8"))
     }
 
     #[test]
@@ -325,7 +360,7 @@ mod tests {
         let image = dir.path().join("image.img.xz");
         std::fs::write(&image, b"image bytes").unwrap();
 
-        let sidecar = sign_image(&image, &key_path, pass_supplier).unwrap();
+        let sidecar = sign_image(&image, &key_path, || Ok(test_passphrase())).unwrap();
 
         assert_eq!(sidecar, russignol_release_signature::sidecar_path(&image));
         let content = std::fs::read_to_string(&sidecar).unwrap();
@@ -341,28 +376,56 @@ mod tests {
     }
 
     #[test]
-    fn sign_image_missing_image_errors() {
+    fn failed_signing_removes_a_stale_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("maintainer-key");
         generate_and_write_sealed_key(&key_path, PASS).unwrap();
+        let image = dir.path().join("image.img.xz");
+        std::fs::write(&image, b"fresh image bytes").unwrap();
+        let sidecar = russignol_release_signature::sidecar_path(&image);
+        std::fs::write(&sidecar, "stale signature\n").unwrap();
 
+        let result = sign_image(&image, &key_path, || bail!("prompt aborted"));
+
+        assert!(result.is_err());
         assert!(
-            sign_image(
-                &dir.path().join("no-such-image.img.xz"),
-                &key_path,
-                pass_supplier
-            )
-            .is_err()
+            !sidecar.exists(),
+            "a signature from an earlier signing must not survive a failed run"
         );
     }
 
     #[test]
-    fn sign_image_missing_key_errors() {
+    fn sign_image_missing_image_errors_without_prompting() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("maintainer-key");
+        generate_and_write_sealed_key(&key_path, PASS).unwrap();
+
+        let err = sign_image(&dir.path().join("no-such-image.img.xz"), &key_path, || {
+            panic!("the passphrase must not be requested for a missing image")
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            err.downcast_ref::<MissingSigningInput>(),
+            Some(MissingSigningInput::Image(_))
+        ));
+    }
+
+    #[test]
+    fn sign_image_missing_key_errors_without_prompting() {
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("image.img.xz");
         std::fs::write(&image, b"image bytes").unwrap();
 
-        assert!(sign_image(&image, &dir.path().join("no-such-key"), pass_supplier).is_err());
+        let err = sign_image(&image, &dir.path().join("no-such-key"), || {
+            panic!("the passphrase must not be requested for a missing key")
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            err.downcast_ref::<MissingSigningInput>(),
+            Some(MissingSigningInput::Key(_))
+        ));
     }
 
     #[test]
