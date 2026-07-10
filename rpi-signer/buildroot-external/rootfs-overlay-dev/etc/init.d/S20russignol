@@ -190,7 +190,11 @@ case "$1" in
         ;;
     stop)
         echo "Stopping Russignol the Tezos Signer"
-        if ! start-stop-daemon --stop --oknodo --pidfile "$PID_FILE" --retry 5; then
+        # Match the signer by its executable, not a pidfile: start-stop-daemon
+        # --background records the /bin/sh wrapper's pid, and busybox sh does not
+        # forward SIGTERM to its child, so stopping by pidfile kills the wrapper
+        # and leaves the signer orphaned holding the display GPIO.
+        if ! start-stop-daemon --stop --oknodo --exec "$COMMAND" --retry 5; then
             echo "Failed to stop Russignol" >&2
             exit 1
         fi
