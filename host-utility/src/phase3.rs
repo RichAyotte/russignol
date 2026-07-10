@@ -727,7 +727,7 @@ fn import_and_set_key(
         spinner.finish_and_clear();
         let label = format!(
             "{}{} key set to {pkh}",
-            &kind[..1].to_uppercase(),
+            kind[..1].to_uppercase(),
             &kind[1..]
         );
         success(&label);

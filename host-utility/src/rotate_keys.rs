@@ -381,12 +381,10 @@ fn execute_fresh_rotation(ctx: &FreshRotationContext<'_>, config: &RussignolConf
 
     if *dry_run {
         info(&format!(
-            "Would import {} -> {}",
-            CONSENSUS_KEY_PENDING_ALIAS, &consensus_hash
+            "Would import {CONSENSUS_KEY_PENDING_ALIAS} -> {consensus_hash}"
         ));
         info(&format!(
-            "Would import {} -> {}",
-            COMPANION_KEY_PENDING_ALIAS, &companion_hash
+            "Would import {COMPANION_KEY_PENDING_ALIAS} -> {companion_hash}"
         ));
     } else {
         import_new_keys(&consensus_hash, &companion_hash, config)?;
@@ -2135,7 +2133,7 @@ fn resume_from_pending_on_chain_only(
                         .as_deref()
                         .unwrap_or("unknown")
                 ));
-                warning(&format!("Connected signer: {}", &consensus_hash));
+                warning(&format!("Connected signer: {consensus_hash}"));
                 info("Please connect the correct device (the one with the pending keys).");
             }
             Err(e) => {
