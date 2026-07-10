@@ -418,6 +418,10 @@ start_gadget_supervisor() {
 #
 R_CMD="/bin/russignol-signer"
 PANIC_LOG="/data/logs/panic.log"
+# Without this env_logger defaults to error-only and signer.log carries no
+# operational trail; the value survives the non-login `su` below. Must match
+# the dev init (rootfs-overlay-dev/etc/init.d/S20russignol).
+export RUST_LOG=info
 
 # Signer exits with this code to request a clean reboot from the supervisor
 # (used to land each PIN-blob migration step on a fresh boot).
