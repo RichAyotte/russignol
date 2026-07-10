@@ -260,6 +260,15 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
+    /// Sign an image with the maintainer key, writing a `<image>.sig` sidecar
+    MaintainerSign {
+        /// Path to the image to sign (e.g. an .img.xz)
+        image: PathBuf,
+        /// Sealed maintainer key (default: ~/.config/russignol/maintainer-key)
+        #[arg(short, long)]
+        key: Option<PathBuf>,
+    },
+
     /// Generate code coverage report
     Coverage {
         /// Open HTML report in browser
@@ -467,6 +476,7 @@ fn try_main() -> Result<()> {
         Commands::Validate => cmd_validate(),
         Commands::Publish { component, publish } => cmd_publish(component, &publish),
         Commands::MaintainerKeygen { output } => maintainer_key::cmd_maintainer_keygen(output),
+        Commands::MaintainerSign { image, key } => maintainer_key::cmd_maintainer_sign(&image, key),
         Commands::Coverage { open, lcov } => cmd_coverage(open, lcov),
         Commands::Deploy { skip_build, dev } => deploy::deploy(skip_build, dev),
         Commands::WatermarkTest {
@@ -863,9 +873,9 @@ fn cmd_github_release(component: ReleaseComponent) -> Result<()> {
     Ok(())
 }
 
-/// Path of the built release image and its detached maintainer signature.
+/// Path of the built release image; its detached maintainer signature lives at
+/// the image's sidecar path.
 const RELEASE_IMAGE: &str = "target/russignol-pi-zero.img.xz";
-const RELEASE_IMAGE_SIG: &str = "target/russignol-pi-zero.img.xz.sig";
 
 /// Sign the built release image with the maintainer key, writing a detached
 /// signature beside it. Skips silently when the image was not built, and leaves
@@ -873,17 +883,17 @@ const RELEASE_IMAGE_SIG: &str = "target/russignol-pi-zero.img.xz.sig";
 fn sign_release_image() -> Result<()> {
     sign_release_image_at(
         Path::new(RELEASE_IMAGE),
-        Path::new(RELEASE_IMAGE_SIG),
         &maintainer_key::default_key_path()?,
     )
 }
 
-fn sign_release_image_at(image: &Path, sig_path: &Path, key_path: &Path) -> Result<()> {
+fn sign_release_image_at(image: &Path, key_path: &Path) -> Result<()> {
     // A signature left over from a prior build belongs to a different image;
     // shipped together they can only fail verification. Remove it up front so a
     // .sig exists only when this run produced it.
+    let sig_path = russignol_release_signature::sidecar_path(image);
     if sig_path.exists() {
-        std::fs::remove_file(sig_path)
+        std::fs::remove_file(&sig_path)
             .with_context(|| format!("Failed to remove stale {}", sig_path.display()))?;
     }
 
@@ -900,11 +910,12 @@ fn sign_release_image_at(image: &Path, sig_path: &Path, key_path: &Path) -> Resu
         return Ok(());
     }
 
-    let digest = compute_sha256(image)?;
-    let signature = maintainer_key::sign_digest_with_sealed_key(key_path, &digest)?;
-    std::fs::write(sig_path, format!("{signature}\n"))
-        .with_context(|| format!("Failed to write {}", sig_path.display()))?;
-    println!("    {} russignol-pi-zero.img.xz.sig", "✓".green());
+    let sidecar = maintainer_key::sign_image_with_prompt(image, key_path)?;
+    println!(
+        "    {} {}",
+        "✓".green(),
+        sidecar.file_name().unwrap_or_default().display()
+    );
     Ok(())
 }
 
@@ -1689,12 +1700,12 @@ mod tests {
     fn unsigned_release_removes_stale_signature() {
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("image.img.xz");
-        let sig = dir.path().join("image.img.xz.sig");
+        let sig = russignol_release_signature::sidecar_path(&image);
         let key = dir.path().join("no-such-key");
         std::fs::write(&image, b"fresh image").unwrap();
         std::fs::write(&sig, "stale signature\n").unwrap();
 
-        sign_release_image_at(&image, &sig, &key).unwrap();
+        sign_release_image_at(&image, &key).unwrap();
 
         assert!(
             !sig.exists(),
@@ -1706,11 +1717,11 @@ mod tests {
     fn skipped_image_removes_stale_signature() {
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("image.img.xz");
-        let sig = dir.path().join("image.img.xz.sig");
+        let sig = russignol_release_signature::sidecar_path(&image);
         let key = dir.path().join("no-such-key");
         std::fs::write(&sig, "stale signature\n").unwrap();
 
-        sign_release_image_at(&image, &sig, &key).unwrap();
+        sign_release_image_at(&image, &key).unwrap();
 
         assert!(
             !sig.exists(),

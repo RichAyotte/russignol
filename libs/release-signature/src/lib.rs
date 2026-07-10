@@ -8,6 +8,7 @@
 //! `public_key`, and `generate_seed`. The signing seed never reaches the device.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 /// SHA-256 digest length in bytes — the signed payload is the raw digest.
@@ -53,6 +54,17 @@ fn message(image_sha256_hex: &str) -> Result<[u8; DIGEST_LEN], SignatureError> {
     digest
         .try_into()
         .map_err(|_| SignatureError::MalformedDigest)
+}
+
+/// The detached-signature sidecar path for `image`: the image path with
+/// `.sig` appended to its full file name. Signing writes the sidecar here and
+/// the flash-time verifier looks for it here, so the naming recipe has a
+/// single home.
+#[must_use]
+pub fn sidecar_path(image: &Path) -> PathBuf {
+    let mut sidecar = image.as_os_str().to_os_string();
+    sidecar.push(".sig");
+    PathBuf::from(sidecar)
 }
 
 /// Generate a fresh signing seed from the OS CSPRNG.
@@ -115,6 +127,26 @@ mod tests {
 
     /// A deterministic seed — a test fixture, never a production key.
     const DEV_SEED: [u8; 32] = [7u8; 32];
+
+    // --- sidecar naming ---
+
+    /// `.sig` is appended to the whole name — `with_extension` semantics
+    /// (replacing `.xz`) would break the sign/verify rendezvous.
+    #[test]
+    fn sidecar_path_appends_sig_to_the_full_name() {
+        assert_eq!(
+            sidecar_path(Path::new("/tmp/dir/foo.img.xz")),
+            Path::new("/tmp/dir/foo.img.xz.sig")
+        );
+    }
+
+    #[test]
+    fn sidecar_path_works_on_a_bare_filename() {
+        assert_eq!(
+            sidecar_path(Path::new("image.img")),
+            Path::new("image.img.sig")
+        );
+    }
 
     // --- keygen ---
 

@@ -151,24 +151,80 @@ pub fn unseal_seed(passphrase: &[u8], blob: &[u8]) -> io::Result<Zeroizing<[u8; 
     Ok(seed)
 }
 
-/// Sign `digest_hex` with the sealed key at `key_path`, prompting once for its
-/// passphrase, and return the detached signature as hex.
+/// Prompt once for the maintainer key passphrase.
+fn prompt_passphrase() -> Result<Zeroizing<String>> {
+    Ok(Zeroizing::new(
+        rpassword::prompt_password("Maintainer key passphrase: ")
+            .context("failed to read passphrase")?,
+    ))
+}
+
+/// Sign the image at `image` with the sealed key at `key_path`, prompting once
+/// for its passphrase, and write the detached signature sidecar where the
+/// flash-time verifier looks for it.
 ///
 /// # Errors
 ///
-/// Returns an error if the passphrase cannot be read, the key cannot be
-/// unsealed (wrong passphrase or tampered file), or signing fails.
-pub fn sign_digest_with_sealed_key(key_path: &Path, digest_hex: &str) -> Result<String> {
-    let passphrase = Zeroizing::new(
-        rpassword::prompt_password("Maintainer key passphrase: ")
-            .context("failed to read passphrase")?,
+/// Returns an error if the image or key is missing, the passphrase cannot be
+/// read, the key cannot be unsealed, or the sidecar cannot be written.
+pub fn cmd_maintainer_sign(image: &Path, key: Option<PathBuf>) -> Result<()> {
+    let key_path = match key {
+        Some(path) => path,
+        None => default_key_path()?,
+    };
+    let sidecar = sign_image_with_prompt(image, &key_path)?;
+    println!(
+        "{} Detached signature written to {}",
+        "✓".green(),
+        sidecar.display()
     );
-    sign_digest(key_path, passphrase.as_bytes(), digest_hex)
+    Ok(())
+}
+
+/// [`sign_image`] with the passphrase prompted from the terminal.
+///
+/// # Errors
+///
+/// Propagates [`sign_image`] errors, plus a failed passphrase read.
+pub fn sign_image_with_prompt(image: &Path, key_path: &Path) -> Result<PathBuf> {
+    sign_image(image, key_path, prompt_passphrase)
+}
+
+/// Digest `image`, sign it with the sealed key at `key_path`, and write the
+/// signature (hex plus a trailing newline) to the image's sidecar path,
+/// returning that path. `passphrase` is invoked only after the image and key
+/// are known to exist, so a prompting supplier never wastes an entry on an
+/// invocation that cannot sign.
+///
+/// # Errors
+///
+/// Returns an error if the image or key does not exist, the passphrase
+/// supplier fails, unsealing fails (wrong passphrase or tampered file), or
+/// the sidecar cannot be written.
+fn sign_image(
+    image: &Path,
+    key_path: &Path,
+    passphrase: impl FnOnce() -> Result<Zeroizing<String>>,
+) -> Result<PathBuf> {
+    if !image.exists() {
+        bail!("image not found: {}", image.display());
+    }
+    if !key_path.exists() {
+        bail!(
+            "no maintainer key at {}; generate one with `cargo xtask maintainer-keygen`",
+            key_path.display()
+        );
+    }
+    let digest = crate::compute_sha256(image)?;
+    let signature = sign_digest(key_path, passphrase()?.as_bytes(), &digest)?;
+    let sidecar = russignol_release_signature::sidecar_path(image);
+    std::fs::write(&sidecar, format!("{signature}\n"))
+        .with_context(|| format!("failed to write {}", sidecar.display()))?;
+    Ok(sidecar)
 }
 
 /// Read the sealed key at `key_path`, unseal it under `passphrase`, and sign
-/// `digest_hex`. The passphrase-prompt-free core of
-/// [`sign_digest_with_sealed_key`].
+/// `digest_hex`.
 fn sign_digest(key_path: &Path, passphrase: &[u8], digest_hex: &str) -> Result<String> {
     let blob =
         fs::read(key_path).with_context(|| format!("failed to read {}", key_path.display()))?;
@@ -183,6 +239,13 @@ mod tests {
 
     const SEED: [u8; 32] = [0x11; 32];
     const PASS: &[u8] = b"correct horse battery staple";
+
+    /// A prompt-free passphrase supplier for [`sign_image`].
+    fn pass_supplier() -> Result<Zeroizing<String>> {
+        Ok(Zeroizing::new(
+            String::from_utf8(PASS.to_vec()).expect("test passphrase is UTF-8"),
+        ))
+    }
 
     #[test]
     fn seal_unseal_roundtrip() {
@@ -250,6 +313,54 @@ mod tests {
             russignol_release_signature::verify(&pubkey, &digest, &sig),
             Ok(())
         );
+    }
+
+    #[test]
+    fn sign_image_writes_a_verifiable_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("maintainer-key");
+        let pubkey = generate_and_write_sealed_key(&key_path, PASS).unwrap();
+        let image = dir.path().join("image.img.xz");
+        std::fs::write(&image, b"image bytes").unwrap();
+
+        let sidecar = sign_image(&image, &key_path, pass_supplier).unwrap();
+
+        assert_eq!(sidecar, russignol_release_signature::sidecar_path(&image));
+        let content = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "the sidecar is a single hex line with a trailing newline"
+        );
+        let digest = crate::compute_sha256(&image).unwrap();
+        assert_eq!(
+            russignol_release_signature::verify(&pubkey, &digest, content.trim()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn sign_image_missing_image_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("maintainer-key");
+        generate_and_write_sealed_key(&key_path, PASS).unwrap();
+
+        assert!(
+            sign_image(
+                &dir.path().join("no-such-image.img.xz"),
+                &key_path,
+                pass_supplier
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sign_image_missing_key_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image.img.xz");
+        std::fs::write(&image, b"image bytes").unwrap();
+
+        assert!(sign_image(&image, &dir.path().join("no-such-key"), pass_supplier).is_err());
     }
 
     #[test]

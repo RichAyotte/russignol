@@ -817,9 +817,7 @@ fn resolve_local_signature(image: &Path, explicit: Option<&Path>) -> Result<Opti
     let path = if let Some(path) = explicit {
         path.to_path_buf()
     } else {
-        let mut sidecar = image.as_os_str().to_os_string();
-        sidecar.push(".sig");
-        let sidecar = PathBuf::from(sidecar);
+        let sidecar = russignol_release_signature::sidecar_path(image);
         if !sidecar.exists() {
             return Ok(None);
         }
