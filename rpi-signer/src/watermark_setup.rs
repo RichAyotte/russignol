@@ -8,7 +8,7 @@
 //! The watermark config is a one-time use file that is deleted after processing.
 
 use crate::constants::{BOOT_MOUNT, CHAIN_INFO_FILE};
-use crate::util::{mount_boot_partition, unmount_boot_partition};
+use crate::util::{BootMountMode, mount_boot_partition, unmount_boot_partition};
 use serde::Deserialize;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -72,7 +72,7 @@ pub enum WatermarkResult {
 pub fn process_watermark_config() -> WatermarkResult {
     log::info!("Checking for watermark configuration...");
 
-    if let Err(e) = mount_boot_partition() {
+    if let Err(e) = mount_boot_partition(BootMountMode::ReadWrite) {
         return WatermarkResult::Error(format!("Failed to mount boot partition: {e}"));
     }
 
@@ -96,7 +96,7 @@ pub fn process_watermark_config() -> WatermarkResult {
 pub fn validate_watermark_config() -> WatermarkResult {
     log::info!("Validating watermark configuration (non-consuming)...");
 
-    if let Err(e) = mount_boot_partition() {
+    if let Err(e) = mount_boot_partition(BootMountMode::ReadOnly) {
         return WatermarkResult::Error(format!("Failed to mount boot partition: {e}"));
     }
 

@@ -12,7 +12,7 @@
 //! rootfs skips the check.
 
 use crate::constants::{BOOT_MOUNT, ROOTFS_PARTITION};
-use crate::util::{mount_boot_partition, unmount_boot_partition};
+use crate::util::{BootMountMode, mount_boot_partition, unmount_boot_partition};
 use russignol_flash_manifest::{FlashManifest, MANIFEST_FILENAME};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
@@ -132,7 +132,7 @@ pub fn verify_rootfs(progress: impl FnMut(u8)) -> RootfsCheck {
 /// unmounting around the read. A missing manifest is `Ok(None)` — cards
 /// flashed by older hosts have no manifest hash to compare against.
 fn staged_manifest_hash() -> Result<Option<String>, String> {
-    mount_boot_partition()?;
+    mount_boot_partition(BootMountMode::ReadOnly)?;
     let content = std::fs::read_to_string(Path::new(BOOT_MOUNT).join(MANIFEST_FILENAME));
     let _ = unmount_boot_partition();
     match content {

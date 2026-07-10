@@ -20,21 +20,37 @@ pub fn run_command(cmd: &str, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn mount_boot_partition() -> Result<(), String> {
+/// Mount mode for the boot partition
+#[derive(Clone, Copy)]
+pub enum BootMountMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+pub fn mount_boot_partition(mode: BootMountMode) -> Result<(), String> {
     std::fs::create_dir_all(BOOT_MOUNT)
         .map_err(|e| format!("Failed to create mount point: {e}"))?;
 
     // Check if already mounted (e.g. from a previous attempt or manual SSH inspection)
     if is_mounted(BOOT_MOUNT) {
         log::info!("Boot partition already mounted at {BOOT_MOUNT}");
+        // The leftover mount may be read-only (a read-only consumer that never
+        // unmounted); a read-write request must still end read-write.
+        if matches!(mode, BootMountMode::ReadWrite) {
+            run_command("/bin/mount", &["-o", "remount,rw", BOOT_MOUNT])?;
+        }
         return Ok(());
     }
 
+    let options = match mode {
+        BootMountMode::ReadOnly => "ro",
+        BootMountMode::ReadWrite => "rw",
+    };
     run_command(
         "/bin/mount",
-        &["-t", "vfat", "-o", "rw", BOOT_PARTITION, BOOT_MOUNT],
+        &["-t", "vfat", "-o", options, BOOT_PARTITION, BOOT_MOUNT],
     )?;
-    log::debug!("Mounted {BOOT_PARTITION} to {BOOT_MOUNT}");
+    log::debug!("Mounted {BOOT_PARTITION} to {BOOT_MOUNT} ({options})");
     Ok(())
 }
 
