@@ -3,9 +3,9 @@
 //! A detached Ed25519 signature over a release image's SHA-256 lets the host
 //! verify a card's authenticity before flashing. The signed payload is the raw
 //! 32-byte digest, so `sign` and `verify` share one `message` helper and cannot
-//! disagree on what the signature covers. `host-utility` links only `verify`
-//! (its `MAINTAINER_PUBKEY` is the trust anchor); `xtask` links `sign`,
-//! `public_key`, and `generate_seed`. The signing seed never reaches the device.
+//! disagree on what the signature covers. `host-utility` never links the
+//! signing side (its `MAINTAINER_PUBKEY` is the trust anchor); signing lives
+//! only in `xtask`, and the signing seed never reaches the device.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use std::path::{Path, PathBuf};
