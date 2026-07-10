@@ -40,6 +40,9 @@ u8g2-fonts = { version = "0.8.0", features = ["embedded_graphics_textstyle"] }
 ctrlc = "3.5"
 russignol-storage = { version = "0.1.0", path = "../libs/storage" }
 zeroize = "1.9"
+russignol-flash-manifest = { version = "0.1.0", path = "../libs/flash-manifest" }
+sha2 = "0.11.0"
+hex = "0.4.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -7,13 +7,12 @@
 //!
 //! The watermark config is a one-time use file that is deleted after processing.
 
-use crate::constants::{BOOT_MOUNT, BOOT_PARTITION, CHAIN_INFO_FILE};
-use crate::util::run_command;
+use crate::constants::{BOOT_MOUNT, CHAIN_INFO_FILE};
+use crate::util::{mount_boot_partition, unmount_boot_partition};
 use serde::Deserialize;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
 
 /// Config file name on boot partition
 const CONFIG_FILENAME: &str = "watermark-config.json";
@@ -107,40 +106,6 @@ pub fn validate_watermark_config() -> WatermarkResult {
     let _ = unmount_boot_partition();
 
     result
-}
-
-fn mount_boot_partition() -> Result<(), String> {
-    fs::create_dir_all(BOOT_MOUNT).map_err(|e| format!("Failed to create mount point: {e}"))?;
-
-    // Check if already mounted (e.g. from a previous attempt or manual SSH inspection)
-    if is_mounted(BOOT_MOUNT) {
-        log::info!("Boot partition already mounted at {BOOT_MOUNT}");
-        return Ok(());
-    }
-
-    run_command(
-        "/bin/mount",
-        &["-t", "vfat", "-o", "rw", BOOT_PARTITION, BOOT_MOUNT],
-    )?;
-    log::debug!("Mounted {BOOT_PARTITION} to {BOOT_MOUNT}");
-    Ok(())
-}
-
-/// Check if a path is a mount point by reading /proc/mounts
-fn is_mounted(path: &str) -> bool {
-    fs::read_to_string("/proc/mounts").is_ok_and(|contents| {
-        contents
-            .lines()
-            .any(|line| line.split(' ').nth(1) == Some(path))
-    })
-}
-
-fn unmount_boot_partition() -> Result<(), String> {
-    let _ = Command::new("/bin/sync").output(); // Sync first, ignore result
-    run_command("/bin/umount", &[BOOT_MOUNT])?;
-    let _ = fs::remove_dir(BOOT_MOUNT); // Clean up mount point
-    log::debug!("Unmounted {BOOT_MOUNT}");
-    Ok(())
 }
 
 /// Read, parse, and validate the config at `config_path`. Returns the validated

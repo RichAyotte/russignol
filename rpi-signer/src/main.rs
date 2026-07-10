@@ -8,6 +8,7 @@ mod led;
 mod log_writer;
 mod network_status;
 mod pages;
+mod rootfs_check;
 mod secret;
 mod setup;
 mod signer_server;
@@ -300,6 +301,10 @@ fn run_ui_loop(
     // CRITICAL: Check for error conditions BEFORE showing any UI
     if is_first_boot && let Err(e) = setup::verify_partitions_early() {
         fatal_error(&mut device, "SETUP ERROR", &e);
+    }
+
+    if is_first_boot {
+        verify_rootfs_integrity(&mut device);
     }
 
     let pending_watermark_level = recover_watermark_config(&mut device, is_first_boot);
@@ -879,6 +884,44 @@ fn should_recover_watermark_config(
     migration_pending: bool,
 ) -> bool {
     !is_first_boot && is_root && !migration_pending
+}
+
+/// First-boot rootfs integrity check against the hash the host recorded in
+/// the flash manifest. A mismatch is fatal: setup would otherwise generate
+/// keys on a card that is already corrupting. The check detects accidental
+/// corruption only — the SD card is attacker-mutable, so it makes no
+/// authenticity claim, and the shown message must not either.
+fn verify_rootfs_integrity(device: &mut Device) {
+    let message = "Verifying image";
+    // Created on the first progress tick: a skipped check (dev image, no
+    // manifest hash) never hashes, and must not cost an e-paper refresh.
+    let mut page: Option<progress::Page> = None;
+    let mut last_drawn = 0u8;
+    let result = rootfs_check::verify_rootfs(|percent| {
+        // E-paper refreshes are slow; redraw at coarse steps only
+        if page.is_none() || percent >= last_drawn.saturating_add(20) {
+            last_drawn = percent;
+            let page = page.get_or_insert_with(|| progress::Page::new(message));
+            page.set_progress(message, percent);
+            let _ = page.show(&mut device.display);
+            let _ = device.display.update();
+        }
+    });
+
+    match result {
+        rootfs_check::RootfsCheck::Verified => log::info!("Rootfs integrity verified"),
+        rootfs_check::RootfsCheck::Skipped(reason) => {
+            log::info!("Rootfs integrity check skipped: {reason}");
+        }
+        rootfs_check::RootfsCheck::Mismatch { expected, actual } => {
+            log::error!("Rootfs hash mismatch: expected {expected}, got {actual}");
+            fatal_error(
+                device,
+                "CARD CORRUPTION",
+                "System files differ from what was flashed. The SD card is likely corrupted or worn out. Re-flash it with the host utility.",
+            );
+        }
+    }
 }
 
 /// Consume a staged boot-partition watermark config on a normal boot, then

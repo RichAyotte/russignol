@@ -12,6 +12,9 @@ pub const CHAIN_INFO_FILE: &str = "/keys/chain_info.json";
 /// Boot partition device path (first partition on SD card)
 pub const BOOT_PARTITION: &str = "/dev/mmcblk0p1";
 
+/// Rootfs partition device path (second partition on SD card)
+pub const ROOTFS_PARTITION: &str = "/dev/mmcblk0p2";
+
 /// Log directory on the data partition
 pub const LOG_DIR: &str = "/data/logs";
 
