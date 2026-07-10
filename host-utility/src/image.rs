@@ -772,9 +772,9 @@ fn resolve_key_source(
 }
 
 /// Enforce the maintainer release-signature policy before any destructive
-/// write. With no maintainer key embedded yet, this proceeds silently; once a
-/// key is embedded it verifies the image's signature and refuses on mismatch,
-/// requiring `--allow-unsigned` to flash an image that carries no signature.
+/// write: verify the image's signature against the embedded maintainer key and
+/// refuse on mismatch; flashing an image that carries no signature requires
+/// `--allow-unsigned`. A build without an embedded key proceeds silently.
 fn enforce_release_signature(
     image_sha256: &str,
     signature: Option<&str>,
@@ -792,7 +792,7 @@ fn enforce_release_signature(
             utils::success("Maintainer release signature verified");
             Ok(())
         }
-        // No production key embedded yet — nothing to verify against.
+        // A build without an embedded key has nothing to verify against.
         Ok(SignatureVerdict::Unavailable) => Ok(()),
         Ok(SignatureVerdict::UnsignedAllowed) => {
             utils::warning("Flashing an unsigned image (--allow-unsigned)");

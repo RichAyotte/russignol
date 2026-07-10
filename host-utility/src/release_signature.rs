@@ -14,11 +14,11 @@
 
 use russignol_release_signature::{SignatureError, verify};
 
-/// The maintainer public key that signs releases, or `None` until the
-/// production key is generated. While `None`, no release carries a verifiable
-/// signature, so flashing proceeds unverified with a warning rather than
-/// refusing every card.
-pub const MAINTAINER_PUBKEY: Option<[u8; 32]> = None;
+/// The maintainer public key that signs releases.
+pub const MAINTAINER_PUBKEY: Option<[u8; 32]> = Some([
+    0x92, 0x4e, 0xa4, 0x05, 0x2e, 0x28, 0xf7, 0xdc, 0xc5, 0x97, 0xde, 0xb6, 0xc3, 0xfd, 0x37, 0x03,
+    0xc7, 0x37, 0x70, 0x11, 0x89, 0x9c, 0xeb, 0xc3, 0x62, 0x93, 0xfa, 0x9f, 0x04, 0xd8, 0x12, 0x62,
+]);
 
 /// Why a release could not be accepted for flashing.
 #[derive(Debug, PartialEq, Eq)]
@@ -53,14 +53,14 @@ impl From<SignatureError> for ReleaseSignatureError {
 pub enum SignatureVerdict {
     /// A maintainer signature was verified against the embedded key.
     Verified,
-    /// No maintainer key is embedded yet; proceeding unverified.
+    /// The build embeds no maintainer key; proceeding unverified.
     Unavailable,
     /// The image is unsigned but the operator allowed unsigned flashing.
     UnsignedAllowed,
 }
 
 /// Apply the flash-time signature policy, given the embedded maintainer key
-/// (`None` until one is generated), the image hash, an optional detached
+/// (`None` when the build embeds none), the image hash, an optional detached
 /// signature for the image, and whether the operator allowed unsigned images.
 ///
 /// Returns the verdict to proceed under, or the reason to refuse.
