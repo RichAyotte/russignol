@@ -384,8 +384,11 @@ enum KernelAction {
     Update,
 }
 
-// Build targets for host utility
-const HOST_TARGETS: &[&str] = &["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"];
+/// Host-utility build targets and the release asset each is shipped as.
+const HOST_RELEASE_BINARIES: &[(&str, &str)] = &[
+    ("x86_64-unknown-linux-gnu", "target/russignol-amd64"),
+    ("aarch64-unknown-linux-gnu", "target/russignol-aarch64"),
+];
 
 // glibc symbol-version floor for released host binaries. cargo-zigbuild caps the
 // binary's required GLIBC symbols at this version so it runs on any distro at or
@@ -564,7 +567,10 @@ fn cmd_host_utility(arch: Arch, sequential: bool, dev: bool) -> Result<()> {
 
 fn resolve_targets(arch: Arch) -> Vec<&'static str> {
     match arch {
-        Arch::All => HOST_TARGETS.to_vec(),
+        Arch::All => HOST_RELEASE_BINARIES
+            .iter()
+            .map(|(target, _)| *target)
+            .collect(),
         Arch::X86_64 => vec!["x86_64-unknown-linux-gnu"],
         Arch::Aarch64 => vec!["aarch64-unknown-linux-gnu"],
     }
@@ -693,22 +699,26 @@ fn compute_sha256(path: &Path) -> Result<String> {
 
 /// Move release assets to target/ with canonical names and generate checksums
 fn copy_release_assets() -> Result<Vec<String>> {
-    let mut assets: Vec<String> = Vec::new();
+    let mut assets = move_binary_release_assets()?;
+    assets.extend(move_image_release_asset()?);
+    with_checksums(assets)
+}
 
-    // Move host utility binaries
-    for target in HOST_TARGETS {
+/// Move built host-utility binaries to their release asset paths, returning
+/// the assets that were moved.
+fn move_binary_release_assets() -> Result<Vec<String>> {
+    let mut assets: Vec<String> = Vec::new();
+    for (target, asset) in HOST_RELEASE_BINARIES {
         let binary = format!("target/{target}/release/russignol");
         if Path::new(&binary).exists() {
-            let output_name = match *target {
-                "x86_64-unknown-linux-gnu" => "russignol-amd64",
-                "aarch64-unknown-linux-gnu" => "russignol-aarch64",
-                _ => continue,
-            };
-            let release_path = format!("target/{output_name}");
-            std::fs::rename(&binary, &release_path)
+            std::fs::rename(&binary, asset)
                 .with_context(|| format!("Failed to move binary for {target}"))?;
-            assets.push(release_path);
-            println!("    {} {}", "✓".green(), output_name);
+            assets.push((*asset).to_string());
+            println!(
+                "    {} {}",
+                "✓".green(),
+                Path::new(asset).file_name().unwrap_or_default().display()
+            );
         } else {
             println!(
                 "    {} Skipping {} (binary not found)",
@@ -717,51 +727,39 @@ fn copy_release_assets() -> Result<Vec<String>> {
             );
         }
     }
+    Ok(assets)
+}
 
-    // Move SD card image
+/// Move the built SD card image to its release asset path, returning the
+/// asset if the image was built.
+fn move_image_release_asset() -> Result<Option<String>> {
     let image_path = Path::new("buildroot/output/images/sdcard.img.xz");
-    if image_path.exists() {
-        std::fs::rename(image_path, RELEASE_IMAGE).context("Failed to move SD card image")?;
-        assets.push(RELEASE_IMAGE.to_string());
-        println!(
-            "    {} {}",
-            "✓".green(),
-            Path::new(RELEASE_IMAGE)
-                .file_name()
-                .unwrap_or_default()
-                .display()
-        );
-    } else {
+    if !image_path.exists() {
         println!(
             "    {} Skipping SD card image (not found at {})",
             "⚠".yellow(),
             image_path.display()
         );
+        return Ok(None);
     }
+    std::fs::rename(image_path, RELEASE_IMAGE).context("Failed to move SD card image")?;
+    println!(
+        "    {} {}",
+        "✓".green(),
+        Path::new(RELEASE_IMAGE)
+            .file_name()
+            .unwrap_or_default()
+            .display()
+    );
+    Ok(Some(RELEASE_IMAGE.to_string()))
+}
 
-    // Generate checksums.txt for all assets
+/// Append the generated checksums file to a non-empty asset list.
+fn with_checksums(mut assets: Vec<String>) -> Result<Vec<String>> {
     if !assets.is_empty() {
-        println!("  Computing checksums...");
-        let checksums_path = "target/checksums.txt";
-        let file = File::create(checksums_path).context("Failed to create checksums.txt")?;
-        let mut writer = BufWriter::new(file);
-
-        for asset_path in &assets {
-            let path = Path::new(asset_path);
-            let filename = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .context("Invalid asset filename")?;
-            let hash = compute_sha256(path)?;
-            // sha256sum format: two spaces between hash and filename
-            writeln!(writer, "{hash}  {filename}").context("Failed to write checksum")?;
-        }
-
-        writer.flush().context("Failed to flush checksums.txt")?;
-        assets.push(checksums_path.to_string());
-        println!("    {} checksums.txt", "✓".green());
+        let checksums = generate_checksums(&assets)?;
+        assets.push(checksums);
     }
-
     Ok(assets)
 }
 
@@ -883,6 +881,9 @@ fn cmd_github_release(component: ReleaseComponent) -> Result<()> {
 /// the image's sidecar path.
 const RELEASE_IMAGE: &str = "target/russignol-pi-zero.img.xz";
 
+/// Path of the generated release checksums file.
+const RELEASE_CHECKSUMS: &str = "target/checksums.txt";
+
 /// Sign the built release image with the maintainer key, writing a detached
 /// signature beside it. Skips silently when the image was not built, and leaves
 /// the release unsigned (as before) when no maintainer key is present.
@@ -920,27 +921,20 @@ fn sign_release_image_at(image: &Path, key_path: &Path) -> Result<()> {
 
 /// Collect release assets based on the component being released
 fn collect_release_assets(component: ReleaseComponent) -> Vec<String> {
+    let host_binaries = HOST_RELEASE_BINARIES
+        .iter()
+        .map(|(_, asset)| (*asset).to_string());
     let image_sig = russignol_release_signature::sidecar_path(Path::new(RELEASE_IMAGE))
         .display()
         .to_string();
     let assets: Vec<String> = match component {
-        ReleaseComponent::All => vec![
-            "target/russignol-amd64".into(),
-            "target/russignol-aarch64".into(),
-            RELEASE_IMAGE.into(),
-            image_sig,
-            "target/checksums.txt".into(),
-        ],
-        ReleaseComponent::Signer => vec![
-            RELEASE_IMAGE.into(),
-            image_sig,
-            "target/checksums.txt".into(),
-        ],
-        ReleaseComponent::HostUtility => vec![
-            "target/russignol-amd64".into(),
-            "target/russignol-aarch64".into(),
-            "target/checksums.txt".into(),
-        ],
+        ReleaseComponent::All => host_binaries
+            .chain([RELEASE_IMAGE.into(), image_sig, RELEASE_CHECKSUMS.into()])
+            .collect(),
+        ReleaseComponent::Signer => {
+            vec![RELEASE_IMAGE.into(), image_sig, RELEASE_CHECKSUMS.into()]
+        }
+        ReleaseComponent::HostUtility => host_binaries.chain([RELEASE_CHECKSUMS.into()]).collect(),
         // Libraries don't have binary assets
         ReleaseComponent::SignerLib
         | ReleaseComponent::Ui
@@ -1355,79 +1349,18 @@ fn build_component_artifacts(component: ReleaseComponent, mut step: usize) -> Re
 
 /// Copy only signer-related release assets
 fn copy_signer_release_assets() -> Result<Vec<String>> {
-    let mut assets: Vec<String> = Vec::new();
-
-    // Move SD card image
-    let image_path = Path::new("buildroot/output/images/sdcard.img.xz");
-    if image_path.exists() {
-        std::fs::rename(image_path, RELEASE_IMAGE).context("Failed to move SD card image")?;
-        assets.push(RELEASE_IMAGE.to_string());
-        println!(
-            "    {} {}",
-            "✓".green(),
-            Path::new(RELEASE_IMAGE)
-                .file_name()
-                .unwrap_or_default()
-                .display()
-        );
-    } else {
-        println!(
-            "    {} Skipping SD card image (not found at {})",
-            "⚠".yellow(),
-            image_path.display()
-        );
-    }
-
-    // Generate checksums
-    if !assets.is_empty() {
-        generate_checksums(&assets)?;
-        assets.push("target/checksums.txt".to_string());
-    }
-
-    Ok(assets)
+    with_checksums(move_image_release_asset()?.into_iter().collect())
 }
 
 /// Copy only host-utility release assets
 fn copy_host_utility_release_assets() -> Result<Vec<String>> {
-    let mut assets: Vec<String> = Vec::new();
-
-    // Move host utility binaries
-    for target in HOST_TARGETS {
-        let binary = format!("target/{target}/release/russignol");
-        if Path::new(&binary).exists() {
-            let output_name = match *target {
-                "x86_64-unknown-linux-gnu" => "russignol-amd64",
-                "aarch64-unknown-linux-gnu" => "russignol-aarch64",
-                _ => continue,
-            };
-            let release_path = format!("target/{output_name}");
-            std::fs::rename(&binary, &release_path)
-                .with_context(|| format!("Failed to move binary for {target}"))?;
-            assets.push(release_path);
-            println!("    {} {}", "✓".green(), output_name);
-        } else {
-            println!(
-                "    {} Skipping {} (binary not found)",
-                "⚠".yellow(),
-                target
-            );
-        }
-    }
-
-    // Generate checksums
-    if !assets.is_empty() {
-        generate_checksums(&assets)?;
-        assets.push("target/checksums.txt".to_string());
-    }
-
-    Ok(assets)
+    with_checksums(move_binary_release_assets()?)
 }
 
-/// Generate checksums.txt for the given assets
-fn generate_checksums(assets: &[String]) -> Result<()> {
+/// Generate the release checksums file for the given assets, returning its path
+fn generate_checksums(assets: &[String]) -> Result<String> {
     println!("  Computing checksums...");
-    let checksums_path = "target/checksums.txt";
-    let file = File::create(checksums_path).context("Failed to create checksums.txt")?;
+    let file = File::create(RELEASE_CHECKSUMS).context("Failed to create checksums.txt")?;
     let mut writer = BufWriter::new(file);
 
     for asset_path in assets {
@@ -1442,9 +1375,16 @@ fn generate_checksums(assets: &[String]) -> Result<()> {
     }
 
     writer.flush().context("Failed to flush checksums.txt")?;
-    println!("    {} checksums.txt", "✓".green());
+    println!(
+        "    {} {}",
+        "✓".green(),
+        Path::new(RELEASE_CHECKSUMS)
+            .file_name()
+            .unwrap_or_default()
+            .display()
+    );
 
-    Ok(())
+    Ok(RELEASE_CHECKSUMS.to_string())
 }
 
 /// Print release completion summary
@@ -1455,16 +1395,21 @@ fn print_release_summary(component: ReleaseComponent, version: &str, publish: &P
         format!("{version} complete!").green().bold()
     );
 
+    let binaries = HOST_RELEASE_BINARIES
+        .iter()
+        .map(|(_, asset)| *asset)
+        .collect::<Vec<_>>()
+        .join(", ");
     match component {
         ReleaseComponent::All => {
-            println!("  - Binaries: target/russignol-amd64, target/russignol-aarch64");
+            println!("  - Binaries: {binaries}");
             println!("  - SD image: {RELEASE_IMAGE}");
         }
         ReleaseComponent::Signer => {
             println!("  - SD image: {RELEASE_IMAGE}");
         }
         ReleaseComponent::HostUtility => {
-            println!("  - Binaries: target/russignol-amd64, target/russignol-aarch64");
+            println!("  - Binaries: {binaries}");
         }
         ReleaseComponent::SignerLib
         | ReleaseComponent::Ui
