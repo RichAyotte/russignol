@@ -7,11 +7,18 @@ use colored::Colorize;
 use std::io::Write;
 use std::net::TcpStream;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::deploy::{DEVICE_PASS, RESTART_SIGNER_CMD};
 
 /// Default device address (link-local USB network)
 const DEFAULT_DEVICE_IP: &str = "169.254.1.1";
 const DEFAULT_DEVICE_PORT: u16 = 7732;
+
+/// On-device watermark storage, the `SignerConfig::watermark_dir` default in
+/// `rpi-signer/src/signer_server.rs`. Clearing it drops every key to
+/// uninitialized so the next unlock reloads a clean slate.
+const WATERMARK_DIR: &str = "/data/watermarks";
 
 /// Watermark test configuration
 pub struct WatermarkTestConfig {
@@ -97,13 +104,13 @@ pub fn run_watermark_test(config: &WatermarkTestConfig) -> Result<()> {
     if config.restart {
         println!("\n{}", "Step 3: Restarting Russignol service...".cyan());
         restart_device(&config.device_ip, &config.ssh_user)?;
-        println!("  {} Service restarted", "✓".green());
+        println!(
+            "  {} Service restarted; the device is back at PIN entry",
+            "✓".green()
+        );
 
-        // Wait for service to come back up
-        println!("  Waiting for service to start...");
-        std::thread::sleep(Duration::from_secs(5));
-
-        // Verify connectivity after restart
+        // The signer only binds its port after unlock, so the operator must
+        // re-enter the PIN before the harness can reconnect.
         check_device_connectivity(&config.device_ip, config.device_port)?;
         println!("  {} Device responding after restart", "✓".green());
     } else {
@@ -176,69 +183,69 @@ fn check_device_connectivity(ip: &str, port: u16) -> Result<()> {
             .read_line(&mut input)
             .context("Failed to read user input")?;
 
-        // Try to connect again
+        // Poll for the port rather than a single retry: the operator may press
+        // ENTER a moment before the signer finishes binding after unlock.
         print!("  Reconnecting... ");
         std::io::stdout().flush().ok();
 
-        match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(5)) {
-            Ok(_) => {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2)).is_ok() {
                 println!("{}", "connected".green());
-                Ok(())
+                return Ok(());
             }
-            Err(e) => {
+            if Instant::now() >= deadline {
                 println!("{}", "failed".red());
-                bail!("Still cannot connect to device at {addr}: {e}")
+                bail!("Still cannot connect to device at {addr} after unlock");
             }
+            std::thread::sleep(Duration::from_millis(500));
         }
     }
 }
 
-/// Clear watermark files on the device via SSH
-fn clear_watermarks(ip: &str, user: &str) -> Result<()> {
-    let ssh_target = format!("{user}@{ip}");
-
-    let output = Command::new("ssh")
+/// Run a command on the device over SSH as the unprivileged `russignol` user.
+/// Dev images authenticate with a fixed password; hardened images have no SSH.
+fn device_ssh(user: &str, ip: &str, cmd: &str) -> Result<()> {
+    let output = Command::new("sshpass")
         .args([
-            "-o",
-            "ConnectTimeout=10",
+            "-p",
+            DEVICE_PASS,
+            "ssh",
+            "-x",
             "-o",
             "StrictHostKeyChecking=accept-new",
-            &ssh_target,
-            "rm -f /home/russignol/.tezos-signer/*_high_watermark",
+            "-o",
+            "ConnectTimeout=10",
+            &format!("{user}@{ip}"),
+            cmd,
         ])
         .output()
-        .context("Failed to execute SSH command")?;
+        .context("Failed to execute sshpass ssh (is sshpass installed?)")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Failed to clear watermarks: {stderr}");
+        bail!("SSH command failed: {stderr}");
     }
-
     Ok(())
 }
 
-/// Restart the Russignol service on the device
+/// Run a command on the device as root via `su`; root has no SSH login, so the
+/// unprivileged user escalates with the dev-image password. `cmd` must not
+/// contain double quotes.
+fn device_ssh_su(user: &str, ip: &str, cmd: &str) -> Result<()> {
+    device_ssh(user, ip, &format!("echo {DEVICE_PASS} | su -c \"{cmd}\""))
+}
+
+/// Clear the device's stored watermarks, dropping every key to uninitialized so
+/// the next unlock reloads a clean slate.
+fn clear_watermarks(ip: &str, user: &str) -> Result<()> {
+    device_ssh(user, ip, &format!("rm -rf {WATERMARK_DIR}/*"))
+}
+
+/// Restart the signer as root. The service comes back at PIN entry, so the
+/// caller must wait for the operator to unlock before the port reopens.
 fn restart_device(ip: &str, user: &str) -> Result<()> {
-    let ssh_target = format!("{user}@{ip}");
-
-    let output = Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            &ssh_target,
-            "sudo systemctl restart russignol",
-        ])
-        .output()
-        .context("Failed to execute SSH command")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Failed to restart service: {stderr}");
-    }
-
-    Ok(())
+    device_ssh_su(user, ip, RESTART_SIGNER_CMD)
 }
 
 /// Run the watermark E2E test harness

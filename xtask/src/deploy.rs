@@ -6,7 +6,8 @@ use crate::build::{build_rpi_signer, get_signer_binary_path};
 use crate::utils::check_command;
 
 const DEVICE_USER: &str = "russignol";
-const DEVICE_PASS: &str = "russignol";
+/// Fixed dev-image login (buildroot `users.txt`); hardened images have no SSH.
+pub(crate) const DEVICE_PASS: &str = "russignol";
 const DEVICE_HOST: &str = "169.254.1.1";
 /// Staging path on the device tmpfs (large enough for debug builds); the SSH
 /// user can write here, root moves it into place.
@@ -15,6 +16,16 @@ const REMOTE_STAGING: &str = "/tmp/russignol-signer.next";
 /// than a side location the init never consults) makes the deploy survive
 /// reboots.
 const REMOTE_BINARY: &str = "/bin/russignol-signer";
+
+/// Reliably restart the signer as root. The init pidfile tracks the `/bin/sh`
+/// wrapper, not the signer, so it goes stale and `stop` kills a dead PID while
+/// the real process keeps the display GPIO — a second signer then crashes on
+/// EBUSY. Kill by name instead, wait for the GPIO to release, then start
+/// through the init script (the sole authority on how the signer starts). The
+/// `[r]` class stops pkill/pgrep from matching their own command lines.
+pub(crate) const RESTART_SIGNER_CMD: &str = "pkill -f '[r]ussignol-signer'; \
+     for i in 1 2 3 4 5; do pgrep -f '[r]ussignol-signer' >/dev/null || break; sleep 1; done; \
+     /etc/init.d/S20russignol start";
 
 pub fn deploy(skip_build: bool, dev: bool) -> Result<()> {
     check_command("sshpass", "Install with: sudo apt-get install sshpass")?;
@@ -44,15 +55,7 @@ pub fn deploy(skip_build: bool, dev: bool) -> Result<()> {
     ))?;
 
     println!("{}", "Restarting signer...".cyan());
-    // The init script is the sole authority on how the signer starts (user,
-    // panic-log wrapper, reboot-on-42 handling), so restart through it rather
-    // than re-deriving an invocation here. The character class [r] prevents
-    // pkill/pgrep from matching their own command lines.
-    ssh_su(
-        "pkill -f '[r]ussignol-signer'; \
-         for i in 1 2 3 4 5; do pgrep -f '[r]ussignol-signer' >/dev/null || break; sleep 1; done; \
-         /etc/init.d/S20russignol start",
-    )?;
+    ssh_su(RESTART_SIGNER_CMD)?;
 
     // A dead-on-arrival signer must fail the deploy, not print success. Also
     // require it to still be alive a few seconds after startup so an
