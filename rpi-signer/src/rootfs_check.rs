@@ -44,12 +44,16 @@ fn rootfs_mounted_readonly(proc_mounts: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The rootfs hash recorded in the flash manifest, if the manifest parses and
-/// carries one
-fn expected_rootfs_hash(manifest_json: &str) -> Option<String> {
+/// The rootfs hash recorded in the flash manifest, `None` when the manifest
+/// carries none
+///
+/// # Errors
+///
+/// Fails when the manifest does not parse.
+fn expected_rootfs_hash(manifest_json: &str) -> Result<Option<String>, String> {
     serde_json::from_str::<FlashManifest>(manifest_json)
-        .ok()
-        .and_then(|manifest| manifest.rootfs_sha256)
+        .map(|manifest| manifest.rootfs_sha256)
+        .map_err(|e| format!("cannot parse the flash manifest: {e}"))
 }
 
 /// SHA-256 (hex) of a file or block device, streaming. `progress` receives
@@ -136,7 +140,7 @@ fn staged_manifest_hash() -> Result<Option<String>, String> {
     let content = std::fs::read_to_string(Path::new(BOOT_MOUNT).join(MANIFEST_FILENAME));
     let _ = unmount_boot_partition();
     match content {
-        Ok(json) => Ok(expected_rootfs_hash(&json)),
+        Ok(json) => expected_rootfs_hash(&json),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("cannot read the flash manifest: {e}")),
     }
@@ -190,7 +194,7 @@ mod tests {
             "image_sha256": "abc123",
             "rootfs_sha256": "def456"
         }"#;
-        assert_eq!(expected_rootfs_hash(json), Some("def456".to_string()));
+        assert_eq!(expected_rootfs_hash(json), Ok(Some("def456".to_string())));
     }
 
     #[test]
@@ -201,12 +205,14 @@ mod tests {
             "host_version": "0.20.0",
             "image_sha256": "abc123"
         }"#;
-        assert_eq!(expected_rootfs_hash(json), None);
+        assert_eq!(expected_rootfs_hash(json), Ok(None));
     }
 
+    /// A manifest that fails to parse is a distinct skip reason, not "no hash
+    /// recorded"
     #[test]
-    fn unparseable_manifest_yields_none() {
-        assert_eq!(expected_rootfs_hash("not json"), None);
+    fn unparseable_manifest_is_an_error() {
+        assert!(expected_rootfs_hash("not json").is_err());
     }
 
     #[test]
