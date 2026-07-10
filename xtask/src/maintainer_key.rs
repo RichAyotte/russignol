@@ -26,6 +26,14 @@ pub fn default_key_path() -> Result<PathBuf> {
     Ok(config_dir.join("russignol").join("maintainer-key"))
 }
 
+/// The maintainer key location: `explicit` when given, else [`default_key_path`].
+fn resolve_key_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    match explicit {
+        Some(path) => Ok(path),
+        None => default_key_path(),
+    }
+}
+
 /// Generate a maintainer signing key, seal its seed behind a freshly prompted
 /// passphrase, write it to `output` (or [`default_key_path`]), and print the
 /// public key as a literal ready to paste into `MAINTAINER_PUBKEY`.
@@ -36,10 +44,7 @@ pub fn default_key_path() -> Result<PathBuf> {
 /// prompt fails or is not confirmed, the OS random source is unavailable, or
 /// the sealed seed cannot be written.
 pub fn cmd_maintainer_keygen(output: Option<PathBuf>) -> Result<()> {
-    let key_path = match output {
-        Some(path) => path,
-        None => default_key_path()?,
-    };
+    let key_path = resolve_key_path(output)?;
 
     if key_path.exists() {
         bail!(
@@ -168,10 +173,7 @@ fn prompt_passphrase() -> Result<Zeroizing<String>> {
 /// Returns an error if the image or key is missing, the passphrase cannot be
 /// read, the key cannot be unsealed, or the sidecar cannot be written.
 pub fn cmd_maintainer_sign(image: &Path, key: Option<PathBuf>) -> Result<()> {
-    let key_path = match key {
-        Some(path) => path,
-        None => default_key_path()?,
-    };
+    let key_path = resolve_key_path(key)?;
     let sidecar = sign_image_with_prompt(image, &key_path)?;
     println!(
         "{} Detached signature written to {}",

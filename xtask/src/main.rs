@@ -721,10 +721,16 @@ fn copy_release_assets() -> Result<Vec<String>> {
     // Move SD card image
     let image_path = Path::new("buildroot/output/images/sdcard.img.xz");
     if image_path.exists() {
-        let release_image = "target/russignol-pi-zero.img.xz";
-        std::fs::rename(image_path, release_image).context("Failed to move SD card image")?;
-        assets.push(release_image.to_string());
-        println!("    {} russignol-pi-zero.img.xz", "✓".green());
+        std::fs::rename(image_path, RELEASE_IMAGE).context("Failed to move SD card image")?;
+        assets.push(RELEASE_IMAGE.to_string());
+        println!(
+            "    {} {}",
+            "✓".green(),
+            Path::new(RELEASE_IMAGE)
+                .file_name()
+                .unwrap_or_default()
+                .display()
+        );
     } else {
         println!(
             "    {} Skipping SD card image (not found at {})",
@@ -921,30 +927,36 @@ fn sign_release_image_at(image: &Path, key_path: &Path) -> Result<()> {
 
 /// Collect release assets based on the component being released
 fn collect_release_assets(component: ReleaseComponent) -> Vec<String> {
-    let asset_names: &[&str] = match component {
-        ReleaseComponent::All => &[
-            "russignol-amd64",
-            "russignol-aarch64",
-            "russignol-pi-zero.img.xz",
-            "russignol-pi-zero.img.xz.sig",
-            "checksums.txt",
+    let image_sig = russignol_release_signature::sidecar_path(Path::new(RELEASE_IMAGE))
+        .display()
+        .to_string();
+    let assets: Vec<String> = match component {
+        ReleaseComponent::All => vec![
+            "target/russignol-amd64".into(),
+            "target/russignol-aarch64".into(),
+            RELEASE_IMAGE.into(),
+            image_sig,
+            "target/checksums.txt".into(),
         ],
-        ReleaseComponent::Signer => &[
-            "russignol-pi-zero.img.xz",
-            "russignol-pi-zero.img.xz.sig",
-            "checksums.txt",
+        ReleaseComponent::Signer => vec![
+            RELEASE_IMAGE.into(),
+            image_sig,
+            "target/checksums.txt".into(),
         ],
-        ReleaseComponent::HostUtility => &["russignol-amd64", "russignol-aarch64", "checksums.txt"],
+        ReleaseComponent::HostUtility => vec![
+            "target/russignol-amd64".into(),
+            "target/russignol-aarch64".into(),
+            "target/checksums.txt".into(),
+        ],
         // Libraries don't have binary assets
         ReleaseComponent::SignerLib
         | ReleaseComponent::Ui
         | ReleaseComponent::Crypto
-        | ReleaseComponent::EpdDisplay => &[],
+        | ReleaseComponent::EpdDisplay => vec![],
     };
 
-    asset_names
-        .iter()
-        .map(|name| format!("target/{name}"))
+    assets
+        .into_iter()
         .filter(|path| Path::new(path).exists())
         .collect()
 }
@@ -1355,10 +1367,16 @@ fn copy_signer_release_assets() -> Result<Vec<String>> {
     // Move SD card image
     let image_path = Path::new("buildroot/output/images/sdcard.img.xz");
     if image_path.exists() {
-        let release_image = "target/russignol-pi-zero.img.xz";
-        std::fs::rename(image_path, release_image).context("Failed to move SD card image")?;
-        assets.push(release_image.to_string());
-        println!("    {} russignol-pi-zero.img.xz", "✓".green());
+        std::fs::rename(image_path, RELEASE_IMAGE).context("Failed to move SD card image")?;
+        assets.push(RELEASE_IMAGE.to_string());
+        println!(
+            "    {} {}",
+            "✓".green(),
+            Path::new(RELEASE_IMAGE)
+                .file_name()
+                .unwrap_or_default()
+                .display()
+        );
     } else {
         println!(
             "    {} Skipping SD card image (not found at {})",
@@ -1447,10 +1465,10 @@ fn print_release_summary(component: ReleaseComponent, version: &str, publish: &P
     match component {
         ReleaseComponent::All => {
             println!("  - Binaries: target/russignol-amd64, target/russignol-aarch64");
-            println!("  - SD image: target/russignol-pi-zero.img.xz");
+            println!("  - SD image: {RELEASE_IMAGE}");
         }
         ReleaseComponent::Signer => {
-            println!("  - SD image: target/russignol-pi-zero.img.xz");
+            println!("  - SD image: {RELEASE_IMAGE}");
         }
         ReleaseComponent::HostUtility => {
             println!("  - Binaries: target/russignol-amd64, target/russignol-aarch64");
