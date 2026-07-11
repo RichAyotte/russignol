@@ -223,6 +223,15 @@ pub enum WatermarkError {
         /// Approximate cycles (for display)
         cycles: u32,
     },
+
+    /// Operation targets a chain the device was not provisioned for
+    #[error("Chain mismatch: provisioned for {expected}, operation for {got}")]
+    ChainMismatch {
+        /// Provisioned chain ID (base58 encoded)
+        expected: String,
+        /// Operation's chain ID (base58 encoded)
+        got: String,
+    },
 }
 
 /// Result type for high watermark operations
@@ -575,6 +584,12 @@ impl HighWatermark {
         per_key.disk_entries[idx] = Some(ceiling_entry);
 
         Ok(())
+    }
+
+    /// The chain this watermark store is bound to (the provisioned chain).
+    #[must_use]
+    pub fn chain_id(&self) -> ChainId {
+        self.chain_id
     }
 
     /// Get the current in-memory watermark level for a key.

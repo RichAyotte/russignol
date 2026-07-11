@@ -505,6 +505,26 @@ impl RequestHandler {
             })
         };
 
+        // The device signs only for its provisioned chain. Reject a foreign-chain
+        // operation before any watermark logic so it cannot raise a gap/missing/level
+        // dialog. A wrong chain is never operator-recoverable, so this takes the
+        // silent watermark-error path (no recovery dialog), like RoundTooLow.
+        if let Some(op_chain) = operation_chain_id
+            && let Some(ref watermark) = self.watermark
+        {
+            let provisioned = watermark.read()?.chain_id();
+            if op_chain != provisioned {
+                let err = crate::high_watermark::WatermarkError::ChainMismatch {
+                    expected: provisioned.to_b58check(),
+                    got: op_chain.to_b58check(),
+                };
+                if let Some(ref callback) = self.watermark_error_callback {
+                    callback(pkh, op_chain, &err);
+                }
+                return Err(Error::Watermark(err));
+            }
+        }
+
         // 2a. Check for large level gap (stale watermark detection)
         // This must happen BEFORE the normal watermark check
         if let Some(chain_id) = operation_chain_id
@@ -1273,7 +1293,9 @@ mod tests {
         let mut mgr = KeyManager::new();
         mgr.add_signer(pkh, signer, "test_key".to_string());
 
-        let chain_id = ChainId::from_bytes(&[1u8; 32]);
+        // Match the chain the watermark store is bound to; a foreign chain would
+        // be rejected before the level check this test exercises.
+        let chain_id = crate::test_utils::default_test_chain_id();
 
         // Pre-initialize watermarks BEFORE creating HighWatermark
         preinit_watermarks(temp_dir.path(), &pkh, 99);
@@ -1331,6 +1353,89 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Watermark(_)));
+    }
+
+    #[test]
+    fn test_sign_rejects_foreign_chain() {
+        let temp_dir = TempDir::new().unwrap();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
+
+        let mut mgr = KeyManager::new();
+        mgr.add_signer(pkh, signer, "test_key".to_string());
+
+        // Watermark store is bound to the default test chain ([0, 0, 0, 1]).
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let hwm = new_watermark(temp_dir.path(), &[pkh]).unwrap();
+
+        let handler = RequestHandler::new(
+            Arc::new(RwLock::new(mgr)),
+            Some(Arc::new(RwLock::new(hwm))),
+            Some(vec![0x11, 0x12, 0x13]),
+            true,
+            true,
+        );
+
+        // Block for mainnet, a chain this device was not provisioned for, at a
+        // level above the floor so only the chain check can reject it.
+        let data = crate::test_utils::create_block_data_with_chain(
+            &crate::test_utils::MAINNET_CHAIN_ID,
+            100,
+            0,
+        );
+
+        let err = handler
+            .handle_request(SignerRequest::Sign {
+                pkh: (pkh, 0),
+                data,
+                signature: None,
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                Error::Watermark(crate::high_watermark::WatermarkError::ChainMismatch { .. })
+            ),
+            "Expected ChainMismatch, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_sign_accepts_provisioned_chain() {
+        let temp_dir = TempDir::new().unwrap();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
+
+        let mut mgr = KeyManager::new();
+        mgr.add_signer(pkh, signer, "test_key".to_string());
+
+        // Watermark store is bound to the default test chain ([0, 0, 0, 1]).
+        preinit_watermarks(temp_dir.path(), &pkh, 99);
+        let hwm = new_watermark(temp_dir.path(), &[pkh]).unwrap();
+
+        let handler = RequestHandler::new(
+            Arc::new(RwLock::new(mgr)),
+            Some(Arc::new(RwLock::new(hwm))),
+            Some(vec![0x11, 0x12, 0x13]),
+            true,
+            true,
+        );
+
+        // Block on the provisioned chain at a level above the floor.
+        let data = crate::test_utils::create_block_data_with_chain(&[0, 0, 0, 1], 100, 0);
+
+        let (response, _) = handler
+            .handle_request(SignerRequest::Sign {
+                pkh: (pkh, 0),
+                data,
+                signature: None,
+            })
+            .unwrap();
+
+        assert!(matches!(response, SignerResponse::Signature(_)));
     }
 
     #[test]
