@@ -13,6 +13,7 @@ mod changelog;
 mod clean;
 mod config;
 mod deploy;
+mod device;
 mod image;
 mod maintainer_key;
 mod upgrade;
@@ -294,15 +295,15 @@ enum Commands {
     /// Run watermark protection E2E tests on a physical device
     WatermarkTest {
         /// Device IP address
-        #[arg(short, long, default_value = "169.254.1.1")]
+        #[arg(short, long, default_value = device::DEVICE_HOST)]
         device: String,
 
         /// Device TCP port
-        #[arg(short, long, default_value = "7732")]
+        #[arg(short, long, default_value_t = watermark_test::DEFAULT_DEVICE_PORT)]
         port: u16,
 
         /// SSH user for device access
-        #[arg(short, long, default_value = "russignol")]
+        #[arg(short, long, default_value = device::DEVICE_USER)]
         user: String,
 
         /// Run only tests matching this category (basic, multi, chain, edge)

@@ -9,11 +9,10 @@ use std::net::TcpStream;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::deploy::{DEVICE_PASS, RESTART_SIGNER_CMD};
+use crate::device::{RESTART_SIGNER_CMD, ssh_run, ssh_su};
+use crate::utils::check_command;
 
-/// Default device address (link-local USB network)
-const DEFAULT_DEVICE_IP: &str = "169.254.1.1";
-const DEFAULT_DEVICE_PORT: u16 = 7732;
+pub(crate) const DEFAULT_DEVICE_PORT: u16 = 7732;
 
 /// On-device watermark storage, the `SignerConfig::watermark_dir` default in
 /// `rpi-signer/src/signer_server.rs`. Clearing it drops every key to
@@ -38,22 +37,12 @@ pub struct WatermarkTestConfig {
     pub verbose: bool,
 }
 
-impl Default for WatermarkTestConfig {
-    fn default() -> Self {
-        Self {
-            device_ip: DEFAULT_DEVICE_IP.to_string(),
-            device_port: DEFAULT_DEVICE_PORT,
-            ssh_user: "russignol".to_string(),
-            category: None,
-            clean: false,
-            restart: false,
-            verbose: false,
-        }
-    }
-}
-
 /// Run watermark E2E tests
 pub fn run_watermark_test(config: &WatermarkTestConfig) -> Result<()> {
+    if config.clean || config.restart {
+        check_command("sshpass", "Install with: sudo apt-get install sshpass")?;
+    }
+
     println!(
         "{}",
         "═══════════════════════════════════════════════════════════════"
@@ -203,49 +192,16 @@ fn check_device_connectivity(ip: &str, port: u16) -> Result<()> {
     }
 }
 
-/// Run a command on the device over SSH as the unprivileged `russignol` user.
-/// Dev images authenticate with a fixed password; hardened images have no SSH.
-fn device_ssh(user: &str, ip: &str, cmd: &str) -> Result<()> {
-    let output = Command::new("sshpass")
-        .args([
-            "-p",
-            DEVICE_PASS,
-            "ssh",
-            "-x",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-o",
-            "ConnectTimeout=10",
-            &format!("{user}@{ip}"),
-            cmd,
-        ])
-        .output()
-        .context("Failed to execute sshpass ssh (is sshpass installed?)")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("SSH command failed: {stderr}");
-    }
-    Ok(())
-}
-
-/// Run a command on the device as root via `su`; root has no SSH login, so the
-/// unprivileged user escalates with the dev-image password. `cmd` must not
-/// contain double quotes.
-fn device_ssh_su(user: &str, ip: &str, cmd: &str) -> Result<()> {
-    device_ssh(user, ip, &format!("echo {DEVICE_PASS} | su -c \"{cmd}\""))
-}
-
 /// Clear the device's stored watermarks, dropping every key to uninitialized so
 /// the next unlock reloads a clean slate.
 fn clear_watermarks(ip: &str, user: &str) -> Result<()> {
-    device_ssh(user, ip, &format!("rm -rf {WATERMARK_DIR}/*"))
+    ssh_run(user, ip, &format!("rm -rf {WATERMARK_DIR}/*"))
 }
 
 /// Restart the signer as root. The service comes back at PIN entry, so the
 /// caller must wait for the operator to unlock before the port reopens.
 fn restart_device(ip: &str, user: &str) -> Result<()> {
-    device_ssh_su(user, ip, RESTART_SIGNER_CMD)
+    ssh_su(user, ip, RESTART_SIGNER_CMD)
 }
 
 /// Run the watermark E2E test harness
