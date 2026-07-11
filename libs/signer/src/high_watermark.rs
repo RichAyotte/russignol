@@ -981,6 +981,36 @@ mod tests {
     }
 
     #[test]
+    fn test_level_progression_at_u32_ceiling() {
+        let temp_dir = TempDir::new().unwrap();
+        let chain_id = create_test_chain_id();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+
+        // Seed just below the u32 ceiling so the boundary levels are reachable by
+        // forward progression rather than a large gap.
+        preinit_watermarks(temp_dir.path(), &pkh, u32::MAX - 2);
+        let mut hwm = new_watermark(temp_dir.path(), &[pkh]).unwrap();
+
+        for level in [u32::MAX - 1, u32::MAX] {
+            let data = create_block_data(level, 0);
+            assert!(
+                hwm.check_and_update(chain_id, &pkh, &data)
+                    .unwrap()
+                    .is_some(),
+                "block at level {level} should advance the floor"
+            );
+        }
+
+        // Floor now sits at u32::MAX; the previous level is below it and rejected.
+        let data = create_block_data(u32::MAX - 1, 0);
+        assert!(matches!(
+            hwm.check_and_update(chain_id, &pkh, &data),
+            Err(WatermarkError::LevelTooLow { .. })
+        ));
+    }
+
+    #[test]
     fn test_allow_signing_at_higher_round_same_level() {
         let temp_dir = TempDir::new().unwrap();
         let chain_id = create_test_chain_id();

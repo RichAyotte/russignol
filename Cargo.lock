@@ -3136,6 +3136,7 @@ dependencies = [
  "russignol-crypto",
  "russignol-release-signature",
  "russignol-storage",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "which",

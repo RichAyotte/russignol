@@ -9,10 +9,15 @@ use std::net::TcpStream;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::device::{RESTART_SIGNER_CMD, ssh_run, ssh_su};
+use crate::device::{RESTART_SIGNER_CMD, ssh_capture, ssh_run, ssh_su};
 use crate::utils::check_command;
 
 pub(crate) const DEFAULT_DEVICE_PORT: u16 = 7732;
+
+/// Provisioned-chain descriptor on the keys partition. Its `id` is the base58
+/// chain the device signs for; the harness passes it to the example so every
+/// valid sign targets that chain and foreign chains are rejected.
+const CHAIN_INFO_FILE: &str = "/keys/chain_info.json";
 
 /// On-device watermark storage, the `SignerConfig::watermark_dir` default in
 /// `rpi-signer/src/signer_server.rs`. Clearing it drops every key to
@@ -39,9 +44,9 @@ pub struct WatermarkTestConfig {
 
 /// Run watermark E2E tests
 pub fn run_watermark_test(config: &WatermarkTestConfig) -> Result<()> {
-    if config.clean || config.restart {
-        check_command("sshpass", "Install with: sudo apt-get install sshpass")?;
-    }
+    // The harness always reads the provisioned chain over SSH, so sshpass is
+    // required regardless of --clean/--restart.
+    check_command("sshpass", "Install with: sudo apt-get install sshpass")?;
 
     println!(
         "{}",
@@ -109,11 +114,21 @@ pub fn run_watermark_test(config: &WatermarkTestConfig) -> Result<()> {
         );
     }
 
-    // Step 4: Run the test harness
-    println!("\n{}", "Step 4: Running watermark E2E tests...".cyan());
+    // Step 4: Read the provisioned chain the device signs for
+    println!("\n{}", "Step 4: Reading provisioned chain...".cyan());
+    let chain_id = read_provisioned_chain(&config.device_ip, &config.ssh_user)?;
+    println!("  {} Provisioned chain: {}", "✓".green(), chain_id.yellow());
+
+    // Step 5: Run the test harness
+    println!("\n{}", "Step 5: Running watermark E2E tests...".cyan());
     println!();
 
-    run_test_harness(&device_addr, config.category.as_deref(), config.verbose)?;
+    run_test_harness(
+        &device_addr,
+        &chain_id,
+        config.category.as_deref(),
+        config.verbose,
+    )?;
 
     println!(
         "\n{}",
@@ -204,8 +219,29 @@ fn restart_device(ip: &str, user: &str) -> Result<()> {
     ssh_su(user, ip, RESTART_SIGNER_CMD)
 }
 
+/// Read the base58 chain id the device was provisioned for from
+/// `/keys/chain_info.json`. Errors clearly when the device is not provisioned.
+fn read_provisioned_chain(ip: &str, user: &str) -> Result<String> {
+    let json = ssh_capture(user, ip, &format!("cat {CHAIN_INFO_FILE}")).with_context(|| {
+        format!("Device not provisioned: {CHAIN_INFO_FILE} is missing or unreadable")
+    })?;
+
+    let info: serde_json::Value = serde_json::from_str(&json)
+        .with_context(|| format!("Invalid JSON in {CHAIN_INFO_FILE}"))?;
+
+    info.get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("Missing string \"id\" field in {CHAIN_INFO_FILE}"))
+}
+
 /// Run the watermark E2E test harness
-fn run_test_harness(device_addr: &str, category: Option<&str>, verbose: bool) -> Result<()> {
+fn run_test_harness(
+    device_addr: &str,
+    chain_id: &str,
+    category: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
     let mut args = vec![
         "run",
         "--release",
@@ -216,6 +252,8 @@ fn run_test_harness(device_addr: &str, category: Option<&str>, verbose: bool) ->
         "--",
         "--device",
         device_addr,
+        "--chain-id",
+        chain_id,
     ];
 
     if let Some(cat) = category {

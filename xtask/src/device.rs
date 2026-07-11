@@ -45,6 +45,35 @@ pub(crate) fn ssh_run(user: &str, host: &str, cmd: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run a command on the device over SSH and return its stdout. The command must
+/// succeed (non-zero exit fails), so callers get a clear error when the target
+/// is absent (e.g. a missing file).
+pub(crate) fn ssh_capture(user: &str, host: &str, cmd: &str) -> Result<String> {
+    let output = Command::new("sshpass")
+        .args([
+            "-p",
+            DEVICE_PASS,
+            "ssh",
+            "-x",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=5",
+            &format!("{user}@{host}"),
+            cmd,
+        ])
+        .output()
+        .context("Failed to execute sshpass ssh")?;
+
+    if !output.status.success() {
+        bail!(
+            "SSH command failed: {cmd}\n{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Run a command on the device as root via `su`; the root account has no SSH
 /// login, so the unprivileged user escalates with the dev-image password. The
 /// command must not contain double quotes.

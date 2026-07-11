@@ -39,17 +39,18 @@
 
 use colored::Colorize;
 use russignol_signer_lib::{
+    ChainId,
     bls::PublicKeyHash,
     protocol::{
         SignerRequest, SignerResponse,
         encoding::{decode_response, encode_request},
     },
     test_utils::{
-        GHOSTNET_CHAIN_ID, MAINNET_CHAIN_ID, create_attestation_data,
-        create_attestation_data_with_chain, create_block_data, create_block_data_with_chain,
-        create_preattestation_data,
+        create_attestation_data_with_chain, create_block_data_with_chain,
+        create_preattestation_data_with_chain,
     },
 };
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
@@ -140,8 +141,44 @@ fn handle_watermark_error(error_msg: &str) -> Result<bool, String> {
     }
 }
 
+/// Assert a Sign response is the chain-mismatch rejection. A foreign chain is
+/// refused before any watermark logic, so the message names the mismatch and
+/// never a level/round error — any other outcome (including a signature) fails.
+fn expect_chain_mismatch(response: SignerResponse) -> Result<(), String> {
+    match response {
+        SignerResponse::Error(e) if e.contains("Chain mismatch") => Ok(()),
+        SignerResponse::Error(e) => Err(format!("Expected a chain-mismatch rejection, got: {e}")),
+        SignerResponse::Signature(_) => {
+            Err("SECURITY FAILURE: Signed an operation for a foreign chain!".to_string())
+        }
+        other => Err(format!("Unexpected response: {other:?}")),
+    }
+}
+
 /// Default device address (link-local USB)
 const DEFAULT_DEVICE: &str = "169.254.1.1:7732";
+
+/// A chain the device is never provisioned for. Signing an operation on it must
+/// be rejected outright. These are Tezos mainnet's chain bytes: a test/staging
+/// device is provisioned for a testnet, so mainnet is always foreign. `main`
+/// refuses to run if the provisioned chain equals this, so the rejection tests
+/// can never silently pass by signing the "foreign" chain.
+const FOREIGN_CHAIN: [u8; 4] = [0x7a, 0x06, 0xa7, 0x70];
+
+/// First level handed out by the shared cursor. The device's first block sign
+/// recovers a missing watermark to this level (setting every op-type's floor),
+/// so it must sit above any leftover floor a prior run may have lowered.
+const LEVEL_BASE: u32 = 100;
+
+/// Gap between successive cursor hand-outs. Wide enough for a test's local
+/// offsets (a few levels up or down within its band) without overlapping the
+/// neighbouring test's band.
+const LEVEL_STRIDE: u32 = 10;
+
+/// Fixed low level the interactive test signs to trip a "level too low" dialog.
+/// Below [`LEVEL_BASE`], so it is always under the floor the earlier tests
+/// raised, independent of how far the cursor has advanced.
+const INTERACTIVE_TRIGGER_LEVEL: u32 = 50;
 
 /// Test result
 struct TestResult {
@@ -156,17 +193,83 @@ struct TestContext {
     device_addr: SocketAddr,
     pkh: Option<PublicKeyHash>,
     verbose: bool,
+    /// The chain the device is provisioned for; every valid sign targets it.
+    provisioned_chain: [u8; 4],
+    /// Next level to hand out. Under single-chain enforcement all signs share
+    /// one chain, so a (key, op-type) floor rises across every test. A single
+    /// cursor keeps each hand-out above the current floor for every op-type; it
+    /// is shared (not per-op-type) because the large-gap check compares against
+    /// the global max level across op-types, so levels must climb together.
+    next_level: Cell<u32>,
 }
 
 impl TestContext {
-    fn new(device: &str, verbose: bool) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        device: &str,
+        provisioned_chain: [u8; 4],
+        verbose: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let device_addr: SocketAddr = device.parse()?;
 
         Ok(Self {
             device_addr,
             pkh: None,
             verbose,
+            provisioned_chain,
+            next_level: Cell::new(LEVEL_BASE),
         })
+    }
+
+    /// Reserve the next level band, returning its base. Callers use the base and
+    /// a few levels around it; the stride keeps bands from overlapping.
+    fn reserve_level(&self) -> u32 {
+        let base = self.next_level.get();
+        self.next_level.set(base + LEVEL_STRIDE);
+        base
+    }
+
+    /// Block operation data on the provisioned chain.
+    fn block(&self, level: u32, round: u32) -> Vec<u8> {
+        create_block_data_with_chain(&self.provisioned_chain, level, round)
+    }
+
+    /// Attestation operation data on the provisioned chain.
+    fn attestation(&self, level: u32, round: u32) -> Vec<u8> {
+        create_attestation_data_with_chain(&self.provisioned_chain, level, round)
+    }
+
+    /// Preattestation operation data on the provisioned chain.
+    fn preattestation(&self, level: u32, round: u32) -> Vec<u8> {
+        create_preattestation_data_with_chain(&self.provisioned_chain, level, round)
+    }
+
+    /// Open a fresh connection, send a Sign request, and return the response.
+    /// A new connection per request matches the device closing on error.
+    fn sign(&self, pkh: PublicKeyHash, data: Vec<u8>) -> Result<SignerResponse, String> {
+        let mut stream = self.connect().map_err(|e| e.to_string())?;
+        let request = SignerRequest::Sign {
+            pkh: (pkh, 0),
+            data,
+            signature: None,
+        };
+        self.send_request(&mut stream, &request)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Sign and require a signature, logging `what` on success.
+    fn expect_signature(
+        &self,
+        pkh: PublicKeyHash,
+        data: Vec<u8>,
+        what: &str,
+    ) -> Result<(), String> {
+        match self.sign(pkh, data)? {
+            SignerResponse::Signature(_) => {
+                self.log(&format!("{what}: OK"));
+                Ok(())
+            }
+            other => Err(format!("{what} expected a signature, got: {other:?}")),
+        }
     }
 
     fn connect(&self) -> Result<TcpStream, Box<dyn std::error::Error>> {
@@ -274,10 +377,10 @@ impl TestSuite {
             self.run_category_multi_operation()?;
         }
 
-        if (self.should_run_category("chain") || self.should_run_category("isolation"))
+        if (self.should_run_category("chain") || self.should_run_category("enforcement"))
             && !self.failed
         {
-            self.run_category_chain_isolation()?;
+            self.run_category_chain_enforcement()?;
         }
 
         if self.should_run_category("edge") && !self.failed {
@@ -435,152 +538,71 @@ impl TestSuite {
 
         // Test 1.1: Forward progression (block)
         self.run_test("1.1 Forward progression (block)", |ctx, pkh| {
-            // Establish the baseline at level 100. On a freshly cleaned device the
-            // block watermark is missing, so the device shows a "Set level to 100"
-            // recovery dialog; confirming it sets the floor to 100. The floor records
-            // 100 as signed, so re-signing 100 is a replay — forward progression is
-            // proven by the level-101 signature below, not by retrying 100.
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
-            let data = create_block_data(100, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            match response {
-                SignerResponse::Signature(_) => ctx.log("Signed level 100"),
+            // Establish the baseline at the first cursor level. On a freshly
+            // cleaned device the block watermark is missing, so the device shows
+            // a "Set level to N" recovery dialog; confirming it sets every
+            // op-type's floor to N. The floor records N as signed, so re-signing N
+            // is a replay — forward progression is proven by the N+1 signature
+            // below, not by retrying N.
+            let base = ctx.reserve_level();
+            match ctx.sign(pkh, ctx.block(base, 0))? {
+                SignerResponse::Signature(_) => ctx.log(&format!("Signed level {base}")),
                 SignerResponse::Error(ref e) if e.contains("not initialized") => {
                     // Missing watermark: the device shows the recovery dialog.
                     if !handle_watermark_error(e)? {
                         return Err(format!("Operator cancelled the watermark dialog: {e}"));
                     }
-                    ctx.log("Recovered missing watermark to level 100");
+                    ctx.log(&format!("Recovered missing watermark to level {base}"));
                 }
                 SignerResponse::Error(ref e) => {
                     return Err(format!(
-                        "Watermark already initialized at or above level 100 ({e}); \
+                        "Watermark already initialized at or above level {base} ({e}); \
                          run with --clean to reset it first"
                     ));
                 }
                 other => {
-                    return Err(format!("Expected signature at level 100, got: {other:?}"));
+                    return Err(format!(
+                        "Expected signature at level {base}, got: {other:?}"
+                    ));
                 }
             }
 
-            // Prove forward progression: level 101 must sign (101 > the level-100 floor).
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
-            let data = create_block_data(101, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Expected signature at level 101, got: {response:?}"
-                ));
-            }
-            ctx.log("Signed level 101");
-
-            Ok(())
+            // Prove forward progression: N+1 must sign (N+1 > the level-N floor).
+            ctx.expect_signature(
+                pkh,
+                ctx.block(base + 1, 0),
+                &format!("Block level {}", base + 1),
+            )
         });
 
         // Test 1.2: Reject lower level (block)
         self.run_test("1.2 Reject lower level (block)", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
+            let base = ctx.reserve_level();
+            ctx.expect_signature(pkh, ctx.block(base, 0), &format!("Block level {base}"))?;
 
-            // Sign at level 200
-            let data = create_block_data(200, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Expected signature at level 200, got: {response:?}"
-                ));
-            }
-            ctx.log("Signed level 200");
-
-            // Try to sign at level 199 (should fail)
-            let data = create_block_data(199, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-
-            // Need new connection as device may close on error
-            let mut stream2 = ctx.connect().map_err(|e| e.to_string())?;
-            let response = ctx
-                .send_request(&mut stream2, &request)
-                .map_err(|e| e.to_string())?;
-
-            match response {
+            match ctx.sign(pkh, ctx.block(base - 1, 0))? {
                 SignerResponse::Error(e) if e.contains("Level too low") || e.contains("level") => {
-                    ctx.log("Correctly rejected level 199");
-                    wait_for_reset_dialog(
-                        "Level too low: \"Set level to 199\" dialog (watermark at 200)",
-                    )?;
+                    ctx.log(&format!("Correctly rejected level {}", base - 1));
+                    wait_for_reset_dialog(&format!(
+                        "Level too low: \"Set level to {}\" dialog (watermark at {base})",
+                        base - 1
+                    ))?;
                     Ok(())
                 }
                 SignerResponse::Error(e) => Err(format!("Got error but unexpected message: {e}")),
                 SignerResponse::Signature(_) => {
                     Err("SECURITY FAILURE: Signed at lower level!".to_string())
                 }
-                _ => Err(format!("Unexpected response: {response:?}")),
+                other => Err(format!("Unexpected response: {other:?}")),
             }
         });
 
         // Test 1.3: Reject lower round at same level (block)
         self.run_test("1.3 Reject lower round at same level", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
+            let base = ctx.reserve_level();
+            ctx.expect_signature(pkh, ctx.block(base, 5), &format!("Block {base}/round 5"))?;
 
-            // Sign at level 300, round 5
-            let data = create_block_data(300, 5);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Expected signature at level 300/round 5, got: {response:?}"
-                ));
-            }
-            ctx.log("Signed level 300, round 5");
-
-            // Try to sign at level 300, round 4 (should fail)
-            let data = create_block_data(300, 4);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-
-            let mut stream2 = ctx.connect().map_err(|e| e.to_string())?;
-            let response = ctx
-                .send_request(&mut stream2, &request)
-                .map_err(|e| e.to_string())?;
-
-            match response {
+            match ctx.sign(pkh, ctx.block(base, 4))? {
                 SignerResponse::Error(e) if e.contains("Round too low") || e.contains("round") => {
                     ctx.log("Correctly rejected round 4 (no dialog shown)");
                     Ok(())
@@ -589,184 +611,74 @@ impl TestSuite {
                 SignerResponse::Signature(_) => {
                     Err("SECURITY FAILURE: Signed at lower round!".to_string())
                 }
-                _ => Err(format!("Unexpected response: {response:?}")),
+                other => Err(format!("Unexpected response: {other:?}")),
             }
         });
 
         // Test 1.4: Allow higher round at same level
         self.run_test("1.4 Allow higher round at same level", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
-
-            // Sign at level 400, round 5
-            let data = create_block_data(400, 5);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!("Expected signature at round 5, got: {response:?}"));
-            }
-            ctx.log("Signed level 400, round 5");
-
-            // Sign at level 400, round 6 (should succeed)
-            let data = create_block_data(400, 6);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!("Expected signature at round 6, got: {response:?}"));
-            }
-            ctx.log("Signed level 400, round 6");
-
-            Ok(())
+            let base = ctx.reserve_level();
+            ctx.expect_signature(pkh, ctx.block(base, 5), &format!("Block {base}/round 5"))?;
+            ctx.expect_signature(pkh, ctx.block(base, 6), &format!("Block {base}/round 6"))
         });
 
         // Test 1.5: Forward progression (attestation)
         self.run_test("1.5 Forward progression (attestation)", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
-
-            // Sign attestation at level 500
-            let data = create_attestation_data(500, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Expected signature at level 500, got: {response:?}"
-                ));
-            }
-            ctx.log("Signed attestation level 500");
-
-            // Sign at level 501
-            let data = create_attestation_data(501, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Expected signature at level 501, got: {response:?}"
-                ));
-            }
-            ctx.log("Signed attestation level 501");
-
-            Ok(())
+            let base = ctx.reserve_level();
+            ctx.expect_signature(
+                pkh,
+                ctx.attestation(base, 0),
+                &format!("Attestation {base}"),
+            )?;
+            ctx.expect_signature(
+                pkh,
+                ctx.attestation(base + 1, 0),
+                &format!("Attestation {}", base + 1),
+            )
         });
 
         // Test 1.6: Reject lower level (attestation)
         self.run_test("1.6 Reject lower level (attestation)", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
+            let base = ctx.reserve_level();
+            ctx.expect_signature(
+                pkh,
+                ctx.attestation(base, 0),
+                &format!("Attestation {base}"),
+            )?;
 
-            // Sign attestation at level 600
-            let data = create_attestation_data(600, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Expected signature at level 600, got: {response:?}"
-                ));
-            }
-            ctx.log("Signed attestation level 600");
-
-            // Try to sign at level 599 (should fail)
-            let data = create_attestation_data(599, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-
-            let mut stream2 = ctx.connect().map_err(|e| e.to_string())?;
-            let response = ctx
-                .send_request(&mut stream2, &request)
-                .map_err(|e| e.to_string())?;
-
-            match response {
+            match ctx.sign(pkh, ctx.attestation(base - 1, 0))? {
                 SignerResponse::Error(e) if e.contains("Level too low") || e.contains("level") => {
-                    ctx.log("Correctly rejected attestation level 599");
-                    wait_for_reset_dialog(
-                        "Level too low: \"Set level to 599\" dialog (watermark at 600)",
-                    )?;
+                    ctx.log(&format!(
+                        "Correctly rejected attestation level {}",
+                        base - 1
+                    ));
+                    wait_for_reset_dialog(&format!(
+                        "Level too low: \"Set level to {}\" dialog (watermark at {base})",
+                        base - 1
+                    ))?;
                     Ok(())
                 }
                 SignerResponse::Error(e) => Err(format!("Got error but unexpected message: {e}")),
                 SignerResponse::Signature(_) => {
                     Err("SECURITY FAILURE: Signed attestation at lower level!".to_string())
                 }
-                _ => Err(format!("Unexpected response: {response:?}")),
+                other => Err(format!("Unexpected response: {other:?}")),
             }
         });
 
         // Test 1.7: Forward progression (preattestation)
         self.run_test("1.7 Forward progression (preattestation)", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
-
-            // Sign preattestation at level 700
-            let data = create_preattestation_data(700, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Expected signature at level 700, got: {response:?}"
-                ));
-            }
-            ctx.log("Signed preattestation level 700");
-
-            // Sign at level 701
-            let data = create_preattestation_data(701, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Expected signature at level 701, got: {response:?}"
-                ));
-            }
-            ctx.log("Signed preattestation level 701");
-
-            Ok(())
+            let base = ctx.reserve_level();
+            ctx.expect_signature(
+                pkh,
+                ctx.preattestation(base, 0),
+                &format!("Preattestation {base}"),
+            )?;
+            ctx.expect_signature(
+                pkh,
+                ctx.preattestation(base + 1, 0),
+                &format!("Preattestation {}", base + 1),
+            )
         });
 
         Ok(())
@@ -782,193 +694,78 @@ impl TestSuite {
 
         // Test 2.1: Independent watermarks per operation type
         self.run_test("2.1 Independent watermarks per op type", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
+            // Block at the band's top, then attestation and preattestation just
+            // below it. Both succeed only because each op-type keeps its own
+            // floor: if the floor were shared, a level below the just-signed block
+            // would be rejected. base-1 and base-2 still clear their own floors,
+            // which the earlier Category 1 signs left well below this band.
+            let base = ctx.reserve_level();
+            ctx.expect_signature(pkh, ctx.block(base, 0), &format!("Block {base}"))?;
+            ctx.expect_signature(
+                pkh,
+                ctx.attestation(base - 1, 0),
+                &format!("Attestation {} below block {base}", base - 1),
+            )?;
+            ctx.expect_signature(
+                pkh,
+                ctx.preattestation(base - 2, 0),
+                &format!("Preattestation {} below block {base}", base - 2),
+            )?;
 
-            // Sign block at level 1000
-            let data = create_block_data(1000, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!("Block at 1000 failed: {response:?}"));
-            }
-            ctx.log("Block at 1000: OK");
-
-            // Sign attestation at level 999 (should succeed - separate watermark)
-            let data = create_attestation_data(999, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Attestation at 999 should succeed (separate watermark), got: {response:?}"
-                ));
-            }
-            ctx.log("Attestation at 999: OK (independent)");
-
-            // Sign preattestation at level 998 (should succeed - separate watermark)
-            let data = create_preattestation_data(998, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Preattestation at 998 should succeed (separate watermark), got: {response:?}"
-                ));
-            }
-            ctx.log("Preattestation at 998: OK (independent)");
-
-            // Now try block at 999 (should fail - block watermark is at 1000)
-            let data = create_block_data(999, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let mut stream2 = ctx.connect().map_err(|e| e.to_string())?;
-            let response = ctx
-                .send_request(&mut stream2, &request)
-                .map_err(|e| e.to_string())?;
-            match response {
+            // Block just below its own floor must still be rejected.
+            match ctx.sign(pkh, ctx.block(base - 1, 0))? {
                 SignerResponse::Error(_) => {
-                    ctx.log("Block at 999: Correctly rejected");
-                    wait_for_reset_dialog(
-                        "Level too low: \"Set level to 999\" dialog (watermark at 1000)",
-                    )?;
+                    ctx.log(&format!("Block at {} correctly rejected", base - 1));
+                    wait_for_reset_dialog(&format!(
+                        "Level too low: \"Set level to {}\" dialog (watermark at {base})",
+                        base - 1
+                    ))?;
                     Ok(())
                 }
                 SignerResponse::Signature(_) => {
                     Err("SECURITY FAILURE: Block signed below watermark!".to_string())
                 }
-                _ => Err(format!("Unexpected response: {response:?}")),
+                other => Err(format!("Unexpected response: {other:?}")),
             }
         });
 
         Ok(())
     }
 
-    fn run_category_chain_isolation(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_category_chain_enforcement(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "\n{}",
-            "─── Category 3: Chain ID Isolation ────────────────────────────"
+            "─── Category 3: Chain Enforcement ─────────────────────────────"
                 .cyan()
                 .bold()
         );
 
-        // Test 3.1: Different chains have independent watermarks
-        self.run_test("3.1 Chain ID isolation", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
+        // Test 3.1: Foreign-chain block is rejected
+        self.run_test("3.1 Foreign-chain block rejected", |ctx, pkh| {
+            let base = ctx.reserve_level();
+            ctx.expect_signature(
+                pkh,
+                ctx.block(base, 0),
+                &format!("Provisioned block {base}"),
+            )?;
 
-            // Sign on "mainnet" chain at level 2000
-            let data = create_block_data_with_chain(&MAINNET_CHAIN_ID, 2000, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!("Mainnet block at 2000 failed: {response:?}"));
-            }
-            ctx.log("Mainnet block at 2000: OK");
-
-            // Sign on "ghostnet" chain at level 1999 (should succeed - different chain)
-            let data = create_block_data_with_chain(&GHOSTNET_CHAIN_ID, 1999, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Ghostnet block at 1999 should succeed (different chain), got: {response:?}"
-                ));
-            }
-            ctx.log("Ghostnet block at 1999: OK (independent chain)");
-
-            // Try mainnet at 1999 (should fail)
-            let data = create_block_data_with_chain(&MAINNET_CHAIN_ID, 1999, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let mut stream2 = ctx.connect().map_err(|e| e.to_string())?;
-            let response = ctx
-                .send_request(&mut stream2, &request)
-                .map_err(|e| e.to_string())?;
-            match response {
-                SignerResponse::Error(_) => {
-                    ctx.log("Mainnet block at 1999: Correctly rejected");
-                    wait_for_reset_dialog(
-                        "Level too low: \"Set level to 1999\" dialog (mainnet, watermark at 2000)",
-                    )?;
-                    Ok(())
-                }
-                SignerResponse::Signature(_) => {
-                    Err("SECURITY FAILURE: Mainnet signed below watermark!".to_string())
-                }
-                _ => Err(format!("Unexpected response: {response:?}")),
-            }
+            // A block for a chain the device was not provisioned for is rejected
+            // before any watermark check, so its level is irrelevant.
+            let foreign = create_block_data_with_chain(&FOREIGN_CHAIN, base + 1, 0);
+            expect_chain_mismatch(ctx.sign(pkh, foreign)?)
         });
 
-        // Test 3.2: Cross-chain attestations are independent
-        self.run_test("3.2 Cross-chain attestations independent", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
+        // Test 3.2: Foreign-chain attestation is rejected
+        self.run_test("3.2 Foreign-chain attestation rejected", |ctx, pkh| {
+            let base = ctx.reserve_level();
+            ctx.expect_signature(
+                pkh,
+                ctx.attestation(base, 0),
+                &format!("Provisioned attestation {base}"),
+            )?;
 
-            // Attestation on mainnet at 2100
-            let data = create_attestation_data_with_chain(&MAINNET_CHAIN_ID, 2100, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!("Mainnet attestation at 2100 failed: {response:?}"));
-            }
-            ctx.log("Mainnet attestation at 2100: OK");
-
-            // Attestation on ghostnet at 50 (should succeed - different chain)
-            let data = create_attestation_data_with_chain(&GHOSTNET_CHAIN_ID, 50, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Ghostnet attestation at 50 should succeed, got: {response:?}"
-                ));
-            }
-            ctx.log("Ghostnet attestation at 50: OK (independent chain)");
-
-            Ok(())
+            let foreign = create_attestation_data_with_chain(&FOREIGN_CHAIN, base + 1, 0);
+            expect_chain_mismatch(ctx.sign(pkh, foreign)?)
         });
 
         Ok(())
@@ -982,137 +779,34 @@ impl TestSuite {
                 .bold()
         );
 
-        // Test 4.1: Maximum level value
-        // Uses unique chain ID to avoid polluting mainnet watermark with extreme values
-        self.run_test("4.1 Maximum level value (u32::MAX)", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
-
-            // Use unique chain ID for this extreme-value test
-            let max_level_chain = [0xDE, 0xAD, 0xBE, 0xEF];
-            let data = create_block_data_with_chain(&max_level_chain, u32::MAX - 1, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!(
-                    "Expected signature at max level, got: {response:?}"
-                ));
-            }
-            ctx.log("Signed at u32::MAX - 1 (on isolated chain)");
-
-            Ok(())
-        });
-
-        // Test 4.2: Zero level/round
-        self.run_test("4.2 Zero level and round", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
-
-            // Use a different chain for this test to avoid watermark conflicts
-            let test_chain = [0xAA, 0xBB, 0xCC, 0xDD];
-            let data = create_block_data_with_chain(&test_chain, 0, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!("Expected signature at level 0, got: {response:?}"));
-            }
-            ctx.log("Signed at level 0, round 0");
-
-            // Level 1 should work
-            let data = create_block_data_with_chain(&test_chain, 1, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!("Expected signature at level 1, got: {response:?}"));
-            }
-            ctx.log("Signed at level 1");
-
-            Ok(())
-        });
-
         // Test 4.3: Same level, same round (replay attempt)
         self.run_test("4.3 Replay attempt (same level/round)", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
+            let base = ctx.reserve_level();
+            let data = ctx.block(base, 3);
+            ctx.expect_signature(pkh, data.clone(), &format!("Block {base}/round 3"))?;
 
-            let test_chain = [0x11, 0x22, 0x33, 0x44];
-
-            // Sign at level 5000, round 3
-            let data = create_block_data_with_chain(&test_chain, 5000, 3);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data: data.clone(),
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!("First sign at 5000/3 failed: {response:?}"));
-            }
-            ctx.log("First signature at 5000/3: OK");
-
-            // Try same level/round again (replay - should fail)
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let mut stream2 = ctx.connect().map_err(|e| e.to_string())?;
-            let response = ctx
-                .send_request(&mut stream2, &request)
-                .map_err(|e| e.to_string())?;
-            match response {
-                SignerResponse::Error(_) => {
-                    ctx.log("Replay attempt: Correctly rejected (no dialog shown)");
+            // Same level/round again is a replay: the round must be strictly higher.
+            match ctx.sign(pkh, data)? {
+                SignerResponse::Error(e) if e.contains("Round too low") || e.contains("round") => {
+                    ctx.log("Replay correctly rejected (no dialog shown)");
                     Ok(())
                 }
+                SignerResponse::Error(e) => Err(format!("Got error but unexpected message: {e}")),
                 SignerResponse::Signature(_) => {
-                    // Note: Some implementations may allow re-signing the exact same data
-                    // This is technically safe as it produces the same signature
-                    ctx.log("Replay produced signature (may be acceptable if identical)");
-                    Ok(())
+                    Err("SECURITY FAILURE: Replay produced a signature!".to_string())
                 }
-                _ => Err(format!("Unexpected response: {response:?}")),
+                other => Err(format!("Unexpected response: {other:?}")),
             }
         });
 
         // Test 4.4: Invalid magic byte
         self.run_test("4.4 Invalid magic byte rejection", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
+            // An invalid magic byte is rejected before chain/watermark checks, so
+            // the level and chain are irrelevant here.
+            let mut data = ctx.block(1, 0);
+            data[0] = 0xFF;
 
-            // Create data with invalid magic byte (0xFF instead of 0x11/0x12/0x13)
-            let mut data = create_block_data(9999, 0);
-            data[0] = 0xFF; // Invalid magic byte
-
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            match response {
+            match ctx.sign(pkh, data)? {
                 SignerResponse::Error(e) => {
                     ctx.log(&format!("Correctly rejected invalid magic: {e}"));
                     Ok(())
@@ -1120,7 +814,7 @@ impl TestSuite {
                 SignerResponse::Signature(_) => {
                     Err("Should not sign data with invalid magic byte".to_string())
                 }
-                _ => Err(format!("Unexpected response: {response:?}")),
+                other => Err(format!("Unexpected response: {other:?}")),
             }
         });
 
@@ -1163,29 +857,11 @@ impl TestSuite {
         wait_for_user("    Press ENTER when the device is ready... ")?;
         println!();
 
-        // Use a dedicated chain ID for interactive tests
-        let interactive_chain = [0xEE, 0xFF, 0x00, 0x11];
-
         // Test 5.1: Reset watermark via UI
         self.run_test("5.1 Interactive: Set high watermark", |ctx, pkh| {
-            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
-
-            // Sign at a high level to set watermark
-            let data = create_block_data_with_chain(&interactive_chain, 10000, 0);
-            let request = SignerRequest::Sign {
-                pkh: (pkh, 0),
-                data,
-                signature: None,
-            };
-            let response = ctx
-                .send_request(&mut stream, &request)
-                .map_err(|e| e.to_string())?;
-
-            if !matches!(response, SignerResponse::Signature(_)) {
-                return Err(format!("Failed to set watermark at 10000: {response:?}"));
-            }
-            ctx.log("Watermark set to level 10000");
-            Ok(())
+            // Raise the block floor above the trigger level the next test uses.
+            let high = ctx.reserve_level();
+            ctx.expect_signature(pkh, ctx.block(high, 0), &format!("Watermark set to {high}"))
         });
 
         // This test triggers the error and waits for the operator to confirm the
@@ -1193,20 +869,10 @@ impl TestSuite {
         self.run_test(
             "5.2 Interactive: Trigger error and verify user action",
             |ctx, pkh| {
-                let mut stream = ctx.connect().map_err(|e| e.to_string())?;
+                let trigger = INTERACTIVE_TRIGGER_LEVEL;
 
-                // Try to sign at lower level - will trigger watermark error on device
-                let data = create_block_data_with_chain(&interactive_chain, 100, 0);
-                let request = SignerRequest::Sign {
-                    pkh: (pkh, 0),
-                    data: data.clone(),
-                    signature: None,
-                };
-                let response = ctx
-                    .send_request(&mut stream, &request)
-                    .map_err(|e| e.to_string())?;
-
-                match response {
+                // Sign below the floor 5.1 set — triggers the watermark dialog.
+                match ctx.sign(pkh, ctx.block(trigger, 0))? {
                     SignerResponse::Error(e) => {
                         println!();
                         println!(
@@ -1226,12 +892,12 @@ impl TestSuite {
                         println!("    Watermark error triggered: {}", e.dimmed());
                         println!();
                         println!(
-                            "    The device should be showing a \"Set level to 100\" watermark dialog."
+                            "    The device should be showing a \"Set level to {trigger}\" watermark dialog."
                         );
-                        println!("    1. Touch \"Set level to 100\" or Cancel on the device screen");
+                        println!("    1. Touch \"Set level to {trigger}\" or Cancel on the device screen");
                         println!("    2. Wait for the device to return to the home screen");
                         println!("    3. Then tell me what you pressed:");
-                        println!("       [S] = I pressed \"Set level to 100\"");
+                        println!("       [S] = I pressed \"Set level to {trigger}\"");
                         println!("       [C] = I pressed Cancel");
                         print!("    Your choice: ");
                         std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
@@ -1252,33 +918,23 @@ impl TestSuite {
 
                             println!("    Verifying the watermark was set...");
 
-                            // "Set level to 100" records 100 as signed, so verify the
-                            // lowered floor by signing 101 — rejected before (floor was
-                            // 10000), now allowed.
-                            let verify_data =
-                                create_block_data_with_chain(&interactive_chain, 101, 0);
-                            let mut verify_stream = ctx.connect().map_err(|e| e.to_string())?;
-                            let verify_request = SignerRequest::Sign {
-                                pkh: (pkh, 0),
-                                data: verify_data,
-                                signature: None,
-                            };
-                            let verify_response = ctx
-                                .send_request(&mut verify_stream, &verify_request)
-                                .map_err(|e| e.to_string())?;
-
-                            match verify_response {
+                            // "Set level to N" records N as signed, so verify the
+                            // lowered floor by signing N+1 — rejected before (higher
+                            // floor), now allowed.
+                            let verify = ctx.sign(pkh, ctx.block(trigger + 1, 0))?;
+                            match verify {
                                 SignerResponse::Signature(_) => {
                                     println!(
-                                        "    Set level confirmed! Signing at level 101 succeeded."
+                                        "    Set level confirmed! Signing at level {} succeeded.",
+                                        trigger + 1
                                     );
                                     Ok(())
                                 }
                                 SignerResponse::Error(verify_e) => Err(format!(
                                     "Set level did not work - still getting error: {verify_e}"
                                 )),
-                                _ => Err(format!(
-                                    "Unexpected response after setting level: {verify_response:?}"
+                                other => Err(format!(
+                                    "Unexpected response after setting level: {other:?}"
                                 )),
                             }
                         } else if choice == "c" || choice == "cancel" {
@@ -1292,17 +948,8 @@ impl TestSuite {
                             println!("    Verifying cancel preserved watermark...");
 
                             // Verify the signing still fails after cancel
-                            let mut verify_stream = ctx.connect().map_err(|e| e.to_string())?;
-                            let verify_request = SignerRequest::Sign {
-                                pkh: (pkh, 0),
-                                data: data.clone(),
-                                signature: None,
-                            };
-                            let verify_response = ctx
-                                .send_request(&mut verify_stream, &verify_request)
-                                .map_err(|e| e.to_string())?;
-
-                            match verify_response {
+                            let verify = ctx.sign(pkh, ctx.block(trigger, 0))?;
+                            match verify {
                                 SignerResponse::Error(_) => {
                                     println!(
                                         "    Cancel confirmed! Watermark protection still active."
@@ -1313,8 +960,8 @@ impl TestSuite {
                                     Err("Cancel failed - watermark was unexpectedly changed"
                                         .to_string())
                                 }
-                                _ => Err(format!(
-                                    "Unexpected response after cancel: {verify_response:?}"
+                                other => Err(format!(
+                                    "Unexpected response after cancel: {other:?}"
                                 )),
                             }
                         } else {
@@ -1324,7 +971,7 @@ impl TestSuite {
                     SignerResponse::Signature(_) => {
                         Err("Should have rejected signing at lower level".to_string())
                     }
-                    _ => Err(format!("Unexpected response: {response:?}")),
+                    other => Err(format!("Unexpected response: {other:?}")),
                 }
             },
         );
@@ -1398,6 +1045,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut device = DEFAULT_DEVICE.to_string();
     let mut category = None;
+    let mut chain_id = None;
     let mut verbose = false;
 
     let mut i = 1;
@@ -1415,6 +1063,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     category = Some(args[i].clone());
                 }
             }
+            "--chain-id" => {
+                i += 1;
+                if i < args.len() {
+                    chain_id = Some(args[i].clone());
+                }
+            }
             "--verbose" | "-v" => {
                 verbose = true;
             }
@@ -1424,6 +1078,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("    cargo run --example watermark_e2e_test [OPTIONS]\n");
                 println!("OPTIONS:");
                 println!("    -d, --device <ADDR>     Device address (default: {DEFAULT_DEVICE})");
+                println!("        --chain-id <B58>    Provisioned chain the device signs for");
                 println!("    -c, --category <NAME>   Run only tests matching category");
                 println!("                            (basic, multi, chain, edge)");
                 println!("    -v, --verbose           Verbose output");
@@ -1435,7 +1090,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    let ctx = TestContext::new(&device, verbose)?;
+    let chain_id = chain_id.ok_or(
+        "--chain-id <b58> is required; run via `cargo xtask watermark-test`, which reads \
+         it from the device",
+    )?;
+    let provisioned_chain: [u8; 4] = ChainId::from_b58check(&chain_id)
+        .ok_or_else(|| format!("Invalid --chain-id {chain_id:?}: not a base58 chain id"))?
+        .as_bytes()[..4]
+        .try_into()
+        .expect("chain id has at least 4 bytes");
+
+    if provisioned_chain == FOREIGN_CHAIN {
+        return Err(format!(
+            "Device is provisioned for {chain_id}, the chain the rejection tests use as foreign; \
+             use a device on a different chain"
+        )
+        .into());
+    }
+
+    let ctx = TestContext::new(&device, provisioned_chain, verbose)?;
     let mut suite = TestSuite::new(ctx, category);
 
     suite.run_all()?;
