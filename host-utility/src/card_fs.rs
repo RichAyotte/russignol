@@ -1,7 +1,7 @@
 //! Shared writers for the device-owned files a host may write onto a signer card.
 //!
 //! The device reads `chain_info.json`, so a host that writes it (restoring a
-//! card, or repairing one with `disk doctor`) must produce a byte- and
+//! card, or repairing one with `check disk`) must produce a byte- and
 //! mode-identical artifact. Watermark files are not written here: only the
 //! PIN-unlocked device can authenticate a mark, so the host stages a boot config
 //! and the device establishes the floor itself. Both callers route through these

@@ -11,6 +11,7 @@ use utils::print_title_bar;
 mod backup;
 mod blockchain;
 mod card_fs;
+mod check;
 mod config;
 mod confirmation;
 mod constants;
@@ -85,20 +86,6 @@ enum Commands {
         #[arg(long)]
         baker_key: Option<String>,
     },
-    /// Display current status without making changes
-    Status {
-        /// Display detailed diagnostic information
-        #[arg(long, short)]
-        verbose: bool,
-
-        /// Tezos node RPC endpoint (default: <http://localhost:8732>)
-        #[arg(long)]
-        endpoint: Option<String>,
-
-        /// Remote signer endpoint (e.g., <tcp://192.168.1.100:7732>)
-        #[arg(long)]
-        signer_endpoint: Option<String>,
-    },
     /// Remove all system configuration
     Purge {
         /// Simulate all operations without making any changes
@@ -144,15 +131,10 @@ enum Commands {
         #[command(subcommand)]
         command: image::ImageCommands,
     },
-    /// Manage watermark configuration for first boot
-    Watermark {
+    /// Diagnose and repair a signer SD card or the host
+    Check {
         #[command(subcommand)]
-        command: WatermarkCommands,
-    },
-    /// Diagnose and repair a signer SD card
-    Disk {
-        #[command(subcommand)]
-        command: disk::DiskCommands,
+        command: check::CheckCommands,
     },
     /// Rotate to new consensus and companion keys
     RotateKeys {
@@ -203,25 +185,6 @@ enum Commands {
         /// Command to start the baker (for --restart-method=script)
         #[arg(long)]
         start_command: Option<String>,
-    },
-}
-
-/// Watermark subcommands
-#[derive(Subcommand, Debug)]
-pub enum WatermarkCommands {
-    /// Initialize watermarks on an SD card (for manually flashed cards)
-    Init {
-        /// Target device with boot partition (e.g., /dev/sdc or /dev/mmcblk0)
-        #[arg(long, short)]
-        device: Option<std::path::PathBuf>,
-
-        /// Tezos node RPC endpoint (default: <http://localhost:8732>)
-        #[arg(long)]
-        endpoint: Option<String>,
-
-        /// Skip confirmation prompt
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
 }
 
@@ -305,24 +268,6 @@ fn install_completions(shell: Shell) -> Result<()> {
     Ok(())
 }
 
-fn handle_watermark_command(command: WatermarkCommands) -> Result<()> {
-    let mut config = config::RussignolConfig::load_valid()?;
-    match command {
-        WatermarkCommands::Init {
-            device,
-            endpoint,
-            yes,
-        } => {
-            config.with_overrides(endpoint.as_deref(), None);
-            if endpoint.is_none() {
-                network::resolve_endpoint_interactively(&mut config, yes)?;
-            }
-            watermark::cmd_watermark_init(device, yes, &config)?;
-        }
-    }
-    Ok(())
-}
-
 /// Dispatch a parsed CLI command to its handler.
 fn dispatch(command: Option<Commands>) -> Result<()> {
     match command {
@@ -351,19 +296,13 @@ fn dispatch(command: Option<Commands>) -> Result<()> {
             signer_endpoint: signer_endpoint.as_deref(),
             network_backend,
         }),
-        Some(Commands::Status {
-            verbose,
-            endpoint,
-            signer_endpoint,
-        }) => handle_status_command(verbose, endpoint.as_deref(), signer_endpoint.as_deref()),
         Some(Commands::Purge { dry_run }) => handle_purge_command(dry_run),
         Some(Commands::Install { backup }) => install::run_install(backup),
         Some(Commands::Upgrade { check, yes, beta }) => upgrade::run_upgrade(check, yes, beta),
         Some(Commands::Config { command }) => config::run_config_command(command),
         Some(Commands::Completions { shell, print }) => handle_completions_command(shell, print),
         Some(Commands::Image { command }) => image::run_image_command(command),
-        Some(Commands::Watermark { command }) => handle_watermark_command(command),
-        Some(Commands::Disk { command }) => disk::run_disk_command(command),
+        Some(Commands::Check { command }) => check::run_check_command(command),
         Some(Commands::RotateKeys {
             monitor,
             replace,
@@ -396,35 +335,6 @@ fn dispatch(command: Option<Commands>) -> Result<()> {
             signer_endpoint.as_deref(),
         ),
     }
-}
-
-fn handle_status_command(
-    verbose: bool,
-    endpoint: Option<&str>,
-    signer_endpoint: Option<&str>,
-) -> Result<()> {
-    let log_level = if verbose {
-        log::LevelFilter::Debug
-    } else {
-        log::LevelFilter::Info
-    };
-    env_logger::Builder::from_default_env()
-        .filter_level(log_level)
-        .init();
-
-    // Status is read-only and degrades gracefully: an invalid config surfaces
-    // as unknown probes and a non-zero exit, which is more useful than refusing
-    // to run, so it keeps the lenient loader.
-    let mut config = config::RussignolConfig::load()?;
-    config.with_overrides(endpoint, signer_endpoint);
-    if endpoint.is_none() && !network::resolve_endpoint_interactively(&mut config, false)? {
-        utils::warning(network::NON_INTERACTIVE_HINT.trim_start());
-    }
-    let healthy = status::run_status(verbose, &config);
-    if !healthy {
-        std::process::exit(constants::EXIT_UNHEALTHY);
-    }
-    Ok(())
 }
 
 fn handle_purge_command(dry_run: bool) -> Result<()> {

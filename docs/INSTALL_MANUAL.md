@@ -95,12 +95,13 @@ diskutil eject /dev/diskN
 > machine, seed the watermark floor after flashing:
 >
 > ```bash
-> russignol watermark init --device /dev/sdX
+> russignol check disk --device /dev/sdX
 > ```
 >
-> This performs the watermark initialization described in the warning above,
-> querying your Tezos node and writing the current blockchain state to the
-> card's boot partition.
+> This diagnoses the freshly flashed card and, finding no watermark seed staged,
+> offers to write it — querying your Tezos node and writing the current
+> blockchain state to the card's boot partition (the watermark initialization
+> described in the warning above).
 
 ## Step 2: Boot and Initialize Device
 

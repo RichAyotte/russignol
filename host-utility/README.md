@@ -49,14 +49,15 @@ russignol config path               Show configuration file path
 russignol rotate-keys               Start key rotation workflow
 russignol rotate-keys --monitor     Check pending rotation status
 
-russignol watermark init            Initialize watermarks on a manually flashed SD card
+russignol check disk                Diagnose an SD card and repair fixable issues
+russignol check disk --dry-run      Report issues without repairing
 
 russignol purge                     Remove system configuration and imported key aliases
 russignol purge --dry-run           Simulate without changes
 
-russignol status                    Check device connectivity
-russignol status --verbose          Detailed diagnostics
-russignol status --endpoint <URL>   Check status using remote node
+russignol check host                Check host, node, and device health
+russignol check host --verbose      Detailed diagnostics
+russignol check host --endpoint <URL>   Check health using remote node
 
 russignol install                   Install russignol to ~/.local/bin
 russignol upgrade                   Upgrade to the latest release
@@ -67,7 +68,7 @@ russignol completions <shell>       Install shell completions (bash/zsh/fish)
 russignol completions <shell> --print   Print completions to stdout instead
 ```
 
-All node-dependent commands (`setup`, `status`, `rotate-keys`, `image flash`, `image download-and-flash`, `watermark init`) support `--endpoint` to override the configured RPC endpoint.
+All node-dependent commands (`setup`, `check host`, `check disk`, `rotate-keys`, `image flash`, `image download-and-flash`) support `--endpoint` to override the configured RPC endpoint.
 
 ## Documentation
 

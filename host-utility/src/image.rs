@@ -576,7 +576,7 @@ fn check_node_for_watermarks(
     } else {
         utils::warning(
             "No russignol configuration found. Watermarks will not be configured.\n  \
-             Run 'russignol config' first, or use 'russignol watermark init' after flashing.",
+             Run 'russignol config' first, or use 'russignol check disk' after flashing.",
         );
         Ok(None)
     }
@@ -1000,9 +1000,7 @@ fn finalize_flash(device: &Path, chain_info: Option<&watermark::ChainInfo>) -> R
         );
         println!();
     } else {
-        utils::success(
-            "Flash complete! (no watermark config - run 'russignol watermark init' later)",
-        );
+        utils::success("Flash complete! (no watermark config - run 'russignol check disk' later)");
         println!();
     }
 

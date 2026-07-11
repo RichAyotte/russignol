@@ -219,8 +219,8 @@ russignol config set rpc-endpoint http://127.0.0.1:8733
 ### Public RPC Networks
 
 When the configured endpoint doesn't answer and no `--endpoint` was given,
-interactive commands (`setup`, `status`, `image flash`/`download-and-flash`,
-`watermark init`, `rotate-keys`) offer recovery choices: retry, enter a
+interactive commands (`setup`, `check host`, `image flash`/`download-and-flash`,
+`check disk`, `rotate-keys`) offer recovery choices: retry, enter a
 different endpoint, or pick a public RPC network. The network list comes from
 [teztnets.com](https://teztnets.com/) (Mainnet first, then long-running and
 protocol testnets), with a built-in fallback of Mainnet

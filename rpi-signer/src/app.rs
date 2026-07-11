@@ -180,7 +180,8 @@ const CONFIG_GATE_TITLE: &str = "Card Not Ready";
 /// staged. Directs the operator to provision the card on a node-connected host,
 /// the only source of chain id and watermark floor. The fatal page word-wraps,
 /// so the text carries no manual line breaks.
-const CONFIG_GATE_MESSAGE: &str = "No watermark config is staged on this card. Prepare it on the host with: russignol disk doctor";
+const CONFIG_GATE_MESSAGE: &str =
+    "No watermark config is staged on this card. Prepare it on the host with: russignol check disk";
 
 /// Maximum failed PIN attempts before lockout
 const MAX_FAILED_ATTEMPTS: u32 = 5;
@@ -970,7 +971,7 @@ impl App {
             // N"), not here: with it the message overflows the page's three
             // wrapped rows and the text box clips the overflow.
             message: format!(
-                "No watermark: {pkh_short}\nOr run russignol watermark init then reboot on host."
+                "No watermark: {pkh_short}\nOr run russignol check disk then reboot on host."
             ),
             on_confirm: AppEvent::UpdateWatermarkToLevel {
                 pkh,
@@ -1833,7 +1834,7 @@ mod tests {
 
         assert!(warning, "missing-watermark recovery dialog must be warned");
         assert!(
-            message.contains("russignol watermark init"),
+            message.contains("russignol check disk"),
             "dialog must name the host recovery command, got: {message}"
         );
         assert_eq!(

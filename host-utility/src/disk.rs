@@ -1,4 +1,4 @@
-//! `russignol disk doctor` — diagnose a signer SD card (read-only).
+//! `russignol check disk` — diagnose a signer SD card (read-only).
 //!
 //! Reads a signer's SD card and reports every detectable issue: missing or
 //! corrupt watermarks, missing or stale `chain_info.json`, ownership/mode drift,
@@ -9,7 +9,6 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::Subcommand;
 use colored::Colorize;
 use russignol_signer_lib::KeyManager;
 use russignol_signer_lib::server::{KEY_ROLES, LARGE_GAP_CYCLES};
@@ -23,29 +22,6 @@ use crate::{config, network};
 /// Maximum `panic.log` size before the doctor offers to truncate it, matching
 /// the 1 MiB cap the device init applies on boot.
 const PANIC_LOG_MAX_BYTES: u64 = 1024 * 1024;
-
-/// Disk subcommands
-#[derive(Subcommand, Debug)]
-pub enum DiskCommands {
-    /// Diagnose a signer SD card and repair fixable issues on confirmation
-    Doctor {
-        /// Target device (e.g. /dev/sdc or /dev/mmcblk0); auto-detected if omitted
-        #[arg(long, short)]
-        device: Option<PathBuf>,
-
-        /// Tezos node RPC endpoint (default: <http://localhost:8732>)
-        #[arg(long)]
-        endpoint: Option<String>,
-
-        /// Report issues without applying any repair
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Apply all fixable repairs without prompting
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
-}
 
 /// Whether the running kernel can mount f2fs, read from `/proc/filesystems`
 /// contents. Each line is `<flags>\t<name>`; a bare `nodev` line marks a
@@ -215,6 +191,7 @@ pub enum IssueKind {
     MigrationPending,
     F2fsNotInspected,
     FatStageAvailable,
+    WatermarkSeedMissing,
     WatermarkDirMissing,
     WatermarkFileMissing,
     WatermarkCorrupt,
@@ -261,7 +238,9 @@ pub struct Issue {
     pub severity: Severity,
     pub partition: Partition,
     pub remedy: Remedy,
-    /// The in-place repair for this issue, present iff `remedy` is `HostDirect`.
+    /// The repair the doctor can apply for this issue: present for `HostDirect`
+    /// (in place) and `FatStage` (staged boot config) remedies, `None` for
+    /// `NeedsNode` and `Manual`.
     pub action: Option<RepairAction>,
     pub message: String,
 }
@@ -305,7 +284,7 @@ pub fn classify(state: &CardState, node: Option<&ChainInfo>) -> Vec<Issue> {
     if state.inspection != Inspection::Inspected {
         let message = if state.inspection == Inspection::NotCapable {
             "the host kernel cannot mount f2fs, so the keys and data partitions \
-             were not inspected; run 'disk doctor' on an f2fs-capable host to \
+             were not inspected; run 'check disk' on an f2fs-capable host to \
              diagnose them"
         } else {
             "the keys or data partition could not be mounted, so they were not \
@@ -371,6 +350,36 @@ pub fn classify(state: &CardState, node: Option<&ChainInfo>) -> Vec<Issue> {
                       first boot"
                 .to_string(),
         });
+        // A card that has never completed first-boot setup and has no seed staged
+        // cannot establish an authenticated watermark floor on its own; stage a boot
+        // config so the device seeds one. A seed already present is classified by
+        // `classify_boot_config`, so gate on its absence to avoid double-counting.
+        if state.boot_config.is_none() {
+            let remedy = if node.is_some() {
+                Remedy::FatStage
+            } else {
+                Remedy::NeedsNode
+            };
+            issues.push(Issue {
+                kind: IssueKind::WatermarkSeedMissing,
+                severity: Severity::Warning,
+                partition: Partition::Boot,
+                remedy,
+                action: node.map(|n| RepairAction::StageBootConfig(n.clone())),
+                message: match node {
+                    Some(n) => format!(
+                        "the card has no staged watermark-config.json and first-boot \
+                         setup has not completed; a config can be staged so the device \
+                         seeds watermarks and chain_info at level {} on its next boot",
+                        n.level
+                    ),
+                    None => "the card has no staged watermark-config.json and first-boot \
+                             setup has not completed; provide a node endpoint to stage one \
+                             so the device seeds its authenticated watermark floor"
+                        .to_string(),
+                },
+            });
+        }
         return issues;
     }
 
@@ -1337,19 +1346,9 @@ fn apply_action(mount: &Path, node: Option<&ChainInfo>, action: &RepairAction) -
 // Command entry point
 // =============================================================================
 
-/// Main entry point for disk commands
-pub fn run_disk_command(command: DiskCommands) -> Result<()> {
-    match command {
-        DiskCommands::Doctor {
-            device,
-            endpoint,
-            dry_run,
-            yes,
-        } => run_doctor(device, endpoint.as_deref(), dry_run, yes),
-    }
-}
-
-fn run_doctor(
+/// Diagnose a signer SD card and, unless `dry_run`, repair fixable issues on
+/// confirmation (all at once when `yes`).
+pub fn run_disk_check(
     device: Option<PathBuf>,
     endpoint: Option<&str>,
     dry_run: bool,
@@ -1702,6 +1701,51 @@ mod tests {
         assert!(!ks.contains(&IssueKind::KeysMissing));
         assert!(!ks.contains(&IssueKind::ChainInfoMissing));
         assert!(!ks.contains(&IssueKind::WatermarkDirMissing));
+    }
+
+    fn uninitialized_state() -> CardState {
+        let mut state = healthy_state();
+        state.setup_complete = false;
+        state.keys = KeysState::Missing;
+        state.chain_info = ChainInfoState::Missing;
+        state.watermarks.clear();
+        state.boot_config = None;
+        state
+    }
+
+    #[test]
+    fn uninitialized_card_without_seed_offers_stage_with_node() {
+        // A manually flashed / never-booted card with no staged seed is offered
+        // the boot config that seeds the device's authenticated watermark floor.
+        let issues = classify(&uninitialized_state(), Some(&node()));
+        let issue = find(&issues, IssueKind::WatermarkSeedMissing).expect("seed-missing issue");
+        assert_eq!(issue.severity, Severity::Warning);
+        assert_eq!(issue.partition, Partition::Boot);
+        assert_eq!(issue.remedy, Remedy::FatStage);
+        assert_eq!(issue.action, Some(RepairAction::StageBootConfig(node())));
+    }
+
+    #[test]
+    fn uninitialized_card_without_seed_needs_node() {
+        // Without a node there is nothing to stage; the missing seed is reported
+        // so the operator knows to supply an endpoint.
+        let issues = classify(&uninitialized_state(), None);
+        let issue = find(&issues, IssueKind::WatermarkSeedMissing).expect("seed-missing issue");
+        assert_eq!(issue.remedy, Remedy::NeedsNode);
+        assert_eq!(issue.action, None);
+    }
+
+    #[test]
+    fn uninitialized_card_with_seed_staged_is_not_flagged_missing() {
+        // A seed already staged is handled by the boot-config classifier; the
+        // seed-missing finding must not double-count it.
+        let mut state = uninitialized_state();
+        state.boot_config = Some(BootConfigState {
+            chain_id: "NetXmainnet".to_string(),
+            level: 1_000,
+        });
+        let issues = classify(&state, Some(&node()));
+        assert!(find(&issues, IssueKind::WatermarkSeedMissing).is_none());
     }
 
     #[test]

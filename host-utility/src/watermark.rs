@@ -11,16 +11,12 @@ use crate::config::RussignolConfig;
 use crate::image;
 use crate::system;
 use crate::utils::{
-    create_http_agent, create_orange_theme, format_with_separators, get_partition_path,
-    http_get_json, info, mount_partition, print_title_bar, resolve_tool, success,
-    unmount_partition, warn_if_err, warning,
+    create_http_agent, format_with_separators, get_partition_path, http_get_json, info,
+    mount_partition, resolve_tool, success, unmount_partition, warn_if_err, warning,
 };
 use anyhow::{Context, Result, bail};
-use colored::Colorize;
-use inquire::Confirm;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::network::MAINNET_CHAIN_NAME;
 
@@ -166,70 +162,6 @@ pub fn read_watermark_config(device: &Path) -> Result<WatermarkConfig> {
     result
 }
 
-/// Standalone watermark init command with strict verifications.
-///
-/// Derives the chain info through the same `prefetch_chain_info` producer the
-/// flash path uses, then persists it with the same `write_watermark_config` /
-/// `read_back_and_verify` pair — so the level written by `watermark init` and
-/// the level written during flashing cannot drift.
-pub fn cmd_watermark_init(
-    device: Option<PathBuf>,
-    auto_confirm: bool,
-    config: &RussignolConfig,
-) -> Result<()> {
-    println!();
-    print_title_bar("⚙ Initialize Watermarks");
-    check_required_tools();
-
-    let device = detect_and_verify_device(device)?;
-    let boot_partition = get_boot_partition_path(&device);
-    verify_boot_partition(&boot_partition)?;
-    verify_russignol_card(&boot_partition)?;
-
-    // Single canonical producer (includes the node sync check). Fetching before
-    // the write keeps an unsynced node's stale level from ever reaching the card.
-    let chain_info = prefetch_chain_info(config)?;
-
-    display_watermark_summary(&device, &chain_info);
-
-    if !auto_confirm {
-        let confirmed = Confirm::new("Write watermark configuration to this SD card?")
-            .with_default(true)
-            .with_render_config(create_orange_theme())
-            .prompt()
-            .context("Failed to get confirmation")?;
-
-        if !confirmed {
-            info("Watermark configuration cancelled");
-            return Ok(());
-        }
-    }
-
-    write_watermark_config(&device, &chain_info)?;
-    let written = read_back_and_verify(&device)?;
-
-    println!();
-    success("Watermark configuration written successfully!");
-    println!();
-    println!(
-        "  Chain:       {} ({})",
-        written.chain.name.cyan(),
-        written.chain.id.cyan()
-    );
-    println!(
-        "  Head Level:  {}",
-        format_with_separators(written.chain.level).cyan()
-    );
-    println!();
-    println!("  Next steps:");
-    println!("  1. Safely eject the SD card");
-    println!("  2. Insert into your russignol device");
-    println!("  3. Boot the device - watermarks will be configured automatically");
-    println!();
-
-    Ok(())
-}
-
 pub(crate) fn detect_and_verify_device(device: Option<PathBuf>) -> Result<PathBuf> {
     let device = if let Some(d) = device {
         if !d.exists() {
@@ -248,41 +180,6 @@ pub(crate) fn detect_and_verify_device(device: Option<PathBuf>) -> Result<PathBu
 
     verify_block_device(&device)?;
     Ok(device)
-}
-
-/// Confirm the card carries a russignol image before touching the node or
-/// writing. Mounts the boot partition read-only, checks the expected boot
-/// files, and always unmounts.
-fn verify_russignol_card(boot_partition: &Path) -> Result<()> {
-    let mount_point = mount_partition(boot_partition, "vfat", true)?;
-    let result = verify_russignol_image(&mount_point);
-    warn_if_err(
-        unmount_partition(&mount_point, boot_partition),
-        "Failed to unmount after verifying the russignol image",
-    );
-    result.map_err(|e| {
-        anyhow::anyhow!(
-            "SD card verification failed: {e}. This doesn't appear to be a valid russignol image."
-        )
-    })
-}
-
-fn display_watermark_summary(device: &Path, chain: &ChainInfo) {
-    println!();
-    println!("  Device:      {}", device.display().to_string().cyan());
-    println!("  Chain ID:    {}", chain.id.cyan());
-    if chain.name != chain.id {
-        println!("  Network:     {}", chain.name.cyan());
-    }
-    println!(
-        "  Head Level:  {}",
-        format_with_separators(chain.level).cyan()
-    );
-    println!(
-        "  Blocks/Cycle: {}",
-        format_with_separators(chain.blocks_per_cycle).cyan()
-    );
-    println!();
 }
 
 // =============================================================================
@@ -383,7 +280,7 @@ fn get_boot_partition_path(device: &Path) -> PathBuf {
 }
 
 // =============================================================================
-// Strict verification helpers (for standalone command)
+// Device verification
 // =============================================================================
 
 fn verify_block_device(device: &Path) -> Result<()> {
@@ -408,24 +305,16 @@ fn verify_block_device(device: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether a blkid-reported filesystem type is acceptable for the boot
-/// partition. An empty type (blkid could not identify one) is accepted here;
-/// the subsequent vfat mount is the real gate.
-#[cfg(target_os = "linux")]
-fn boot_fstype_is_acceptable(fs_type: &str) -> bool {
-    fs_type.is_empty() || fs_type == "vfat"
-}
-
 /// Read the watermark config back off `device` and confirm it is non-empty.
 ///
-/// The post-write check shared by the flash path and standalone `watermark
-/// init`, so the two verify the write the same way and cannot drift.
+/// The post-write check shared by the flash path and the disk check's boot-config
+/// staging, so the two verify the write the same way and cannot drift.
 pub fn read_back_and_verify(device: &Path) -> Result<WatermarkConfig> {
     let written = read_watermark_config(device).context("Failed to read back watermark config")?;
     if written.chain.name.is_empty() || written.chain.id.is_empty() {
         bail!(
             "Invalid chain info on the SD card (name '{}', id '{}'); the watermark config \
-             is corrupted. Reflash the card or re-run 'russignol watermark init'.",
+             is corrupted. Reflash the card or run 'russignol check disk'.",
             written.chain.name,
             written.chain.id
         );
@@ -433,83 +322,9 @@ pub fn read_back_and_verify(device: &Path) -> Result<WatermarkConfig> {
     Ok(written)
 }
 
-fn verify_boot_partition(partition: &Path) -> Result<()> {
-    if !partition.exists() {
-        bail!(
-            "Boot partition {} not found. Is the SD card properly flashed?",
-            partition.display()
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        // Check partition type using blkid (use /sbin/blkid as it may not be in PATH)
-        let output = Command::new("/sbin/blkid")
-            .args(["-o", "value", "-s", "TYPE"])
-            .arg(partition)
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => {
-                let fs_type = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !boot_fstype_is_acceptable(&fs_type) {
-                    bail!(
-                        "Boot partition {} is {} (expected vfat/FAT32)",
-                        partition.display(),
-                        fs_type
-                    );
-                }
-            }
-            // blkid could not confirm the type; the check is skipped rather than
-            // silently passing — the vfat mount below is still a hard gate.
-            Ok(output) => warning(&format!(
-                "Could not verify boot partition type (blkid exited with {}); \
-                 skipping the vfat check — the mount step still enforces it.",
-                output.status
-            )),
-            Err(e) => warning(&format!(
-                "Could not run blkid to verify boot partition type ({e}); \
-                 skipping the vfat check — the mount step still enforces it."
-            )),
-        }
-    }
-
-    Ok(())
-}
-
-fn verify_russignol_image(mount_point: &Path) -> Result<()> {
-    // Check for expected boot files that indicate this is a russignol image
-    let expected_files = ["config.txt", "cmdline.txt"];
-
-    for filename in &expected_files {
-        let path = mount_point.join(filename);
-        if !path.exists() {
-            bail!("Missing expected file: {filename}");
-        }
-    }
-
-    // Check cmdline.txt contains russignol-specific content
-    let cmdline = std::fs::read_to_string(mount_point.join("cmdline.txt"))?;
-    if !cmdline.contains("root=") {
-        bail!("cmdline.txt doesn't appear to be a valid boot configuration");
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn boot_fstype_only_accepts_vfat_or_unidentified() {
-        assert!(boot_fstype_is_acceptable("vfat"));
-        // Empty: blkid could not identify it — deferred to the vfat mount.
-        assert!(boot_fstype_is_acceptable(""));
-        assert!(!boot_fstype_is_acceptable("ext4"));
-        assert!(!boot_fstype_is_acceptable("f2fs"));
-    }
 
     #[test]
     fn resolve_chain_name_prefers_human_name() {

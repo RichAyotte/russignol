@@ -141,6 +141,6 @@ fn print_next_steps(config: &RussignolConfig) {
     println!();
     println!(
         "Run {} to see the latest status",
-        "russignol status".truecolor(ORANGE.0, ORANGE.1, ORANGE.2)
+        "russignol check host".truecolor(ORANGE.0, ORANGE.1, ORANGE.2)
     );
 }
