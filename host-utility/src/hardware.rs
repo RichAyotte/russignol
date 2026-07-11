@@ -126,7 +126,7 @@ pub fn detect_hardware_device() -> Result<()> {
         "russignol hardware device not detected.\n\n\
          Please check:\n\
          1. Is the SD card flashed with Russignol firmware?\n\
-            If not, run: russignol image download-and-flash\n\n\
+            If not, run: russignol image flash\n\n\
          2. Is the device connected via USB and powered on?\n\n\
          3. Is the device fully booted? (allow ~30 seconds after power-on)"
     )

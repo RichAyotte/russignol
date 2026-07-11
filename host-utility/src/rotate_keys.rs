@@ -875,7 +875,7 @@ fn check_sd_card_readiness(auto_confirm: bool) -> Result<bool> {
 
             // Retry loop for flash operations
             loop {
-                match image::run_image_command(image::ImageCommands::download_and_flash_latest()) {
+                match image::run_image_command(image::ImageCommands::flash_latest()) {
                     Ok(()) => {
                         println!();
                         success("SD card flashed successfully!");
@@ -917,10 +917,7 @@ fn check_sd_card_readiness(auto_confirm: bool) -> Result<bool> {
                         if retry_selection.contains("Exit") {
                             println!();
                             info("To flash manually, run:");
-                            info(&format!(
-                                "  {} image download-and-flash",
-                                "russignol".cyan()
-                            ));
+                            info(&format!("  {} image flash", "russignol".cyan()));
                             println!();
                             anyhow::bail!("Please prepare a new SD card before continuing");
                         }
@@ -935,10 +932,7 @@ fn check_sd_card_readiness(auto_confirm: bool) -> Result<bool> {
         } else {
             println!();
             info("To flash manually, run:");
-            info(&format!(
-                "  {} image download-and-flash",
-                "russignol".cyan()
-            ));
+            info(&format!("  {} image flash", "russignol".cyan()));
             println!();
             anyhow::bail!("Please prepare a new SD card before continuing");
         }

@@ -219,8 +219,8 @@ russignol config set rpc-endpoint http://127.0.0.1:8733
 ### Choosing a Network
 
 When no `--endpoint` is given, interactive commands (`setup`, `rotate-keys`,
-`check host`, `image flash`/`download-and-flash`) present a network selection
-menu rather than guessing which node to use. The menu lists:
+`check host`, `image flash`) present a network selection menu rather than
+guessing which node to use. The menu lists:
 
 - the public networks from [teztnets.com](https://teztnets.com/) — Mainnet
   first, then long-running and protocol testnets (short-lived periodic nets are

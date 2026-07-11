@@ -63,10 +63,10 @@ To update the utility later, run `russignol upgrade` (use `--check` to only chec
 Insert an SD card and flash the Russignol image:
 
 ```bash
-russignol image download-and-flash
+russignol image flash
 ```
 
-This downloads and flashes in one step, auto-detecting your SD card.
+With no image file given, this downloads the latest release and flashes it in one step, auto-detecting your SD card.
 
 This is the supported way to flash a card: it verifies the download checksum, guards against writing the wrong device, and — when restoring keys — verifies the result before reporting success. Flashing another way (see [manual installation](INSTALL_MANUAL.md)) skips those checks.
 
@@ -80,18 +80,18 @@ The utility will:
 
 ### Reusing Keys from an Existing Card
 
-Two options carry keys onto the new card during flashing (both also work with `russignol image flash`):
+Two options carry keys onto the new card during flashing (both also work when flashing a local image, e.g. `russignol image flash <path> --restore-keys`):
 
 Preserve the keys and watermarks from an existing Russignol card:
 
 ```bash
-russignol image download-and-flash --restore-keys
+russignol image flash --restore-keys
 ```
 
 Migrate keys from a Nomadic Labs `tezos-rpi-bls-signer` card:
 
 ```bash
-russignol image download-and-flash --migrate-keys
+russignol image flash --migrate-keys
 ```
 
 Both accept an optional source device (e.g. `--restore-keys /dev/sdd`) and auto-detect it when omitted. Migration accepts `--consensus-key` and `--companion-key` to choose which source key aliases become the consensus and companion keys.

@@ -33,12 +33,13 @@ russignol setup --endpoint <URL>    Use remote node RPC endpoint
 russignol setup --signer-endpoint <URL>     Use remote signer (skips USB/network config)
 russignol setup --yes --baker-key <ALIAS>   Non-interactive setup
 
-russignol image download-and-flash  Download and flash SD card
+russignol image flash               Download the latest image and flash it
+russignol image flash --beta        Download and flash the latest beta image
+russignol image flash <path>        Flash a local image
+russignol image flash --restore-keys   Carry keys and watermarks over from an existing card
+russignol image flash --migrate-keys   Migrate keys from a Nomadic Labs RPI BLS signer card
 russignol image download            Download image only
 russignol image download --beta     Download the latest beta image
-russignol image flash <path>        Flash local image
-russignol image flash <path> --restore-keys   Carry keys and watermarks over from an existing card
-russignol image flash <path> --migrate-keys   Migrate keys from a Nomadic Labs RPI BLS signer card
 russignol image list                List available images
 
 russignol config show               View current configuration
@@ -68,7 +69,7 @@ russignol completions <shell>       Install shell completions (bash/zsh/fish)
 russignol completions <shell> --print   Print completions to stdout instead
 ```
 
-All node-dependent commands (`setup`, `check host`, `check disk`, `rotate-keys`, `image flash`, `image download-and-flash`) support `--endpoint` to override the configured RPC endpoint.
+All node-dependent commands (`setup`, `check host`, `check disk`, `rotate-keys`, `image flash`) support `--endpoint` to override the configured RPC endpoint.
 
 ## Documentation
 

@@ -206,62 +206,16 @@ pub enum ImageCommands {
         beta: bool,
     },
 
-    /// Flash an image to an SD card
+    /// Flash an SD card image, downloading the latest release when no image
+    /// file is given
     Flash {
-        /// Path to the image file (.img.xz or .img)
-        image: PathBuf,
+        /// Path to a local image file (.img.xz or .img). Downloads the latest
+        /// release when omitted.
+        image: Option<PathBuf>,
 
-        /// Target device (e.g., /dev/sdc or /dev/mmcblk0). Auto-detects if not specified.
-        #[arg(long, short)]
-        device: Option<PathBuf>,
-
-        /// Tezos node RPC endpoint (default: <http://localhost:8732>)
-        #[arg(long)]
-        endpoint: Option<String>,
-
-        /// Skip all confirmation prompts (dangerous!)
-        #[arg(long, short = 'y')]
-        yes: bool,
-
-        /// Restore keys and watermarks from an existing SD card (Linux only).
-        /// Optionally specify the source device, or omit to auto-detect.
-        #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
-        restore_keys: Option<PathBuf>,
-
-        /// Migrate keys from a Nomadic Labs tezos-rpi-bls-signer card (Linux only).
-        /// Optionally specify the source device, or omit to auto-detect.
-        #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
-        migrate_keys: Option<PathBuf>,
-
-        /// Source key alias to import as the consensus key (migration only;
-        /// default: first key)
-        #[arg(long)]
-        consensus_key: Option<String>,
-
-        /// Source key alias to import as the companion key (migration only;
-        /// default: second key)
-        #[arg(long)]
-        companion_key: Option<String>,
-
-        /// Skip the post-flash read-back verification (faster, not recommended)
-        #[arg(long)]
-        skip_verify: bool,
-
-        /// Path to the image's detached maintainer signature (.sig). Defaults
-        /// to a `<image>.sig` sidecar next to the image when present.
-        #[arg(long)]
-        signature: Option<PathBuf>,
-
-        /// Flash an image with no verifiable maintainer signature (e.g. a
-        /// self-built or dev image). Ignored while no maintainer key is embedded.
-        #[arg(long)]
-        allow_unsigned: bool,
-    },
-
-    /// Download and flash in one step
-    DownloadAndFlash {
-        /// Custom URL to download image from (default: russignol.com)
-        #[arg(long)]
+        /// Custom URL to download image from (default: russignol.com).
+        /// Download mode only (no image file given).
+        #[arg(long, conflicts_with = "image")]
         url: Option<String>,
 
         /// Target device (e.g., /dev/sdc or /dev/mmcblk0). Auto-detects if not specified.
@@ -296,13 +250,20 @@ pub enum ImageCommands {
         #[arg(long)]
         companion_key: Option<String>,
 
-        /// Download the latest beta (pre-release) version
-        #[arg(long)]
+        /// Download the latest beta (pre-release) version. Download mode only
+        /// (no image file given).
+        #[arg(long, conflicts_with = "image")]
         beta: bool,
 
         /// Skip the post-flash read-back verification (faster, not recommended)
         #[arg(long)]
         skip_verify: bool,
+
+        /// Path to the image's detached maintainer signature (.sig). Defaults
+        /// to a `<image>.sig` sidecar next to the image when present. Local
+        /// mode only (an image file must be given).
+        #[arg(long, requires = "image", conflicts_with_all = ["url", "beta"])]
+        signature: Option<PathBuf>,
 
         /// Flash an image with no verifiable maintainer signature (e.g. a
         /// self-built or dev image). Ignored while no maintainer key is embedded.
@@ -319,10 +280,11 @@ pub enum ImageCommands {
 }
 
 impl ImageCommands {
-    /// A plain interactive `download-and-flash` of the latest stable image,
-    /// with no key-source, device, or channel overrides.
-    pub fn download_and_flash_latest() -> Self {
-        Self::DownloadAndFlash {
+    /// A plain interactive flash of the latest stable image, downloaded
+    /// automatically, with no key-source, device, or channel overrides.
+    pub fn flash_latest() -> Self {
+        Self::Flash {
+            image: None,
             url: None,
             device: None,
             endpoint: None,
@@ -333,6 +295,7 @@ impl ImageCommands {
             companion_key: None,
             beta: false,
             skip_verify: false,
+            signature: None,
             allow_unsigned: false,
         }
     }
@@ -390,6 +353,7 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
         } => cmd_download(url, output, skip_verify, beta),
         ImageCommands::Flash {
             image,
+            url,
             device,
             endpoint,
             yes,
@@ -397,55 +361,42 @@ pub fn run_image_command(command: ImageCommands) -> Result<()> {
             migrate_keys,
             consensus_key,
             companion_key,
+            beta,
             skip_verify,
             signature,
             allow_unsigned,
-        } => cmd_flash(
-            &image,
-            device,
-            endpoint.as_deref(),
-            yes,
-            KeySourceArgs {
+        } => {
+            let keys = KeySourceArgs {
                 restore_keys: restore_keys.as_deref(),
                 migrate_keys: migrate_keys.as_deref(),
                 consensus_key: consensus_key.as_deref(),
                 companion_key: companion_key.as_deref(),
-            },
-            signature.as_deref(),
-            FlashVerification {
+            };
+            let verification = FlashVerification {
                 skip_readback: skip_verify,
                 allow_unsigned,
-            },
-        ),
-        ImageCommands::DownloadAndFlash {
-            url,
-            device,
-            endpoint,
-            yes,
-            restore_keys,
-            migrate_keys,
-            consensus_key,
-            companion_key,
-            beta,
-            skip_verify,
-            allow_unsigned,
-        } => cmd_download_and_flash(
-            url,
-            device,
-            endpoint.as_deref(),
-            yes,
-            KeySourceArgs {
-                restore_keys: restore_keys.as_deref(),
-                migrate_keys: migrate_keys.as_deref(),
-                consensus_key: consensus_key.as_deref(),
-                companion_key: companion_key.as_deref(),
-            },
-            beta,
-            FlashVerification {
-                skip_readback: skip_verify,
-                allow_unsigned,
-            },
-        ),
+            };
+            match image {
+                Some(image) => cmd_flash(
+                    &image,
+                    device,
+                    endpoint.as_deref(),
+                    yes,
+                    keys,
+                    signature.as_deref(),
+                    verification,
+                ),
+                None => cmd_flash_download(
+                    url,
+                    device,
+                    endpoint.as_deref(),
+                    yes,
+                    keys,
+                    beta,
+                    verification,
+                ),
+            }
+        }
         ImageCommands::List { beta } => cmd_list(beta),
     }
 }
@@ -653,9 +604,9 @@ fn cmd_download(
     Ok(())
 }
 
-/// Shared keyed-flash logic (restore or migrate) used by both `cmd_flash` and
-/// `cmd_download_and_flash`. The `source` selects how the key material is read
-/// and how a physical card is identified for the single-reader swap guard;
+/// Shared keyed-flash logic (restore or migrate) used by both the local-image
+/// and download paths of `flash`. The `source` selects how the key material is
+/// read and how a physical card is identified for the single-reader swap guard;
 /// everything downstream is shared.
 fn run_keyed_flash(
     source: &dyn restore_keys::CardSource,
@@ -712,9 +663,9 @@ fn run_keyed_flash(
     restore_keys::run_dual_reader_restore(&target, &backup, source.noun(), job, privilege)
 }
 
-/// Where a keyed flash gets its key material. Both `flash` and
-/// `download-and-flash` accept the same options; at most one of `restore_keys`
-/// / `migrate_keys` may be set.
+/// Where a keyed flash gets its key material. The local-image and download
+/// paths of `flash` accept the same options; at most one of `restore_keys` /
+/// `migrate_keys` may be set.
 #[derive(Clone, Copy)]
 struct KeySourceArgs<'a> {
     restore_keys: Option<&'a Path>,
@@ -1055,11 +1006,11 @@ fn rootfs_hash_or_warn(hash: Result<String>) -> Option<String> {
     }
 }
 
-/// Shared trust gate of both `download-and-flash` paths: download the image
-/// with its release checksum, verify the downloaded file's hash against it,
-/// and enforce the maintainer signature policy. Returns the cached image path
-/// and the flash metadata built from the verified download. Kept in one place
-/// so the two entry points cannot diverge.
+/// Shared trust gate of both download paths (keyed and normal): download the
+/// image with its release checksum, verify the downloaded file's hash against
+/// it, and enforce the maintainer signature policy. Returns the cached image
+/// path and the flash metadata built from the verified download. Kept in one
+/// place so the two entry points cannot diverge.
 fn download_and_verify_release_image(
     dl: &DownloadInfo,
     allow_unsigned: bool,
@@ -1088,7 +1039,7 @@ fn download_and_verify_release_image(
     Ok((image_path, metadata))
 }
 
-fn cmd_download_and_flash(
+fn cmd_flash_download(
     url: Option<String>,
     device: Option<PathBuf>,
     endpoint: Option<&str>,
@@ -3177,6 +3128,101 @@ mod tests {
         assert_eq!(
             hash,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    use clap::Parser as _;
+
+    /// Test-only wrapper so `ImageCommands` (a `Subcommand`) can be parsed on
+    /// its own, exercising the merged `flash` command's mode rules.
+    #[derive(clap::Parser)]
+    struct FlashCli {
+        #[command(subcommand)]
+        cmd: ImageCommands,
+    }
+
+    fn parse_flash(args: &[&str]) -> Result<ImageCommands, clap::Error> {
+        FlashCli::try_parse_from(std::iter::once("russignol").chain(args.iter().copied()))
+            .map(|c| c.cmd)
+    }
+
+    #[test]
+    fn flash_without_image_is_download_mode() {
+        let ImageCommands::Flash { image, beta, .. } = parse_flash(&["flash"]).unwrap() else {
+            panic!("expected Flash");
+        };
+        assert_eq!(image, None);
+        assert!(!beta);
+    }
+
+    #[test]
+    fn flash_beta_parses_in_download_mode() {
+        let ImageCommands::Flash { image, beta, .. } = parse_flash(&["flash", "--beta"]).unwrap()
+        else {
+            panic!("expected Flash");
+        };
+        assert_eq!(image, None);
+        assert!(beta);
+    }
+
+    #[test]
+    fn flash_url_parses_in_download_mode() {
+        let ImageCommands::Flash { image, url, .. } =
+            parse_flash(&["flash", "--url", "http://example.com/x.img.xz"]).unwrap()
+        else {
+            panic!("expected Flash");
+        };
+        assert_eq!(image, None);
+        assert_eq!(url.as_deref(), Some("http://example.com/x.img.xz"));
+    }
+
+    #[test]
+    fn flash_with_image_is_local_mode() {
+        let ImageCommands::Flash { image, .. } = parse_flash(&["flash", "/path/to.img"]).unwrap()
+        else {
+            panic!("expected Flash");
+        };
+        assert_eq!(image, Some(PathBuf::from("/path/to.img")));
+    }
+
+    #[test]
+    fn flash_local_with_signature_parses() {
+        let ImageCommands::Flash {
+            image, signature, ..
+        } = parse_flash(&["flash", "/path/to.img", "--signature", "/path/to.img.sig"]).unwrap()
+        else {
+            panic!("expected Flash");
+        };
+        assert_eq!(image, Some(PathBuf::from("/path/to.img")));
+        assert_eq!(signature, Some(PathBuf::from("/path/to.img.sig")));
+    }
+
+    #[test]
+    fn flash_local_image_rejects_url() {
+        assert!(parse_flash(&["flash", "/path/to.img", "--url", "http://x"]).is_err());
+    }
+
+    #[test]
+    fn flash_local_image_rejects_beta() {
+        assert!(parse_flash(&["flash", "/path/to.img", "--beta"]).is_err());
+    }
+
+    #[test]
+    fn flash_signature_requires_image() {
+        assert!(parse_flash(&["flash", "--signature", "/path/to.img.sig"]).is_err());
+    }
+
+    #[test]
+    fn flash_signature_rejects_url() {
+        assert!(
+            parse_flash(&[
+                "flash",
+                "--signature",
+                "/path/to.img.sig",
+                "--url",
+                "http://x"
+            ])
+            .is_err()
         );
     }
 }
