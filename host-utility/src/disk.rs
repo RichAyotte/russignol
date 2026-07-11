@@ -19,7 +19,7 @@ use crate::utils::{self, get_partition_path, info, print_title_bar, success, war
 use crate::watermark::ChainInfo;
 use crate::{config, network};
 
-/// Maximum `panic.log` size before the doctor offers to truncate it, matching
+/// Maximum `panic.log` size before the disk check offers to truncate it, matching
 /// the 1 MiB cap the device init applies on boot.
 const PANIC_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -178,8 +178,19 @@ pub enum Remedy {
     FatStage,
     /// A node endpoint is required before this can be resolved or even judged.
     NeedsNode,
-    /// The doctor does not change this; the user or device must act.
+    /// The disk check does not change this; the user or device must act.
     Manual,
+}
+
+/// Whether the tool can apply a repair for an issue with this remedy. This is
+/// the only fix/no-fix split the report surfaces; the `HostDirect` (in place)
+/// vs `FatStage` (staged for next boot) mechanism difference is internal to the
+/// executor and deliberately not shown to the user.
+fn remedy_is_fixable(remedy: Remedy) -> bool {
+    match remedy {
+        Remedy::HostDirect | Remedy::FatStage => true,
+        Remedy::NeedsNode | Remedy::Manual => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +219,7 @@ pub enum IssueKind {
     PanicLogOversized,
 }
 
-/// A concrete, confirmable repair the doctor applies to a card in a host reader.
+/// A concrete, confirmable repair the disk check applies to a card in a host reader.
 ///
 /// Produced alongside the issue that motivates it, so the executor consumes the
 /// planned repair rather than re-deriving one from the card state.
@@ -238,7 +249,7 @@ pub struct Issue {
     pub severity: Severity,
     pub partition: Partition,
     pub remedy: Remedy,
-    /// The repair the doctor can apply for this issue: present for `HostDirect`
+    /// The repair the disk check can apply for this issue: present for `HostDirect`
     /// (in place) and `FatStage` (staged boot config) remedies, `None` for
     /// `NeedsNode` and `Manual`.
     pub action: Option<RepairAction>,
@@ -333,7 +344,7 @@ pub fn classify(state: &CardState, node: Option<&ChainInfo>) -> Vec<Issue> {
             remedy: Remedy::Manual,
             action: None,
             message: "a pending v1->v2 PIN-blob migration is present; the device \
-                      completes it on boot and the doctor leaves it untouched"
+                      completes it on boot and the disk check leaves it untouched"
                 .to_string(),
         });
     }
@@ -1036,7 +1047,7 @@ fn read_watermark_file(key_dir: &Path, name: &str) -> WatermarkFile {
 
 fn report(issues: &[Issue]) {
     println!();
-    print_title_bar("🩺 Russignol Disk Doctor");
+    print_title_bar("🩺 Russignol Disk Check");
 
     if issues.is_empty() {
         success("No issues detected — the card looks healthy.");
@@ -1072,19 +1083,10 @@ fn report(issues: &[Issue]) {
         .count();
     let fixable = issues
         .iter()
-        .filter(|i| i.remedy == Remedy::HostDirect)
+        .filter(|i| remedy_is_fixable(i.remedy))
         .count();
-    let stageable = issues
-        .iter()
-        .filter(|i| i.remedy == Remedy::FatStage)
-        .count();
-    let stage_note = if stageable > 0 {
-        format!("; {stageable} stageable for the next boot")
-    } else {
-        String::new()
-    };
     info(&format!(
-        "{critical} critical, {warnings} warning(s); {fixable} fixable in place{stage_note}."
+        "{critical} critical, {warnings} warning(s); {fixable} fixable."
     ));
 }
 
@@ -1114,8 +1116,7 @@ fn partition_label(partition: Partition) -> &'static str {
 
 fn remedy_tag(remedy: Remedy) -> colored::ColoredString {
     match remedy {
-        Remedy::HostDirect => "fixable".green(),
-        Remedy::FatStage => "fat-stage".blue(),
+        Remedy::HostDirect | Remedy::FatStage => "fix".green(),
         Remedy::NeedsNode => "needs-node".yellow(),
         Remedy::Manual => "manual".dimmed(),
     }
@@ -1382,14 +1383,11 @@ pub fn run_disk_check(
 
     let actions = plan_repairs(&issues);
     if actions.is_empty() {
-        info("No in-place repairs are available for this card.");
+        info("No repairs are available for this card.");
         return Ok(());
     }
     if dry_run {
-        info(&format!(
-            "{} repair(s) available; re-run without --dry-run to apply.",
-            actions.len()
-        ));
+        info("Re-run without --dry-run to apply.");
         return Ok(());
     }
 
@@ -1442,6 +1440,18 @@ mod tests {
         // The mount attempt autoloads f2fs on demand; still unregistered
         // afterward means the kernel has no f2fs module to offer.
         assert_eq!(inspection_from_failed_mount(false), Inspection::NotCapable);
+    }
+
+    // -- remedy display -----------------------------------------------------
+
+    #[test]
+    fn only_repairable_remedies_count_as_fixable() {
+        // Both host-direct and staged repairs read as a single "fix" to the
+        // user; needs-node and manual are not something the tool can apply.
+        assert!(remedy_is_fixable(Remedy::HostDirect));
+        assert!(remedy_is_fixable(Remedy::FatStage));
+        assert!(!remedy_is_fixable(Remedy::NeedsNode));
+        assert!(!remedy_is_fixable(Remedy::Manual));
     }
 
     // -- classifier ---------------------------------------------------------

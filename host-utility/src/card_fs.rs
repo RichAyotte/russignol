@@ -22,7 +22,7 @@ pub const DEVICE_GID: u32 = 1000;
 
 /// Mode the device sets on `chain_info.json`: owner read-only. The device
 /// (`rpi-signer/src/watermark_setup.rs`) chmods it to this after writing, so a
-/// host writer must match or the doctor reports mode drift on its own output.
+/// host writer must match or the disk check reports mode drift on its own output.
 pub const CHAIN_INFO_MODE: u32 = 0o400;
 
 /// Basename of the chain-info file on the keys partition.
@@ -43,7 +43,7 @@ pub fn write_chain_info(keys_mount: &Path, chain_info: &ChainInfo) -> Result<()>
         serde_json::to_string_pretty(&json).context("failed to serialize chain_info.json")?;
     // A prior chain_info.json is left at 0o400 (owner read-only), so a truncating
     // write is denied unless the owner first restores write permission. The
-    // doctor rewrites a stale one unprivileged, so make an existing file writable
+    // disk check rewrites a stale one unprivileged, so make an existing file writable
     // before overwriting; the mode is reset to 0o400 below.
     if path.exists() {
         let mut perms = fs::metadata(&path)
@@ -59,7 +59,7 @@ pub fn write_chain_info(keys_mount: &Path, chain_info: &ChainInfo) -> Result<()>
 }
 
 /// Set `chain_info.json` to its device mode (`0o400`, owner read-only). Shared
-/// by the writer and the doctor's mode-drift repair so the mode has one home.
+/// by the writer and the disk check's mode-drift repair so the mode has one home.
 pub fn set_chain_info_mode(path: &Path) -> Result<()> {
     let mut perms = fs::metadata(path)
         .with_context(|| format!("failed to stat {}", path.display()))?
@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn chain_info_rewrites_over_an_existing_read_only_file() {
         // The device and restore path leave chain_info.json at 0o400 (owner
-        // read-only). The doctor rewrites a stale one over that existing file
+        // read-only). The disk check rewrites a stale one over that existing file
         // while running unprivileged, where a plain truncating write is denied.
         let dir = tempfile::tempdir().unwrap();
         let stale = ChainInfo {
