@@ -194,12 +194,12 @@ Every octez-client command receives:
 ### Working with Shadownet
 
 ```bash
-# First run - auto-detects shadownet configuration
+# First run - detects the client directory, then asks which network to use
 russignol setup
 
-# Auto-detected configuration:
-# - Client Dir: ~/.octez-client-shadownet
-# - RPC Endpoint: http://127.0.0.1:8733 (from ~/.octez-node-shadownet/config.json)
+# - Client Dir: ~/.octez-client-shadownet (auto-detected)
+# - The menu's "Local system" entry is pre-filled from a detected node, e.g.
+#   http://127.0.0.1:8733 (from ~/.octez-node-shadownet/config.json)
 ```
 
 ### Working with Multiple Networks
@@ -216,22 +216,30 @@ russignol config set octez-client-dir ~/.octez-client-shadownet
 russignol config set rpc-endpoint http://127.0.0.1:8733
 ```
 
-### Public RPC Networks
+### Choosing a Network
 
-When the configured endpoint doesn't answer and no `--endpoint` was given,
-interactive commands (`setup`, `check host`, `image flash`/`download-and-flash`,
-`check disk`, `rotate-keys`) offer recovery choices: retry, enter a
-different endpoint, or pick a public RPC network. The network list comes from
-[teztnets.com](https://teztnets.com/) (Mainnet first, then long-running and
-protocol testnets), with a built-in fallback of Mainnet
-(`https://rpc.tzbeta.net`) and Shadownet
-(`https://rpc.shadownet.teztnets.com`) when teztnets.com is unreachable.
-After a working endpoint is chosen you are offered to persist it to the
-config file; declining uses it for the current run only.
+When no `--endpoint` is given, interactive commands (`setup`, `rotate-keys`,
+`check host`, `image flash`/`download-and-flash`) present a network selection
+menu rather than guessing which node to use. The menu lists:
 
-Passing `--endpoint <URL>` explicitly bypasses the picker. Note that baking
-requires your own node — public RPCs are suitable for status and watermark
-reads.
+- the public networks from [teztnets.com](https://teztnets.com/) — Mainnet
+  first, then long-running and protocol testnets (short-lived periodic nets are
+  excluded),
+- **Local system** — a node on this machine, from a detected `octez-node`
+  config or the default `http://localhost:8732`,
+- **Other** — a bare IP address (which gains the default RPC port `:8732`), a
+  `host:port`, or a full `http(s)://` URL.
+
+When teztnets.com is unreachable the list falls back to Mainnet
+(`https://rpc.tzbeta.net`) and Shadownet (`https://rpc.shadownet.teztnets.com`).
+After a working endpoint is chosen you are offered to persist it to the config
+file; declining uses it for the current run only.
+
+`check disk` is best-effort: it does not force the menu, only offering it when
+the configured node is unreachable. Passing `--endpoint <URL>` bypasses the
+menu, and non-interactive runs (`--yes`, or no TTY) never prompt. Note that
+baking requires your own node — public RPCs are suitable for status and
+watermark reads.
 
 ### Fresh Setup After Changes
 

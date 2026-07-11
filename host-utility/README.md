@@ -10,7 +10,7 @@ CLI tool for configuring and managing a Russignol hardware signer from your bake
 - SD card image flashing, with key restore and migration when re-flashing
   (including from Nomadic Labs RPI BLS signer cards)
 - Key rotation with minimal downtime
-- Interactive RPC endpoint recovery with a public-network picker
+- Interactive network selection menu (teztnets.com testnets, Mainnet, local, or custom)
 - Self-install and self-upgrade
 
 ## Installation

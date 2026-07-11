@@ -79,7 +79,7 @@ fn run_host_check(
     // it keeps the lenient loader.
     let mut config = config::RussignolConfig::load()?;
     config.with_overrides(endpoint, signer_endpoint);
-    if endpoint.is_none() && !network::resolve_endpoint_interactively(&mut config, false)? {
+    if endpoint.is_none() && !network::select_endpoint_interactively(&mut config, false)? {
         utils::warning(network::NON_INTERACTIVE_HINT.trim_start());
     }
     let healthy = status::run_status(verbose, &config);

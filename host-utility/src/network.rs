@@ -166,118 +166,157 @@ pub fn probe_endpoint(endpoint: &str) -> Result<()> {
     crate::utils::http_get_json(&agent, &url).map(|_| ())
 }
 
-enum EndpointChoice {
-    Retry,
+fn category_label(category: NetworkCategory) -> &'static str {
+    match category {
+        NetworkCategory::Mainnet => "mainnet",
+        NetworkCategory::LongRunning => "long-running testnet",
+        NetworkCategory::Protocol => "protocol testnet",
+        NetworkCategory::Periodic | NetworkCategory::Other => "testnet",
+    }
+}
+
+/// One row of the network selection menu.
+enum NetworkChoice {
+    Network(PublicNetwork),
+    /// The RPC endpoint of a node running on this machine.
+    Local(String),
+    /// Prompt for an IP address or RPC URL.
     Custom,
-    PublicNetwork,
     Cancel,
 }
 
-impl std::fmt::Display for EndpointChoice {
+impl std::fmt::Display for NetworkChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EndpointChoice::Retry => write!(f, "Retry the current endpoint"),
-            EndpointChoice::Custom => write!(f, "Enter a different endpoint"),
-            EndpointChoice::PublicNetwork => write!(f, "Use a public RPC network"),
-            EndpointChoice::Cancel => write!(f, "Cancel"),
+            NetworkChoice::Network(n) => write!(
+                f,
+                "{}  {}  [{}]",
+                n.human_name,
+                n.rpc_url,
+                category_label(n.category)
+            ),
+            NetworkChoice::Local(endpoint) => {
+                write!(f, "Local system  {endpoint}  [this machine]")
+            }
+            NetworkChoice::Custom => write!(f, "Other (enter an IP address or URL)"),
+            NetworkChoice::Cancel => write!(f, "Cancel"),
         }
     }
 }
 
-struct PickerEntry(PublicNetwork);
-
-impl std::fmt::Display for PickerEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let category = match self.0.category {
-            NetworkCategory::Mainnet => "mainnet",
-            NetworkCategory::LongRunning => "long-running testnet",
-            NetworkCategory::Protocol => "protocol testnet",
-            NetworkCategory::Periodic | NetworkCategory::Other => "testnet",
-        };
-        write!(
-            f,
-            "{}  {}  [{}]",
-            self.0.human_name, self.0.rpc_url, category
-        )
+/// Normalize user-entered node input into a canonical RPC URL. A bare host or
+/// IP gains the default RPC port (`http://host:8732`), `host:port` gains only
+/// the scheme, and a full `http(s)://` URL passes through; trailing slashes are
+/// stripped.
+fn normalize_endpoint_input(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Endpoint cannot be empty");
     }
+    if trimmed.chars().any(char::is_whitespace) {
+        anyhow::bail!("Endpoint '{trimmed}' must not contain spaces");
+    }
+
+    let normalized = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let host = trimmed
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        if host.is_empty() {
+            anyhow::bail!("Endpoint '{trimmed}' is missing a host");
+        }
+        trimmed.to_string()
+    } else if trimmed.contains('/') {
+        anyhow::bail!(
+            "Endpoint '{trimmed}' must be a bare IP/host or start with http:// or https://"
+        );
+    } else if trimmed.contains(':') {
+        format!("http://{trimmed}")
+    } else {
+        format!("http://{trimmed}:8732")
+    };
+
+    Ok(normalized.trim_end_matches('/').to_string())
 }
 
-/// When the configured endpoint doesn't answer, interactively offer retry, a
-/// custom endpoint, or a public network; returns whether an endpoint now
-/// probes OK. The chosen endpoint is applied to `config` in memory and
-/// optionally persisted (never creating a first config file silently).
+/// Assemble the flat menu: public networks first, then Local system, Other, and
+/// Cancel. `local_endpoint` is passed in so node detection stays out of this
+/// pure builder.
+fn build_network_choices(
+    networks: Vec<PublicNetwork>,
+    local_endpoint: String,
+) -> Vec<NetworkChoice> {
+    let mut choices: Vec<NetworkChoice> =
+        networks.into_iter().map(NetworkChoice::Network).collect();
+    choices.push(NetworkChoice::Local(local_endpoint));
+    choices.push(NetworkChoice::Custom);
+    choices.push(NetworkChoice::Cancel);
+    choices
+}
+
+/// Index of the menu entry whose endpoint matches `current_endpoint`, else 0.
+fn starting_cursor(choices: &[NetworkChoice], current_endpoint: &str) -> usize {
+    choices
+        .iter()
+        .position(|choice| match choice {
+            NetworkChoice::Network(n) => n.rpc_url == current_endpoint,
+            NetworkChoice::Local(endpoint) => endpoint == current_endpoint,
+            NetworkChoice::Custom | NetworkChoice::Cancel => false,
+        })
+        .unwrap_or(0)
+}
+
+/// The RPC endpoint of a node on this machine: read from a local octez-node's
+/// config, or the default local port when none is found.
+fn local_system_endpoint() -> String {
+    crate::config::RussignolConfig::detect_rpc_endpoint_from_node()
+        .unwrap_or_else(|| crate::config::DEFAULT_RPC_ENDPOINT.to_string())
+}
+
+/// Present the network selection menu and apply the choice to `config`.
 ///
-/// Non-interactive runs return `false` immediately — callers keep their
-/// existing error paths and append `NON_INTERACTIVE_HINT`.
-pub fn resolve_endpoint_interactively(
-    config: &mut crate::config::RussignolConfig,
-    yes: bool,
-) -> Result<bool> {
-    if probe_endpoint(&config.rpc_endpoint).is_ok() {
-        return Ok(true);
-    }
-    if yes || crate::confirmation::is_non_interactive() {
-        return Ok(false);
-    }
-
+/// Loops until the chosen endpoint answers a probe (persisting it) or the user
+/// cancels. The chosen endpoint is applied to `config` in memory and optionally
+/// persisted (never creating a first config file silently).
+fn pick_network_interactively(config: &mut crate::config::RussignolConfig) -> Result<bool> {
     let theme = crate::utils::create_orange_theme();
-    crate::utils::warning(&format!(
-        "No Tezos node is responding at {}.",
-        config.rpc_endpoint
-    ));
-
+    let networks = order_for_picker(fetch_public_networks());
+    let local_endpoint = local_system_endpoint();
     loop {
-        let choice = inquire::Select::new(
-            "How would you like to proceed?",
-            vec![
-                EndpointChoice::Retry,
-                EndpointChoice::Custom,
-                EndpointChoice::PublicNetwork,
-                EndpointChoice::Cancel,
-            ],
-        )
-        .with_render_config(theme)
-        .prompt();
+        let choices = build_network_choices(networks.clone(), local_endpoint.clone());
+        let cursor = starting_cursor(&choices, &config.rpc_endpoint);
 
-        let candidate = match choice {
-            Ok(EndpointChoice::Retry) => config.rpc_endpoint.clone(),
-            Ok(EndpointChoice::Custom) => {
-                let entered = inquire::Text::new("RPC endpoint:")
+        let selected = inquire::Select::new("Which Tezos network?", choices)
+            .with_starting_cursor(cursor)
+            .with_help_message(
+                "Baking requires your own node; public RPCs are fine for status and \
+                 watermark reads.",
+            )
+            .with_render_config(theme)
+            .prompt();
+
+        let candidate = match selected {
+            Ok(NetworkChoice::Network(n)) => n.rpc_url,
+            Ok(NetworkChoice::Local(endpoint)) => endpoint,
+            Ok(NetworkChoice::Custom) => {
+                let entered = inquire::Text::new("Node IP address or RPC URL:")
                     .with_default(&config.rpc_endpoint)
-                    .with_help_message("Must start with http:// or https://")
+                    .with_help_message(
+                        "e.g. 192.168.1.50, 192.168.1.50:8732, or https://rpc.example.com",
+                    )
                     .with_render_config(theme)
                     .prompt();
                 match entered {
-                    Ok(url) if url.starts_with("http://") || url.starts_with("https://") => {
-                        url.trim_end_matches('/').to_string()
-                    }
-                    Ok(url) => {
-                        crate::utils::warning(&format!(
-                            "Invalid endpoint '{url}': must start with http:// or https://"
-                        ));
-                        continue;
-                    }
+                    Ok(input) => match normalize_endpoint_input(&input) {
+                        Ok(url) => url,
+                        Err(e) => {
+                            crate::utils::warning(&format!("{e}"));
+                            continue;
+                        }
+                    },
                     Err(_) => continue,
                 }
             }
-            Ok(EndpointChoice::PublicNetwork) => {
-                crate::utils::warning(
-                    "Baking requires your own node; public RPCs are fine for status and \
-                     watermark reads.",
-                );
-                let entries: Vec<PickerEntry> = order_for_picker(fetch_public_networks())
-                    .into_iter()
-                    .map(PickerEntry)
-                    .collect();
-                match inquire::Select::new("Network:", entries)
-                    .with_render_config(theme)
-                    .prompt()
-                {
-                    Ok(entry) => entry.0.rpc_url,
-                    Err(_) => continue,
-                }
-            }
-            Ok(EndpointChoice::Cancel) | Err(_) => return Ok(false),
+            Ok(NetworkChoice::Cancel) | Err(_) => return Ok(false),
         };
 
         match probe_endpoint(&candidate) {
@@ -290,10 +329,49 @@ pub fn resolve_endpoint_interactively(
                 return Ok(true);
             }
             Err(e) => {
-                crate::utils::warning(&format!("Still no answer from {candidate}: {e:#}"));
+                crate::utils::warning(&format!("No answer from {candidate}: {e:#}"));
             }
         }
     }
+}
+
+/// Ask the user which network to use, returning whether an endpoint now probes
+/// OK. Shows the selection menu on every interactive run so a node is never
+/// chosen silently.
+///
+/// Non-interactive runs (`yes` or no TTY) skip the menu: they probe the
+/// configured endpoint and return whether it answered, so callers keep their
+/// existing error paths and append `NON_INTERACTIVE_HINT`.
+pub fn select_endpoint_interactively(
+    config: &mut crate::config::RussignolConfig,
+    yes: bool,
+) -> Result<bool> {
+    if yes || crate::confirmation::is_non_interactive() {
+        return Ok(probe_endpoint(&config.rpc_endpoint).is_ok());
+    }
+    pick_network_interactively(config)
+}
+
+/// Recover an endpoint only when the configured one doesn't answer: probe
+/// first, and show the selection menu just on failure. Used by best-effort
+/// flows that should not prompt when the current node is reachable.
+///
+/// Non-interactive runs return whether the configured endpoint answered.
+pub fn resolve_endpoint_interactively(
+    config: &mut crate::config::RussignolConfig,
+    yes: bool,
+) -> Result<bool> {
+    if probe_endpoint(&config.rpc_endpoint).is_ok() {
+        return Ok(true);
+    }
+    if yes || crate::confirmation::is_non_interactive() {
+        return Ok(false);
+    }
+    crate::utils::warning(&format!(
+        "No Tezos node is responding at {}.",
+        config.rpc_endpoint
+    ));
+    pick_network_interactively(config)
 }
 
 /// Offer to save the in-memory endpoint; asks before creating a config file
@@ -465,5 +543,106 @@ mod tests {
             category: NetworkCategory::LongRunning,
         }];
         assert_eq!(human_name_for_chain("", &networks), None);
+    }
+
+    #[test]
+    fn normalize_bare_ip_gets_default_port() {
+        assert_eq!(
+            normalize_endpoint_input("192.168.1.50").unwrap(),
+            "http://192.168.1.50:8732"
+        );
+    }
+
+    #[test]
+    fn normalize_host_port_gets_scheme_only() {
+        assert_eq!(
+            normalize_endpoint_input("192.168.1.50:8733").unwrap(),
+            "http://192.168.1.50:8733"
+        );
+    }
+
+    #[test]
+    fn normalize_full_url_passthrough_and_strips_trailing_slash() {
+        assert_eq!(
+            normalize_endpoint_input("https://rpc.tzbeta.net/").unwrap(),
+            "https://rpc.tzbeta.net"
+        );
+        assert_eq!(
+            normalize_endpoint_input("http://localhost:8732").unwrap(),
+            "http://localhost:8732"
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_empty_and_garbage() {
+        assert!(normalize_endpoint_input("   ").is_err());
+        assert!(normalize_endpoint_input("has space").is_err());
+        assert!(normalize_endpoint_input("no/scheme/path").is_err());
+        assert!(normalize_endpoint_input("http://").is_err());
+    }
+
+    #[test]
+    fn choices_list_mainnet_first_then_local_custom_cancel() {
+        let networks = order_for_picker(parse_teztnets(&teztnets_fixture()));
+        let choices = build_network_choices(networks, "http://localhost:8732".to_string());
+
+        assert!(
+            matches!(&choices[0], NetworkChoice::Network(n) if n.human_name == "Mainnet"),
+            "first entry is Mainnet"
+        );
+        let n = choices.len();
+        assert!(matches!(&choices[n - 3], NetworkChoice::Local(e) if e == "http://localhost:8732"));
+        assert!(matches!(choices[n - 2], NetworkChoice::Custom));
+        assert!(matches!(choices[n - 1], NetworkChoice::Cancel));
+    }
+
+    #[test]
+    fn choices_offline_still_offer_local_mainnet_and_custom() {
+        let choices = build_network_choices(
+            order_for_picker(fallback_networks()),
+            "http://localhost:8732".to_string(),
+        );
+        assert!(choices.iter().any(|c| matches!(c, NetworkChoice::Local(_))));
+        assert!(choices.iter().any(|c| matches!(c, NetworkChoice::Custom)));
+        assert!(
+            choices
+                .iter()
+                .any(|c| matches!(c, NetworkChoice::Network(n) if n.human_name == "Mainnet"))
+        );
+    }
+
+    #[test]
+    fn starting_cursor_matches_local_and_network_endpoints() {
+        let choices = build_network_choices(
+            order_for_picker(fallback_networks()),
+            "http://localhost:8732".to_string(),
+        );
+
+        let local_idx = choices
+            .iter()
+            .position(|c| matches!(c, NetworkChoice::Local(_)))
+            .unwrap();
+        assert_eq!(
+            starting_cursor(&choices, "http://localhost:8732"),
+            local_idx
+        );
+
+        let main_idx = choices
+            .iter()
+            .position(|c| matches!(c, NetworkChoice::Network(n) if n.human_name == "Mainnet"))
+            .unwrap();
+        assert_eq!(
+            starting_cursor(&choices, "https://rpc.tzbeta.net"),
+            main_idx
+        );
+    }
+
+    #[test]
+    fn starting_cursor_defaults_to_zero_when_no_match() {
+        let choices = build_network_choices(
+            order_for_picker(fallback_networks()),
+            "http://localhost:8732".to_string(),
+        );
+        assert_eq!(starting_cursor(&choices, "https://nowhere.invalid"), 0);
     }
 }

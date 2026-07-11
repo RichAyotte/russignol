@@ -549,36 +549,36 @@ fn check_node_for_watermarks(
     endpoint_override: Option<&str>,
     yes: bool,
 ) -> Result<Option<NodeCheck>> {
-    let effective_config = effective_config(endpoint_override);
-
-    if let Some(mut cfg) = effective_config {
-        match watermark::prefetch_chain_info(&cfg) {
-            Ok(chain_info) => Ok(Some(NodeCheck {
-                chain_info,
-                config: cfg,
-            })),
-            Err(e) => {
-                if endpoint_override.is_none()
-                    && crate::network::resolve_endpoint_interactively(&mut cfg, yes)?
-                {
-                    let chain_info = watermark::prefetch_chain_info(&cfg)?;
-                    return Ok(Some(NodeCheck {
-                        chain_info,
-                        config: cfg,
-                    }));
-                }
-                bail!(
-                    "Node check failed: {e}. Ensure your node is running before flashing.{}",
-                    crate::network::NON_INTERACTIVE_HINT
-                );
-            }
-        }
+    let non_interactive = yes || crate::confirmation::is_non_interactive();
+    let mut cfg = if let Some(cfg) = effective_config(endpoint_override) {
+        cfg
     } else {
-        utils::warning(
-            "No russignol configuration found. Watermarks will not be configured.\n  \
-             Run 'russignol config' first, or use 'russignol check disk' after flashing.",
-        );
-        Ok(None)
+        // No config file and no --endpoint. Without a TTY there is nothing to
+        // ask, so skip watermark configuration; interactively, the selection
+        // menu below lets the user choose a network to configure against.
+        if non_interactive {
+            utils::warning(
+                "No russignol configuration found. Watermarks will not be configured.\n  \
+                 Run 'russignol config' first, or use 'russignol check disk' after flashing.",
+            );
+            return Ok(None);
+        }
+        config::RussignolConfig::minimal_with_endpoint(config::DEFAULT_RPC_ENDPOINT)
+    };
+
+    if endpoint_override.is_none() && !non_interactive {
+        crate::network::select_endpoint_interactively(&mut cfg, yes)?;
+    }
+
+    match watermark::prefetch_chain_info(&cfg) {
+        Ok(chain_info) => Ok(Some(NodeCheck {
+            chain_info,
+            config: cfg,
+        })),
+        Err(e) => bail!(
+            "Node check failed: {e}. Ensure your node is running before flashing.{}",
+            crate::network::NON_INTERACTIVE_HINT
+        ),
     }
 }
 

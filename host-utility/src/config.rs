@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 const CONFIG_VERSION: u32 = 2;
-const DEFAULT_RPC_ENDPOINT: &str = "http://localhost:8732";
+pub(crate) const DEFAULT_RPC_ENDPOINT: &str = "http://localhost:8732";
 const DEFAULT_DAL_ENDPOINT: &str = "http://localhost:10732";
 
 /// Minimal structure to extract RPC config from octez-node config.json
@@ -371,13 +371,11 @@ impl RussignolConfig {
         // For now, don't auto-detect node directory (optional field)
         let node_dir = None;
 
-        // Try to detect RPC endpoint from node config, or prompt if not found
-        let rpc_endpoint = if let Some(detected) = Self::detect_rpc_endpoint_from_node() {
-            println!("  {} Detected RPC endpoint: {}", "✓".green(), detected);
-            detected
-        } else {
-            Self::prompt_for_rpc_endpoint()?
-        };
+        // The network is chosen interactively by `network::select_endpoint_interactively`,
+        // not guessed here; seed with a detected or default local endpoint that the
+        // menu then overrides.
+        let rpc_endpoint = Self::detect_rpc_endpoint_from_node()
+            .unwrap_or_else(|| DEFAULT_RPC_ENDPOINT.to_string());
 
         // Try to detect DAL node endpoint. Finding a directory only tells us a
         // DAL node is configured, not that it is reachable — probe the port
@@ -490,7 +488,7 @@ impl RussignolConfig {
     ///
     /// Searches for octez-node directories and reads the RPC listen address
     /// from config.json if available.
-    fn detect_rpc_endpoint_from_node() -> Option<String> {
+    pub(crate) fn detect_rpc_endpoint_from_node() -> Option<String> {
         let home = std::env::var("HOME").ok()?;
         let home_path = Path::new(&home);
 
@@ -610,34 +608,6 @@ impl RussignolConfig {
         }
 
         None
-    }
-
-    /// Prompt user for RPC endpoint with auto-detected or default value
-    fn prompt_for_rpc_endpoint() -> Result<String> {
-        // Try to detect RPC endpoint from node config
-        let detected = Self::detect_rpc_endpoint_from_node();
-        let default_endpoint = detected.as_deref().unwrap_or(DEFAULT_RPC_ENDPOINT);
-
-        if detected.is_some() {
-            println!(
-                "  {} Detected RPC endpoint: {}",
-                "✓".green(),
-                default_endpoint
-            );
-        }
-
-        let endpoint = inquire::Text::new("Enter Octez node RPC endpoint:")
-            .with_default(default_endpoint)
-            .with_help_message("The URL where your octez-node RPC is accessible")
-            .prompt()
-            .context("Failed to get user input")?;
-
-        // Basic validation
-        if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
-            anyhow::bail!("RPC endpoint must start with http:// or https://");
-        }
-
-        Ok(endpoint)
     }
 
     /// Reset configuration - delete config file and re-run auto-detection

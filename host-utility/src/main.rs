@@ -380,7 +380,7 @@ fn handle_rotate_keys_command(
     let mut config = config::RussignolConfig::load_valid()?;
     config.with_overrides(endpoint, signer_endpoint);
     if endpoint.is_none() {
-        network::resolve_endpoint_interactively(&mut config, opts.auto_confirm || opts.dry_run)?;
+        network::select_endpoint_interactively(&mut config, opts.auto_confirm || opts.dry_run)?;
     }
     rotate_keys::run(opts, hardware_config, restart_config, &config)
 }
@@ -409,7 +409,7 @@ fn run_setup(setup_config: &SetupConfig<'_>) -> Result<()> {
     let mut config = config::RussignolConfig::load_valid()?;
     config.with_overrides(*endpoint, *signer_endpoint);
     if endpoint.is_none() {
-        network::resolve_endpoint_interactively(
+        network::select_endpoint_interactively(
             &mut config,
             confirmation.auto_confirm || confirmation.dry_run,
         )?;
