@@ -65,17 +65,18 @@ fn wait_for_user(prompt: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Wait for user to dismiss a watermark reset confirmation dialog on the device.
-/// Used after tests that trigger "Level too low" errors which show RESET/CANCEL buttons.
-/// `expected_dialog` describes what the dialog should show.
+/// Wait for the operator to dismiss a watermark dialog on the device.
+/// Used after tests that trigger "Level too low" errors, which show a dialog
+/// with a "Set level to N" button and Cancel. `expected_dialog` describes what
+/// the dialog should show.
 fn wait_for_reset_dialog(expected_dialog: &str) -> Result<(), String> {
     println!();
     println!(
         "    The device should be showing: {}",
         expected_dialog.yellow()
     );
-    println!("    This is a RESET confirmation dialog with RESET and CANCEL buttons.");
-    println!("    Press CANCEL on the device to dismiss it (preserve watermark).");
+    println!("    This is a watermark dialog with a \"Set level to N\" button and Cancel.");
+    println!("    Press Cancel on the device to dismiss it (keep the current watermark).");
     println!("    Press ENTER here when the device shows the home screen...");
     let mut input = String::new();
     std::io::stdin()
@@ -84,9 +85,9 @@ fn wait_for_reset_dialog(expected_dialog: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Handle a watermark error by prompting the user to reset or cancel on the device.
-/// Returns Ok(true) if user reset and we should retry, Ok(false) if user cancelled,
-/// or Err if something went wrong.
+/// Prompt the operator to confirm or cancel the watermark dialog on the device.
+/// Returns Ok(true) if they confirmed ("Set level to N"), Ok(false) if they
+/// cancelled, or Err if the input was invalid.
 fn handle_watermark_error(error_msg: &str) -> Result<bool, String> {
     println!();
     println!(
@@ -105,10 +106,14 @@ fn handle_watermark_error(error_msg: &str) -> Result<bool, String> {
     );
     println!("    Error: {}", error_msg.dimmed());
     println!();
-    println!("    The device should be showing a watermark error dialog.");
-    println!("    Please interact with the device:");
-    println!("       [R] = Press RESET on device to clear watermark, then press R here");
-    println!("       [C] = Press CANCEL on device to keep watermark, then press C here");
+    println!("    The device should be showing a watermark dialog.");
+    println!("    Interact with the device, then tell me what you did:");
+    println!(
+        "       [S] = Pressed \"Set level to N\" on the device (sets the watermark), then press S here"
+    );
+    println!(
+        "       [C] = Pressed Cancel on the device (keeps the current watermark), then press C here"
+    );
     print!("    Your choice: ");
     std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
 
@@ -124,14 +129,14 @@ fn handle_watermark_error(error_msg: &str) -> Result<bool, String> {
         .read_line(&mut ready)
         .map_err(|e| e.to_string())?;
 
-    if choice == "r" || choice == "reset" {
-        println!("    Watermark reset - will retry operation...");
+    if choice == "s" || choice == "set" {
+        println!("    Watermark level set on the device.");
         Ok(true)
     } else if choice == "c" || choice == "cancel" {
-        println!("    Watermark preserved.");
+        println!("    Watermark unchanged.");
         Ok(false)
     } else {
-        Err(format!("Invalid choice '{choice}'. Please enter R or C."))
+        Err(format!("Invalid choice '{choice}'. Please enter S or C."))
     }
 }
 
@@ -430,42 +435,43 @@ impl TestSuite {
 
         // Test 1.1: Forward progression (block)
         self.run_test("1.1 Forward progression (block)", |ctx, pkh| {
-            // Sign at level 100 - may need retry if watermark exists from previous run
-            loop {
-                let mut stream = ctx.connect().map_err(|e| e.to_string())?;
-                let data = create_block_data(100, 0);
-                let request = SignerRequest::Sign {
-                    pkh: (pkh, 0),
-                    data,
-                    signature: None,
-                };
-                let response = ctx
-                    .send_request(&mut stream, &request)
-                    .map_err(|e| e.to_string())?;
+            // Establish the baseline at level 100. On a freshly cleaned device the
+            // block watermark is missing, so the device shows a "Set level to 100"
+            // recovery dialog; confirming it sets the floor to 100. The floor records
+            // 100 as signed, so re-signing 100 is a replay — forward progression is
+            // proven by the level-101 signature below, not by retrying 100.
+            let mut stream = ctx.connect().map_err(|e| e.to_string())?;
+            let data = create_block_data(100, 0);
+            let request = SignerRequest::Sign {
+                pkh: (pkh, 0),
+                data,
+                signature: None,
+            };
+            let response = ctx
+                .send_request(&mut stream, &request)
+                .map_err(|e| e.to_string())?;
 
-                match response {
-                    SignerResponse::Signature(_) => {
-                        ctx.log("Signed level 100");
-                        break;
+            match response {
+                SignerResponse::Signature(_) => ctx.log("Signed level 100"),
+                SignerResponse::Error(ref e) if e.contains("not initialized") => {
+                    // Missing watermark: the device shows the recovery dialog.
+                    if !handle_watermark_error(e)? {
+                        return Err(format!("Operator cancelled the watermark dialog: {e}"));
                     }
-                    SignerResponse::Error(ref e)
-                        if e.contains("Watermark") || e.contains("watermark") =>
-                    {
-                        // Watermark error - prompt user to reset or cancel
-                        if handle_watermark_error(e)? {
-                            // User reset - retry
-                            continue;
-                        }
-                        // User cancelled - fail test
-                        return Err(format!("User cancelled watermark reset: {e}"));
-                    }
-                    other => {
-                        return Err(format!("Expected signature at level 100, got: {other:?}"));
-                    }
+                    ctx.log("Recovered missing watermark to level 100");
+                }
+                SignerResponse::Error(ref e) => {
+                    return Err(format!(
+                        "Watermark already initialized at or above level 100 ({e}); \
+                         run with --clean to reset it first"
+                    ));
+                }
+                other => {
+                    return Err(format!("Expected signature at level 100, got: {other:?}"));
                 }
             }
 
-            // Sign at level 101
+            // Prove forward progression: level 101 must sign (101 > the level-100 floor).
             let mut stream = ctx.connect().map_err(|e| e.to_string())?;
             let data = create_block_data(101, 0);
             let request = SignerRequest::Sign {
@@ -527,7 +533,7 @@ impl TestSuite {
                 SignerResponse::Error(e) if e.contains("Level too low") || e.contains("level") => {
                     ctx.log("Correctly rejected level 199");
                     wait_for_reset_dialog(
-                        "Level too low - RESET confirmation with level 200 → 199",
+                        "Level too low: \"Set level to 199\" dialog (watermark at 200)",
                     )?;
                     Ok(())
                 }
@@ -708,7 +714,7 @@ impl TestSuite {
                 SignerResponse::Error(e) if e.contains("Level too low") || e.contains("level") => {
                     ctx.log("Correctly rejected attestation level 599");
                     wait_for_reset_dialog(
-                        "Level too low - RESET confirmation with level 600 → 599",
+                        "Level too low: \"Set level to 599\" dialog (watermark at 600)",
                     )?;
                     Ok(())
                 }
@@ -842,7 +848,7 @@ impl TestSuite {
                 SignerResponse::Error(_) => {
                     ctx.log("Block at 999: Correctly rejected");
                     wait_for_reset_dialog(
-                        "Level too low - RESET confirmation with level 1000 → 999",
+                        "Level too low: \"Set level to 999\" dialog (watermark at 1000)",
                     )?;
                     Ok(())
                 }
@@ -915,7 +921,7 @@ impl TestSuite {
                 SignerResponse::Error(_) => {
                     ctx.log("Mainnet block at 1999: Correctly rejected");
                     wait_for_reset_dialog(
-                        "Level too low - RESET confirmation (mainnet) level 2000 → 1999",
+                        "Level too low: \"Set level to 1999\" dialog (mainnet, watermark at 2000)",
                     )?;
                     Ok(())
                 }
@@ -1124,7 +1130,7 @@ impl TestSuite {
     fn run_category_interactive_reset(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "\n{}",
-            "─── Category 5: Interactive Reset ─────────────────────────────"
+            "─── Category 5: Interactive Set Level ─────────────────────────"
                 .cyan()
                 .bold()
         );
@@ -1182,7 +1188,8 @@ impl TestSuite {
             Ok(())
         });
 
-        // This test triggers the error and waits for user to confirm reset or cancel
+        // This test triggers the error and waits for the operator to confirm the
+        // "Set level" dialog or cancel it
         self.run_test(
             "5.2 Interactive: Trigger error and verify user action",
             |ctx, pkh| {
@@ -1218,11 +1225,13 @@ impl TestSuite {
                         );
                         println!("    Watermark error triggered: {}", e.dimmed());
                         println!();
-                        println!("    The device should be showing a reset confirmation dialog.");
-                        println!("    1. Touch RESET or CANCEL on the device screen");
+                        println!(
+                            "    The device should be showing a \"Set level to 100\" watermark dialog."
+                        );
+                        println!("    1. Touch \"Set level to 100\" or Cancel on the device screen");
                         println!("    2. Wait for the device to return to the home screen");
                         println!("    3. Then tell me what you pressed:");
-                        println!("       [R] = I pressed Reset");
+                        println!("       [S] = I pressed \"Set level to 100\"");
                         println!("       [C] = I pressed Cancel");
                         print!("    Your choice: ");
                         std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
@@ -1233,7 +1242,7 @@ impl TestSuite {
                             .map_err(|e| e.to_string())?;
                         let choice = input.trim().to_lowercase();
 
-                        if choice == "r" || choice == "reset" {
+                        if choice == "s" || choice == "set" {
                             // Wait for user to confirm device is back to home screen
                             println!("    Press ENTER when the device shows the home screen...");
                             let mut ready = String::new();
@@ -1241,13 +1250,17 @@ impl TestSuite {
                                 .read_line(&mut ready)
                                 .map_err(|e| e.to_string())?;
 
-                            println!("    Verifying reset was successful...");
+                            println!("    Verifying the watermark was set...");
 
-                            // Verify the signing works after reset
+                            // "Set level to 100" records 100 as signed, so verify the
+                            // lowered floor by signing 101 — rejected before (floor was
+                            // 10000), now allowed.
+                            let verify_data =
+                                create_block_data_with_chain(&interactive_chain, 101, 0);
                             let mut verify_stream = ctx.connect().map_err(|e| e.to_string())?;
                             let verify_request = SignerRequest::Sign {
                                 pkh: (pkh, 0),
-                                data: data.clone(),
+                                data: verify_data,
                                 signature: None,
                             };
                             let verify_response = ctx
@@ -1257,15 +1270,15 @@ impl TestSuite {
                             match verify_response {
                                 SignerResponse::Signature(_) => {
                                     println!(
-                                        "    Reset confirmed! Signing at level 100 succeeded."
+                                        "    Set level confirmed! Signing at level 101 succeeded."
                                     );
                                     Ok(())
                                 }
                                 SignerResponse::Error(verify_e) => Err(format!(
-                                    "Reset did not work - still getting error: {verify_e}"
+                                    "Set level did not work - still getting error: {verify_e}"
                                 )),
                                 _ => Err(format!(
-                                    "Unexpected response after reset: {verify_response:?}"
+                                    "Unexpected response after setting level: {verify_response:?}"
                                 )),
                             }
                         } else if choice == "c" || choice == "cancel" {
@@ -1297,7 +1310,7 @@ impl TestSuite {
                                     Ok(())
                                 }
                                 SignerResponse::Signature(_) => {
-                                    Err("Cancel failed - watermark was unexpectedly reset"
+                                    Err("Cancel failed - watermark was unexpectedly changed"
                                         .to_string())
                                 }
                                 _ => Err(format!(
@@ -1305,7 +1318,7 @@ impl TestSuite {
                                 )),
                             }
                         } else {
-                            Err(format!("Invalid choice '{choice}'. Please enter R or C."))
+                            Err(format!("Invalid choice '{choice}'. Please enter S or C."))
                         }
                     }
                     SignerResponse::Signature(_) => {
