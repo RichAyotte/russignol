@@ -9,6 +9,10 @@ use anyhow::Result;
 /// Chain name mainnet has always used; stable enough to hardcode.
 pub const MAINNET_CHAIN_NAME: &str = "TEZOS_MAINNET";
 
+/// Mainnet's chain id has never changed, so a Mainnet card can be matched to a
+/// Mainnet node without first querying a node for its chain id.
+pub const MAINNET_CHAIN_ID: &str = "NetXdQprcVkpaWU";
+
 pub const MAINNET_RPC_URL: &str = "https://rpc.tzbeta.net";
 pub const SHADOWNET_RPC_URL: &str = "https://rpc.shadownet.teztnets.com";
 
@@ -349,28 +353,6 @@ pub fn select_endpoint_interactively(
     if yes || crate::confirmation::is_non_interactive() {
         return Ok(probe_endpoint(&config.rpc_endpoint).is_ok());
     }
-    pick_network_interactively(config)
-}
-
-/// Recover an endpoint only when the configured one doesn't answer: probe
-/// first, and show the selection menu just on failure. Used by best-effort
-/// flows that should not prompt when the current node is reachable.
-///
-/// Non-interactive runs return whether the configured endpoint answered.
-pub fn resolve_endpoint_interactively(
-    config: &mut crate::config::RussignolConfig,
-    yes: bool,
-) -> Result<bool> {
-    if probe_endpoint(&config.rpc_endpoint).is_ok() {
-        return Ok(true);
-    }
-    if yes || crate::confirmation::is_non_interactive() {
-        return Ok(false);
-    }
-    crate::utils::warning(&format!(
-        "No Tezos node is responding at {}.",
-        config.rpc_endpoint
-    ));
     pick_network_interactively(config)
 }
 

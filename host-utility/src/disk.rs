@@ -193,6 +193,17 @@ fn remedy_is_fixable(remedy: Remedy) -> bool {
     }
 }
 
+/// A card with no fault and nothing to repair. Info-severity findings describe
+/// expected, self-resolving state — a staged config the device consumes on its
+/// next boot, a directory it recreates on boot — so they are not issues: there
+/// is nothing to warn about and nothing to act on. A fixable finding of any
+/// severity means a repair is pending, so it is not healthy.
+fn is_healthy(issues: &[Issue]) -> bool {
+    !issues.iter().any(|i| {
+        matches!(i.severity, Severity::Critical | Severity::Warning) || remedy_is_fixable(i.remedy)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueKind {
     SetupIncomplete,
@@ -599,10 +610,30 @@ fn classify_chain_info(state: &CardState, node: Option<&ChainInfo>, issues: &mut
     }
 }
 
+/// Whether a staged boot config the device will consume seeds the per-key
+/// watermark floors on its next boot, so a wholly absent watermark directory is
+/// pending that seed rather than a fault the host must repair now.
+///
+/// A fresh key has no existing floor, so the device's post-unlock seed path
+/// (`rpi-signer` `recover_watermark_config` → `HighWatermark::seed_floor`)
+/// unconditionally creates the directory and writes the authenticated floor —
+/// but only for the chain the config targets, so a config whose chain differs
+/// from the node's (the stale case `classify_boot_config` flags for deletion)
+/// does not cover it. With no node the staged config is taken at face value,
+/// matching the never-booted path's `boot_config.is_none()` gate above.
+fn staged_config_seeds_watermarks(state: &CardState, node: Option<&ChainInfo>) -> bool {
+    match (&state.boot_config, node) {
+        (Some(bc), Some(n)) => n.id == bc.chain_id,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 fn classify_watermarks(state: &CardState, node: Option<&ChainInfo>, issues: &mut Vec<Issue>) {
+    let seeds_pending = staged_config_seeds_watermarks(state, node);
     let mut any_valid = false;
     for key in &state.watermarks {
-        classify_key_watermarks(key, node, issues, &mut any_valid);
+        classify_key_watermarks(key, node, seeds_pending, issues, &mut any_valid);
     }
     // Valid floors exist but there is no head to compare them against.
     if any_valid && node.is_none() {
@@ -622,6 +653,7 @@ fn classify_watermarks(state: &CardState, node: Option<&ChainInfo>, issues: &mut
 fn classify_key_watermarks(
     key: &KeyWatermarks,
     node: Option<&ChainInfo>,
+    seeds_pending: bool,
     issues: &mut Vec<Issue>,
     any_valid: &mut bool,
 ) {
@@ -636,14 +668,20 @@ fn classify_key_watermarks(
     };
     let stage_action = node.map(|n| RepairAction::StageBootConfig(n.clone()));
     if !key.dir_present {
-        issues.push(Issue {
-            kind: IssueKind::WatermarkDirMissing,
-            severity: Severity::Critical,
-            partition: Partition::Data,
-            remedy,
-            action: stage_action,
-            message: format!("the watermark directory for key {} is missing", key.pkh),
-        });
+        // A covering staged config already is the remedy: the device creates the
+        // directory and seeds the floor on its next boot, so offering to stage
+        // another would be redundant and misread as a fault. classify_boot_config
+        // surfaces the staged config the operator is waiting on.
+        if !seeds_pending {
+            issues.push(Issue {
+                kind: IssueKind::WatermarkDirMissing,
+                severity: Severity::Critical,
+                partition: Partition::Data,
+                remedy,
+                action: stage_action,
+                message: format!("the watermark directory for key {} is missing", key.pkh),
+            });
+        }
         return;
     }
 
@@ -1049,8 +1087,8 @@ fn report(issues: &[Issue]) {
     println!();
     print_title_bar("🩺 Russignol Disk Check");
 
-    if issues.is_empty() {
-        success("No issues detected — the card looks healthy.");
+    if is_healthy(issues) {
+        success("No issues found — the card is good.");
         return;
     }
 
@@ -1344,6 +1382,139 @@ fn apply_action(mount: &Path, node: Option<&ChainInfo>, action: &RepairAction) -
 }
 
 // =============================================================================
+// Node selection (the card's own chain is authoritative)
+// =============================================================================
+
+/// The chain the card is for, taken from the card itself. `chain_info.json` is
+/// the network the device commits to signing; the staged boot config's chain is
+/// the fallback when the keys partition can't be read (no f2fs / no privilege),
+/// which is exactly when a Mainnet card would otherwise be diagnosed against
+/// whatever testnet the host's saved endpoint points at.
+fn card_target_chain_id(state: &CardState) -> Option<&str> {
+    match &state.chain_info {
+        ChainInfoState::Present { id, .. } => Some(id.as_str()),
+        _ => state.boot_config.as_ref().map(|bc| bc.chain_id.as_str()),
+    }
+}
+
+/// What to do with the endpoint currently configured, given the chain the card
+/// is for. A card doctor's node is only a reference for the card's own chain, so
+/// a node on a different chain must never stand in for it.
+#[derive(Debug, PartialEq, Eq)]
+enum NodePlan {
+    /// The endpoint is on the card's chain (or the card names none); use it.
+    Accept,
+    /// Switch to this endpoint (the Mainnet public RPC) and re-check.
+    Switch(&'static str),
+    /// Ask the operator to point at the card's network.
+    Prompt,
+    /// No node on the card's chain is available; node-based checks stay unknown.
+    GiveUp,
+}
+
+/// Decide how to reconcile the configured endpoint with the card's chain.
+///
+/// `current` is the chain id the configured endpoint reported, or `None` when it
+/// was unreachable. An explicit `--endpoint` is honored as the operator's
+/// choice: it is used when it matches and dropped (not auto-replaced) when it
+/// does not.
+fn plan_node(
+    current: Option<&str>,
+    card_chain_id: Option<&str>,
+    explicit_endpoint: bool,
+    non_interactive: bool,
+) -> NodePlan {
+    // Nothing on the card to match against: whatever answered is all we can use.
+    let Some(cid) = card_chain_id else {
+        return NodePlan::Accept;
+    };
+    if current == Some(cid) {
+        return NodePlan::Accept;
+    }
+    if explicit_endpoint {
+        return NodePlan::GiveUp;
+    }
+    if cid == network::MAINNET_CHAIN_ID {
+        return NodePlan::Switch(network::MAINNET_RPC_URL);
+    }
+    if non_interactive {
+        return NodePlan::GiveUp;
+    }
+    NodePlan::Prompt
+}
+
+/// Keep a node only when it is on the card's chain; a mismatch after a switch or
+/// an operator's pick is dropped so it cannot misjudge the card.
+fn accept_if_on_chain(node: Option<ChainInfo>, card_chain_id: Option<&str>) -> Option<ChainInfo> {
+    match (node, card_chain_id) {
+        (Some(info), Some(cid)) if info.id != cid => {
+            warning(&format!(
+                "The node is on chain {} but the card is for {cid}; node-based checks report as unknown.",
+                info.id
+            ));
+            None
+        }
+        (node, _) => node,
+    }
+}
+
+/// Fetch the node snapshot from the configured endpoint, surfacing
+/// unreachability the way the rest of the check does: a warning, then
+/// node-based checks report as unknown.
+fn fetch_node(config: &config::RussignolConfig) -> Option<ChainInfo> {
+    match crate::watermark::prefetch_chain_info(config) {
+        Ok(info) => Some(info),
+        Err(e) => {
+            warning(&format!(
+                "Node unavailable ({e:#}); node-based checks report as unknown"
+            ));
+            None
+        }
+    }
+}
+
+/// Resolve the node the card is diagnosed against, preferring the card's own
+/// chain over the host's saved endpoint. Returns `None` (node-based checks
+/// report as unknown) when no node on the card's chain can be reached.
+fn resolve_node_for_card(
+    config: &mut config::RussignolConfig,
+    explicit_endpoint: bool,
+    card_chain_id: Option<&str>,
+    non_interactive: bool,
+) -> Option<ChainInfo> {
+    let node = fetch_node(config);
+    match plan_node(
+        node.as_ref().map(|n| n.id.as_str()),
+        card_chain_id,
+        explicit_endpoint,
+        non_interactive,
+    ) {
+        NodePlan::Accept => node,
+        NodePlan::GiveUp => {
+            warning(
+                "No node on the card's chain is available; node-based checks report as unknown.\n  \
+                 Pass --endpoint <url> for the card's network to enable them.",
+            );
+            None
+        }
+        NodePlan::Switch(url) => {
+            info(
+                "The saved node is on a different chain than the card; switching to the Mainnet public RPC.",
+            );
+            config.rpc_endpoint = url.to_string();
+            accept_if_on_chain(fetch_node(config), card_chain_id)
+        }
+        NodePlan::Prompt => {
+            warning(
+                "The saved node is on a different chain than the card; choose the card's network.",
+            );
+            let _ = network::select_endpoint_interactively(config, false);
+            accept_if_on_chain(fetch_node(config), card_chain_id)
+        }
+    }
+}
+
+// =============================================================================
 // Command entry point
 // =============================================================================
 
@@ -1359,27 +1530,30 @@ pub fn run_disk_check(
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    // Diagnosis runs offline; the node snapshot is best-effort. Node-dependent
-    // checks downgrade to "unknown" when it is absent.
     let mut config = config::RussignolConfig::load()?;
     config.with_overrides(endpoint, None);
-    if endpoint.is_none() {
-        let _ = network::resolve_endpoint_interactively(&mut config, yes || dry_run);
-    }
-    let node = match crate::watermark::prefetch_chain_info(&config) {
-        Ok(chain_info) => Some(chain_info),
-        Err(e) => {
-            warning(&format!(
-                "Node unavailable ({e:#}); floor-vs-head and chain-id checks report as unknown"
-            ));
-            None
-        }
-    };
 
+    // The card names the chain it is for, so read it before choosing a node: the
+    // node is only a valid reference for the card's own chain, and diagnosis is
+    // offline, so the card state does not depend on the node.
     let device = crate::watermark::detect_and_verify_device(device)?;
     let state = gather_card_state(&device);
+    let node = resolve_node_for_card(
+        &mut config,
+        endpoint.is_some(),
+        card_target_chain_id(&state),
+        yes || dry_run,
+    );
+
     let issues = classify(&state, node.as_ref());
     report(&issues);
+
+    // A healthy card already reported "the card is good"; the repair machinery
+    // below (and its "no repairs available" note) is only meaningful when there
+    // was a fault to act on.
+    if is_healthy(&issues) {
+        return Ok(());
+    }
 
     let actions = plan_repairs(&issues);
     if actions.is_empty() {
@@ -1553,6 +1727,81 @@ mod tests {
         let issues = classify(&state, None);
         let issue = find(&issues, IssueKind::WatermarkDirMissing).expect("dir-missing issue");
         assert_eq!(issue.remedy, Remedy::NeedsNode);
+    }
+
+    #[test]
+    fn missing_watermark_dir_is_pending_when_staged_config_covers_it() {
+        // A freshly restored, not-yet-unlocked card: keys, chain_info, and
+        // .setup_complete are written and a watermark-config.json is staged, but
+        // the device only seeds the authenticated floors after the first PIN
+        // unlock. The empty watermark tree is pending that seed, not a fault the
+        // host must repair, so it must not read as critical.
+        let n = node();
+        let mut state = healthy_state();
+        for key in &mut state.watermarks {
+            key.dir_present = false;
+            key.dir_owner = None;
+            key.files.clear();
+        }
+        state.boot_config = Some(BootConfigState {
+            chain_id: n.id.clone(),
+            level: n.level,
+        });
+        let issues = classify(&state, Some(&n));
+        assert!(
+            find(&issues, IssueKind::WatermarkDirMissing).is_none(),
+            "a covering staged config makes a missing watermark dir pending: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.severity == Severity::Critical),
+            "a restored card awaiting its first unlock has no critical faults: {issues:?}"
+        );
+        // The staged config is still surfaced as the pending remedy.
+        assert!(find(&issues, IssueKind::LeftoverBootConfig).is_some());
+        // A config is already staged, so no repair is offered to stage another.
+        assert!(
+            plan_repairs(&issues).is_empty(),
+            "the staged config is the remedy; no repair should be planned: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn missing_watermark_dir_is_pending_under_staged_config_without_a_node() {
+        // The same restored card diagnosed with no reachable node: the staged
+        // config is taken at face value, so the empty tree stays pending.
+        let mut state = healthy_state();
+        for key in &mut state.watermarks {
+            key.dir_present = false;
+            key.dir_owner = None;
+            key.files.clear();
+        }
+        state.boot_config = Some(BootConfigState {
+            chain_id: "NetXmainnet".to_string(),
+            level: 1_000,
+        });
+        let issues = classify(&state, None);
+        assert!(find(&issues, IssueKind::WatermarkDirMissing).is_none());
+        assert!(!issues.iter().any(|i| i.severity == Severity::Critical));
+    }
+
+    #[test]
+    fn missing_watermark_dir_stays_critical_when_staged_config_is_stale() {
+        // A staged config for a different chain will not seed this card's floors,
+        // so a missing directory is still a genuine fault.
+        let mut state = healthy_state();
+        state.watermarks[0].dir_present = false;
+        state.watermarks[0].files.clear();
+        state.boot_config = Some(BootConfigState {
+            chain_id: "NetXold".to_string(),
+            level: 1,
+        });
+        let issues = classify(&state, Some(&node()));
+        assert_eq!(
+            find(&issues, IssueKind::WatermarkDirMissing)
+                .expect("dir-missing issue")
+                .severity,
+            Severity::Critical
+        );
     }
 
     #[test]
@@ -2037,6 +2286,200 @@ mod tests {
         assert!(plan.contains(&RepairAction::WriteChainInfo));
         assert!(!plan.contains(&RepairAction::ChmodChainInfo));
         assert!(!plan.contains(&RepairAction::ChownChainInfo));
+    }
+
+    #[test]
+    fn no_findings_is_healthy() {
+        assert!(is_healthy(&[]));
+    }
+
+    #[test]
+    fn restored_card_awaiting_first_unlock_is_healthy() {
+        // The exact post-restore state: a staged config (Info), missing watermark
+        // directories the device seeds after the first unlock, and /data/logs it
+        // recreates on boot (Info). No fault, nothing to repair — the card is good.
+        let n = node();
+        let mut state = healthy_state();
+        for key in &mut state.watermarks {
+            key.dir_present = false;
+            key.dir_owner = None;
+            key.files.clear();
+        }
+        state.logs_dir_present = false;
+        state.boot_config = Some(BootConfigState {
+            chain_id: n.id.clone(),
+            level: n.level,
+        });
+        let issues = classify(&state, Some(&n));
+        assert!(
+            is_healthy(&issues),
+            "info-only findings are not issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn a_warning_is_not_healthy() {
+        let mut n = node();
+        n.level = 1_000_000; // pushes the floor far behind head → below-head warning
+        assert!(!is_healthy(&classify(&healthy_state(), Some(&n))));
+    }
+
+    #[test]
+    fn a_critical_is_not_healthy() {
+        let mut state = healthy_state();
+        state.keys = KeysState::Missing;
+        assert!(!is_healthy(&classify(&state, Some(&node()))));
+    }
+
+    #[test]
+    fn a_fixable_info_finding_is_not_healthy() {
+        // Guards the fixable arm independently of severity: an Info-severity
+        // finding that still carries a repair must not read as healthy.
+        let issue = Issue {
+            kind: IssueKind::FatStageAvailable,
+            severity: Severity::Info,
+            partition: Partition::Boot,
+            remedy: Remedy::FatStage,
+            action: Some(RepairAction::StageBootConfig(node())),
+            message: String::new(),
+        };
+        assert!(!is_healthy(std::slice::from_ref(&issue)));
+    }
+
+    // -- node selection -----------------------------------------------------
+
+    const TESTNET_CHAIN_ID: &str = "NetXpX8WSZkAZZA";
+
+    #[test]
+    fn card_chain_prefers_chain_info_over_boot_config() {
+        let mut state = healthy_state();
+        state.chain_info = ChainInfoState::Present {
+            id: "NetXcommitted".to_string(),
+            mode: Some(CHAIN_INFO_MODE),
+            owner: Some((DEVICE_UID, DEVICE_GID)),
+        };
+        state.boot_config = Some(BootConfigState {
+            chain_id: "NetXstaged".to_string(),
+            level: 1,
+        });
+        assert_eq!(card_target_chain_id(&state), Some("NetXcommitted"));
+    }
+
+    #[test]
+    fn card_chain_falls_back_to_boot_config_when_keys_unreadable() {
+        let mut state = uninspected_state(
+            Inspection::Failed,
+            Some(BootConfigState {
+                chain_id: network::MAINNET_CHAIN_ID.to_string(),
+                level: 1,
+            }),
+        );
+        state.chain_info = ChainInfoState::Missing;
+        assert_eq!(
+            card_target_chain_id(&state),
+            Some(network::MAINNET_CHAIN_ID)
+        );
+    }
+
+    #[test]
+    fn card_chain_is_none_when_the_card_names_none() {
+        let state = uninspected_state(Inspection::Failed, None);
+        assert_eq!(card_target_chain_id(&state), None);
+    }
+
+    #[test]
+    fn plan_accepts_a_node_on_the_cards_chain() {
+        assert_eq!(
+            plan_node(Some(TESTNET_CHAIN_ID), Some(TESTNET_CHAIN_ID), false, false),
+            NodePlan::Accept
+        );
+    }
+
+    #[test]
+    fn plan_accepts_any_node_when_the_card_names_no_chain() {
+        assert_eq!(
+            plan_node(Some(TESTNET_CHAIN_ID), None, false, false),
+            NodePlan::Accept
+        );
+    }
+
+    #[test]
+    fn plan_switches_a_mainnet_card_off_a_wrong_node() {
+        assert_eq!(
+            plan_node(
+                Some(TESTNET_CHAIN_ID),
+                Some(network::MAINNET_CHAIN_ID),
+                false,
+                false
+            ),
+            NodePlan::Switch(network::MAINNET_RPC_URL)
+        );
+    }
+
+    #[test]
+    fn plan_switches_a_mainnet_card_when_the_node_is_unreachable() {
+        assert_eq!(
+            plan_node(None, Some(network::MAINNET_CHAIN_ID), false, false),
+            NodePlan::Switch(network::MAINNET_RPC_URL)
+        );
+    }
+
+    #[test]
+    fn plan_prompts_for_a_testnet_card_on_a_wrong_node_interactively() {
+        assert_eq!(
+            plan_node(
+                Some(network::MAINNET_CHAIN_ID),
+                Some(TESTNET_CHAIN_ID),
+                false,
+                false
+            ),
+            NodePlan::Prompt
+        );
+    }
+
+    #[test]
+    fn plan_gives_up_for_a_testnet_card_non_interactively() {
+        assert_eq!(
+            plan_node(
+                Some(network::MAINNET_CHAIN_ID),
+                Some(TESTNET_CHAIN_ID),
+                false,
+                true
+            ),
+            NodePlan::GiveUp
+        );
+    }
+
+    #[test]
+    fn plan_drops_a_mismatched_explicit_endpoint_without_replacing_it() {
+        // An explicit --endpoint is honored, so a Mainnet card pointed at a testnet
+        // node is dropped (node-based checks go unknown) rather than auto-switched.
+        assert_eq!(
+            plan_node(
+                Some(TESTNET_CHAIN_ID),
+                Some(network::MAINNET_CHAIN_ID),
+                true,
+                false
+            ),
+            NodePlan::GiveUp
+        );
+    }
+
+    #[test]
+    fn accept_drops_a_node_on_a_different_chain() {
+        let mut wrong = node();
+        wrong.id = TESTNET_CHAIN_ID.to_string();
+        assert!(accept_if_on_chain(Some(wrong), Some(network::MAINNET_CHAIN_ID)).is_none());
+    }
+
+    #[test]
+    fn accept_keeps_a_node_on_the_cards_chain() {
+        assert!(accept_if_on_chain(Some(node()), Some(&node().id)).is_some());
+    }
+
+    #[test]
+    fn accept_keeps_a_node_when_the_card_names_no_chain() {
+        assert!(accept_if_on_chain(Some(node()), None).is_some());
     }
 
     #[test]
