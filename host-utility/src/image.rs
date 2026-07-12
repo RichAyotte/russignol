@@ -660,7 +660,7 @@ fn run_keyed_flash(
     };
 
     check_device_not_mounted(&target.path)?;
-    check_device_has_media(&target.path)?;
+    wait_for_device_media(&target.path);
     let privilege = device_access::probe_write_access(&target.path, Some(&target.path), job.yes)?;
 
     let backup = source.read(restore_source)?;
@@ -890,12 +890,12 @@ fn cmd_flash(
     let target_device = if let Some(dev) = device {
         user_specified_device(dev)
     } else {
-        select_device()?
+        wait_for_removable_device(CardRole::Target)?
     };
 
     // Check if mounted, has media, and is writable by this process
     check_device_not_mounted(&target_device.path)?;
-    check_device_has_media(&target_device.path)?;
+    wait_for_device_media(&target_device.path);
     let privilege =
         device_access::probe_write_access(&target_device.path, Some(&target_device.path), yes)?;
 
@@ -1136,12 +1136,12 @@ fn cmd_flash_download(
     let target_device = if let Some(dev) = device {
         user_specified_device(dev)
     } else {
-        select_device()?
+        wait_for_removable_device(CardRole::Target)?
     };
 
     // Check if mounted, has media, and is writable by this process
     check_device_not_mounted(&target_device.path)?;
-    check_device_has_media(&target_device.path)?;
+    wait_for_device_media(&target_device.path);
     let privilege =
         device_access::probe_write_access(&target_device.path, Some(&target_device.path), yes)?;
 
@@ -1451,21 +1451,55 @@ pub(crate) fn lookup_block_device(device: &Path) -> Result<BlockDevice> {
     })
 }
 
-/// Interactive device selection
-fn select_device() -> Result<BlockDevice> {
-    let devices = detect_removable_devices()?;
+/// Which card an acquire prompt is asking for. Drives the spinner text shown
+/// while waiting and the title of the disambiguation menu when several cards
+/// are plugged in.
+#[derive(Clone, Copy)]
+pub(crate) enum CardRole {
+    /// The card being flashed.
+    Target,
+    /// The card keys are being read from.
+    Source,
+    /// A card to inspect, with no source/target distinction.
+    Any,
+}
+
+impl CardRole {
+    /// Message shown on the spinner while waiting for a card to appear.
+    fn waiting(self) -> &'static str {
+        match self {
+            CardRole::Target => "Insert the SD card to flash",
+            CardRole::Source => "Insert the source SD card",
+            CardRole::Any => "Insert an SD card",
+        }
+    }
+
+    /// Title of the menu shown when more than one removable card is present.
+    fn select(self) -> &'static str {
+        match self {
+            CardRole::Target => "Select target device:",
+            CardRole::Source => "Select source device to restore keys from:",
+            CardRole::Any => "Select device:",
+        }
+    }
+}
+
+/// Acquire a removable SD card, waiting for one if none is present.
+///
+/// Detects removable devices; with none inserted it shows a spinner and polls
+/// until a card appears (indefinitely — Ctrl-C to abort), so the caller never
+/// has to press a key. A single card is used directly; several present the
+/// selection menu, the only case that cannot be resolved automatically.
+pub(crate) fn wait_for_removable_device(role: CardRole) -> Result<BlockDevice> {
+    let mut devices = detect_removable_devices().unwrap_or_default();
 
     if devices.is_empty() {
-        bail!(
-            "No removable SD card devices found.\n\
-             \n\
-             Please:\n\
-             1. Insert an SD card into a USB or built-in card reader\n\
-             2. Wait a few seconds for it to be detected\n\
-             3. Run this command again\n\
-             \n\
-             Or specify a device manually with --device /dev/sdX or --device /dev/mmcblk0"
-        );
+        let spinner = crate::progress::create_spinner(role.waiting());
+        while devices.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            devices = detect_removable_devices().unwrap_or_default();
+        }
+        spinner.finish_and_clear();
     }
 
     if devices.len() == 1 {
@@ -1474,24 +1508,20 @@ fn select_device() -> Result<BlockDevice> {
         return Ok(device.clone());
     }
 
-    // Multiple devices - let user select
     let options: Vec<String> = devices
         .iter()
         .map(std::string::ToString::to_string)
         .collect();
 
-    let selection = Select::new("Select target device:", options)
+    let selection = Select::new(role.select(), options)
         .with_render_config(create_orange_theme())
         .prompt()
         .context("Failed to get device selection")?;
 
-    // Find the selected device
-    let selected = devices
+    devices
         .into_iter()
         .find(|d| d.to_string() == selection)
-        .context("Selected device not found")?;
-
-    Ok(selected)
+        .context("Selected device not found")
 }
 
 // =============================================================================
@@ -1601,8 +1631,26 @@ fn unmount_device_partitions(device: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Check that the device has media inserted (non-zero size)
-fn check_device_has_media(device: &Path) -> Result<()> {
+/// Wait until the device has media inserted, auto-detecting as it appears.
+///
+/// On the auto-detect path the card is already present (it was enumerated from
+/// its media), so this returns at once. Only an explicitly named `--device`
+/// with an empty slot actually waits — indefinitely, with a spinner, so it
+/// behaves the same as auto-detection (Ctrl-C to abort).
+fn wait_for_device_media(device: &Path) {
+    if !device_has_media(device) {
+        let spinner = crate::progress::create_spinner("Insert an SD card");
+        while !device_has_media(device) {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        spinner.finish_and_clear();
+    }
+}
+
+/// Whether the device currently has media. A check that cannot run (unreadable
+/// sysfs size, `diskutil` failure) is treated as "present" so the caller skips
+/// the wait rather than blocking forever on a probe it can't evaluate.
+fn device_has_media(device: &Path) -> bool {
     #[cfg(target_os = "linux")]
     {
         // Get device name (e.g., "sdc" from "/dev/sdc")
@@ -1612,24 +1660,23 @@ fn check_device_has_media(device: &Path) -> Result<()> {
         let size_path = format!("/sys/block/{device_name}/size");
         match std::fs::read_to_string(&size_path) {
             Ok(size_str) => match size_str.trim().parse::<u64>() {
-                Ok(0) => bail!(
-                    "No media found in device {}.\n\
-                     \n\
-                     Please insert an SD card and try again.",
-                    device.display()
-                ),
-                Ok(_) => {}
-                // A present-but-unparseable size means the check could not run;
-                // surface it rather than silently treating the media as present.
-                Err(e) => utils::warning(&format!(
-                    "Could not parse device size from {size_path} ({e}); \
-                     skipping the media-presence check."
-                )),
+                Ok(0) => false,
+                Ok(_) => true,
+                Err(e) => {
+                    utils::warning(&format!(
+                        "Could not parse device size from {size_path} ({e}); \
+                         skipping the media-presence check."
+                    ));
+                    true
+                }
             },
-            Err(e) => utils::warning(&format!(
-                "Could not read {size_path} ({e}) to verify media presence; \
-                 skipping the media-presence check."
-            )),
+            Err(e) => {
+                utils::warning(&format!(
+                    "Could not read {size_path} ({e}) to verify media presence; \
+                     skipping the media-presence check."
+                ));
+                true
+            }
         }
     }
 
@@ -1642,30 +1689,27 @@ fn check_device_has_media(device: &Path) -> Result<()> {
         {
             Ok(output) if output.status.success() => {
                 let info = String::from_utf8_lossy(&output.stdout);
-                // If diskutil can't find the disk or shows 0 bytes, no media
-                if info.contains("Total Size:") && info.contains("0 B") {
-                    bail!(
-                        "No media found in device {}.\n\
-                         \n\
-                         Please insert an SD card and try again.",
-                        device.display()
-                    );
-                }
+                // If diskutil shows 0 bytes, no media
+                !(info.contains("Total Size:") && info.contains("0 B"))
             }
-            Ok(output) => utils::warning(&format!(
-                "diskutil could not report media for {} ({}); \
-                 skipping the media-presence check.",
-                device.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )),
-            Err(e) => utils::warning(&format!(
-                "Could not run diskutil to verify media presence ({e}); \
-                 skipping the media-presence check."
-            )),
+            Ok(output) => {
+                utils::warning(&format!(
+                    "diskutil could not report media for {} ({}); \
+                     skipping the media-presence check.",
+                    device.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+                true
+            }
+            Err(e) => {
+                utils::warning(&format!(
+                    "Could not run diskutil to verify media presence ({e}); \
+                     skipping the media-presence check."
+                ));
+                true
+            }
         }
     }
-
-    Ok(())
 }
 
 /// Confirm flash operation - show warning and require typing device name
@@ -2524,12 +2568,12 @@ fn check_partition(device: &Path, part_num: u8, fs_type: &str) -> PartitionCheck
 /// rootfs) must be present and mount cleanly. When the host view is stale the
 /// card is re-plugged first (the kernel re-scans on re-insertion), which is how
 /// a non-root run gets the new partitions without `CAP_SYS_ADMIN`.
-fn verify_flashed_card(device: &Path, view: HostPartitionView) -> Result<()> {
+fn verify_flashed_card(device: &Path, view: HostPartitionView) {
     #[cfg(target_os = "linux")]
     {
         if view == HostPartitionView::Stale {
             utils::info("Remove and re-insert the card to reveal the new partitions.");
-            restore_keys::wait_for_card_swap(device)?;
+            restore_keys::wait_for_card_swap(device);
         }
 
         let spinner = crate::progress::create_spinner("Verifying card structure...");
@@ -2554,8 +2598,6 @@ fn verify_flashed_card(device: &Path, view: HostPartitionView) -> Result<()> {
     {
         let _ = (device, view);
     }
-
-    Ok(())
 }
 
 /// After a flash, offer a structural verification of the card. Declined by
@@ -2575,13 +2617,7 @@ fn offer_structural_verify(
         .prompt()
         .context("Failed to read verification choice")?;
     if verify {
-        // The flash itself already succeeded and was read-back verified, so a
-        // verification hiccup (e.g. the re-plug wait timing out) is reported, not
-        // fatal.
-        utils::warn_if_err(
-            verify_flashed_card(device, view),
-            "Card verification did not complete",
-        );
+        verify_flashed_card(device, view);
     }
     Ok(())
 }
@@ -2761,6 +2797,16 @@ fn div_with_tenths(value: u64, divisor: u64) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_role_messages_are_distinct_per_role() {
+        for role in [CardRole::Target, CardRole::Source, CardRole::Any] {
+            assert!(!role.waiting().is_empty());
+            assert!(role.select().ends_with(':'));
+        }
+        assert_ne!(CardRole::Target.select(), CardRole::Source.select());
+        assert!(CardRole::Source.waiting().contains("source"));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

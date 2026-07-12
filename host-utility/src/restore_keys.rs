@@ -174,57 +174,7 @@ pub fn resolve_restore_source(arg: &Path) -> Result<PathBuf> {
         return Ok(arg.to_path_buf());
     }
 
-    // Auto-detect: check if a card is already inserted
-    let mut devices = image::detect_removable_devices().unwrap_or_default();
-
-    // No card yet — prompt the user to insert one
-    if devices.is_empty() {
-        prompt_enter("Insert the SOURCE SD card and press Enter...")?;
-
-        // Poll for a device to appear (30-second timeout)
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let spinner = progress::create_spinner("Waiting for device...");
-        loop {
-            devices = image::detect_removable_devices().unwrap_or_default();
-            if !devices.is_empty() {
-                break;
-            }
-            if std::time::Instant::now() > deadline {
-                spinner.finish_and_clear();
-                bail!(
-                    "No removable SD card devices detected.\n\
-                     Please check that the SD card is inserted and try again,\n\
-                     or specify the device directly: --restore-keys /dev/sdX or /dev/mmcblk0"
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-        spinner.finish_and_clear();
-    }
-
-    if devices.len() == 1 {
-        let device = &devices[0];
-        utils::success(&format!("Found source device: {device}"));
-        return Ok(device.path.clone());
-    }
-
-    // Multiple devices — prompt the user to pick the source
-    let options: Vec<String> = devices
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect();
-
-    let selection = inquire::Select::new("Select source device to restore keys from:", options)
-        .with_render_config(utils::create_orange_theme())
-        .prompt()
-        .context("Failed to get device selection")?;
-
-    let selected = devices
-        .into_iter()
-        .find(|d| d.to_string() == selection)
-        .context("Selected device not found")?;
-
-    Ok(selected.path)
+    Ok(image::wait_for_removable_device(image::CardRole::Source)?.path)
 }
 
 /// Defends `dir.join(name)` against a hostile source card whose directory
@@ -976,31 +926,6 @@ pub fn is_single_reader_mode(
     }
 }
 
-/// Wait for a device to appear (e.g. after initial insertion).
-///
-/// Polls for the device node to exist, then waits for udev to settle.
-pub fn wait_for_device_reappear(device: &Path) -> Result<()> {
-    let spinner = progress::create_spinner("Waiting for device...");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        if device.exists() {
-            // Give udev a moment to settle
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            spinner.finish_and_clear();
-            return Ok(());
-        }
-        if std::time::Instant::now() > deadline {
-            spinner.finish_and_clear();
-            bail!(
-                "Device {} did not reappear within 30 seconds. \
-                 Please insert the target SD card and try again.",
-                device.display()
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-}
-
 /// Read the media sector count from sysfs. Returns 0 if no media is present.
 fn device_media_sectors(device: &Path) -> u64 {
     let device_name = device.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1062,8 +987,8 @@ fn describe_card(device: &Path) -> String {
 /// Wait for a card swap in a card reader, expecting the **target** card.
 ///
 /// Equivalent to `wait_for_card_swap_labeled(device, "target")`.
-pub(crate) fn wait_for_card_swap(device: &Path) -> Result<()> {
-    wait_for_card_swap_labeled(device, "target")
+pub(crate) fn wait_for_card_swap(device: &Path) {
+    wait_for_card_swap_labeled(device, "target");
 }
 
 /// Wait for a card swap in a card reader.
@@ -1077,57 +1002,34 @@ pub(crate) fn wait_for_card_swap(device: &Path) -> Result<()> {
 /// 2. Waits for the new card to be **inserted** (node present, media sectors > 0)
 /// 3. Runs `udevadm settle` to let the kernel finish initializing the device
 ///
-/// `label` is shown in spinners (e.g. "source" or "target").
-fn wait_for_card_swap_labeled(device: &Path, label: &str) -> Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
-
+/// Both phases poll indefinitely (Ctrl-C to abort). `label` is shown in
+/// spinners (e.g. "source" or "target").
+fn wait_for_card_swap_labeled(device: &Path, label: &str) {
     // Phase 1: wait for card removal (media disappears)
     if device_media_sectors(device) > 0 {
         let desc = describe_card(device);
         let spinner = progress::create_spinner(&format!("Card present ({desc}) — remove it"));
-        loop {
-            if device_media_sectors(device) == 0 || !device.exists() {
-                spinner.finish_and_clear();
-                utils::success("Card removed");
-                break;
-            }
-            if std::time::Instant::now() > deadline {
-                spinner.finish_and_clear();
-                bail!(
-                    "Timed out waiting for card removal from {}.\n  \
-                     Remove the SD card from the reader.",
-                    device.display()
-                );
-            }
+        while device_media_sectors(device) > 0 && device.exists() {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
+        spinner.finish_and_clear();
+        utils::success("Card removed");
     }
 
-    wait_for_card_insert(device, deadline, label)?;
-
-    Ok(())
+    wait_for_card_present(device, label);
 }
 
-/// Wait for a card to be inserted and udev to settle.
+/// Wait for a card to be present in a known reader node and udev to settle.
 ///
-/// `label` is shown in the spinner (e.g. "source" or "target").
-fn wait_for_card_insert(device: &Path, deadline: std::time::Instant, label: &str) -> Result<()> {
+/// Polls sysfs media presence indefinitely (Ctrl-C to abort) — a USB reader
+/// keeps its `/dev/sdX` node with zero media when empty, so node existence
+/// alone is not enough. `label` is shown in the spinner (e.g. "source").
+pub(crate) fn wait_for_card_present(device: &Path, label: &str) {
     let spinner = progress::create_spinner(&format!("No card — insert {label} card"));
-    loop {
-        if device.exists() && device_media_sectors(device) > 0 {
-            spinner.finish_and_clear();
-            break;
-        }
-        if std::time::Instant::now() > deadline {
-            spinner.finish_and_clear();
-            bail!(
-                "Timed out waiting for new card in {}.\n  \
-                 Insert the {label} SD card into the reader.",
-                device.display()
-            );
-        }
+    while !(device.exists() && device_media_sectors(device) > 0) {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+    spinner.finish_and_clear();
 
     let spinner = progress::create_spinner("Card detected — waiting for kernel to initialize");
     utils::run_best_effort(
@@ -1139,8 +1041,6 @@ fn wait_for_card_insert(device: &Path, deadline: std::time::Instant, label: &str
 
     let desc = describe_card(device);
     utils::success(&format!("{} card ready ({desc})", uppercase_first(label)));
-
-    Ok(())
 }
 
 /// Capitalize the first character of a string.
@@ -1182,27 +1082,15 @@ pub fn ensure_source_partitions_visible(device: &Path) -> Result<()> {
     }
 }
 
-/// Prompt user to press Enter (for card swap prompts)
-fn prompt_enter(message: &str) -> Result<()> {
-    print!("  {message}");
-    std::io::stdout().flush()?;
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_line(&mut buf)
-        .context("Failed to read input")?;
-    Ok(())
-}
-
 /// Run the keyed-flash workflow for single-reader mode (card swap)
 pub fn run_single_reader_restore(
     source: &dyn CardSource,
     restore_from: &Path,
     job: FlashJob<'_>,
 ) -> Result<()> {
-    // Step 1: Read source card, prompting for swap if the inserted card isn't valid
-    if !restore_from.exists() {
-        prompt_enter("Insert SOURCE card and press Enter...")?;
-        wait_for_device_reappear(restore_from)?;
+    // Step 1: Read source card, auto-detecting it if the reader is empty.
+    if device_media_sectors(restore_from) == 0 {
+        wait_for_card_present(restore_from, "source");
     }
 
     // Probe before the source read and card swap: recovery may re-exec the
@@ -1222,7 +1110,7 @@ pub fn run_single_reader_restore(
                         "Could not read source card: {e:#}\n  \
                          Please insert the correct SOURCE card."
                     ));
-                    wait_for_card_swap_labeled(restore_from, "source")?;
+                    wait_for_card_swap_labeled(restore_from, "source");
                 }
             },
         }
@@ -1248,7 +1136,7 @@ pub fn run_single_reader_restore(
 
     // Step 2: Swap to target card — auto-detect via media presence
     utils::info("Remove SOURCE card from the reader, then insert TARGET card");
-    wait_for_card_swap(restore_from)?;
+    wait_for_card_swap(restore_from);
 
     // Verify the user actually swapped cards, looping until they do
     while card_ids_match(
@@ -1259,7 +1147,7 @@ pub fn run_single_reader_restore(
             "This is the same card that was just read (source card).\n  \
              Please swap it for the TARGET card.",
         );
-        wait_for_card_swap(restore_from)?;
+        wait_for_card_swap(restore_from);
     }
 
     // Look up device info for the warning box

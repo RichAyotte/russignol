@@ -169,13 +169,7 @@ pub(crate) fn detect_and_verify_device(device: Option<PathBuf>) -> Result<PathBu
         }
         d
     } else {
-        info("Detecting SD card...");
-        let devices = image::detect_removable_devices()?;
-        devices.into_iter().next().map(|d| d.path).ok_or_else(|| {
-            anyhow::anyhow!(
-                "No removable USB device found. Insert SD card and try again, or use --device."
-            )
-        })?
+        image::wait_for_removable_device(image::CardRole::Any)?.path
     };
 
     verify_block_device(&device)?;
