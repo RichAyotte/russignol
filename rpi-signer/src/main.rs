@@ -4,6 +4,7 @@ mod constants;
 mod cpu_freq;
 mod events;
 mod fonts;
+mod image_info;
 mod led;
 mod log_writer;
 mod network_status;
@@ -152,6 +153,7 @@ fn build_signer_event_callbacks(app_tx: &Sender<AppEvent>) -> SignerEventCallbac
 
 fn main() -> epd_2in13_v4::EpdResult<()> {
     init_logging();
+    image_info::log_image_info();
 
     // Shared signing activity tracker
     let signing_activity = Arc::new(Mutex::new(signing_activity::SigningActivity::default()));
@@ -506,6 +508,8 @@ fn construct_page(
         PageSpec::Watermarks => Box::new(watermarks::Page::new(tx.clone(), watermark.clone())),
         PageSpec::Blockchain => Box::new(blockchain::Page::new(tx.clone())),
         PageSpec::About => Box::new(about::Page::new(tx.clone())),
+        PageSpec::Greeting => Box::new(greeting::Page::new(tx.clone())),
+        PageSpec::Image { back } => Box::new(pages::image_info::Page::new(tx.clone(), back)),
         PageSpec::Dialog {
             message,
             on_dismiss,

@@ -76,6 +76,9 @@ pub struct FlashMetadata {
     pub image_sha256: String,
     pub image_version: Option<String>,
     pub channel: Option<String>,
+    /// Maintainer-signature verdict from `enforce_release_signature`, recorded
+    /// in the manifest so the device can show it.
+    pub signed: Option<String>,
 }
 
 /// Generate a 128-bit random card ID as a 32-character hex string
@@ -113,6 +116,25 @@ pub fn compute_file_sha256(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Build the manifest from the flash metadata and the teed rootfs hash. The
+/// single construction site, so writer and test cannot disagree on the shape.
+fn build_flash_manifest(
+    card_id: String,
+    metadata: &FlashMetadata,
+    rootfs_sha256: Option<String>,
+) -> FlashManifest {
+    FlashManifest {
+        card_id,
+        flashed_at: chrono::Utc::now().to_rfc3339(),
+        host_version: version::VERSION.to_string(),
+        image_sha256: metadata.image_sha256.clone(),
+        image_version: metadata.image_version.clone(),
+        channel: metadata.channel.clone(),
+        rootfs_sha256,
+        signed: metadata.signed.clone(),
+    }
+}
+
 /// Write a flash manifest to the boot partition (p1, FAT32)
 ///
 /// Generates a unique `card_id`, builds the manifest with current timestamp
@@ -128,15 +150,7 @@ pub fn write_flash_manifest(
     let mount_point = utils::mount_partition(&boot_partition, "vfat", false)?;
 
     let card_id = generate_card_id()?;
-    let manifest = FlashManifest {
-        card_id: card_id.clone(),
-        flashed_at: chrono::Utc::now().to_rfc3339(),
-        host_version: version::VERSION.to_string(),
-        image_sha256: metadata.image_sha256.clone(),
-        image_version: metadata.image_version.clone(),
-        channel: metadata.channel.clone(),
-        rootfs_sha256,
-    };
+    let manifest = build_flash_manifest(card_id.clone(), metadata, rootfs_sha256);
 
     let json =
         serde_json::to_string_pretty(&manifest).context("Failed to serialize flash manifest")?;
@@ -722,35 +736,48 @@ fn resolve_key_source(
     }
 }
 
+/// Map a permitted signature verdict to the manifest `signed` value the device
+/// reads back.
+fn signed_verdict(verdict: &crate::release_signature::SignatureVerdict) -> &'static str {
+    use crate::release_signature::SignatureVerdict;
+    match verdict {
+        SignatureVerdict::Verified => russignol_flash_manifest::SIGNED_VERIFIED,
+        SignatureVerdict::UnsignedAllowed => russignol_flash_manifest::SIGNED_UNSIGNED,
+        SignatureVerdict::Unavailable => russignol_flash_manifest::SIGNED_UNAVAILABLE,
+    }
+}
+
 /// Enforce the maintainer release-signature policy before any destructive
 /// write: verify the image's signature against the embedded maintainer key and
 /// refuse on mismatch; flashing an image that carries no signature requires
 /// `--allow-unsigned`. A build without an embedded key proceeds silently.
+///
+/// Returns the verdict string to record in the manifest.
 fn enforce_release_signature(
     image_sha256: &str,
     signature: Option<&str>,
     allow_unsigned: bool,
-) -> Result<()> {
+) -> Result<String> {
     use crate::release_signature::{MAINTAINER_PUBKEY, SignatureVerdict, check_release_signature};
 
-    match check_release_signature(
+    let verdict = match check_release_signature(
         MAINTAINER_PUBKEY.as_ref(),
         image_sha256,
         signature,
         allow_unsigned,
     ) {
-        Ok(SignatureVerdict::Verified) => {
-            utils::success("Maintainer release signature verified");
-            Ok(())
-        }
-        // A build without an embedded key has nothing to verify against.
-        Ok(SignatureVerdict::Unavailable) => Ok(()),
-        Ok(SignatureVerdict::UnsignedAllowed) => {
-            utils::warning("Flashing an unsigned image (--allow-unsigned)");
-            Ok(())
-        }
+        Ok(verdict) => verdict,
         Err(e) => bail!("Refusing to flash: {e}"),
+    };
+    match verdict {
+        SignatureVerdict::Verified => utils::success("Maintainer release signature verified"),
+        // A build without an embedded key has nothing to verify against.
+        SignatureVerdict::Unavailable => {}
+        SignatureVerdict::UnsignedAllowed => {
+            utils::warning("Flashing an unsigned image (--allow-unsigned)");
+        }
     }
+    Ok(signed_verdict(&verdict).to_string())
 }
 
 /// Resolve the detached maintainer signature for a locally-supplied image: an
@@ -809,7 +836,7 @@ fn cmd_flash(
     let image_sha256 = compute_file_sha256(image)?;
 
     // Runs before device selection so nothing is written on refusal.
-    enforce_release_signature(
+    let signed = enforce_release_signature(
         &image_sha256,
         signature.as_deref(),
         verification.allow_unsigned,
@@ -823,6 +850,7 @@ fn cmd_flash(
         image_sha256,
         image_version: None,
         channel: None,
+        signed: Some(signed),
     };
 
     // Keyed path: restore or migrate (mutually exclusive, checked above)
@@ -1029,12 +1057,13 @@ fn download_and_verify_release_image(
         );
     }
 
-    enforce_release_signature(&image_sha256, dl.signature.as_deref(), allow_unsigned)?;
+    let signed = enforce_release_signature(&image_sha256, dl.signature.as_deref(), allow_unsigned)?;
 
     let metadata = FlashMetadata {
         image_sha256,
         image_version: dl.version.clone(),
         channel: dl.channel.clone(),
+        signed: Some(signed),
     };
     Ok((image_path, metadata))
 }
@@ -2896,6 +2925,34 @@ mod tests {
             ),
             Ok(SignatureVerdict::Verified)
         );
+    }
+
+    /// The verified verdict reaches the manifest: a signed image resolves to
+    /// `Verified`, and the manifest built from that metadata serializes the
+    /// verdict the device reads back.
+    #[test]
+    fn manifest_records_the_verified_signature_verdict() {
+        use crate::release_signature::{SignatureVerdict, check_release_signature};
+        use russignol_release_signature::{public_key, sign};
+
+        let seed = [7u8; 32];
+        let image_sha256 = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        let sig = sign(&seed, image_sha256).unwrap();
+
+        let verdict =
+            check_release_signature(Some(&public_key(&seed)), image_sha256, Some(&sig), false)
+                .unwrap();
+        assert_eq!(verdict, SignatureVerdict::Verified);
+
+        let metadata = FlashMetadata {
+            image_sha256: image_sha256.to_string(),
+            image_version: None,
+            channel: None,
+            signed: Some(signed_verdict(&verdict).to_string()),
+        };
+        let manifest = build_flash_manifest("card".to_string(), &metadata, None);
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(json.contains(r#""signed":"verified""#), "{json}");
     }
 
     #[test]

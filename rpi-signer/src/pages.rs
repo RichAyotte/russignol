@@ -3,6 +3,7 @@ pub mod blockchain;
 pub mod confirmation;
 pub mod dialog;
 pub mod greeting;
+pub mod image_info;
 pub mod menu;
 pub mod notice;
 pub mod pin;

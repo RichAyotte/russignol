@@ -10,10 +10,33 @@ The device uses a 2.13" e-ink touchscreen for all interaction. After unlocking w
 - **Activity** — recent signing activity
 - **Blockchain** — chain name, chain ID, and key addresses
 - **Watermarks** — per-key watermark levels, both in-memory and persisted to disk
-- **About** — version information
+- **About** — version and license; tap the logo to open the Image screen (see [Image Provenance](#image-provenance))
 - **Shutdown** — safe shutdown (see below)
 
 After 1 minute of inactivity the display enters screensaver mode. Touch the screen once to wake it. The screensaver only puts the display to sleep — signing continues, and no PIN re-entry is required.
+
+## Image Provenance
+
+The **Image** screen shows where the running image came from — its version, whether it is a hardened or development build, whether its release signature was verified, and the checksums recorded when the card was flashed. Open it by tapping the **logo**:
+
+- On the first-boot **greeting** screen, before setup — so a freshly flashed card's origin can be confirmed before any keys are generated.
+- On the **About** page, after unlocking.
+
+Tapping anywhere below the tabs returns to wherever you opened it from. Two tabs switch the view.
+
+**Summary**
+
+- **Version** — the flashed release's version and channel (e.g. `0.25.0 (beta)`). A locally built image carries no release version, so it instead shows the signer's build commit (e.g. `8dc66dd`); `Unknown` if neither is recorded.
+- **Mode** — `Hardened` (production) or `Dev` (development build, which permits SSH), read live from the running system rather than the manifest.
+- **Signed** — the maintainer release-signature verdict recorded at flash time: `Verified` (matched the embedded key), `Unsigned` (flashed with `--allow-unsigned`), `Unavailable` (the host had no key to check against), or `Unknown` (flashed by a host too old to record it).
+- **Flashed** — the date the card was written.
+
+**Checksums**
+
+- **Image** — SHA-256 of the flashed image, shown middle-truncated to fit.
+- **Rootfs** — SHA-256 of the root filesystem.
+- **Host** — version of the host utility that flashed the card.
+- **Card ID** — the card identity the host recorded when flashing (the same identity the key-restore swap guard uses to recognise a card).
 
 ## PIN Entry & Lockout
 

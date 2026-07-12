@@ -28,3 +28,11 @@ pub const LOG_FILE: &str = "/data/logs/signer.log";
 /// - The Buildroot system has predictable state at boot time
 /// - Using a fixed path simplifies error recovery and debugging
 pub const BOOT_MOUNT: &str = "/tmp/boot";
+
+/// Environment variable through which the init hands the signer the flash
+/// manifest it read from the boot partition (p1). The unprivileged runtime
+/// signer cannot mount p1 itself, so the always-root init reads it once and
+/// passes it here. A cross-language contract with the init scripts
+/// (`rootfs-overlay-hardened/init`, `rootfs-overlay-dev/etc/init.d/S20russignol`),
+/// like `EXIT_CODE_REBOOT`.
+pub const FLASH_MANIFEST_ENV: &str = "RUSSIGNOL_FLASH_MANIFEST";

@@ -3,7 +3,7 @@ use russignol_signer_lib::{ChainId, HighWatermark, signing_activity};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::events::{AppEvent, ConfigPresence};
+use crate::events::{AppEvent, BackTarget, ConfigPresence};
 use crate::secret::Secret;
 use crate::setup;
 use crate::tezos_encrypt::MigrationEvent;
@@ -227,6 +227,10 @@ pub enum PageSpec {
     Watermarks,
     Blockchain,
     About,
+    Greeting,
+    Image {
+        back: BackTarget,
+    },
     Dialog {
         message: String,
         on_dismiss: AppEvent,
@@ -454,6 +458,15 @@ impl App {
     }
 
     fn handle_setup(&mut self, event: AppEvent) -> (LoopAction, Vec<Effect>) {
+        // The first-boot greeting can open the Image screen, which returns to
+        // it; both go through the shared navigation map. No other navigation
+        // targets are reachable before setup completes.
+        if matches!(event, AppEvent::ShowImage { .. } | AppEvent::ShowGreeting)
+            && let Some(spec) = Self::navigation_page(&event)
+        {
+            return (LoopAction::Proceed, vec![Effect::ShowPage(spec)]);
+        }
+
         let mut effects = Vec::new();
         match event {
             AppEvent::StartSetup => {
@@ -527,23 +540,7 @@ impl App {
                 effects.extend(self.handle_setup_pin_confirm(pin));
             }
             AppEvent::KeyGenSuccess(secret_keys_json) => {
-                log::info!("Keys generated and encrypted successfully");
-                effects.extend([
-                    Effect::ProcessWatermarkConfig,
-                    Effect::WriteSetupMarker,
-                    Effect::SetKeyPermissions,
-                    Effect::SyncDisk,
-                    Effect::RemountKeysReadonly,
-                    Effect::DropPrivileges,
-                    Effect::InitWatermark {
-                        context: "first boot setup".into(),
-                        secret_keys: secret_keys_json.clone(),
-                    },
-                ]);
-                self.state = AppState::Active {
-                    screensaver_active: false,
-                };
-                effects.push(Effect::Emit(AppEvent::KeysDecrypted(secret_keys_json)));
+                effects.extend(self.finalize_first_boot(secret_keys_json));
             }
             AppEvent::KeyGenFailed(e) => {
                 effects.push(Effect::FatalError {
@@ -554,6 +551,30 @@ impl App {
             _ => {}
         }
         (LoopAction::Proceed, effects)
+    }
+
+    /// Complete first-boot setup once keys exist: persist and lock down the
+    /// keys, drop to the unprivileged runtime, arm watermarks, and enter the
+    /// active state with the decrypted keys handed to the signer.
+    fn finalize_first_boot(&mut self, secret_keys_json: Secret<String>) -> Vec<Effect> {
+        log::info!("Keys generated and encrypted successfully");
+        let mut effects = vec![
+            Effect::ProcessWatermarkConfig,
+            Effect::WriteSetupMarker,
+            Effect::SetKeyPermissions,
+            Effect::SyncDisk,
+            Effect::RemountKeysReadonly,
+            Effect::DropPrivileges,
+            Effect::InitWatermark {
+                context: "first boot setup".into(),
+                secret_keys: secret_keys_json.clone(),
+            },
+        ];
+        self.state = AppState::Active {
+            screensaver_active: false,
+        };
+        effects.push(Effect::Emit(AppEvent::KeysDecrypted(secret_keys_json)));
+        effects
     }
 
     fn handle_setup_pin_confirm(&mut self, pin: Secret<Vec<u8>>) -> Vec<Effect> {
@@ -763,6 +784,8 @@ impl App {
             AppEvent::ShowWatermarks => Some(PageSpec::Watermarks),
             AppEvent::ShowBlockchain => Some(PageSpec::Blockchain),
             AppEvent::ShowAbout => Some(PageSpec::About),
+            AppEvent::ShowGreeting => Some(PageSpec::Greeting),
+            AppEvent::ShowImage { back } => Some(PageSpec::Image { back: *back }),
             _ => None,
         }
     }
@@ -2335,6 +2358,72 @@ mod tests {
         let mut app = active_app();
         let (_action, effects) = app.handle_event(AppEvent::ShowAbout);
         assert_eq!(effects, vec![Effect::ShowPage(PageSpec::About)]);
+    }
+
+    #[test]
+    fn show_image_navigates_to_image() {
+        let mut app = active_app();
+        let (_action, effects) = app.handle_event(AppEvent::ShowImage {
+            back: BackTarget::About,
+        });
+        assert_eq!(
+            effects,
+            vec![Effect::ShowPage(PageSpec::Image {
+                back: BackTarget::About
+            })]
+        );
+    }
+
+    #[test]
+    fn show_image_from_greeting_carries_its_back_target() {
+        let mut app = active_app();
+        let (_action, effects) = app.handle_event(AppEvent::ShowImage {
+            back: BackTarget::Greeting,
+        });
+        assert_eq!(
+            effects,
+            vec![Effect::ShowPage(PageSpec::Image {
+                back: BackTarget::Greeting
+            })]
+        );
+    }
+
+    #[test]
+    fn show_greeting_navigates_to_greeting() {
+        let mut app = active_app();
+        let (_action, effects) = app.handle_event(AppEvent::ShowGreeting);
+        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Greeting)]);
+    }
+
+    #[test]
+    fn greeting_opens_image_screen_during_setup() {
+        let mut app = first_boot_app();
+        let (_action, effects) = app.handle_event(AppEvent::ShowImage {
+            back: BackTarget::Greeting,
+        });
+        assert_eq!(
+            effects,
+            vec![Effect::ShowPage(PageSpec::Image {
+                back: BackTarget::Greeting
+            })]
+        );
+    }
+
+    #[test]
+    fn image_screen_returns_to_greeting_during_setup() {
+        let mut app = first_boot_app();
+        let (_action, effects) = app.handle_event(AppEvent::ShowGreeting);
+        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Greeting)]);
+    }
+
+    #[test]
+    fn show_image_when_modal_produces_no_effects() {
+        let mut app = active_app();
+        app.current_page_modal = true;
+        let (_action, effects) = app.handle_event(AppEvent::ShowImage {
+            back: BackTarget::About,
+        });
+        assert!(effects.is_empty());
     }
 
     #[test]

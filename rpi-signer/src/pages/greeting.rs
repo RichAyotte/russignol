@@ -3,9 +3,9 @@
 //! This page displays the Russignol logo and a "Begin" button to start
 //! the first-boot setup process (PIN creation and key generation).
 
-use crate::events::AppEvent;
+use crate::events::{AppEvent, BackTarget};
 use crossbeam_channel::Sender;
-use embedded_graphics::{image::Image, pixelcolor::BinaryColor, prelude::*};
+use embedded_graphics::{image::Image, pixelcolor::BinaryColor, prelude::*, primitives::Rectangle};
 use russignol_ui::{fonts, widgets::Button};
 use tinybmp::Bmp;
 use u8g2_fonts::{
@@ -22,6 +22,8 @@ const LOGO_DATA: &[u8] = include_bytes!("../../assets/russignol-61h.bmp");
 pub struct Page {
     app_sender: Sender<AppEvent>,
     button: Button,
+    /// Logo hit-box, set on each draw so a tap can open the Image screen.
+    logo_bounds: Rectangle,
 }
 
 impl Page {
@@ -31,6 +33,7 @@ impl Page {
             app_sender,
             // Generous padding around text
             button: Button::new_text(Size::new(90, 36), "Begin"),
+            logo_bounds: Rectangle::new(Point::zero(), Size::zero()),
         }
     }
 }
@@ -59,6 +62,7 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         // Center logo horizontally in left half
         let logo_x = (half_width - logo_size.width.cast_signed()) / 2;
         let logo_y = content_top;
+        self.logo_bounds = Rectangle::new(Point::new(logo_x, logo_y), logo_size);
         if let Ok(logo) = logo_result {
             Image::new(&logo, Point::new(logo_x, logo_y)).draw(display)?;
         } else {
@@ -98,6 +102,12 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn handle_touch(&mut self, point: Point) -> bool {
         if self.button.contains(point) {
             let _ = self.app_sender.send(AppEvent::StartSetup);
+            true
+        } else if self.logo_bounds.contains(point) {
+            // Tapping the logo opens the Image screen; its Back returns here.
+            let _ = self.app_sender.send(AppEvent::ShowImage {
+                back: BackTarget::Greeting,
+            });
             true
         } else {
             false

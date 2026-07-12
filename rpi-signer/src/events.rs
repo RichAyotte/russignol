@@ -5,6 +5,15 @@ use std::time::Duration;
 use crate::secret::Secret;
 use crate::tezos_encrypt::MigrationEvent;
 
+/// Where the Image screen returns to when dismissed. It is reached from the
+/// About page (post-unlock) and the first-boot greeting, so the entry point
+/// carries its own back target rather than the screen guessing from app state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackTarget {
+    About,
+    Greeting,
+}
+
 /// Outcome of the pre-keygen watermark-config presence check, carried by
 /// [`AppEvent::WatermarkConfigChecked`]. The setup gate maps it to a
 /// proceed-to-keygen vs block decision.
@@ -104,6 +113,10 @@ pub enum AppEvent {
     ShowWatermarks,        // Show watermarks page
     ShowBlockchain,        // Show blockchain/chain info page
     ShowAbout,             // Show about page
+    ShowGreeting,          // Return to the first-boot greeting page
+    ShowImage {
+        back: BackTarget,
+    }, // Show flashed-image provenance page
     RequestShutdown,       // Show shutdown confirmation from menu
     FatalError {
         title: String,

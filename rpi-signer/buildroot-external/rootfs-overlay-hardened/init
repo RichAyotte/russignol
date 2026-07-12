@@ -89,10 +89,12 @@ R_USER="russignol"
 F2FS_OPTS="rw,inline_data,inline_dentry,fsync_mode=strict,atgc,gc_merge,alloc_mode=reuse,background_gc=off,errors=remount-ro"
 
 # Boot partition (p1, vfat): a host doctor without f2fs support stages
-# watermark-config.json here for the device to consume on the next boot.
+# watermark-config.json here for the device to consume on the next boot; the
+# host also writes flash-manifest.json here at flash time.
 BOOT_PART="/dev/mmcblk0p1"
 BOOT_PROBE_MOUNT="/tmp/boot-config-probe"
 WATERMARK_CONFIG="watermark-config.json"
+FLASH_MANIFEST_FILE="flash-manifest.json"
 
 # Check if partition exists in kernel (created at first boot)
 partition_exists() {
@@ -119,6 +121,20 @@ config_pending() {
     umount "${BOOT_PROBE_MOUNT}" 2>/dev/null
     rmdir "${BOOT_PROBE_MOUNT}" 2>/dev/null
     return "$pending"
+}
+
+# Reads the host-written flash-manifest.json off p1 (read-only) into
+# FLASH_MANIFEST, so run_supervisor can hand it to the signer as an env var for
+# the Image screen. Empty on older cards with no manifest. Pipe-free (see
+# init_signals). The env-var name is a cross-language contract with the signer
+# (rpi-signer/src/constants.rs FLASH_MANIFEST_ENV), like EXIT_CODE_REBOOT.
+read_flash_manifest() {
+    FLASH_MANIFEST=""
+    mkdir -p "${BOOT_PROBE_MOUNT}"
+    mount -t vfat -o ro "${BOOT_PART}" "${BOOT_PROBE_MOUNT}" 2>/dev/null || return 0
+    [ -f "${BOOT_PROBE_MOUNT}/${FLASH_MANIFEST_FILE}" ] && FLASH_MANIFEST=$(cat "${BOOT_PROBE_MOUNT}/${FLASH_MANIFEST_FILE}")
+    umount "${BOOT_PROBE_MOUNT}" 2>/dev/null
+    rmdir "${BOOT_PROBE_MOUNT}" 2>/dev/null
 }
 
 init_keys_partition() {
@@ -517,6 +533,11 @@ if config_pending; then
 else
     CONFIG_PENDING=0
 fi
+
+# Read the flash manifest off p1 and export it for the signer's Image screen.
+# Inherited across the su boundary in run_supervisor like RUST_LOG.
+read_flash_manifest
+export RUSSIGNOL_FLASH_MANIFEST="$FLASH_MANIFEST"
 
 log_debug "Before init_keys_partition"
 init_keys_partition

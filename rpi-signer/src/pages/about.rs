@@ -1,9 +1,9 @@
-use crate::events::AppEvent;
+use crate::events::{AppEvent, BackTarget};
 use crate::fonts;
 
 use super::Page as PageTrait;
 use crossbeam_channel::Sender;
-use embedded_graphics::{image::Image, pixelcolor::BinaryColor, prelude::*};
+use embedded_graphics::{image::Image, pixelcolor::BinaryColor, prelude::*, primitives::Rectangle};
 use tinybmp::Bmp;
 use u8g2_fonts::{
     FontRenderer,
@@ -16,13 +16,18 @@ const LOGO_DATA: &[u8] = include_bytes!("../../assets/russignol-61h.bmp");
 
 pub struct Page {
     app_sender: Sender<AppEvent>,
+    /// Logo hit-box, set on each draw so a tap can open the Image screen.
+    logo_bounds: Rectangle,
 }
 
 use super::{DISPLAY_HEIGHT, DISPLAY_WIDTH};
 
 impl Page {
     pub fn new(app_sender: Sender<AppEvent>) -> Self {
-        Self { app_sender }
+        Self {
+            app_sender,
+            logo_bounds: Rectangle::new(Point::zero(), Size::zero()),
+        }
     }
 }
 
@@ -40,6 +45,7 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
             .map_or(Size::new(64, 64), |l| l.bounding_box().size);
         let logo_x = (half_width - logo_size.width.cast_signed()) / 2;
         let logo_y = (DISPLAY_HEIGHT - logo_size.height.cast_signed()) / 2;
+        self.logo_bounds = Rectangle::new(Point::new(logo_x, logo_y), logo_size);
         if let Ok(logo) = logo_result {
             Image::new(&logo, Point::new(logo_x, logo_y)).draw(display)?;
         }
@@ -99,8 +105,16 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         Ok(())
     }
 
-    fn handle_touch(&mut self, _point: Point) -> bool {
-        let _ = self.app_sender.send(AppEvent::ShowMenu);
-        false
+    fn handle_touch(&mut self, point: Point) -> bool {
+        if self.logo_bounds.contains(point) {
+            // Tapping the logo opens the Image screen; its Back returns here.
+            let _ = self.app_sender.send(AppEvent::ShowImage {
+                back: BackTarget::About,
+            });
+            true
+        } else {
+            let _ = self.app_sender.send(AppEvent::ShowMenu);
+            false
+        }
     }
 }

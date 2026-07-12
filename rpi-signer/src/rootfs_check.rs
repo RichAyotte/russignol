@@ -44,6 +44,14 @@ fn rootfs_mounted_readonly(proc_mounts: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this is a hardened image: the rootfs is mounted read-only, which is
+/// exactly the hardened cmdline's `ro` (dev images mount it read-write).
+/// Observed from `/proc/mounts` at call time, never stored. An unreadable
+/// `/proc/mounts` reads as not-hardened, so the display never over-claims.
+pub fn is_hardened() -> bool {
+    std::fs::read_to_string("/proc/mounts").is_ok_and(|mounts| rootfs_mounted_readonly(&mounts))
+}
+
 /// The rootfs hash recorded in the flash manifest, `None` when the manifest
 /// carries none
 ///

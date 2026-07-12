@@ -18,6 +18,9 @@ pub struct Button {
     pub text: Option<String>,
     pub bmp: Option<Bmp<'static, BinaryColor>>,
     pub bounds: Rectangle,
+    /// Filled (inverted) rather than outlined — a solid body with light text,
+    /// used to mark the active option in a segmented control.
+    pub filled: bool,
 }
 
 impl Button {
@@ -27,6 +30,7 @@ impl Button {
             bounds: Rectangle::new(Point::zero(), size),
             text: Some(text.to_string()),
             bmp: None,
+            filled: false,
         }
     }
 
@@ -40,6 +44,7 @@ impl Button {
             bounds: Rectangle::new(Point::zero(), size),
             text: None,
             bmp: Some(bmp),
+            filled: false,
         }
     }
 
@@ -68,10 +73,20 @@ impl Drawable for Button {
         D: DrawTarget<Color = Self::Color>,
     {
         let rect = self.bounds;
-        let style = PrimitiveStyle::with_stroke(BinaryColor::Off, 1);
-        let shape = RoundedRectangle::with_equal_corners(rect, Size::new(5, 5)).into_styled(style);
-
-        shape.draw(display)?;
+        let rounded = RoundedRectangle::with_equal_corners(rect, Size::new(5, 5));
+        // Filled buttons carry light text on a solid body; outlined ones dark
+        // text inside a stroke.
+        let text_color = if self.filled {
+            rounded
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+                .draw(display)?;
+            BinaryColor::On
+        } else {
+            rounded
+                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::Off, 1))
+                .draw(display)?;
+            BinaryColor::Off
+        };
 
         if let Some(text) = &self.text {
             let font = FontRenderer::new::<fonts::FONT_PROPORTIONAL>();
@@ -80,7 +95,7 @@ impl Drawable for Button {
                 rect.center(),
                 VerticalPosition::Center,
                 HorizontalAlignment::Center,
-                FontColor::Transparent(BinaryColor::Off),
+                FontColor::Transparent(text_color),
                 display,
             )
             .map_err(|e| match e {
