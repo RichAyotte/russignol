@@ -8,7 +8,7 @@ This driver is built on top of the `embedded-hal` crate and provides a high-leve
 
 - Drawing graphics and text on the display via `embedded-graphics`.
 - Handling touch input events.
-- Partial and full screen updates, selected automatically (full-refresh cadence configurable via `max_partial_updates`).
+- Partial and full screen updates, selected automatically; unchanged frames are skipped and anti-ghosting full refreshes land at page transitions.
 
 ## Installation
 

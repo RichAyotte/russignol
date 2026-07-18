@@ -172,8 +172,8 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
                             *b = 0;
                         }
                         self.pin.pop();
-                        if self.app_sender.send(AppEvent::DirtyDisplay).is_err() {
-                            log::error!("Could not send AppEvent::DirtyDisplay");
+                        if self.app_sender.send(AppEvent::Invalidate).is_err() {
+                            log::error!("Could not send AppEvent::Invalidate");
                         }
                     }
                     12 => {
@@ -181,8 +181,8 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
                         // truncates length to 0; Vec::clear alone would leave
                         // the digits in the backing allocation.
                         self.pin.zeroize();
-                        if self.app_sender.send(AppEvent::DirtyDisplay).is_err() {
-                            log::error!("Could not send AppEvent::DirtyDisplay");
+                        if self.app_sender.send(AppEvent::Invalidate).is_err() {
+                            log::error!("Could not send AppEvent::Invalidate");
                         }
                     }
                     _ => {
@@ -230,10 +230,9 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
                                     if let Ok(digit) = text.parse::<u8>() {
                                         if self.pin.len() < MAX_PIN_LENGTH {
                                             self.pin.push(digit);
-                                            if self.app_sender.send(AppEvent::DirtyDisplay).is_err()
-                                            {
+                                            if self.app_sender.send(AppEvent::Invalidate).is_err() {
                                                 log::error!(
-                                                    "PIN could not send AppEvent::DirtyDisplay"
+                                                    "PIN could not send AppEvent::Invalidate"
                                                 );
                                             }
                                         } else {

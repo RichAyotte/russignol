@@ -56,7 +56,7 @@ impl Page {
                 }
                 drop(ns);
 
-                let _ = tx.send(AppEvent::DirtyDisplay);
+                let _ = tx.send(AppEvent::Invalidate);
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
@@ -86,23 +86,31 @@ fn read_temperature() -> Option<f32> {
     Some(millideg / 1000.0)
 }
 
-fn read_uptime() -> Option<String> {
+// Coarse resolution (whole degrees, minutes) keeps these rows' rendered text
+// stable between 1 Hz ticks, so unchanged frames die in the display's
+// frame-skip instead of repainting the panel every second.
+
+fn format_temperature(temp: Option<f32>) -> String {
+    temp.map_or_else(|| "N/A".into(), |t| format!("{:.0}\u{00b0}C", t.round()))
+}
+
+fn read_uptime_secs() -> Option<u64> {
     let raw = std::fs::read_to_string("/proc/uptime").ok()?;
     let field = raw.split_whitespace().next()?;
     // /proc/uptime is "seconds.fractional ...", parse integer part
-    let secs: u64 = field.split('.').next()?.parse().ok()?;
-    let seconds = secs % 60;
+    field.split('.').next()?.parse().ok()
+}
+
+fn format_uptime(secs: u64) -> String {
     let minutes = (secs / 60) % 60;
     let hours = (secs / 3600) % 24;
     let days = secs / 86400;
     if days > 0 {
-        Some(format!("{days}d {hours}h {minutes}m {seconds}s"))
+        format!("{days}d {hours}h {minutes}m")
     } else if hours > 0 {
-        Some(format!("{hours}h {minutes}m {seconds}s"))
-    } else if minutes > 0 {
-        Some(format!("{minutes}m {seconds}s"))
+        format!("{hours}h {minutes}m")
     } else {
-        Some(format!("{seconds}s"))
+        format!("{minutes}m")
     }
 }
 
@@ -149,12 +157,11 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         draw_label_value(display, "Baker", status_str, ROW_1_Y);
 
         // Temperature row
-        let temp_str =
-            read_temperature().map_or_else(|| "N/A".into(), |t| format!("{t:.1}\u{00b0}C"));
+        let temp_str = format_temperature(read_temperature());
         draw_label_value(display, "CPU Temp", temp_str.as_str(), ROW_2_Y);
 
         // Uptime row
-        let uptime_str = read_uptime().unwrap_or_else(|| "N/A".into());
+        let uptime_str = read_uptime_secs().map_or_else(|| "N/A".into(), format_uptime);
         draw_label_value(display, "Uptime", uptime_str.as_str(), ROW_3_Y);
 
         // Signatures row
@@ -196,4 +203,29 @@ fn draw_label_value<D: DrawTarget<Color = BinaryColor>>(
         display,
     )
     .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uptime_formats_at_minute_resolution() {
+        assert_eq!(format_uptime(0), "0m");
+        assert_eq!(format_uptime(59), "0m");
+        assert_eq!(format_uptime(60), "1m");
+        assert_eq!(format_uptime(3599), "59m");
+        assert_eq!(format_uptime(3600), "1h 0m");
+        assert_eq!(format_uptime(86399), "23h 59m");
+        assert_eq!(format_uptime(86400), "1d 0h 0m");
+        assert_eq!(format_uptime(90061), "1d 1h 1m");
+    }
+
+    #[test]
+    fn temperature_formats_whole_degrees() {
+        assert_eq!(format_temperature(Some(48.4)), "48\u{00b0}C");
+        assert_eq!(format_temperature(Some(48.5)), "49\u{00b0}C");
+        assert_eq!(format_temperature(Some(48.6)), "49\u{00b0}C");
+        assert_eq!(format_temperature(None), "N/A");
+    }
 }

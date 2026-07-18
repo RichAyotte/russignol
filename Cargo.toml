@@ -22,7 +22,7 @@ pedantic = { level = "warn", priority = -1 }
 
 # Shared dependencies across workspace
 [workspace.dependencies]
-log = { version = "0.4", features = ["max_level_info", "release_max_level_info"] }
+log = { version = "0.4", features = ["release_max_level_info"] }
 
 # Dev profile - enable optimizations for usable debug builds
 [profile.dev]

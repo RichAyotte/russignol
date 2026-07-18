@@ -1,12 +1,22 @@
 use crate::common::{BUFFER_SIZE, HEIGHT, Rotation, WIDTH};
-use crate::display_driver::{DisplayMode, Epd2in13v4};
+use crate::display_driver::{Epd2in13v4, PushOutcome, WaitPolicy};
 use crate::error::EpdResult;
+use crate::refresh_policy::{self, RefreshAction, RefreshOpportunity};
 use embedded_graphics::{
     geometry::Dimensions,
     pixelcolor::BinaryColor,
     prelude::{DrawTarget, OriginDimensions, Pixel, PointsIter, Size},
     primitives::Rectangle,
 };
+
+/// Outcome of a non-blocking update attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    /// The frame was pushed, or the policy decided no push was needed.
+    Done,
+    /// The panel is mid-refresh; nothing was pushed or recorded — retry later.
+    Busy,
+}
 
 pub trait AsFillByte {
     fn as_byte(&self) -> u8;
@@ -21,13 +31,9 @@ impl AsFillByte for BinaryColor {
 pub struct Display {
     driver: Epd2in13v4,
     buffer: Box<[u8]>,
-    partial_update_count: u8,
+    partials_since_full: u16,
+    has_ever_pushed: bool,
     rotation: Rotation,
-
-    // For SSD1680 e-paper displays, it is recommended to perform a full update
-    // every 10 partial updates or every 30 minutes to prevent ghosting and
-    // maintain display quality.
-    pub max_partial_updates: u8,
 }
 
 impl Display {
@@ -38,32 +44,52 @@ impl Display {
             rotation,
             driver,
             buffer,
-            partial_update_count: 0,
-            max_partial_updates: 255,
+            partials_since_full: 0,
+            has_ever_pushed: false,
         }
     }
 
-    /// Send the framebuffer to the display, choosing full or partial mode automatically.
+    /// Repaint the page already on screen. Skips the push when the frame is
+    /// unchanged; never performs a full refresh after the boot push.
     ///
     /// # Errors
     ///
     /// Returns an error if the display driver fails to update.
     pub fn update(&mut self) -> EpdResult<()> {
-        if self.partial_update_count >= self.max_partial_updates {
-            self.partial_update_count = 0;
-        }
+        self.push(RefreshOpportunity::InPlace, WaitPolicy::Block)
+            .map(|_| ())
+    }
 
-        let mode = match self.partial_update_count {
-            0 => DisplayMode::Full,
-            _ => DisplayMode::Partial,
-        };
+    /// Non-blocking [`Self::update`]: defers instead of waiting when the
+    /// panel is mid-refresh, leaving all state untouched for the retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the display driver fails to update.
+    pub fn try_update(&mut self) -> EpdResult<UpdateOutcome> {
+        self.push(RefreshOpportunity::InPlace, WaitPolicy::Bail)
+    }
 
-        let result = self.driver.display(&self.buffer, mode);
+    /// Repaint for a page transition. Performs an anti-ghosting full refresh
+    /// when enough partial updates have accumulated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the display driver fails to update.
+    pub fn update_transition(&mut self) -> EpdResult<()> {
+        self.push(RefreshOpportunity::Transition, WaitPolicy::Block)
+            .map(|_| ())
+    }
 
-        if result.is_ok() {
-            self.partial_update_count += 1;
-        }
-        result
+    /// Non-blocking [`Self::update_transition`]: defers instead of waiting
+    /// when the panel is mid-refresh, leaving all state untouched for the
+    /// retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the display driver fails to update.
+    pub fn try_update_transition(&mut self) -> EpdResult<UpdateOutcome> {
+        self.push(RefreshOpportunity::Transition, WaitPolicy::Bail)
     }
 
     /// Force a full display update (not partial)
@@ -72,8 +98,33 @@ impl Display {
     ///
     /// Returns an error if the display driver fails to update.
     pub fn update_full(&mut self) -> EpdResult<()> {
-        self.partial_update_count = 0;
-        self.update()
+        self.push(RefreshOpportunity::ForcedFull, WaitPolicy::Block)
+            .map(|_| ())
+    }
+
+    fn push(
+        &mut self,
+        opportunity: RefreshOpportunity,
+        policy: WaitPolicy,
+    ) -> EpdResult<UpdateOutcome> {
+        let decision = refresh_policy::decide(
+            self.driver.frame_differs(&self.buffer),
+            self.has_ever_pushed,
+            self.partials_since_full,
+            opportunity,
+        );
+        if let RefreshAction::Push(mode) = decision.action {
+            if self
+                .driver
+                .display_with_policy(&self.buffer, mode, policy)?
+                == PushOutcome::Busy
+            {
+                return Ok(UpdateOutcome::Busy);
+            }
+            self.has_ever_pushed = true;
+        }
+        self.partials_since_full = decision.partials_since_full;
+        Ok(UpdateOutcome::Done)
     }
 
     pub(crate) fn sleep(&mut self) -> EpdResult<()> {

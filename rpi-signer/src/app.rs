@@ -215,6 +215,40 @@ pub enum LoopAction {
     Proceed,
 }
 
+/// Deferred render work for the event loop's single flush site. A push that
+/// bails on a busy panel is re-recorded here and retried on a short poll, so
+/// the loop never blocks on the panel. Variant order is escalation order: a
+/// transition subsumes an in-place repaint, never the reverse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PendingRender {
+    #[default]
+    None,
+    /// Redraw the current page and push it in place.
+    InPlace,
+    /// Push with transition policy, where a due anti-ghosting full may land.
+    Transition,
+}
+
+impl PendingRender {
+    pub fn record_invalidate(&mut self) {
+        self.record(Self::InPlace);
+    }
+
+    pub fn record_transition(&mut self) {
+        self.record(Self::Transition);
+    }
+
+    /// Merge `kind`, keeping the more demanding of the two.
+    fn record(&mut self, kind: Self) {
+        *self = (*self).max(kind);
+    }
+
+    /// Consume the pending work, leaving none.
+    pub fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
 /// Identifies which page to show without constructing it
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageSpec {
@@ -331,6 +365,9 @@ pub struct App {
     pub unknown_keys: UnknownKeyAlert,
     pub needs_animation: bool,
     pub animation_interval: Duration,
+    /// Render work deferred to the loop's flush site; survives loop
+    /// iterations when a push bails on a busy panel.
+    pub pending_render: PendingRender,
 }
 
 impl App {
@@ -361,6 +398,7 @@ impl App {
             unknown_keys: UnknownKeyAlert::default(),
             needs_animation: false,
             animation_interval: Duration::from_secs(1),
+            pending_render: PendingRender::None,
         }
     }
 
@@ -374,20 +412,26 @@ impl App {
         )
     }
 
-    /// Whether a `DirtyDisplay` (a page repainting itself, e.g. PIN entry dots
-    /// on each touch) should render. Suppressed only by the screensaver; a modal
-    /// page must still repaint its own touch feedback.
-    pub fn should_repaint_on_dirty(&self) -> bool {
+    /// Whether an `Invalidate` should redraw the current page. Suppressed only
+    /// by the screensaver, which has nothing to repaint. Modals are not
+    /// suppressed: an unchanged modal frame dies in the frame diff, not in a
+    /// gate, so a signing burst never flashes it.
+    pub fn should_repaint_on_invalidate(&self) -> bool {
         !self.is_screensaver_active()
     }
 
-    /// Whether a `SigningActivity` refresh (the signer's background per-signature
-    /// callback) should repaint the current page. Suppressed while a modal is up
-    /// (e.g. the unknown-key notice): a held-key signing burst emits one refresh
-    /// per signature, which would flash the modal on the bistable panel each
-    /// time. The screensaver has nothing to repaint.
-    pub fn should_repaint_on_signing_activity(&self) -> bool {
-        !self.is_screensaver_active() && !self.current_page_modal
+    /// Whether the pending render warrants a flush, evaluated at flush time
+    /// against the post-batch state: a mid-batch page change or screensaver
+    /// toggle is reflected here, not when the event was recorded. A
+    /// transition is never suppressed — it is a real page change that must
+    /// land; the screensaver gate only drops repaints of a frame nobody can
+    /// see.
+    pub fn should_flush_repaint(&self, pending: PendingRender) -> bool {
+        match pending {
+            PendingRender::None => false,
+            PendingRender::InPlace => self.should_repaint_on_invalidate(),
+            PendingRender::Transition => true,
+        }
     }
 
     pub fn recv_timeout(&self) -> Duration {
@@ -1586,62 +1630,123 @@ mod tests {
         assert!(effects.is_empty());
     }
 
-    // === DirtyDisplay repaint gate ===
+    // === Invalidate repaint gate ===
 
     #[test]
-    fn dirty_display_repaints_non_modal_page() {
+    fn invalidate_repaints_non_modal_page() {
         let app = active_app();
         assert!(
-            app.should_repaint_on_dirty(),
-            "a page's own repaint must render on a non-modal page"
+            app.should_repaint_on_invalidate(),
+            "an invalidate must redraw a non-modal page"
         );
     }
 
     #[test]
-    fn dirty_display_repaints_while_modal() {
+    fn invalidate_repaints_while_modal() {
         let mut app = active_app();
         app.current_page_modal = true;
         assert!(
-            app.should_repaint_on_dirty(),
-            "a modal page (e.g. PIN entry) must still repaint its own touch feedback"
+            app.should_repaint_on_invalidate(),
+            "a modal page must still redraw; an unchanged frame dies in the diff"
         );
     }
 
     #[test]
-    fn dirty_display_suppressed_during_screensaver() {
+    fn invalidate_suppressed_during_screensaver() {
         let app = active_screensaver_app();
         assert!(
-            !app.should_repaint_on_dirty(),
+            !app.should_repaint_on_invalidate(),
             "screensaver has nothing to repaint"
         );
     }
 
+    // === PendingRender ===
+
     #[test]
-    fn signing_activity_refreshes_non_modal_page() {
-        let app = active_app();
-        assert!(
-            app.should_repaint_on_signing_activity(),
-            "signing activity must refresh a non-modal page"
+    fn pending_render_records_invalidate_as_in_place() {
+        let mut pending = PendingRender::None;
+        pending.record_invalidate();
+        assert_eq!(pending, PendingRender::InPlace);
+        pending.record_invalidate();
+        assert_eq!(pending, PendingRender::InPlace, "repeats must merge");
+    }
+
+    #[test]
+    fn pending_render_records_transition() {
+        let mut pending = PendingRender::None;
+        pending.record_transition();
+        assert_eq!(pending, PendingRender::Transition);
+    }
+
+    #[test]
+    fn pending_render_transition_upgrades_in_place() {
+        let mut pending = PendingRender::None;
+        pending.record_invalidate();
+        pending.record_transition();
+        assert_eq!(
+            pending,
+            PendingRender::Transition,
+            "a transition subsumes an in-place repaint"
         );
     }
 
     #[test]
-    fn signing_activity_suppressed_while_modal() {
-        let mut app = active_app();
-        app.current_page_modal = true;
-        assert!(
-            !app.should_repaint_on_signing_activity(),
-            "a signing burst must not flash the modal on every signature"
+    fn pending_render_invalidate_never_downgrades_transition() {
+        let mut pending = PendingRender::Transition;
+        pending.record_invalidate();
+        assert_eq!(
+            pending,
+            PendingRender::Transition,
+            "an invalidate must not downgrade a pending transition"
         );
     }
 
     #[test]
-    fn signing_activity_suppressed_during_screensaver() {
-        let app = active_screensaver_app();
-        assert!(
-            !app.should_repaint_on_signing_activity(),
-            "screensaver has nothing to repaint"
-        );
+    fn pending_render_take_drains() {
+        let mut pending = PendingRender::None;
+        pending.record_invalidate();
+        assert_eq!(pending.take(), PendingRender::InPlace);
+        assert_eq!(pending, PendingRender::None);
+    }
+
+    // === Flush predicate ===
+
+    #[test]
+    fn flush_repaint_table() {
+        use PendingRender::{InPlace, None as NoPending, Transition};
+        let modal_app = || {
+            let mut app = active_app();
+            app.current_page_modal = true;
+            app
+        };
+        let cases: &[(&str, App, PendingRender, bool)] = &[
+            ("nothing pending", active_app(), NoPending, false),
+            (
+                "nothing pending during screensaver",
+                active_screensaver_app(),
+                NoPending,
+                false,
+            ),
+            ("in-place on live page", active_app(), InPlace, true),
+            ("in-place while modal flushes", modal_app(), InPlace, true),
+            (
+                "in-place during screensaver",
+                active_screensaver_app(),
+                InPlace,
+                false,
+            ),
+            ("transition on live page", active_app(), Transition, true),
+            ("transition while modal", modal_app(), Transition, true),
+            (
+                "transition during screensaver",
+                active_screensaver_app(),
+                Transition,
+                true,
+            ),
+        ];
+        for (name, app, pending, expected) in cases {
+            assert_eq!(app.should_flush_repaint(*pending), *expected, "{name}");
+        }
     }
 
     // === Screensaver tests ===
@@ -2267,10 +2372,10 @@ mod tests {
     fn only_dismiss_deactivates_unknown_key_alert() {
         let mut app = active_app();
         request_unknown_key(&mut app, "tz4wrong1");
-        // A successful signature (the signing callback sends SigningActivity)
+        // A successful signature (the signing callback sends Invalidate)
         // says nothing about the unheld key in a mixed one-held/one-unheld
         // config, so it must not clear the alert.
-        app.handle_event(AppEvent::SigningActivity);
+        app.handle_event(AppEvent::Invalidate);
         app.handle_event(AppEvent::ShowMenu);
         assert_eq!(
             app.unknown_keys.active(),

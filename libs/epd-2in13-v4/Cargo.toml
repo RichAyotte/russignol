@@ -10,7 +10,6 @@ license = "MIT"
 workspace = true
 
 [lib]
-test = false
 doctest = false
 
 [dependencies]

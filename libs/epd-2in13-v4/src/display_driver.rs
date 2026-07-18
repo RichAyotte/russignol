@@ -13,6 +13,21 @@ pub enum DisplayMode {
     Partial,
 }
 
+/// What to do when a push would have to wait for an in-flight refresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitPolicy {
+    /// Wait for the panel to go idle, then push.
+    Block,
+    /// Return `PushOutcome::Busy` without touching any state.
+    Bail,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    Pushed,
+    Busy,
+}
+
 // EPD (Display) constants
 pub(crate) const RESET_DELAY_MS: u32 = 20;
 pub(crate) const RESET_PULSE_MS: u32 = 2;
@@ -116,6 +131,11 @@ impl Epd2in13v4 {
         Ok(driver)
     }
 
+    /// Whether `buffer` differs from the last frame successfully pushed.
+    pub fn frame_differs(&self, buffer: &[u8]) -> bool {
+        *self.last_frame != *buffer
+    }
+
     fn hardware_reset(&mut self) -> EpdResult<()> {
         debug!("EPD: Hardware reset starting");
         self.rst.set_high()?;
@@ -209,33 +229,47 @@ impl Epd2in13v4 {
             Some(EpdData::DataEntryMode.as_slice()),
         )?;
         self.set_full_ram_window()?;
-        // Reset so next display() takes the full update path
+        // Reset so the next partial update waits for idle instead of
+        // taking the supersede fast path
         self.last_update_mode = None;
         Ok(())
     }
 
     pub fn display(&mut self, buffer: &[u8], mode: DisplayMode) -> EpdResult<()> {
+        self.display_with_policy(buffer, mode, WaitPolicy::Block)
+            .map(|_| ())
+    }
+
+    pub(crate) fn display_with_policy(
+        &mut self,
+        buffer: &[u8],
+        mode: DisplayMode,
+        policy: WaitPolicy,
+    ) -> EpdResult<PushOutcome> {
         debug!(
             "EPD: display() called with mode={:?}, buffer_len={}",
             mode,
             buffer.len()
         );
 
-        // Check if display is currently refreshing
         let is_busy = self.busy.is_high()?;
+        let overlap = is_busy && has_overlap(&self.dirty_mask, &self.last_frame, buffer);
 
-        // If display is idle, previous refresh completed - clear dirty tracking
-        if !is_busy {
-            self.dirty_mask.fill(0x00);
+        let must_wait = needs_idle_wait(mode, is_busy, self.last_update_mode, overlap);
+        if must_wait {
+            match policy {
+                WaitPolicy::Block => self.wait_until_idle()?,
+                WaitPolicy::Bail => {
+                    debug!("EPD: display() deferred, panel busy (mode={mode:?})");
+                    return Ok(PushOutcome::Busy);
+                }
+            }
         }
 
-        // For partial updates, only wait if there's pixel overlap with dirty pixels
-        if mode == DisplayMode::Partial
-            && is_busy
-            && has_overlap(&self.dirty_mask, &self.last_frame, buffer)
-        {
-            debug!("EPD: Overlap detected with dirty pixels, waiting for idle");
-            self.wait_until_idle()?;
+        // Panel idle at entry or the wait above completed: the previous
+        // refresh has finished, so its dirty tracking is obsolete.
+        if !is_busy || must_wait {
+            self.dirty_mask.fill(0x00);
         }
 
         let result = match mode {
@@ -270,11 +304,6 @@ impl Epd2in13v4 {
                 self.send_command(EpdCommand::ActivateDisplayUpdateSequence, None)
             }
             DisplayMode::Partial => {
-                if self.last_update_mode.is_none()
-                    || self.last_update_mode == Some(DisplayMode::Full)
-                {
-                    self.wait_until_idle()?;
-                }
                 self.rst.set_low()?;
                 self.delay.delay_ms(PARTIAL_UPDATE_RESET_DELAY_MS);
                 self.rst.set_high()?;
@@ -314,7 +343,7 @@ impl Epd2in13v4 {
         }
 
         self.last_update_mode = Some(mode);
-        result
+        result.map(|()| PushOutcome::Pushed)
     }
 
     fn set_full_ram_window(&mut self) -> EpdResult<()> {
@@ -336,4 +365,99 @@ fn has_overlap(dirty_mask: &[u8], last_frame: &[u8], new_frame: &[u8]) -> bool {
             let changing = last ^ new; // pixels this frame wants to change
             (dirty & changing) != 0 // any of those already dirty?
         })
+}
+
+/// Whether a push must wait for the in-flight refresh before proceeding.
+///
+/// A partial push that changes no in-flight pixel while the previous update
+/// was also partial deliberately supersedes the running refresh (the reset
+/// pulse drops the busy line), so it never waits.
+fn needs_idle_wait(
+    mode: DisplayMode,
+    is_busy: bool,
+    last_update_mode: Option<DisplayMode>,
+    overlap: bool,
+) -> bool {
+    is_busy
+        && match mode {
+            DisplayMode::Full => true,
+            DisplayMode::Partial => overlap || last_update_mode != Some(DisplayMode::Partial),
+        }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use DisplayMode::{Full, Partial};
+
+    fn check(
+        name: &str,
+        mode: DisplayMode,
+        is_busy: bool,
+        last_update_mode: Option<DisplayMode>,
+        overlap: bool,
+        expected: bool,
+    ) {
+        assert_eq!(
+            needs_idle_wait(mode, is_busy, last_update_mode, overlap),
+            expected,
+            "{name}"
+        );
+    }
+
+    #[test]
+    fn busy_full_always_waits() {
+        check("last none", Full, true, None, false, true);
+        check("last full", Full, true, Some(Full), false, true);
+        check("last partial", Full, true, Some(Partial), false, true);
+        check("overlap", Full, true, Some(Partial), true, true);
+    }
+
+    #[test]
+    fn busy_partial_with_overlap_waits() {
+        check("last partial", Partial, true, Some(Partial), true, true);
+        check("last full", Partial, true, Some(Full), true, true);
+        check("last none", Partial, true, None, true, true);
+    }
+
+    #[test]
+    fn busy_partial_no_overlap_after_partial_supersedes() {
+        check("supersede", Partial, true, Some(Partial), false, false);
+    }
+
+    #[test]
+    fn busy_partial_no_overlap_after_full_or_wake_waits() {
+        check("last none", Partial, true, None, false, true);
+        check("last full", Partial, true, Some(Full), false, true);
+    }
+
+    #[test]
+    fn idle_never_waits() {
+        check("full, last none", Full, false, None, false, false);
+        check(
+            "full, last partial",
+            Full,
+            false,
+            Some(Partial),
+            true,
+            false,
+        );
+        check("partial, last none", Partial, false, None, false, false);
+        check(
+            "partial, last full",
+            Partial,
+            false,
+            Some(Full),
+            true,
+            false,
+        );
+        check(
+            "partial, last partial",
+            Partial,
+            false,
+            Some(Partial),
+            true,
+            false,
+        );
+    }
 }

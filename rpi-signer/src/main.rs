@@ -21,7 +21,7 @@ mod util;
 mod watermark_setup;
 mod widgets;
 
-use app::{App, Effect, LoopAction, PageSpec};
+use app::{App, Effect, LoopAction, PageSpec, PendingRender};
 use crossbeam_channel::Sender;
 use russignol_signer_lib::{
     ChainId, HighWatermark,
@@ -34,7 +34,7 @@ use std::sync::RwLock;
 use embedded_graphics::geometry::Dimensions;
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::{DrawTarget, Point};
-use epd_2in13_v4::display::Display;
+use epd_2in13_v4::display::{Display, UpdateOutcome};
 use epd_2in13_v4::{Device, device};
 use events::{AppEvent, ConfigPresence};
 use pages::{
@@ -55,7 +55,7 @@ fn fatal_error(device: &mut Device, title: &str, message: &str) -> ! {
     log::error!("FATAL: {title} - {message}");
     let mut error_page = error::Page::new(title, message);
     let _ = error_page.show(&mut device.display);
-    let _ = device.display.update();
+    let _ = device.display.update_transition();
     std::process::exit(1)
 }
 
@@ -111,7 +111,7 @@ fn build_signer_event_callbacks(app_tx: &Sender<AppEvent>) -> SignerEventCallbac
 
     let tx_for_signing = app_tx.clone();
     let signing: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        let _ = tx_for_signing.send(AppEvent::SigningActivity);
+        let _ = tx_for_signing.send(AppEvent::Invalidate);
     });
 
     let tx_for_large_gap = app_tx.clone();
@@ -275,6 +275,10 @@ fn run_ui_loop(
     cpu_boost: Option<&cpu_freq::CpuBoost>,
 ) -> epd_2in13_v4::EpdResult<()> {
     const SCREENSAVER_TIMEOUT: Duration = Duration::from_mins(1);
+    // A partial refresh runs a few hundred ms, so a deferred render retries
+    // within a few wakeups and lands almost immediately after the panel
+    // goes idle.
+    const RENDER_RETRY_POLL: Duration = Duration::from_millis(50);
 
     let (screensaver_reset_tx, screensaver_reset_rx) = crossbeam_channel::unbounded::<()>();
     let tx_screensaver = tx.clone();
@@ -327,68 +331,54 @@ fn run_ui_loop(
         log::info!("Normal boot - showing PIN verification");
         Box::new(pin::Page::new(tx.clone(), "Enter\n PIN", pin::Mode::Verify))
     };
-    render_page(&mut device, &mut current_page)?;
+    render_page_transition(&mut device, &mut current_page)?;
 
     loop {
-        let timeout = app.recv_timeout();
+        let timeout = match app.pending_render {
+            PendingRender::None => app.recv_timeout(),
+            _ => app.recv_timeout().min(RENDER_RETRY_POLL),
+        };
 
-        let event = match rx.recv_timeout(timeout) {
-            Ok(event) => event,
+        match rx.recv_timeout(timeout) {
+            Ok(first) => {
+                let exit = drain_events(
+                    &mut app,
+                    &mut device,
+                    &mut current_page,
+                    rx,
+                    first,
+                    cpu_boost,
+                    &screensaver_reset_tx,
+                );
+                if exit {
+                    break;
+                }
+            }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 handle_timeout(&mut app, &mut device, &mut current_page)?;
-                continue;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 log::info!("Event channel disconnected, exiting event loop");
                 break;
             }
-        };
-
-        // Handle Touch and DirtyDisplay directly in the runtime
-        match event {
-            AppEvent::Touch(touch_point) => {
-                handle_touch(
-                    &mut app,
-                    &mut current_page,
-                    touch_point,
-                    &screensaver_reset_tx,
-                );
-                continue;
-            }
-            AppEvent::DirtyDisplay => {
-                if app.should_repaint_on_dirty() {
-                    render_page(&mut device, &mut current_page)?;
-                }
-                continue;
-            }
-            AppEvent::SigningActivity => {
-                if app.should_repaint_on_signing_activity() {
-                    render_page(&mut device, &mut current_page)?;
-                }
-                continue;
-            }
-            _ => {}
         }
 
-        // Delegate all other events to App
-        let (action, effects) = app.handle_event(event);
-
-        if action != LoopAction::Continue {
-            // A failed effect otherwise unwinds to `main` and exits with the
-            // last frame still on the bistable panel — a crash that reads as a
-            // hang. Render it instead (fatal_error diverges).
-            if let Err(e) = apply_effects(
-                &mut app,
-                effects,
-                &mut device,
-                &mut current_page,
-                cpu_boost,
-                &screensaver_reset_tx,
-            ) {
-                fatal_error(&mut device, "SYSTEM ERROR", &e.to_string());
-            }
-            if action == LoopAction::Break {
-                break;
+        let kind = app.pending_render.take();
+        if app.should_flush_repaint(kind) {
+            match kind {
+                PendingRender::None => {}
+                PendingRender::InPlace => {
+                    if try_render_page(&mut device, &mut current_page)? == UpdateOutcome::Busy {
+                        app.pending_render.record_invalidate();
+                    }
+                }
+                PendingRender::Transition => {
+                    try_render_page_transition(
+                        &mut device,
+                        &mut current_page,
+                        &mut app.pending_render,
+                    )?;
+                }
             }
         }
     }
@@ -396,13 +386,93 @@ fn run_ui_loop(
     Ok(())
 }
 
-/// Draw the current page and push the frame to the panel.
-fn render_page(
+/// Process `first` plus everything already queued, in arrival order.
+/// Invalidate events are recorded into the app's pending render rather than
+/// rendered, so the caller flushes a burst as at most one render — a touch
+/// never waits behind queued e-paper repaints. Returns whether the loop
+/// should exit.
+fn drain_events(
+    app: &mut App,
+    device: &mut Device,
+    current_page: &mut Box<dyn Page<Display>>,
+    rx: &crossbeam_channel::Receiver<AppEvent>,
+    first: AppEvent,
+    cpu_boost: Option<&cpu_freq::CpuBoost>,
+    screensaver_reset_tx: &Sender<()>,
+) -> bool {
+    let mut next = Some(first);
+    while let Some(event) = next {
+        match event {
+            AppEvent::Touch(touch_point) => {
+                handle_touch(app, current_page, touch_point, screensaver_reset_tx);
+            }
+            AppEvent::Invalidate => app.pending_render.record_invalidate(),
+            event => {
+                let (action, effects) = app.handle_event(event);
+
+                if action != LoopAction::Continue {
+                    // A failed effect otherwise unwinds to `main` and exits
+                    // with the last frame still on the bistable panel — a
+                    // crash that reads as a hang. Render it instead
+                    // (fatal_error diverges).
+                    if let Err(e) = apply_effects(
+                        app,
+                        effects,
+                        device,
+                        current_page,
+                        cpu_boost,
+                        screensaver_reset_tx,
+                    ) {
+                        fatal_error(device, "SYSTEM ERROR", &e.to_string());
+                    }
+                    if action == LoopAction::Break {
+                        return true;
+                    }
+                }
+            }
+        }
+        next = rx.try_recv().ok();
+    }
+    false
+}
+
+/// Draw the current page and push the frame in place unless the panel is
+/// mid-refresh; a busy panel drops the frame, and the caller decides
+/// whether anything retries.
+fn try_render_page(
+    device: &mut Device,
+    current_page: &mut Box<dyn Page<Display>>,
+) -> epd_2in13_v4::EpdResult<UpdateOutcome> {
+    current_page.show(&mut device.display)?;
+    device.display.try_update()
+}
+
+/// Draw the current page and push the frame as a page transition, the
+/// moment where a due anti-ghosting full refresh is allowed to land. A busy
+/// panel defers instead: the transition is recorded in `pending` and the
+/// event loop's retry poll re-pushes the redrawn page once the panel goes
+/// idle.
+fn try_render_page_transition(
+    device: &mut Device,
+    current_page: &mut Box<dyn Page<Display>>,
+    pending: &mut PendingRender,
+) -> epd_2in13_v4::EpdResult<()> {
+    current_page.show(&mut device.display)?;
+    if device.display.try_update_transition()? == UpdateOutcome::Busy {
+        pending.record_transition();
+    }
+    Ok(())
+}
+
+/// Draw the current page and push the frame as a page transition, waiting
+/// out any in-flight refresh. For sites that must land before the loop
+/// continues (boot, terminal paths).
+fn render_page_transition(
     device: &mut Device,
     current_page: &mut Box<dyn Page<Display>>,
 ) -> epd_2in13_v4::EpdResult<()> {
     current_page.show(&mut device.display)?;
-    device.display.update()?;
+    device.display.update_transition()?;
     Ok(())
 }
 
@@ -412,7 +482,8 @@ fn handle_timeout(
     current_page: &mut Box<dyn Page<Display>>,
 ) -> epd_2in13_v4::EpdResult<()> {
     if app.needs_animation && !app.is_screensaver_active() {
-        render_page(device, current_page)?;
+        // A busy panel drops this frame; the next animation tick redraws.
+        try_render_page(device, current_page)?;
     }
     Ok(())
 }
@@ -435,7 +506,8 @@ fn sleep_with_animation(
             return Ok(());
         }
         if app.needs_animation && !app.is_screensaver_active() {
-            if let Err(e) = render_page(device, current_page) {
+            // A busy panel drops this frame; the next animation tick redraws.
+            if let Err(e) = try_render_page(device, current_page) {
                 log::warn!("display update during sleep: {e}");
             }
             std::thread::sleep(app.animation_interval.min(remaining));
@@ -588,7 +660,7 @@ fn apply_effects(
             Effect::SleepDevice => device.sleep()?,
             Effect::ClearDisplay => {
                 device.display.clear(BinaryColor::On)?;
-                device.display.update()?;
+                device.display.update_full()?;
             }
             Effect::Emit(event) => {
                 let _ = app.tx.send(event);
@@ -640,8 +712,7 @@ fn apply_effects(
                 let _ = screensaver_reset_tx.send(());
             }
             Effect::DropCurrentPage => {
-                *current_page = Box::new(screensaver::Page::new());
-                render_page(device, current_page)?;
+                apply_drop_current_page(app, device, current_page)?;
             }
             Effect::RebuildSavedPage => {
                 if let Some(spec) = app.current_page_spec.clone() {
@@ -649,7 +720,7 @@ fn apply_effects(
                     app.current_page_modal = page.is_modal();
                     app.needs_animation = false;
                     *current_page = page;
-                    render_page(device, current_page)?;
+                    try_render_page_transition(device, current_page, &mut app.pending_render)?;
                 }
             }
             Effect::FatalError { title, message } => fatal_error(device, &title, &message),
@@ -660,6 +731,27 @@ fn apply_effects(
             Effect::Sleep(duration) => sleep_with_animation(app, device, current_page, duration)?,
         }
     }
+    Ok(())
+}
+
+/// Swap in the screensaver page and push it. Blocking: the push must
+/// complete before the `SleepDisplay` that follows in the same effect list,
+/// so nothing may defer here.
+fn apply_drop_current_page(
+    app: &mut App,
+    device: &mut Device,
+    current_page: &mut Box<dyn Page<Display>>,
+) -> epd_2in13_v4::EpdResult<()> {
+    // The screensaver frame supersedes any deferred render — wake rebuilds
+    // the saved page — and a surviving transition could land a due
+    // anti-ghosting full on the panel after it goes to sleep.
+    app.pending_render = PendingRender::None;
+    *current_page = Box::new(screensaver::Page::new());
+    // A transition, not a forced full: with a 1-minute idle timeout an
+    // unconditional full would flash every minute of hands-off watching; a
+    // due anti-ghosting full still lands here behind the logo swap.
+    current_page.show(&mut device.display)?;
+    device.display.update_transition()?;
     Ok(())
 }
 
@@ -681,14 +773,14 @@ fn apply_show_page(
             u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
             &mut device.display,
         );
-        device.display.update()?;
+        device.display.update_transition()?;
     } else {
         app.current_page_spec = Some(spec.clone());
         let page = construct_page(spec, &app.tx, &app.signing_activity, &app.watermark);
         app.current_page_modal = page.is_modal();
         app.needs_animation = false;
         *current_page = page;
-        render_page(device, current_page)?;
+        try_render_page_transition(device, current_page, &mut app.pending_render)?;
     }
     Ok(())
 }
@@ -715,7 +807,7 @@ fn apply_show_progress(
         app.needs_animation = false;
         *current_page = Box::new(progress);
     }
-    render_page(device, current_page)?;
+    try_render_page_transition(device, current_page, &mut app.pending_render)?;
     Ok(())
 }
 
@@ -1072,7 +1164,7 @@ fn apply_watermark_update(
         ));
         app.current_page_modal = true;
         *current_page = page;
-        render_page(device, current_page)?;
+        try_render_page_transition(device, current_page, &mut app.pending_render)?;
     }
     Ok(())
 }

@@ -97,7 +97,7 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
             // Repaint only on an actual view change to spare the e-paper a refresh.
             if self.view != view {
                 self.view = view;
-                let _ = self.app_sender.send(AppEvent::DirtyDisplay);
+                let _ = self.app_sender.send(AppEvent::Invalidate);
             }
             true
         } else {
