@@ -78,11 +78,7 @@ pub enum AppEvent {
         pkh: String,
         chain_id: ChainId,
         error_message: String,
-        /// For `LevelTooLow` errors: current watermark level
-        current_level: Option<u32>,
-        /// For `LevelTooLow` errors: requested signing level
-        requested_level: Option<u32>,
-    }, // Watermark error from signer
+    }, // Non-actionable watermark rejection (e.g. below-floor level, foreign chain); logged, no dialog
     WatermarkUpdateSuccess, // Signal that watermark update is complete
     LargeWatermarkGap {
         pkh: String,
@@ -98,24 +94,24 @@ pub enum AppEvent {
     UnknownKeyRequested {
         pkh: String,
     }, // Signing request named a key the device does not hold
-    UnknownKeyDismissed,   // User acknowledged the unknown-key alert modal
+    UnknownKeyDismissed,    // User acknowledged the unknown-key alert modal
     UpdateWatermarkToLevel {
         pkh: String,
         chain_id: ChainId,
         new_level: u32,
     }, // User confirmed updating watermark to new level
-    DialogDismissed,       // User cancelled a dialog, return to menu
-    ShowMenu,              // Show menu page
-    ShowStatus,            // Show status page
-    ShowSignatures,        // Show signatures/activity page
-    ShowWatermarks,        // Show watermarks page
-    ShowBlockchain,        // Show blockchain/chain info page
-    ShowAbout,             // Show about page
-    ShowGreeting,          // Return to the first-boot greeting page
+    DialogDismissed,        // User cancelled a dialog, return to menu
+    ShowMenu,               // Show menu page
+    ShowStatus,             // Show status page
+    ShowSignatures,         // Show signatures/activity page
+    ShowWatermarks,         // Show watermarks page
+    ShowBlockchain,         // Show blockchain/chain info page
+    ShowAbout,              // Show about page
+    ShowGreeting,           // Return to the first-boot greeting page
     ShowImage {
         back: BackTarget,
     }, // Show flashed-image provenance page
-    RequestShutdown,       // Show shutdown confirmation from menu
+    RequestShutdown,        // Show shutdown confirmation from menu
     FatalError {
         title: String,
         message: String,

@@ -90,22 +90,10 @@ fn build_signer_event_callbacks(app_tx: &Sender<AppEvent>) -> SignerEventCallbac
     let tx_for_callback = app_tx.clone();
     let watermark_error: signer_server::WatermarkErrorCallback =
         Arc::new(move |pkh, chain_id, error| {
-            use russignol_signer_lib::WatermarkError;
-
-            // Extract structured error info for LevelTooLow variant
-            let (current_level, requested_level) = match error {
-                WatermarkError::LevelTooLow { current, requested } => {
-                    (Some(*current), Some(*requested))
-                }
-                _ => (None, None),
-            };
-
             let _ = tx_for_callback.send(AppEvent::WatermarkError {
                 pkh: pkh.to_b58check(),
                 chain_id,
                 error_message: error.to_string(),
-                current_level,
-                requested_level,
             });
         });
 

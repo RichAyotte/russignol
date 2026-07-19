@@ -865,16 +865,17 @@ impl App {
                 pkh,
                 chain_id,
                 error_message,
-                current_level,
-                requested_level,
-            } if !self.current_page_modal => {
-                effects.extend(self.watermark_error_effects(
-                    pkh,
-                    chain_id,
-                    &error_message,
-                    current_level,
-                    requested_level,
-                ));
+            } => {
+                // A watermark rejection (below-floor level, foreign chain, …) is
+                // never operator-recoverable inline: lowering the floor is the
+                // double-signing window the watermark exists to close, so the
+                // request is refused and only logged. Genuine recovery — a missing
+                // or far-stale watermark — arrives as WatermarkMissing/
+                // LargeWatermarkGap, which raise their own dialogs.
+                log::info!(
+                    "Watermark rejected request for {pkh} on {}: {error_message}",
+                    chain_id.to_b58check()
+                );
             }
             AppEvent::LargeWatermarkGap {
                 pkh,
@@ -959,36 +960,6 @@ impl App {
             title: UNKNOWN_KEY_TITLE.into(),
             message,
             on_dismiss: AppEvent::UnknownKeyDismissed,
-        }));
-        effects
-    }
-
-    fn watermark_error_effects(
-        &mut self,
-        pkh: String,
-        chain_id: ChainId,
-        error_message: &str,
-        current_level: Option<u32>,
-        requested_level: Option<u32>,
-    ) -> Vec<Effect> {
-        let (Some(current), Some(requested)) = (current_level, requested_level) else {
-            log::info!("Non-destructive watermark error (no dialog): {error_message}");
-            return vec![];
-        };
-        let mut effects = self.wake_from_screensaver_effects();
-        let chain_short = crate::text::truncate_middle(&chain_id.to_b58check(), 12, 0);
-        effects.push(Effect::ShowPage(PageSpec::Confirmation {
-            message: format!(
-                "Watermark test failed.\nChain: {chain_short}\nCurrent level: {current}"
-            ),
-            on_confirm: AppEvent::UpdateWatermarkToLevel {
-                pkh,
-                chain_id,
-                new_level: requested,
-            },
-            on_cancel: AppEvent::DialogDismissed,
-            warning: true,
-            button_text: format!("Set level to {requested}"),
         }));
         effects
     }
@@ -1584,21 +1555,25 @@ mod tests {
         ));
     }
 
-    // === Modal guard tests ===
-
+    /// A below-floor request (`LevelTooLow`) is a routine rejection — a stale or
+    /// replayed sign, or a hostile peer probing for equivocation. It must never
+    /// surface a dialog offering to lower the watermark; lowering is exactly the
+    /// double-signing window the watermark exists to close.
     #[test]
-    fn watermark_error_when_modal_produces_no_effects() {
+    fn below_floor_watermark_error_shows_no_dialog() {
         let mut app = active_app();
-        app.current_page_modal = true;
         let (_action, effects) = app.handle_event(AppEvent::WatermarkError {
             pkh: "tz4test".into(),
             chain_id: test_chain_id(),
-            error_message: "test".into(),
-            current_level: Some(100),
-            requested_level: Some(50),
+            error_message: "Level too low: requested 50, current high watermark 100".into(),
         });
-        assert!(effects.is_empty());
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::ShowPage(_))),
+            "a below-floor rejection must not surface a dialog, got: {effects:?}"
+        );
     }
+
+    // === Modal guard tests ===
 
     #[test]
     fn large_watermark_gap_when_modal_produces_no_effects() {
@@ -1751,20 +1726,20 @@ mod tests {
 
     // === Screensaver tests ===
 
+    /// A below-floor rejection is routine (stale/replayed request, hostile
+    /// probe); it produces no dialog, so it must not wake the display either —
+    /// waking on every such request would be noise, and there is nothing to show.
     #[test]
-    fn watermark_error_during_screensaver_wakes_display() {
+    fn watermark_error_during_screensaver_does_not_wake_display() {
         let mut app = active_screensaver_app();
         let (_action, effects) = app.handle_event(AppEvent::WatermarkError {
             pkh: "tz4test".into(),
             chain_id: test_chain_id(),
-            error_message: "test".into(),
-            current_level: Some(100),
-            requested_level: Some(50),
+            error_message: "Level too low: requested 50, current high watermark 100".into(),
         });
-        assert!(has_effect(&effects, &Effect::WakeDisplay));
         assert!(
-            has_effect(&effects, &Effect::ResetActivity),
-            "every wake must restart the inactivity clock"
+            effects.is_empty(),
+            "a below-floor rejection must not wake the display, got: {effects:?}"
         );
     }
 
@@ -2001,28 +1976,6 @@ mod tests {
             pkh: MAX_TZ4_PKH.into(),
             chain_id: test_chain_id(),
             requested_level: u32::MAX,
-        });
-
-        let (message, warning) = confirmation_dialog(&effects);
-        let height = crate::pages::confirmation::measure_message_height(message, warning);
-        assert!(
-            height <= crate::pages::confirmation::MESSAGE_MAX_HEIGHT.cast_unsigned(),
-            "message {message:?} needs {height}px but the confirmation page fits {}px",
-            crate::pages::confirmation::MESSAGE_MAX_HEIGHT,
-        );
-    }
-
-    /// The watermark-error dialog shares the clip-prone confirmation page; its
-    /// widest message — the largest possible level — must render within it.
-    #[test]
-    fn watermark_error_message_fits_confirmation_page() {
-        let mut app = active_app();
-        let (_action, effects) = app.handle_event(AppEvent::WatermarkError {
-            pkh: MAX_TZ4_PKH.into(),
-            chain_id: test_chain_id(),
-            error_message: "watermark test failed".into(),
-            current_level: Some(u32::MAX - 1),
-            requested_level: Some(u32::MAX),
         });
 
         let (message, warning) = confirmation_dialog(&effects);

@@ -55,37 +55,6 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-/// Prompt user and wait for ENTER with proper blocking and error handling.
-fn wait_for_user(prompt: &str) -> Result<(), Box<dyn std::error::Error>> {
-    print!("{prompt}");
-    std::io::Write::flush(&mut std::io::stdout())?;
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-
-    Ok(())
-}
-
-/// Wait for the operator to dismiss a watermark dialog on the device.
-/// Used after tests that trigger "Level too low" errors, which show a dialog
-/// with a "Set level to N" button and Cancel. `expected_dialog` describes what
-/// the dialog should show.
-fn wait_for_reset_dialog(expected_dialog: &str) -> Result<(), String> {
-    println!();
-    println!(
-        "    The device should be showing: {}",
-        expected_dialog.yellow()
-    );
-    println!("    This is a watermark dialog with a \"Set level to N\" button and Cancel.");
-    println!("    Press Cancel on the device to dismiss it (keep the current watermark).");
-    println!("    Press ENTER here when the device shows the home screen...");
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 /// Prompt the operator to confirm or cancel the watermark dialog on the device.
 /// Returns Ok(true) if they confirmed ("Set level to N"), Ok(false) if they
 /// cancelled, or Err if the input was invalid.
@@ -175,10 +144,10 @@ const LEVEL_BASE: u32 = 100;
 /// neighbouring test's band.
 const LEVEL_STRIDE: u32 = 10;
 
-/// Fixed low level the interactive test signs to trip a "level too low" dialog.
-/// Below [`LEVEL_BASE`], so it is always under the floor the earlier tests
-/// raised, independent of how far the cursor has advanced.
-const INTERACTIVE_TRIGGER_LEVEL: u32 = 50;
+/// Fixed low level the below-floor test signs to trip a "level too low"
+/// rejection. Below [`LEVEL_BASE`], so it is always under the floor the earlier
+/// tests raised, independent of how far the cursor has advanced.
+const BELOW_FLOOR_LEVEL: u32 = 50;
 
 /// Test result
 struct TestResult {
@@ -387,10 +356,8 @@ impl TestSuite {
             self.run_category_edge_cases()?;
         }
 
-        if (self.should_run_category("interactive") || self.should_run_category("reset"))
-            && !self.failed
-        {
-            self.run_category_interactive_reset()?;
+        if self.should_run_category("floor") && !self.failed {
+            self.run_category_below_floor()?;
         }
 
         self.print_summary();
@@ -582,11 +549,10 @@ impl TestSuite {
 
             match ctx.sign(pkh, ctx.block(base - 1, 0))? {
                 SignerResponse::Error(e) if e.contains("Level too low") || e.contains("level") => {
-                    ctx.log(&format!("Correctly rejected level {}", base - 1));
-                    wait_for_reset_dialog(&format!(
-                        "Level too low: \"Set level to {}\" dialog (watermark at {base})",
+                    ctx.log(&format!(
+                        "Correctly rejected level {} (no dialog shown)",
                         base - 1
-                    ))?;
+                    ));
                     Ok(())
                 }
                 SignerResponse::Error(e) => Err(format!("Got error but unexpected message: {e}")),
@@ -649,13 +615,9 @@ impl TestSuite {
             match ctx.sign(pkh, ctx.attestation(base - 1, 0))? {
                 SignerResponse::Error(e) if e.contains("Level too low") || e.contains("level") => {
                     ctx.log(&format!(
-                        "Correctly rejected attestation level {}",
+                        "Correctly rejected attestation level {} (no dialog shown)",
                         base - 1
                     ));
-                    wait_for_reset_dialog(&format!(
-                        "Level too low: \"Set level to {}\" dialog (watermark at {base})",
-                        base - 1
-                    ))?;
                     Ok(())
                 }
                 SignerResponse::Error(e) => Err(format!("Got error but unexpected message: {e}")),
@@ -715,11 +677,10 @@ impl TestSuite {
             // Block just below its own floor must still be rejected.
             match ctx.sign(pkh, ctx.block(base - 1, 0))? {
                 SignerResponse::Error(_) => {
-                    ctx.log(&format!("Block at {} correctly rejected", base - 1));
-                    wait_for_reset_dialog(&format!(
-                        "Level too low: \"Set level to {}\" dialog (watermark at {base})",
+                    ctx.log(&format!(
+                        "Block at {} correctly rejected (no dialog shown)",
                         base - 1
-                    ))?;
+                    ));
                     Ok(())
                 }
                 SignerResponse::Signature(_) => {
@@ -821,158 +782,59 @@ impl TestSuite {
         Ok(())
     }
 
-    fn run_category_interactive_reset(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_category_below_floor(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "\n{}",
-            "─── Category 5: Interactive Set Level ─────────────────────────"
+            "─── Category 5: Below-Floor Requests Cannot Lower the Watermark ─"
                 .cyan()
                 .bold()
         );
-        println!(
-            "{}",
-            "    This category requires user interaction on the device.".yellow()
-        );
-        println!();
 
-        // Prompt user to clear any dialogs from previous tests
-        println!(
-            "    {}",
-            "══════════════════════════════════════════════════════════".yellow()
-        );
-        println!(
-            "    {}",
-            "  PREPARATION: Clear any dialogs on the device           "
-                .yellow()
-                .bold()
-        );
-        println!(
-            "    {}",
-            "══════════════════════════════════════════════════════════".yellow()
-        );
-        println!();
-        println!("    If the device is showing any confirmation dialogs from");
-        println!("    previous tests, please dismiss them now (press Cancel).");
-        println!("    The device should be showing the home screen.");
-        println!();
-        wait_for_user("    Press ENTER when the device is ready... ")?;
-        println!();
-
-        // Test 5.1: Reset watermark via UI
-        self.run_test("5.1 Interactive: Set high watermark", |ctx, pkh| {
-            // Raise the block floor above the trigger level the next test uses.
-            let high = ctx.reserve_level();
-            ctx.expect_signature(pkh, ctx.block(high, 0), &format!("Watermark set to {high}"))
-        });
-
-        // This test triggers the error and waits for the operator to confirm the
-        // "Set level" dialog or cancel it
         self.run_test(
-            "5.2 Interactive: Trigger error and verify user action",
+            "5.1 Below-floor request cannot lower the floor",
             |ctx, pkh| {
-                let trigger = INTERACTIVE_TRIGGER_LEVEL;
+                // Establish a floor well above the below-floor probe level.
+                let base = ctx.reserve_level();
+                ctx.expect_signature(pkh, ctx.block(base, 0), &format!("Floor set to {base}"))?;
 
-                // Sign below the floor 5.1 set — triggers the watermark dialog.
-                match ctx.sign(pkh, ctx.block(trigger, 0))? {
+                // Below the floor: refused outright, with no dialog on the device.
+                match ctx.sign(pkh, ctx.block(BELOW_FLOOR_LEVEL, 0))? {
+                    SignerResponse::Error(e)
+                        if e.contains("Level too low") || e.contains("level") =>
+                    {
+                        ctx.log(&format!(
+                            "Rejected level {BELOW_FLOOR_LEVEL} (no dialog shown)"
+                        ));
+                    }
                     SignerResponse::Error(e) => {
-                        println!();
-                        println!(
-                            "    {}",
-                            "══════════════════════════════════════════════════════════".yellow()
-                        );
-                        println!(
-                            "    {}",
-                            "  ACTION REQUIRED: Interact with the device NOW           "
-                                .yellow()
-                                .bold()
-                        );
-                        println!(
-                            "    {}",
-                            "══════════════════════════════════════════════════════════".yellow()
-                        );
-                        println!("    Watermark error triggered: {}", e.dimmed());
-                        println!();
-                        println!(
-                            "    The device should be showing a \"Set level to {trigger}\" watermark dialog."
-                        );
-                        println!("    1. Touch \"Set level to {trigger}\" or Cancel on the device screen");
-                        println!("    2. Wait for the device to return to the home screen");
-                        println!("    3. Then tell me what you pressed:");
-                        println!("       [S] = I pressed \"Set level to {trigger}\"");
-                        println!("       [C] = I pressed Cancel");
-                        print!("    Your choice: ");
-                        std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
-
-                        let mut input = String::new();
-                        std::io::stdin()
-                            .read_line(&mut input)
-                            .map_err(|e| e.to_string())?;
-                        let choice = input.trim().to_lowercase();
-
-                        if choice == "s" || choice == "set" {
-                            // Wait for user to confirm device is back to home screen
-                            println!("    Press ENTER when the device shows the home screen...");
-                            let mut ready = String::new();
-                            std::io::stdin()
-                                .read_line(&mut ready)
-                                .map_err(|e| e.to_string())?;
-
-                            println!("    Verifying the watermark was set...");
-
-                            // "Set level to N" records N as signed, so verify the
-                            // lowered floor by signing N+1 — rejected before (higher
-                            // floor), now allowed.
-                            let verify = ctx.sign(pkh, ctx.block(trigger + 1, 0))?;
-                            match verify {
-                                SignerResponse::Signature(_) => {
-                                    println!(
-                                        "    Set level confirmed! Signing at level {} succeeded.",
-                                        trigger + 1
-                                    );
-                                    Ok(())
-                                }
-                                SignerResponse::Error(verify_e) => Err(format!(
-                                    "Set level did not work - still getting error: {verify_e}"
-                                )),
-                                other => Err(format!(
-                                    "Unexpected response after setting level: {other:?}"
-                                )),
-                            }
-                        } else if choice == "c" || choice == "cancel" {
-                            // Wait for user to confirm device is back to home screen
-                            println!("    Press ENTER when the device shows the home screen...");
-                            let mut ready = String::new();
-                            std::io::stdin()
-                                .read_line(&mut ready)
-                                .map_err(|e| e.to_string())?;
-
-                            println!("    Verifying cancel preserved watermark...");
-
-                            // Verify the signing still fails after cancel
-                            let verify = ctx.sign(pkh, ctx.block(trigger, 0))?;
-                            match verify {
-                                SignerResponse::Error(_) => {
-                                    println!(
-                                        "    Cancel confirmed! Watermark protection still active."
-                                    );
-                                    Ok(())
-                                }
-                                SignerResponse::Signature(_) => {
-                                    Err("Cancel failed - watermark was unexpectedly changed"
-                                        .to_string())
-                                }
-                                other => Err(format!(
-                                    "Unexpected response after cancel: {other:?}"
-                                )),
-                            }
-                        } else {
-                            Err(format!("Invalid choice '{choice}'. Please enter S or C."))
-                        }
+                        return Err(format!("Got error but unexpected message: {e}"));
                     }
                     SignerResponse::Signature(_) => {
-                        Err("Should have rejected signing at lower level".to_string())
+                        return Err("SECURITY FAILURE: signed below the floor!".to_string());
                     }
-                    other => Err(format!("Unexpected response: {other:?}")),
+                    other => return Err(format!("Unexpected response: {other:?}")),
                 }
+
+                // The refusal did not lower the floor: the same level is still refused.
+                match ctx.sign(pkh, ctx.block(BELOW_FLOOR_LEVEL, 0))? {
+                    SignerResponse::Error(_) => {
+                        ctx.log("Floor unchanged: below-floor level still refused");
+                    }
+                    SignerResponse::Signature(_) => {
+                        return Err(
+                            "SECURITY FAILURE: below-floor request lowered the watermark!"
+                                .to_string(),
+                        );
+                    }
+                    other => return Err(format!("Unexpected response: {other:?}")),
+                }
+
+                // Forward progression above the floor still signs — the floor is intact.
+                ctx.expect_signature(
+                    pkh,
+                    ctx.block(base + 1, 0),
+                    &format!("Above-floor block {}", base + 1),
+                )
             },
         );
 

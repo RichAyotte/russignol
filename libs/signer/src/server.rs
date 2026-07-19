@@ -1500,6 +1500,73 @@ mod tests {
     }
 
     #[test]
+    fn below_floor_request_rejected_without_lowering_floor() {
+        let temp_dir = TempDir::new().unwrap();
+        let seed = [42u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
+
+        let mut mgr = KeyManager::new();
+        mgr.add_signer(pkh, signer, "test_key".to_string());
+
+        preinit_watermarks(temp_dir.path(), &pkh, 100);
+        let hwm = Arc::new(RwLock::new(new_watermark(temp_dir.path(), &[pkh]).unwrap()));
+
+        let handler = RequestHandler::new(
+            Arc::new(RwLock::new(mgr)),
+            Some(Arc::clone(&hwm)),
+            Some(vec![0x11, 0x12, 0x13]),
+            true,
+            true,
+        );
+
+        // Block at level 50, below the floor of 100.
+        let mut data = vec![0x11];
+        data.extend_from_slice(&[0, 0, 0, 1]); // chain_id
+        data.extend_from_slice(&50u32.to_be_bytes()); // level
+        data.push(0); // proto
+        data.extend_from_slice(&[0u8; 32]); // predecessor
+        data.extend_from_slice(&[0u8; 8]); // timestamp
+        data.push(0); // validation_pass
+        data.extend_from_slice(&[0u8; 32]); // operations_hash
+        data.extend_from_slice(&8u32.to_be_bytes()); // fitness_length
+        data.extend_from_slice(&0u32.to_be_bytes()); // round
+
+        let result = handler.handle_request(SignerRequest::Sign {
+            pkh: (pkh, 0),
+            data,
+            signature: None,
+        });
+
+        // A below-floor request is refused, never signed.
+        assert!(
+            matches!(
+                result,
+                Err(Error::Watermark(
+                    crate::high_watermark::WatermarkError::LevelTooLow { .. }
+                ))
+            ),
+            "below-floor request must return LevelTooLow, got: {result:?}"
+        );
+
+        // The floor is neither advanced nor lowered by the rejected request.
+        let chain_id = ChainId::from_bytes(&{
+            let mut b = [0u8; 32];
+            b[..4].copy_from_slice(&[0, 0, 0, 1]);
+            b
+        });
+        let (block_level, _, _) = hwm
+            .read()
+            .unwrap()
+            .get_current_levels(chain_id, &pkh)
+            .unwrap();
+        assert_eq!(
+            block_level, 100,
+            "a rejected below-floor request must leave the floor untouched"
+        );
+    }
+
+    #[test]
     fn test_large_level_gap_detection() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
