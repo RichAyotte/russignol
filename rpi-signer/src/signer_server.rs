@@ -149,9 +149,11 @@ pub struct SignerCallbacks {
     pub missing_watermark: Option<MissingWatermarkCallback>,
     /// Called when a signing request names a key the signer does not hold
     pub unknown_key: Option<UnknownKeyCallback>,
-    /// Called before each signing operation (e.g., CPU frequency boost)
+    /// Called when a client TCP connection opens (e.g., CPU frequency boost).
+    /// Must not block — see `RequestHandler::with_pre_sign_callback`.
     pub pre_sign: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Called after each signing operation (e.g., CPU frequency restore)
+    /// Called when a client TCP connection closes (e.g., CPU frequency restore).
+    /// Must not block — see `RequestHandler::with_post_sign_callback`.
     pub post_sign: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 

@@ -266,9 +266,9 @@ pub struct RequestHandler {
     unknown_key_callback: Option<UnknownKeyCallback>,
     /// Blocks per cycle (chain-specific, used for gap threshold calculation)
     blocks_per_cycle: Option<u32>,
-    /// Callback invoked before each sign request (e.g., CPU frequency boost)
+    /// Callback invoked when a TCP connection opens (e.g., CPU frequency boost)
     pre_sign_callback: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Callback invoked after each sign request (e.g., CPU frequency restore)
+    /// Callback invoked when a TCP connection closes (e.g., CPU frequency restore)
     post_sign_callback: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -365,28 +365,34 @@ impl RequestHandler {
         self
     }
 
-    /// Set pre-sign callback (called at the start of each sign request)
+    /// Set pre-connection callback (called when a client TCP connection opens).
+    ///
+    /// Must not block: octez opens a new connection per sign, so stalls here
+    /// add directly to inter-sign latency (pre→att forge gap).
     #[must_use]
     pub fn with_pre_sign_callback(mut self, callback: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.pre_sign_callback = Some(callback);
         self
     }
 
-    /// Set post-sign callback (called after each sign request completes or fails)
+    /// Set post-connection callback (called when a client TCP connection closes).
+    ///
+    /// Must not block: the next connection's pre-callback may already be running
+    /// on another thread and must not wait on work started here.
     #[must_use]
     pub fn with_post_sign_callback(mut self, callback: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.post_sign_callback = Some(callback);
         self
     }
 
-    /// Notify that a request has been received (e.g., boost CPU frequency).
+    /// Notify that a client connection has opened (e.g., boost CPU frequency).
     pub fn notify_request_received(&self) {
         if let Some(ref callback) = self.pre_sign_callback {
             callback();
         }
     }
 
-    /// Notify that request processing is complete (e.g., restore CPU frequency).
+    /// Notify that a client connection has closed (e.g., restore CPU frequency).
     pub fn notify_request_complete(&self) {
         if let Some(ref callback) = self.post_sign_callback {
             callback();

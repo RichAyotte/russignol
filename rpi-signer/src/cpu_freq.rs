@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const SYSFS_POLICY: &str = "/sys/devices/system/cpu/cpufreq/policy0";
 
@@ -9,6 +9,9 @@ struct CpuBoostInner {
     setspeed_path: PathBuf,
     min_freq: String,
     max_freq: String,
+    /// Nested boost sessions so one connection's restore cannot drop frequency
+    /// while another connection is still signing.
+    active: Mutex<u32>,
 }
 
 /// CPU frequency controller for the userspace governor.
@@ -49,19 +52,35 @@ impl CpuBoost {
             setspeed_path,
             min_freq,
             max_freq,
+            active: Mutex::new(0),
         })))
     }
 
     /// Set CPU to maximum frequency before CPU-intensive work.
     pub fn boost(&self) {
-        if let Err(e) = fs::write(&self.0.setspeed_path, &self.0.max_freq) {
+        // Hold the lock across the sysfs write so a concurrent restore cannot
+        // commit a stale min after this 0→1 raise (last writer would win).
+        let mut active = self.0.active.lock().unwrap();
+        *active = active.saturating_add(1);
+        if *active == 1
+            && let Err(e) = fs::write(&self.0.setspeed_path, &self.0.max_freq)
+        {
             log::warn!("Failed to set CPU max freq: {e}");
         }
     }
 
-    /// Return CPU to minimum frequency after work completes.
+    /// Return CPU to minimum frequency after the last nested boost ends.
     pub fn restore(&self) {
-        if let Err(e) = fs::write(&self.0.setspeed_path, &self.0.min_freq) {
+        // Hold the lock across the sysfs write so a concurrent boost cannot
+        // raise max and then be overwritten by this 1→0 lower.
+        let mut active = self.0.active.lock().unwrap();
+        if *active == 0 {
+            return;
+        }
+        *active -= 1;
+        if *active == 0
+            && let Err(e) = fs::write(&self.0.setspeed_path, &self.0.min_freq)
+        {
             log::warn!("Failed to set CPU min freq: {e}");
         }
     }
@@ -107,6 +126,36 @@ mod tests {
 
         let cpu = CpuBoost::init(dir.path()).unwrap();
         cpu.boost();
+        cpu.restore();
+
+        let freq = fs::read_to_string(dir.path().join("scaling_setspeed")).unwrap();
+        assert_eq!(freq, "600000");
+    }
+
+    #[test]
+    fn nested_boost_keeps_max_until_last_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        create_mock_sysfs(dir.path());
+
+        let cpu = CpuBoost::init(dir.path()).unwrap();
+        cpu.boost();
+        cpu.boost();
+        cpu.restore();
+
+        let freq = fs::read_to_string(dir.path().join("scaling_setspeed")).unwrap();
+        assert_eq!(freq, "1000000");
+
+        cpu.restore();
+        let freq = fs::read_to_string(dir.path().join("scaling_setspeed")).unwrap();
+        assert_eq!(freq, "600000");
+    }
+
+    #[test]
+    fn restore_without_boost_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        create_mock_sysfs(dir.path());
+
+        let cpu = CpuBoost::init(dir.path()).unwrap();
         cpu.restore();
 
         let freq = fs::read_to_string(dir.path().join("scaling_setspeed")).unwrap();
