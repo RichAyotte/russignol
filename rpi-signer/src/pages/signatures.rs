@@ -15,32 +15,29 @@ use u8g2_fonts::FontRenderer;
 /// Record of a signing operation for display in the table
 #[derive(Clone, Debug)]
 struct SigningRecord {
-    key: String,            // Signing key (will be truncated for display)
-    level: u32,             // Block height/level
-    op_type: OperationType, // Type of operation (Block, Attestation, etc.)
-    sign_time: Duration,    // Time it took to sign
+    key_type: KeyType,
+    /// Pre-truncated public key hash for the key column (ASCII, ≤7 chars)
+    pkh_short: String,
+    level: u32,
+    op_type: OperationType,
+    sign_time: Duration,
 }
 
+/// First 7 ASCII bytes of a tz4 (or other base58) pkh for the activity table.
+///
+/// Public key hashes are ASCII base58; no `char` iteration is needed.
+#[must_use]
 pub fn format_key_short(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-
-    if len <= 7 {
-        s.to_string()
-    } else {
-        // Show first 7 characters only
-        chars[0..7].iter().collect()
-    }
+    let end = s.len().min(7);
+    s[..end].to_string()
 }
 
 pub struct Page {
-    // Event sender for navigation
     app_sender: Sender<AppEvent>,
-    // Reference to shared signing activity for reading latest state
     signing_activity_shared: Arc<Mutex<SigningActivity>>,
-    // Public key hashes for consensus and companion keys
-    consensus_pkh: Option<String>,
-    companion_pkh: Option<String>,
+    /// Precomputed short labels (built once at page construct)
+    consensus_short: Option<String>,
+    companion_short: Option<String>,
 }
 
 impl Page {
@@ -48,22 +45,21 @@ impl Page {
         app_sender: Sender<AppEvent>,
         signing_activity: Arc<Mutex<SigningActivity>>,
     ) -> Self {
-        // Load keys to get their public key hashes
         let keys = crate::tezos_signer::get_keys();
-        let consensus_pkh = keys
+        let consensus_short = keys
             .iter()
             .find(|k| k.name == "consensus")
-            .map(|k| k.value.clone());
-        let companion_pkh = keys
+            .map(|k| format_key_short(&k.value));
+        let companion_short = keys
             .iter()
             .find(|k| k.name == "companion")
-            .map(|k| k.value.clone());
+            .map(|k| format_key_short(&k.value));
 
         Self {
             app_sender,
             signing_activity_shared: signing_activity,
-            consensus_pkh,
-            companion_pkh,
+            consensus_short,
+            companion_short,
         }
     }
 
@@ -81,25 +77,20 @@ impl Page {
                     return None;
                 };
 
-                let key = match event.key_type {
-                    KeyType::Consensus => {
-                        if let Some(ref pkh) = self.consensus_pkh {
-                            format!("C{pkh}")
-                        } else {
-                            "C???".to_string()
-                        }
-                    }
-                    KeyType::Companion => {
-                        if let Some(ref pkh) = self.companion_pkh {
-                            format!("P{pkh}")
-                        } else {
-                            "P???".to_string()
-                        }
-                    }
+                let pkh_short = match event.key_type {
+                    KeyType::Consensus => self
+                        .consensus_short
+                        .clone()
+                        .unwrap_or_else(|| "???".to_string()),
+                    KeyType::Companion => self
+                        .companion_short
+                        .clone()
+                        .unwrap_or_else(|| "???".to_string()),
                 };
 
                 Some(SigningRecord {
-                    key,
+                    key_type: event.key_type,
+                    pkh_short,
                     level,
                     op_type,
                     sign_time: duration,
@@ -204,35 +195,33 @@ fn draw_signing_record_row<D: DrawTarget<Color = BinaryColor>>(
         )
         .ok();
 
-    // Key - render icon and PKH
-    if let Some(first_char) = record.key.chars().next() {
-        let pkh = &record.key[1..];
-        let icon_char = if first_char == 'C' { "1" } else { "0" };
+    // Key icon (C→"1", P→"0" glyph set) + pre-truncated pkh
+    let icon_char = match record.key_type {
+        KeyType::Consensus => "1",
+        KeyType::Companion => "0",
+    };
+    icon_key
+        .render_aligned(
+            icon_char,
+            Point::new(COL_KEY_X, row_y),
+            u8g2_fonts::types::VerticalPosition::Center,
+            u8g2_fonts::types::HorizontalAlignment::Left,
+            u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
+            display,
+        )
+        .ok();
 
-        icon_key
-            .render_aligned(
-                icon_char,
-                Point::new(COL_KEY_X, row_y),
-                u8g2_fonts::types::VerticalPosition::Center,
-                u8g2_fonts::types::HorizontalAlignment::Left,
-                u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
-                display,
-            )
-            .ok();
-
-        let pkh_display = format_key_short(pkh);
-        let pkh_x = COL_KEY_X + 22;
-        key_font
-            .render_aligned(
-                pkh_display.as_str(),
-                Point::new(pkh_x, row_y),
-                u8g2_fonts::types::VerticalPosition::Center,
-                u8g2_fonts::types::HorizontalAlignment::Left,
-                u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
-                display,
-            )
-            .ok();
-    }
+    let pkh_x = COL_KEY_X + 22;
+    key_font
+        .render_aligned(
+            record.pkh_short.as_str(),
+            Point::new(pkh_x, row_y),
+            u8g2_fonts::types::VerticalPosition::Center,
+            u8g2_fonts::types::HorizontalAlignment::Left,
+            u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
+            display,
+        )
+        .ok();
 
     // Time (center-aligned)
     let time_micros = record.sign_time.as_micros();
@@ -268,8 +257,8 @@ mod tests {
         Page {
             app_sender: sender,
             signing_activity_shared: shared,
-            consensus_pkh: consensus_pkh.map(String::from),
-            companion_pkh: companion_pkh.map(String::from),
+            consensus_short: consensus_pkh.map(format_key_short),
+            companion_short: companion_pkh.map(format_key_short),
         }
     }
 
@@ -305,9 +294,20 @@ mod tests {
         let records = page.build_records(&activity);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].level, 100);
-        assert!(records[0].key.starts_with('C'));
+        assert_eq!(records[0].key_type, KeyType::Consensus);
+        assert_eq!(records[0].pkh_short, "tz4cons");
         assert_eq!(records[1].level, 101);
-        assert!(records[1].key.starts_with('P'));
+        assert_eq!(records[1].key_type, KeyType::Companion);
+        assert_eq!(records[1].pkh_short, "tz4comp");
+    }
+
+    #[test]
+    fn format_key_short_ascii_prefix() {
+        assert_eq!(format_key_short(""), "");
+        assert_eq!(format_key_short("abc"), "abc");
+        assert_eq!(format_key_short("1234567"), "1234567");
+        assert_eq!(format_key_short("12345678"), "1234567");
+        assert_eq!(format_key_short("tz4ABCDEFG"), "tz4ABCD");
     }
 
     #[test]

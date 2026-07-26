@@ -1,6 +1,6 @@
 use log::{error, info};
 use russignol_signer_lib::{
-    ChainId, HighWatermark, RequestHandler, ServerKeyManager, SigningActivity,
+    ChainId, HighWatermark, MagicByte, RequestHandler, ServerKeyManager, SigningActivity,
     bls::watermark_mac_key, server, signer,
 };
 use serde::Deserialize;
@@ -33,7 +33,7 @@ pub struct SignerConfig {
     pub watermark_dir: String,
     pub address: String,
     pub port: u16,
-    pub magic_bytes: Vec<u8>,
+    pub magic_bytes: &'static [u8],
     pub check_high_watermark: bool,
 }
 
@@ -43,7 +43,7 @@ impl Default for SignerConfig {
             watermark_dir: "/data/watermarks".to_string(),
             address: "169.254.1.1".to_string(),
             port: 7732,
-            magic_bytes: vec![0x11, 0x12, 0x13],
+            magic_bytes: MagicByte::all(),
             check_high_watermark: true,
         }
     }
@@ -89,36 +89,29 @@ fn parse_secret_keys(secret_keys_json: &str) -> Result<ServerKeyManager, String>
     Ok(key_manager)
 }
 
-/// Derive the per-key watermark MAC keys from the decrypted secret keys.
+/// Derive per-key watermark MAC keys from an already-loaded key manager.
 ///
-/// The device is the sole producer of authenticated marks; these keys let the
-/// `HighWatermark` verify existing marks and stamp new ones. Parses the same
-/// JSON as [`parse_secret_keys`] and derives each key's MAC key from its BLS
-/// secret ([`watermark_mac_key`]).
+/// Single recipe for MAC derivation: every consumer must use this (or
+/// [`load_secret_keys`]) rather than re-parsing JSON + BLS secrets.
+#[must_use]
+pub fn mac_keys_from_manager(key_manager: &ServerKeyManager) -> HashMap<PublicKeyHash, [u8; 32]> {
+    key_manager
+        .iter_signers()
+        .map(|(pkh, signer)| (*pkh, watermark_mac_key(signer.secret_key())))
+        .collect()
+}
+
+/// Parse secret-key JSON once into a key manager and MAC map.
 ///
 /// # Errors
 ///
 /// Returns an error if the JSON cannot be parsed or a key fails to load.
-pub fn derive_watermark_mac_keys(
+pub fn load_secret_keys(
     secret_keys_json: &str,
-) -> Result<HashMap<PublicKeyHash, [u8; 32]>, String> {
-    let entries: Vec<BorrowedKeyEntry<'_>> = serde_json::from_str(secret_keys_json)
-        .map_err(|e| format!("Failed to parse secret_keys JSON: {e}"))?;
-
-    let mut mac_keys = HashMap::new();
-    for entry in entries {
-        let sk_b58 = entry
-            .value
-            .strip_prefix("unencrypted:")
-            .unwrap_or(entry.value);
-        let signer = signer::Unencrypted::from_b58check(sk_b58)
-            .map_err(|e| format!("Failed to load key '{}': {e}", entry.name))?;
-        mac_keys.insert(
-            *signer.public_key_hash(),
-            watermark_mac_key(signer.secret_key()),
-        );
-    }
-    Ok(mac_keys)
+) -> Result<(ServerKeyManager, HashMap<PublicKeyHash, [u8; 32]>), String> {
+    let key_manager = parse_secret_keys(secret_keys_json)?;
+    let mac_keys = mac_keys_from_manager(&key_manager);
+    Ok((key_manager, mac_keys))
 }
 
 use russignol_signer_lib::bls::PublicKeyHash;
@@ -187,21 +180,19 @@ pub fn create_high_watermark(
     }
 }
 
-/// Start the integrated signer server
+/// Start the integrated signer server with an already-parsed key manager.
 ///
-/// `secret_keys_json` contains the decrypted secret keys - passed in memory, never written to disk.
+/// Keys are loaded once at unlock ([`load_secret_keys`]) and handed here in
+/// memory — never re-parsed from JSON and never written to disk.
 pub fn start_integrated_signer(
     config: &SignerConfig,
-    secret_keys_json: &str,
+    key_manager: ServerKeyManager,
     signing_activity: &Arc<Mutex<SigningActivity>>,
     watermark: Option<&Arc<RwLock<HighWatermark>>>,
     callbacks: &SignerCallbacks,
     blocks_per_cycle: Option<u32>,
 ) -> Result<(), String> {
-    // Parse keys directly from memory - never touches disk. Parsed outside
-    // the retry loop: a key failure is deterministic, so retrying can never
-    // fix it — it must surface to the caller instead.
-    let key_manager = Arc::new(RwLock::new(parse_secret_keys(secret_keys_json)?));
+    let key_manager = Arc::new(RwLock::new(key_manager));
 
     loop {
         match run_signer_once(
@@ -238,7 +229,7 @@ fn run_signer_once(
     let mut handler = RequestHandler::new(
         key_manager,
         watermark,
-        Some(config.magic_bytes.clone()),
+        Some(config.magic_bytes),
         true, // allow_list_known_keys
         true, // allow_prove_possession
     )
@@ -310,6 +301,17 @@ mod tests {
         );
         let key_manager = parse_secret_keys(&input).expect("valid keys load");
         assert_eq!(key_manager.list_keys().len(), 2);
+    }
+
+    /// `load_secret_keys` must derive MAC keys via the same recipe as
+    /// `mac_keys_from_manager` so unlock has a single BLS load path.
+    #[test]
+    fn load_secret_keys_mac_keys_match_manager_derive() {
+        let input = format!(r#"[{{"name":"consensus","value":"unencrypted:{SAMPLE_SK}"}}]"#);
+        let (manager, from_load) = load_secret_keys(&input).expect("load");
+        let from_manager = mac_keys_from_manager(&manager);
+        assert_eq!(from_load, from_manager);
+        assert_eq!(from_load.len(), 1);
     }
 
     /// A key that fails to parse must abort startup: silently dropping it

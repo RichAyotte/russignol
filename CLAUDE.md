@@ -50,9 +50,23 @@ The host utility handles device auto-detection, mount/safety checks, decompressi
 # Pre-commit
 
 ```sh
-cargo clippy --fix --allow-dirty --allow-staged
+cargo clippy --workspace --all-targets
 cargo fmt
 ```
+
+Run clippy on the **whole workspace** every time. Do not narrow to a single
+package (`-p …`) or target kind (`--lib` only): that skips binary crates such
+as `russignol-signer` and misses lints that only fire on the non-test binary
+compile unit (notably `dead_code` for helpers used solely from `#[cfg(test)]`).
+
+- `--workspace` — every member (`libs/*`, `rpi-signer`, `host-utility`, …)
+- `--all-targets` — lib, bins, tests, examples, and benches for each member
+
+Do not confuse `--fix` with “all packages”: `--fix` auto-applies clippy
+suggestions (and needs `--allow-dirty` / `--allow-staged` on a dirty tree).
+Use it only when you intend to rewrite sources.
+
+Treat warnings as defects and fix them at the source.
 
 # Commits
 

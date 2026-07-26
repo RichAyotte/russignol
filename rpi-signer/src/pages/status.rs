@@ -35,20 +35,28 @@ impl Page {
         let tx = app_sender.clone();
         let signing_activity_bg = signing_activity.clone();
         std::thread::spawn(move || {
+            // Snapshot of every row that can change; only Invalidate when one
+            // flips so idle Status does not force a panel update every tick.
+            let mut last_paint: Option<(NetworkStatus, u64, String, String)> = None;
             loop {
                 let Some(ns) = ns_weak.upgrade() else {
                     return;
                 };
 
-                let last_sig_time = signing_activity_bg.lock().ok().and_then(|activity| {
-                    let ct = activity.consensus.as_ref().map(|c| c.timestamp);
-                    let cpt = activity.companion.as_ref().map(|c| c.timestamp);
-                    match (ct, cpt) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (Some(t), None) | (None, Some(t)) => Some(t),
-                        (None, None) => None,
-                    }
-                });
+                let (last_sig_time, sig_count) =
+                    signing_activity_bg
+                        .lock()
+                        .ok()
+                        .map_or((None, 0), |activity| {
+                            let ct = activity.consensus.as_ref().map(|c| c.timestamp);
+                            let cpt = activity.companion.as_ref().map(|c| c.timestamp);
+                            let last = match (ct, cpt) {
+                                (Some(a), Some(b)) => Some(a.max(b)),
+                                (Some(t), None) | (None, Some(t)) => Some(t),
+                                (None, None) => None,
+                            };
+                            (last, activity.total_signatures)
+                        });
 
                 let status = NetworkStatus::check(last_sig_time);
                 if let Ok(mut guard) = ns.lock() {
@@ -56,8 +64,14 @@ impl Page {
                 }
                 drop(ns);
 
-                let _ = tx.send(AppEvent::Invalidate);
-                std::thread::sleep(Duration::from_secs(1));
+                let temp_str = format_temperature(read_temperature());
+                let uptime_str = read_uptime_secs().map_or_else(|| "N/A".into(), format_uptime);
+                let paint = (status, sig_count, temp_str, uptime_str);
+                if last_paint.as_ref() != Some(&paint) {
+                    last_paint = Some(paint);
+                    let _ = tx.send(AppEvent::Invalidate);
+                }
+                std::thread::sleep(Duration::from_secs(2));
             }
         });
 
@@ -87,8 +101,8 @@ fn read_temperature() -> Option<f32> {
 }
 
 // Coarse resolution (whole degrees, minutes) keeps these rows' rendered text
-// stable between 1 Hz ticks, so unchanged frames die in the display's
-// frame-skip instead of repainting the panel every second.
+// stable between status poll ticks (2s), so unchanged frames die in the
+// display's frame-skip instead of repainting the panel every poll.
 
 fn format_temperature(temp: Option<f32>) -> String {
     temp.map_or_else(|| "N/A".into(), |t| format!("{:.0}\u{00b0}C", t.round()))

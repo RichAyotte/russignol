@@ -164,7 +164,7 @@ mod tests {
         );
     }
 
-    /// Connection path must not serialize the next on() behind MIN_ON_DURATION.
+    /// Connection path must not serialize the next `on()` behind `MIN_ON_DURATION`.
     #[test]
     fn test_on_not_blocked_by_concurrent_off_min_on_hold() {
         let (_dir, led) = mock_led();

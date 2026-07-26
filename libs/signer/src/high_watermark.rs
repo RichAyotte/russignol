@@ -102,7 +102,8 @@ impl OperationType {
     const ALL: [Self; 3] = [Self::Block, Self::Preattestation, Self::Attestation];
 
     /// Convert from magic byte to operation type
-    fn from_magic_byte(magic: u8) -> Option<Self> {
+    #[must_use]
+    pub fn from_magic_byte(magic: u8) -> Option<Self> {
         match magic {
             0x11 => Some(Self::Block),
             0x12 => Some(Self::Preattestation),
@@ -361,6 +362,9 @@ impl HighWatermark {
     /// to [`write_watermark`](Self::write_watermark) before returning the signature.
     /// Returns `Ok(None)` for non-watermarked operations (magic byte not 0x11/0x12/0x13).
     ///
+    /// Prefer [`check_and_update_parsed`](Self::check_and_update_parsed) when the
+    /// caller already extracted level/round (avoids a second parse on the hot path).
+    ///
     /// # Panics
     ///
     /// Cannot panic: `ensure_key()` guarantees the key exists before the `.unwrap()`.
@@ -392,6 +396,27 @@ impl HighWatermark {
             _ => unreachable!(),
         };
 
+        self.check_and_update_parsed(chain_id, pkh, op_type, level, round)
+    }
+
+    /// Like [`check_and_update`](Self::check_and_update) with level/round already parsed.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic: `ensure_key()` guarantees the key exists before the `.unwrap()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is not initialized or signing would violate the
+    /// high watermark (double-signing protection).
+    pub fn check_and_update_parsed(
+        &mut self,
+        chain_id: ChainId,
+        pkh: &PublicKeyHash,
+        op_type: OperationType,
+        level: u32,
+        round: u32,
+    ) -> Result<Option<WatermarkUpdate>> {
         self.ensure_key(pkh)?;
         let per_key = self.keys.get_mut(pkh).unwrap();
         let idx = op_type as usize;

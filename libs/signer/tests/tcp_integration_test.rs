@@ -3,7 +3,7 @@
 //! These tests verify the TCP server works correctly with real network connections.
 
 use russignol_signer_lib::{
-    RequestHandler, ServerKeyManager,
+    MagicByte, RequestHandler, ServerKeyManager,
     bls::generate_key,
     high_watermark::ChainId,
     protocol::{SignerRequest, SignerResponse},
@@ -127,7 +127,7 @@ fn test_tcp_server_sign_with_watermark() {
     let handler = RequestHandler::new(
         Arc::new(RwLock::new(key_mgr)),
         Some(Arc::new(RwLock::new(watermark))),
-        Some(vec![0x11, 0x12, 0x13]),
+        Some(MagicByte::all()),
         true, // allow_list_known_keys
         true, // allow_prove_possession
     );
@@ -202,9 +202,9 @@ fn test_tcp_server_magic_byte_filtering() {
     let handler = RequestHandler::new(
         Arc::new(RwLock::new(key_mgr)),
         None,
-        Some(vec![0x11]), // Only blocks
-        true,             // allow_list_known_keys
-        true,             // allow_prove_possession
+        Some(&[0x11]), // Only blocks
+        true,          // allow_list_known_keys
+        true,          // allow_prove_possession
     );
 
     let addr: SocketAddr = "127.0.0.1:18083".parse().unwrap();

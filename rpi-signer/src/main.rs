@@ -149,8 +149,9 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
     // Create app event channel
     let (app_tx, app_rx) = crossbeam_channel::unbounded();
 
-    // Create channel to pass decrypted secret keys to signer (in memory, never written to disk)
-    let (start_signer_tx, start_signer_rx) = crossbeam_channel::bounded::<Secret<String>>(1);
+    // Channel of already-parsed key managers (secrets loaded once at unlock)
+    let (start_signer_tx, start_signer_rx) =
+        crossbeam_channel::bounded::<russignol_signer_lib::ServerKeyManager>(1);
 
     // Watermark will be created after PIN entry and encryption unlock
     let watermark: Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>> = Arc::new(RwLock::new(None));
@@ -175,8 +176,8 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
         connection_callbacks(cpu_boost.as_ref(), led.as_ref());
 
     let signer_handle = std::thread::spawn(move || {
-        // Wait for decrypted secret keys (passed in memory, never written to disk)
-        if let Ok(secret_keys_json) = start_signer_rx.recv() {
+        // Wait for key manager produced once at unlock (in memory only)
+        if let Ok(key_manager) = start_signer_rx.recv() {
             log::info!("Secret keys received, starting signer server...");
             let config = signer_server::SignerConfig::default();
 
@@ -213,7 +214,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
 
             if let Err(e) = signer_server::start_integrated_signer(
                 &config,
-                &secret_keys_json,
+                key_manager,
                 &signing_activity_clone,
                 watermark.as_ref(),
                 &callbacks,
@@ -256,7 +257,7 @@ fn report_signer_failure(tx: &crossbeam_channel::Sender<AppEvent>, error: String
 
 fn run_ui_loop(
     signing_activity: &Arc<Mutex<signing_activity::SigningActivity>>,
-    start_signer_tx: &crossbeam_channel::Sender<Secret<String>>,
+    start_signer_tx: &crossbeam_channel::Sender<russignol_signer_lib::ServerKeyManager>,
     tx: &crossbeam_channel::Sender<AppEvent>,
     rx: &crossbeam_channel::Receiver<AppEvent>,
     watermark: &Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>>,
@@ -653,8 +654,10 @@ fn apply_effects(
             Effect::Emit(event) => {
                 let _ = app.tx.send(event);
             }
-            Effect::SendKeys(json) => {
-                let _ = app.start_signer_tx.send(json);
+            Effect::StartSigner => {
+                if let Err(e) = app.start_signer() {
+                    fatal_error(device, "SIGNER START ERROR", &e);
+                }
             }
             Effect::InitWatermark {
                 context,
@@ -816,21 +819,18 @@ fn apply_init_watermark(
         );
     }
     let config = signer_server::SignerConfig::default();
-    let pkhs: Vec<PublicKeyHash> = tezos_signer::get_keys()
-        .iter()
-        .filter_map(|k| PublicKeyHash::from_b58check(&k.value).ok())
-        .collect();
 
-    // Per-key MAC keys authenticate the watermark; the device is their sole
-    // producer. Derive them from the just-unlocked secrets.
-    let mac_keys = match signer_server::derive_watermark_mac_keys(secret_keys.as_str()) {
-        Ok(keys) => keys,
+    // Parse secrets once: MAC keys + key manager for the signer thread.
+    // Do not re-parse JSON/B58 on StartSigner.
+    let (key_manager, mac_keys) = match signer_server::load_secret_keys(secret_keys.as_str()) {
+        Ok(loaded) => loaded,
         Err(e) => fatal_error(
             device,
-            "WATERMARK KEY ERROR",
-            &format!("Failed to derive watermark keys: {e}"),
+            "KEY LOAD ERROR",
+            &format!("Failed to load secret keys: {e}"),
         ),
     };
+    let pkhs = key_manager.list_keys();
 
     // A mark is bound to its chain. If chain_info is absent, an unrelated chain
     // id yields marks that fail to verify, which the missing-watermark recovery
@@ -842,6 +842,8 @@ fn apply_init_watermark(
 
     let hwm = signer_server::create_high_watermark(&config, &pkhs, mac_keys, chain_id)
         .map_err(|e| std::io::Error::other(format!("Failed to create watermark: {e}")))?;
+
+    app.pending_key_manager = Some(key_manager);
 
     // Apply a staged config level as an authenticated floor now that the per-key
     // MAC key exists. Never-lower: an existing higher mark is preserved. This is

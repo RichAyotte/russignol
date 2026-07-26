@@ -4,7 +4,7 @@
 //! Run with: cargo run --example `tcp_server_demo`
 
 use russignol_signer_lib::{
-    ChainId, HighWatermark, RequestHandler, ServerKeyManager,
+    ChainId, HighWatermark, MagicByte, RequestHandler, ServerKeyManager,
     bls::{generate_key, watermark_mac_key},
     high_watermark::seed_watermarks,
     server, signer,
@@ -57,9 +57,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handler = RequestHandler::new(
         Arc::new(RwLock::new(key_mgr)),
         Some(Arc::new(RwLock::new(watermark))),
-        Some(vec![0x11, 0x12, 0x13]), // Tenderbake only
-        true,                         // allow_list_known_keys
-        true,                         // allow_prove_possession
+        Some(MagicByte::all()), // Tenderbake only
+        true,                   // allow_list_known_keys
+        true,                   // allow_prove_possession
     );
 
     // 5. Start TCP server

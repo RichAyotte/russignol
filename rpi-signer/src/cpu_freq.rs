@@ -7,8 +7,10 @@ const SYSFS_POLICY: &str = "/sys/devices/system/cpu/cpufreq/policy0";
 
 struct CpuBoostInner {
     setspeed_path: PathBuf,
-    min_freq: String,
-    max_freq: String,
+    /// Sysfs setspeed payload for min frequency (ASCII kHz digits).
+    min_freq: Box<[u8]>,
+    /// Sysfs setspeed payload for max frequency (ASCII kHz digits).
+    max_freq: Box<[u8]>,
     /// Nested boost sessions so one connection's restore cannot drop frequency
     /// while another connection is still signing.
     active: Mutex<u32>,
@@ -35,15 +37,21 @@ impl CpuBoost {
     }
 
     fn init(policy_path: &Path) -> io::Result<Self> {
-        let min_freq = fs::read_to_string(policy_path.join("cpuinfo_min_freq"))?
+        let min_freq: Box<[u8]> = fs::read_to_string(policy_path.join("cpuinfo_min_freq"))?
             .trim()
-            .to_string();
-        let max_freq = fs::read_to_string(policy_path.join("cpuinfo_max_freq"))?
+            .as_bytes()
+            .into();
+        let max_freq: Box<[u8]> = fs::read_to_string(policy_path.join("cpuinfo_max_freq"))?
             .trim()
-            .to_string();
+            .as_bytes()
+            .into();
         let setspeed_path = policy_path.join("scaling_setspeed");
 
-        log::info!("CPU freq control: min={min_freq} max={max_freq} kHz");
+        log::info!(
+            "CPU freq control: min={} max={} kHz",
+            String::from_utf8_lossy(&min_freq),
+            String::from_utf8_lossy(&max_freq)
+        );
 
         // Start at minimum frequency
         fs::write(&setspeed_path, &min_freq)?;

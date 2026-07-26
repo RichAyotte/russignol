@@ -9,7 +9,7 @@ async fn handle_sign(&self, pkh: PublicKeyHash, data: Vec<u8>) -> Result<SignerR
     #[cfg(feature = "perf-trace")]
     let t = std::time::Instant::now();
 
-    if let Some(ref allowed) = self.allowed_magic_bytes {
+    if let Some(allowed) = self.allowed_magic_bytes {
         magic_bytes::check_magic_byte(&data, Some(allowed))?;
     }
 
@@ -36,11 +36,7 @@ async fn handle_sign(&self, pkh: PublicKeyHash, data: Vec<u8>) -> Result<SignerR
     let signer = keys.get_signer(&pkh)?;
 
     // Create handler with same magic byte restrictions
-    let handler = if let Some(ref allowed) = self.allowed_magic_bytes {
-        signer::Handler::new(signer.clone(), Some(allowed.clone()))
-    } else {
-        signer::Handler::new(signer.clone(), None)
-    };
+    let handler = signer::Handler::new(signer.clone(), self.allowed_magic_bytes);
 
     #[cfg(feature = "perf-trace")]
     eprintln!("[PERF] Get signer: {:?}", t.elapsed());

@@ -1,5 +1,5 @@
 use crossbeam_channel::Sender;
-use russignol_signer_lib::{ChainId, HighWatermark, signing_activity};
+use russignol_signer_lib::{ChainId, HighWatermark, ServerKeyManager, signing_activity};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -311,10 +311,12 @@ pub enum Effect {
     SleepDevice,
     ClearDisplay,
     Emit(AppEvent),
-    SendKeys(Secret<String>),
+    /// Start the TCP signer with keys already parsed at unlock (`App::pending_key_manager`).
+    StartSigner,
     InitWatermark {
         context: String,
-        /// Decrypted secret keys, used to derive the per-key watermark MAC keys.
+        /// Decrypted secret keys, used to derive the per-key watermark MAC keys
+        /// and to build the in-memory key manager (parsed once).
         secret_keys: Secret<String>,
     },
     SpawnKeygen {
@@ -355,11 +357,13 @@ pub struct App {
     pub current_page_spec: Option<PageSpec>,
     pub tx: Sender<AppEvent>,
     pub signing_activity: Arc<Mutex<signing_activity::SigningActivity>>,
-    pub start_signer_tx: Sender<Secret<String>>,
+    pub start_signer_tx: Sender<ServerKeyManager>,
     pub watermark: Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>>,
     /// Floor level staged by a consumed boot-partition config, applied as an
     /// authenticated mark after PIN unlock. `None` once seeded or absent.
     pub pending_watermark_level: Option<u32>,
+    /// Key manager produced once at unlock (`InitWatermark`); consumed by `StartSigner`.
+    pub pending_key_manager: Option<ServerKeyManager>,
     /// Signing requests for keys the device does not hold, surfaced as a
     /// modal acknowledge dialog.
     pub unknown_keys: UnknownKeyAlert,
@@ -375,7 +379,7 @@ impl App {
         is_first_boot: bool,
         tx: Sender<AppEvent>,
         signing_activity: Arc<Mutex<signing_activity::SigningActivity>>,
-        start_signer_tx: Sender<Secret<String>>,
+        start_signer_tx: Sender<ServerKeyManager>,
         watermark: Arc<RwLock<Option<Arc<RwLock<HighWatermark>>>>>,
     ) -> Self {
         let state = if is_first_boot {
@@ -395,11 +399,31 @@ impl App {
             start_signer_tx,
             watermark,
             pending_watermark_level: None,
+            pending_key_manager: None,
             unknown_keys: UnknownKeyAlert::default(),
             needs_animation: false,
             animation_interval: Duration::from_secs(1),
             pending_render: PendingRender::None,
         }
+    }
+
+    /// Hand the unlock-time key manager to the signer thread.
+    ///
+    /// Keys are parsed once in `InitWatermark` into [`Self::pending_key_manager`];
+    /// `StartSigner` must consume that value rather than re-parse secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no manager is pending (`InitWatermark` did not run)
+    /// or the signer channel is closed.
+    pub fn start_signer(&mut self) -> Result<(), String> {
+        let manager = self.pending_key_manager.take().ok_or_else(|| {
+            "StartSigner with no pending key manager (InitWatermark must run first)".to_string()
+        })?;
+        self.start_signer_tx
+            .send(manager)
+            .map_err(|_| "Signer channel closed before StartSigner".to_string())?;
+        Ok(())
     }
 
     pub fn is_screensaver_active(&self) -> bool {
@@ -843,9 +867,10 @@ impl App {
 
         let mut effects = Vec::new();
         match event {
-            AppEvent::KeysDecrypted(secret_keys_json) => {
+            AppEvent::KeysDecrypted(_secret_keys_json) => {
+                // Secrets were already parsed in InitWatermark into pending_key_manager.
                 effects.extend([
-                    Effect::SendKeys(secret_keys_json),
+                    Effect::StartSigner,
                     Effect::ShowPage(PageSpec::Menu),
                     Effect::ResetActivity,
                 ]);
@@ -1865,10 +1890,74 @@ mod tests {
         assert_eq!(
             effects,
             vec![
-                Effect::SendKeys(json("keys")),
+                Effect::StartSigner,
                 Effect::ShowPage(PageSpec::Menu),
                 Effect::ResetActivity,
             ]
+        );
+    }
+
+    /// Unlock stages the key manager once; `StartSigner` must hand it off and
+    /// clear the pending slot so a second `StartSigner` cannot double-start.
+    #[test]
+    fn start_signer_hands_off_pending_key_manager() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let (signer_tx, signer_rx) = crossbeam_channel::bounded(1);
+        let mut app = App::new(
+            false,
+            tx,
+            Arc::new(Mutex::new(signing_activity::SigningActivity::default())),
+            signer_tx,
+            Arc::new(RwLock::new(None)),
+        );
+        app.state = AppState::Active {
+            screensaver_active: false,
+        };
+        app.pending_key_manager = Some(ServerKeyManager::new());
+
+        app.start_signer().expect("handoff");
+        assert!(
+            app.pending_key_manager.is_none(),
+            "pending must be consumed"
+        );
+        assert!(
+            signer_rx.try_recv().is_ok(),
+            "signer thread must receive the manager"
+        );
+    }
+
+    #[test]
+    fn start_signer_without_pending_errors() {
+        let mut app = active_app();
+        assert!(
+            app.pending_key_manager.is_none(),
+            "active_app has no unlock"
+        );
+        let err = app.start_signer().expect_err("must refuse empty pending");
+        assert!(
+            err.contains("no pending key manager"),
+            "error should name the missing pending manager, got: {err}"
+        );
+    }
+
+    /// Production unlock always stages `InitWatermark` before `KeysDecrypted` so
+    /// `StartSigner` finds a pending manager. Guard that order on the active path.
+    #[test]
+    fn proceed_to_active_stages_init_watermark_before_keys_decrypted() {
+        let mut app = normal_boot_app();
+        let mut effects = Vec::new();
+        app.proceed_to_active(json("secrets"), false, &mut effects);
+        let init_wm = effects
+            .iter()
+            .position(|e| matches!(e, Effect::InitWatermark { .. }))
+            .expect("InitWatermark");
+        let keys = effects
+            .iter()
+            .position(|e| matches!(e, Effect::Emit(AppEvent::KeysDecrypted(_))))
+            .expect("KeysDecrypted");
+        assert!(
+            init_wm < keys,
+            "InitWatermark must run before KeysDecrypted so pending_key_manager is set"
         );
     }
 

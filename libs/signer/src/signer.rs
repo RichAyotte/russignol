@@ -202,7 +202,7 @@ impl Unencrypted {
 pub struct Handler {
     /// The underlying unencrypted signer
     pub signer: Unencrypted,
-    allowed_magic_bytes: Option<Vec<u8>>,
+    allowed_magic_bytes: Option<&'static [u8]>,
 }
 
 impl Handler {
@@ -212,9 +212,9 @@ impl Handler {
     /// * `signer` - The underlying unencrypted signer
     /// * `allowed_magic_bytes` - Optional list of allowed magic bytes.
     ///   If None, all magic bytes are allowed.
-    ///   Use `Some(vec![0x11, 0x12, 0x13])` for Tenderbake only.
+    ///   Use `Some(MagicByte::all())` for Tenderbake only.
     #[must_use]
-    pub fn new(signer: Unencrypted, allowed_magic_bytes: Option<Vec<u8>>) -> Self {
+    pub fn new(signer: Unencrypted, allowed_magic_bytes: Option<&'static [u8]>) -> Self {
         Self {
             signer,
             allowed_magic_bytes,
@@ -226,7 +226,7 @@ impl Handler {
     /// # Errors
     ///
     /// Returns an error if the base58check string is invalid or decodes to an invalid key.
-    pub fn from_b58check(sk_b58: &str, allowed_magic_bytes: Option<Vec<u8>>) -> Result<Self> {
+    pub fn from_b58check(sk_b58: &str, allowed_magic_bytes: Option<&'static [u8]>) -> Result<Self> {
         let signer = Unencrypted::from_b58check(sk_b58)?;
         Ok(Self::new(signer, allowed_magic_bytes))
     }
@@ -234,7 +234,7 @@ impl Handler {
     /// Create handler with Tenderbake-only magic bytes (0x11, 0x12, 0x13)
     #[must_use]
     pub fn new_tenderbake_only(signer: Unencrypted) -> Self {
-        Self::new(signer, Some(vec![0x11, 0x12, 0x13]))
+        Self::new(signer, Some(magic_bytes::MagicByte::all()))
     }
 
     /// Sign data with magic byte validation
@@ -261,7 +261,7 @@ impl Handler {
     ) -> Result<Signature> {
         // Check magic byte first
         // Corresponds to: handler.ml:293 - check_magic_byte name magic_bytes data
-        magic_bytes::check_magic_byte(data, self.allowed_magic_bytes.as_deref())?;
+        magic_bytes::check_magic_byte(data, self.allowed_magic_bytes)?;
 
         // Sign the data
         // Corresponds to: handler.ml:296-305

@@ -208,6 +208,11 @@ impl KeyManager {
         }
         keys
     }
+
+    /// Iterate loaded signers (pkh, signer) for one-pass MAC-key derivation after parse.
+    pub fn iter_signers(&self) -> impl Iterator<Item = (&PublicKeyHash, &Unencrypted)> {
+        self.signers.iter()
+    }
 }
 
 impl Default for KeyManager {
@@ -246,8 +251,11 @@ pub struct RequestHandler {
     keys: Arc<RwLock<KeyManager>>,
     /// High watermark tracker (if enabled)
     watermark: Option<Arc<RwLock<HighWatermark>>>,
-    /// Allowed magic bytes
-    allowed_magic_bytes: Option<Vec<u8>>,
+    /// Provisioned chain id, cached at construction (immutable on `HighWatermark`).
+    /// Lets Sign reject foreign-chain ops without taking the watermark lock.
+    provisioned_chain_id: Option<ChainId>,
+    /// Allowed magic bytes (static slice — no per-request clone)
+    allowed_magic_bytes: Option<&'static [u8]>,
     /// Allow listing known keys
     allow_list_known_keys: bool,
     /// Allow proof of possession
@@ -277,13 +285,18 @@ impl RequestHandler {
     pub fn new(
         keys: Arc<RwLock<KeyManager>>,
         watermark: Option<Arc<RwLock<HighWatermark>>>,
-        allowed_magic_bytes: Option<Vec<u8>>,
+        allowed_magic_bytes: Option<&'static [u8]>,
         allow_list_known_keys: bool,
         allow_prove_possession: bool,
     ) -> Self {
+        let provisioned_chain_id = watermark.as_ref().map(|arc| match arc.read() {
+            Ok(wm) => wm.chain_id(),
+            Err(poisoned) => poisoned.into_inner().chain_id(),
+        });
         Self {
             keys,
             watermark,
+            provisioned_chain_id,
             allowed_magic_bytes,
             allow_list_known_keys,
             allow_prove_possession,
@@ -399,21 +412,41 @@ impl RequestHandler {
         }
     }
 
-    /// Resolve a pkh to its signer, firing the unknown-key callback when the
-    /// signer does not hold the key.
+    /// Resolve a pkh to its signer (and alias), firing the unknown-key callback
+    /// when the signer does not hold the key.
     ///
     /// Every pkh-bearing request path must resolve through here so a baker
     /// misconfigured with an unheld key is surfaced no matter which request
     /// type arrives first — public-key and proof-of-possession lookups at
     /// baker startup, not just Sign.
-    fn get_signer_or_alert(&self, pkh: &PublicKeyHash) -> Result<Unencrypted> {
-        let result = self.keys.read()?.get_signer(pkh).cloned();
+    ///
+    /// Returns one clone of the signer so the keys lock can be dropped before
+    /// watermark I/O or BLS work. Call sites must not resolve the same pkh twice.
+    ///
+    /// The keys lock is released before any UI callback so a callback cannot
+    /// deadlock against another keys reader/writer.
+    fn resolve_signer(&self, pkh: &PublicKeyHash) -> Result<(Unencrypted, String)> {
+        let result = {
+            let keys = self.keys.read()?;
+            match keys.get_signer(pkh) {
+                Ok(signer) => {
+                    let name = keys.get_key_name(pkh).unwrap_or("").to_lowercase();
+                    Ok((signer.clone(), name))
+                }
+                Err(e) => Err(e),
+            }
+        };
         if matches!(result, Err(Error::KeyNotFound(_)))
             && let Some(ref callback) = self.unknown_key_callback
         {
             callback(*pkh);
         }
         result
+    }
+
+    /// Resolve a pkh to its signer only (drops the alias).
+    fn get_signer_or_alert(&self, pkh: &PublicKeyHash) -> Result<Unencrypted> {
+        self.resolve_signer(pkh).map(|(signer, _)| signer)
     }
 
     /// Handle a signer request
@@ -481,7 +514,7 @@ impl RequestHandler {
         #[cfg(feature = "perf-trace")]
         let t = std::time::Instant::now();
 
-        if let Some(ref allowed) = self.allowed_magic_bytes {
+        if let Some(allowed) = self.allowed_magic_bytes {
             magic_bytes::check_magic_byte(data, Some(allowed))?;
         }
 
@@ -491,125 +524,95 @@ impl RequestHandler {
         // A key the signer does not hold can never be signed, and the watermark
         // checks below would otherwise offer recovery for it. Reject it here so
         // the missing-watermark dialog is reserved for keys we can actually sign.
-        self.get_signer_or_alert(&pkh)?;
+        // Single resolve: one keys-map read and one Unencrypted clone for the
+        // whole request (BLS sign runs after the keys lock is dropped).
+        let (signer, key_name) = self.resolve_signer(&pkh)?;
 
         // 2. Check high watermark
         #[cfg(feature = "perf-trace")]
         let t = std::time::Instant::now();
 
-        // Extract Chain ID from data if this is a Tenderbake operation
-        // Only operations with magic bytes 0x11, 0x12, 0x13 have chain IDs
-        // For other operations (or when chain ID extraction fails), we skip watermarking
-        // This matches OCaml behavior in handler.ml:211-231
-        let operation_chain_id = if data.is_empty() {
-            None
-        } else {
-            magic_bytes::get_chain_id_for_tenderbake(data).map(|bytes| {
-                let mut padded = [0u8; 32];
-                padded[..4].copy_from_slice(&bytes);
-                ChainId::from_bytes(&padded)
-            })
-        };
+        // Parse tenderbake fields once for prechecks, activity, and check_and_update.
+        // BLS-only: attestation/preattestation layout always uses is_bls=true.
+        let parsed = Self::parse_sign_payload(data);
+        let operation_chain_id = parsed.chain_id;
 
         // The device signs only for its provisioned chain. Reject a foreign-chain
         // operation before any watermark logic so it cannot raise a gap/missing/level
         // dialog. A wrong chain is never operator-recoverable, so this takes the
         // silent watermark-error path (no recovery dialog), like RoundTooLow.
+        // provisioned_chain_id is cached at construction — no watermark lock here.
         if let Some(op_chain) = operation_chain_id
-            && let Some(ref watermark) = self.watermark
+            && let Some(provisioned) = self.provisioned_chain_id
+            && op_chain != provisioned
         {
-            let provisioned = watermark.read()?.chain_id();
-            if op_chain != provisioned {
-                let err = crate::high_watermark::WatermarkError::ChainMismatch {
-                    expected: provisioned.to_b58check(),
-                    got: op_chain.to_b58check(),
-                };
-                if let Some(ref callback) = self.watermark_error_callback {
-                    callback(pkh, op_chain, &err);
-                }
-                return Err(Error::Watermark(err));
+            let err = crate::high_watermark::WatermarkError::ChainMismatch {
+                expected: provisioned.to_b58check(),
+                got: op_chain.to_b58check(),
+            };
+            if let Some(ref callback) = self.watermark_error_callback {
+                callback(pkh, op_chain, &err);
             }
+            return Err(Error::Watermark(err));
         }
 
-        // 2a. Check for large level gap (stale watermark detection)
-        // This must happen BEFORE the normal watermark check
+        // 2a + 2a'. Large-gap and missing-watermark prechecks under one read.
+        // Drop the lock before any UI callback. Precedence: missing floor first
+        // (no current level), else large gap when the floor exists.
         if let Some(chain_id) = operation_chain_id
             && let Some(ref watermark) = self.watermark
-            && let Some(ref callback) = self.large_gap_callback
-            && let Some(blocks_per_cycle) = self.blocks_per_cycle
-            && blocks_per_cycle > 0
+            && let Some(requested_level) = parsed.level
         {
-            // Extract requested level from data
-            let requested_level = Self::extract_level_from_data(data, &pkh);
-            if let Some(requested_level) = requested_level {
-                // Get current watermark level
-                let wm = watermark.read()?;
-                if let Some(current_level) = wm.get_current_level(chain_id, &pkh) {
-                    let gap = requested_level.saturating_sub(current_level);
-                    let threshold = LARGE_GAP_CYCLES * blocks_per_cycle;
-                    if gap > threshold {
-                        // Drop lock BEFORE calling callback to avoid deadlock
-                        drop(wm);
-                        callback(pkh, chain_id, current_level, requested_level);
-                        let cycles = gap / blocks_per_cycle;
+            let check_gap = self.large_gap_callback.is_some()
+                && self.blocks_per_cycle.is_some_and(|bpc| bpc > 0);
+            let check_missing = self.missing_watermark_callback.is_some();
+            if check_gap || check_missing {
+                let current_level = {
+                    let wm = watermark.read()?;
+                    wm.get_current_level(chain_id, &pkh)
+                };
+                match current_level {
+                    None if check_missing => {
+                        if let Some(ref callback) = self.missing_watermark_callback {
+                            callback(pkh, chain_id, requested_level);
+                        }
                         return Err(Error::Watermark(
-                            crate::high_watermark::WatermarkError::LargeLevelGap {
-                                current_level,
-                                requested_level,
-                                gap,
-                                cycles,
+                            crate::high_watermark::WatermarkError::NotInitialized {
+                                chain_id: chain_id.to_b58check(),
+                                pkh: pkh.to_b58check(),
                             },
                         ));
                     }
+                    Some(current_level) if check_gap => {
+                        let blocks_per_cycle = self.blocks_per_cycle.unwrap();
+                        let gap = requested_level.saturating_sub(current_level);
+                        let threshold = LARGE_GAP_CYCLES * blocks_per_cycle;
+                        if gap > threshold {
+                            if let Some(ref callback) = self.large_gap_callback {
+                                callback(pkh, chain_id, current_level, requested_level);
+                            }
+                            let cycles = gap / blocks_per_cycle;
+                            return Err(Error::Watermark(
+                                crate::high_watermark::WatermarkError::LargeLevelGap {
+                                    current_level,
+                                    requested_level,
+                                    gap,
+                                    cycles,
+                                },
+                            ));
+                        }
+                    }
+                    _ => {}
                 }
-            }
-        }
-
-        // 2a'. Detect a missing (uninitialized) watermark so the UI can offer
-        // on-device recovery. Signing still fails with NotInitialized; the
-        // callback only supplies the requested level the confirmation needs.
-        if let Some(chain_id) = operation_chain_id
-            && let Some(ref watermark) = self.watermark
-            && let Some(ref callback) = self.missing_watermark_callback
-            && let Some(requested_level) = Self::extract_level_from_data(data, &pkh)
-        {
-            let wm = watermark.read()?;
-            if wm.get_current_level(chain_id, &pkh).is_none() {
-                // Drop lock BEFORE calling callback to avoid deadlock
-                drop(wm);
-                callback(pkh, chain_id, requested_level);
-                return Err(Error::Watermark(
-                    crate::high_watermark::WatermarkError::NotInitialized {
-                        chain_id: chain_id.to_b58check(),
-                        pkh: pkh.to_b58check(),
-                    },
-                ));
             }
         }
 
         #[cfg(feature = "perf-trace")]
         log::info!("[PERF] Watermark check: {:?}", t.elapsed());
 
-        // 3. Get key and prepare signer
-        #[cfg(feature = "perf-trace")]
-        let t = std::time::Instant::now();
-
-        let keys = self.keys.read()?;
-        let signer = keys.get_signer(&pkh)?;
-
-        // Create handler with same magic byte restrictions
-        let handler = if let Some(ref allowed) = self.allowed_magic_bytes {
-            Handler::new(signer.clone(), Some(allowed.clone()))
-        } else {
-            Handler::new(signer.clone(), None)
-        };
-
-        // Extract key name before dropping keys lock
-        let key_name = keys.get_key_name(&pkh).unwrap_or("").to_lowercase();
-        drop(keys);
-
-        #[cfg(feature = "perf-trace")]
-        log::info!("[PERF] Get signer: {:?}", t.elapsed());
+        // Magic bytes already checked on the request; sign via Unencrypted
+        // directly so we do not rebuild a Handler (and re-check magic) per sign.
+        let sign_data = || signer.sign(data, None, None);
 
         // 2b+4. Check watermark, then BLS sign + watermark persist in parallel.
         //    Write lock is held from check_and_update through write_watermark to
@@ -624,7 +627,15 @@ impl RequestHandler {
             && let Some(ref watermark) = self.watermark
         {
             let mut wm = watermark.write()?;
-            let watermark_update = match wm.check_and_update(chain_id, &pkh, data) {
+            let watermark_update = match (parsed.op_type, parsed.level, parsed.round) {
+                (Some(op_type), Some(level), Some(round)) => {
+                    wm.check_and_update_parsed(chain_id, &pkh, op_type, level, round)
+                }
+                // Parse failed for a tenderbake body, or non-watermarked magic
+                // with a chain id: re-enter the data path for InvalidData / None.
+                _ => wm.check_and_update(chain_id, &pkh, data),
+            };
+            let watermark_update = match watermark_update {
                 Ok(update) => update,
                 Err(e) => {
                     // Drop lock BEFORE calling callback to avoid deadlock
@@ -643,10 +654,10 @@ impl RequestHandler {
                 // update the file after we return the signature.
                 // Slow path: no ceiling — fdatasync needed, parallelize with BLS.
                 let (sign_result, write_result) = if wm.ceiling_covers(update) {
-                    (handler.sign(data, None, None), Ok(()))
+                    (sign_data(), Ok(()))
                 } else {
                     std::thread::scope(|s| {
-                        let sign_handle = s.spawn(|| handler.sign(data, None, None));
+                        let sign_handle = s.spawn(sign_data);
                         let write_result = wm.write_watermark(update);
                         (
                             sign_handle.join().expect("sign thread panicked"),
@@ -711,12 +722,12 @@ impl RequestHandler {
             } else {
                 // Non-watermarked operation type
                 drop(wm);
-                let signature = handler.sign(data, None, None)?;
+                let signature = sign_data()?;
                 (signature, sign_start.elapsed())
             }
         } else {
             // No watermark configured — just sign
-            let signature = handler.sign(data, None, None)?;
+            let signature = sign_data()?;
             (signature, sign_start.elapsed())
         };
 
@@ -732,7 +743,7 @@ impl RequestHandler {
             } else {
                 crate::signing_activity::OperationType::from_magic_byte(data[0])
             };
-            let level = Self::extract_level_from_data(data, &pkh);
+            let level = parsed.level;
 
             let sig_activity = crate::signing_activity::SignatureActivity {
                 level,
@@ -875,27 +886,48 @@ impl RequestHandler {
     }
 
     /// Extract level from Tenderbake operation data
-    fn extract_level_from_data(data: &[u8], pkh: &PublicKeyHash) -> Option<u32> {
+    /// Single parse of tenderbake chain id + level/round for one sign request.
+    ///
+    /// This crate only holds BLS keys, so attestation/preattestation always use
+    /// the BLS layout (`is_bls = true`) — no base58 pkh allocation.
+    fn parse_sign_payload(data: &[u8]) -> ParsedSignPayload {
         if data.is_empty() {
-            return None;
+            return ParsedSignPayload::default();
         }
-        match data[0] {
-            0x11 => {
-                // Block signing
-                magic_bytes::get_level_and_round_for_tenderbake_block(data)
-                    .ok()
-                    .map(|(level, _round)| level)
-            }
-            0x12 | 0x13 => {
-                // Attestation or Pre-attestation
-                let is_bls = pkh.to_b58check().starts_with("tz4");
-                magic_bytes::get_level_and_round_for_tenderbake_attestation(data, is_bls)
-                    .ok()
-                    .map(|(level, _round)| level)
-            }
-            _ => None,
+
+        let chain_id = magic_bytes::get_chain_id_for_tenderbake(data).map(|bytes| {
+            let mut padded = [0u8; 32];
+            padded[..4].copy_from_slice(&bytes);
+            ChainId::from_bytes(&padded)
+        });
+
+        let op_type = crate::high_watermark::OperationType::from_magic_byte(data[0]);
+        let (level, round) = match data[0] {
+            0x11 => magic_bytes::get_level_and_round_for_tenderbake_block(data)
+                .ok()
+                .map_or((None, None), |(l, r)| (Some(l), Some(r))),
+            0x12 | 0x13 => magic_bytes::get_level_and_round_for_tenderbake_attestation(data, true)
+                .ok()
+                .map_or((None, None), |(l, r)| (Some(l), Some(r))),
+            _ => (None, None),
+        };
+
+        ParsedSignPayload {
+            chain_id,
+            op_type,
+            level,
+            round,
         }
     }
+}
+
+/// Pre-parsed tenderbake fields for one Sign request (parsed once per `handle_sign`).
+#[derive(Clone, Copy, Default)]
+struct ParsedSignPayload {
+    chain_id: Option<ChainId>,
+    op_type: Option<crate::high_watermark::OperationType>,
+    level: Option<u32>,
+    round: Option<u32>,
 }
 
 /// Handle a single TCP connection
@@ -1310,7 +1342,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::new(RwLock::new(hwm))),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true, // allow_list_known_keys
             true, // allow_prove_possession
         );
@@ -1378,7 +1410,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::new(RwLock::new(hwm))),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true,
             true,
         );
@@ -1425,7 +1457,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::new(RwLock::new(hwm))),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true,
             true,
         );
@@ -1461,7 +1493,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::clone(&hwm)),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true,
             true,
         );
@@ -1521,7 +1553,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::clone(&hwm)),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true,
             true,
         );
@@ -1600,7 +1632,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::clone(&hwm)),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true,
             true,
         )
@@ -1671,7 +1703,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::clone(&hwm)),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true,
             true,
         )
@@ -1728,7 +1760,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::clone(&hwm)),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true,
             true,
         )
@@ -1795,7 +1827,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::clone(&hwm)),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true,
             true,
         )
@@ -1856,7 +1888,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::clone(&hwm)),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true,
             true,
         )
@@ -2009,7 +2041,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::clone(&hwm)),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true,
             true,
         )
@@ -2060,7 +2092,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::clone(&hwm)),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true,
             true,
         );
@@ -2130,7 +2162,7 @@ mod tests {
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
             Some(Arc::clone(&hwm)),
-            Some(vec![0x11, 0x12, 0x13]),
+            Some(magic_bytes::MagicByte::all()),
             true,
             true,
         )

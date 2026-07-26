@@ -4,8 +4,8 @@
 
 use clap::{Parser, Subcommand};
 use russignol_signer_lib::{
-    ChainId, HighWatermark, RequestHandler, ServerKeyManager, bls::watermark_mac_key, server,
-    signer, wallet::KeyManager,
+    ChainId, HighWatermark, MagicByte, RequestHandler, ServerKeyManager, bls::watermark_mac_key,
+    server, signer, wallet::KeyManager,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -143,9 +143,13 @@ fn show_address(key_manager: &KeyManager, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Parse magic bytes from string like "0x11,0x12,0x13"
-fn parse_magic_bytes(s: &str) -> Result<Vec<u8>, String> {
-    s.split(',')
+/// Parse magic bytes from string like "0x11,0x12,0x13" into a static allow-list.
+///
+/// Tenderbake's three bytes map to [`MagicByte::all`]; any other set is
+/// leaked once at process start so the request handler never clones a `Vec`.
+fn parse_magic_bytes(s: &str) -> Result<&'static [u8], String> {
+    let bytes: Vec<u8> = s
+        .split(',')
         .map(|part| {
             let part = part.trim();
             if let Some(hex) = part.strip_prefix("0x") {
@@ -155,7 +159,12 @@ fn parse_magic_bytes(s: &str) -> Result<Vec<u8>, String> {
                     .map_err(|e| format!("Invalid byte value '{part}': {e}"))
             }
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if bytes.as_slice() == MagicByte::all() {
+        return Ok(MagicByte::all());
+    }
+    Ok(Box::leak(bytes.into_boxed_slice()))
 }
 
 /// Write PID file
@@ -225,7 +234,7 @@ fn launch_socket_signer(
     opts: &SocketSignerOptions,
 ) -> Result<(), String> {
     // Parse magic bytes if provided
-    let magic_bytes_filter = if let Some(mb_str) = &opts.magic_bytes {
+    let magic_bytes_filter: Option<&'static [u8]> = if let Some(mb_str) = &opts.magic_bytes {
         Some(parse_magic_bytes(mb_str)?)
     } else {
         None
@@ -277,7 +286,7 @@ fn launch_socket_signer(
     let handler = RequestHandler::new(
         Arc::new(RwLock::new(server_key_mgr)),
         watermark,
-        magic_bytes_filter.clone(),
+        magic_bytes_filter,
         opts.allow_list_known_keys,
         opts.allow_to_prove_possession,
     );
@@ -307,7 +316,7 @@ fn launch_socket_signer(
     // Print configuration
     println!("\n📋 Configuration:");
     println!("  Listen address: {addr}");
-    if let Some(ref mb) = magic_bytes_filter {
+    if let Some(mb) = magic_bytes_filter {
         let mb_str = mb
             .iter()
             .map(|b| format!("0x{b:02x}"))
