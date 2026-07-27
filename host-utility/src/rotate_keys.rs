@@ -18,6 +18,7 @@ use crate::constants::{
     CONSENSUS_KEY_OLD_ALIAS, CONSENSUS_KEY_PENDING_ALIAS,
 };
 use crate::image;
+use crate::key_role::BakerKeyNames;
 use crate::keys;
 use crate::progress::create_spinner;
 use crate::system;
@@ -26,6 +27,7 @@ use crate::utils::{
     prompt_yes_no, rpc_get_json, run_command, run_octez_client_command, success,
     sudo_command_success, warning,
 };
+use russignol_signer_lib::KeyRole;
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
@@ -361,15 +363,23 @@ fn execute_fresh_rotation(ctx: &FreshRotationContext<'_>, config: &RussignolConf
     }
     wait_for_device(&new_expectation, config)?;
 
-    let (consensus_hash, companion_hash) = discover_key_hashes(config)?;
-    success(&format!(
-        "Discovered new keys: consensus={}, companion={}",
-        &consensus_hash[..12],
-        &companion_hash[..12]
-    ));
+    let new_hashes = discover_key_hashes(config)?;
+    let consensus_hash = &new_hashes[KeyRole::Consensus.index()];
+    let discovered = KeyRole::ALL
+        .into_iter()
+        .map(|role| {
+            format!(
+                "{}={}",
+                role.device_alias(),
+                short_hash(&new_hashes[role.index()])
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    success(&format!("Discovered new keys: {discovered}"));
 
     let current_consensus = blockchain::get_active_consensus_key(delegate_address, config)?;
-    if consensus_hash == current_consensus {
+    if consensus_hash == &current_consensus {
         warning("New consensus key matches current active key - nothing to rotate");
         return Ok(());
     }
@@ -380,20 +390,24 @@ fn execute_fresh_rotation(ctx: &FreshRotationContext<'_>, config: &RussignolConf
     print_subtitle_bar("Step 3: Import New Keys");
 
     if *dry_run {
-        info(&format!(
-            "Would import {CONSENSUS_KEY_PENDING_ALIAS} -> {consensus_hash}"
-        ));
-        info(&format!(
-            "Would import {COMPANION_KEY_PENDING_ALIAS} -> {companion_hash}"
-        ));
+        for role in KeyRole::ALL {
+            info(&format!(
+                "Would import {} -> {}",
+                role.baker_pending_alias(),
+                new_hashes[role.index()]
+            ));
+        }
     } else {
-        import_new_keys(&consensus_hash, &companion_hash, config)?;
+        import_new_keys(
+            KeyRole::map_all(|role| new_hashes[role.index()].as_str()),
+            config,
+        )?;
     }
 
     // Check if keys are already pending on-chain before submitting transaction
     let pending_ctx = PendingKeyCheckContext {
         delegate_address,
-        consensus_hash: &consensus_hash,
+        consensus_hash,
         current_consensus: &current_consensus,
         hw_config,
         restart_config,
@@ -748,10 +762,7 @@ fn verify_preconditions(config: &RussignolConfig, verbose: bool) -> Result<(Stri
 
     // Check 6: Current russignol keys exist
     if let Ok(hash) = keys::get_key_hash(CONSENSUS_KEY_ALIAS, config) {
-        success(&format!(
-            "Current consensus key: {}...",
-            &hash[..12.min(hash.len())]
-        ));
+        success(&format!("Current consensus key: {}...", short_hash(&hash)));
     } else {
         println!(
             "  {} No current {} alias found",
@@ -997,8 +1008,9 @@ fn wait_for_device(expectation: &DeviceExpectation, config: &RussignolConfig) ->
             // Verify signer is responding by checking if expected key exists
             match expectation {
                 DeviceExpectation::New => {
-                    // For NEW device, just check that signer responds with at least 2 keys
-                    if keys::discover_remote_keys(config).is_ok_and(|k| k.len() >= 2) {
+                    // A NEW device has no key we can name yet, so responding
+                    // with a key per role is the only reachable liveness check.
+                    if keys::discover_remote_keys(config).is_ok_and(|k| k.len() >= KeyRole::COUNT) {
                         spinner.finish_and_clear();
                         success("Device connected and signer responding");
                         return Ok(());
@@ -1019,11 +1031,11 @@ fn wait_for_device(expectation: &DeviceExpectation, config: &RussignolConfig) ->
                         spinner.finish_and_clear();
                         warning(&format!(
                             "Connected signer doesn't have expected key {}...",
-                            &expected_consensus_hash[..12]
+                            short_hash(expected_consensus_hash)
                         ));
                         anyhow::bail!(
                             "Wrong device connected. Expected OLD device with key {}...",
-                            &expected_consensus_hash[..12]
+                            short_hash(expected_consensus_hash)
                         );
                     }
                 }
@@ -1050,45 +1062,40 @@ fn signer_has_expected_consensus_key(expected_hash: &str, config: &RussignolConf
     keys::signer_holds_key(expected_hash, config).unwrap_or(false)
 }
 
-/// Discover key hashes from the remote signer
-fn discover_key_hashes(config: &RussignolConfig) -> Result<(String, String)> {
+/// Leading slice of a pkh for logs and prompts. Total: a hash shorter than the
+/// prefix (or not sliceable there) is shown whole rather than panicking.
+fn short_hash(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
+}
+
+/// Remote signer pkhs in global role order (`list_keys` / [`KeyRole::ALL`]).
+fn discover_key_hashes(config: &RussignolConfig) -> Result<[String; KeyRole::COUNT]> {
     let remote_keys = keys::discover_remote_keys(config)?;
 
-    if remote_keys.len() < 2 {
+    if remote_keys.len() < KeyRole::COUNT {
         anyhow::bail!(
-            "Expected at least 2 remote keys but found {}. Is this a properly configured Russignol device?",
+            "Expected at least {} remote keys but found {}. Is this a properly configured Russignol device?",
+            KeyRole::COUNT,
             remote_keys.len()
         );
     }
 
-    Ok((remote_keys[0].clone(), remote_keys[1].clone()))
+    Ok(KeyRole::map_all(|role| remote_keys[role.index()].clone()))
 }
 
 /// Import new keys with -pending suffix
 ///
 /// Imports keys from the remote signer into `-pending` aliases.
 /// The public keys are stored locally by octez-client and can be
-/// referenced by alias in subsequent commands.
-fn import_new_keys(
-    consensus_hash: &str,
-    companion_hash: &str,
-    config: &RussignolConfig,
-) -> Result<()> {
-    // Import consensus key as -pending
-    info(&format!(
-        "Importing {} -> {}...",
-        CONSENSUS_KEY_PENDING_ALIAS,
-        &consensus_hash[..12]
-    ));
-    keys::import_key_from_signer(CONSENSUS_KEY_PENDING_ALIAS, consensus_hash, true, config)?;
-
-    // Import companion key as -pending
-    info(&format!(
-        "Importing {} -> {}...",
-        COMPANION_KEY_PENDING_ALIAS,
-        &companion_hash[..12]
-    ));
-    keys::import_key_from_signer(COMPANION_KEY_PENDING_ALIAS, companion_hash, true, config)?;
+/// referenced by alias in subsequent commands. `hashes` is in
+/// [`KeyRole::ALL`] order.
+fn import_new_keys(hashes: [&str; KeyRole::COUNT], config: &RussignolConfig) -> Result<()> {
+    for role in KeyRole::ALL {
+        let hash = hashes[role.index()];
+        let alias = role.baker_pending_alias();
+        info(&format!("Importing {alias} -> {}...", short_hash(hash)));
+        keys::import_key_from_signer(alias, hash, true, config)?;
+    }
 
     success("New keys imported with -pending suffix");
 
@@ -1117,50 +1124,26 @@ fn submit_key_rotation_transactions(
         }
     }
 
-    // Submit consensus key transaction using the -pending alias
-    info("Submitting set consensus key transaction...");
-    let set_consensus = run_octez_client_command(
-        &[
-            "set",
-            "consensus",
-            "key",
-            "for",
-            delegate_alias,
-            "to",
-            CONSENSUS_KEY_PENDING_ALIAS,
-        ],
-        config,
-    )?;
+    for role in KeyRole::ALL {
+        let kind = role.cli_key_kind();
+        let alias = role.baker_pending_alias();
+        info(&format!("Submitting set {kind} key transaction..."));
+        let set_key = run_octez_client_command(
+            &["set", kind, "key", "for", delegate_alias, "to", alias],
+            config,
+        )?;
 
-    if !set_consensus.status.success() {
-        let stderr = String::from_utf8_lossy(&set_consensus.stderr);
-        anyhow::bail!("Failed to set consensus key: {stderr}");
+        if !set_key.status.success() {
+            let stderr = String::from_utf8_lossy(&set_key.stderr);
+            anyhow::bail!("Failed to set {kind} key: {stderr}");
+        }
+        success(&format!("{} transaction submitted", role.display_name()));
+
+        // Stagger submissions so the node can accept both without contention.
+        if role.index() + 1 < KeyRole::COUNT {
+            sleep(Duration::from_secs(5));
+        }
     }
-    success("Consensus key transaction submitted");
-
-    // Wait before submitting companion key
-    sleep(Duration::from_secs(5));
-
-    // Submit companion key transaction using the -pending alias
-    info("Submitting set companion key transaction...");
-    let set_companion = run_octez_client_command(
-        &[
-            "set",
-            "companion",
-            "key",
-            "for",
-            delegate_alias,
-            "to",
-            COMPANION_KEY_PENDING_ALIAS,
-        ],
-        config,
-    )?;
-
-    if !set_companion.status.success() {
-        let stderr = String::from_utf8_lossy(&set_companion.stderr);
-        anyhow::bail!("Failed to set companion key: {stderr}");
-    }
-    success("Companion key transaction submitted");
 
     // Poll for transaction confirmation
     let activation_cycle = poll_for_pending_activation(delegate_address, config)?;
@@ -1518,9 +1501,9 @@ fn promote_aliases_with_backup(config: &RussignolConfig) -> Result<()> {
     log::debug!(
         "Promoting: {} ({}) -> primary, {} ({}) -> backup",
         CONSENSUS_KEY_PENDING_ALIAS,
-        &pending_consensus[..12.min(pending_consensus.len())],
+        short_hash(&pending_consensus),
         CONSENSUS_KEY_ALIAS,
-        &current_consensus[..12.min(current_consensus.len())]
+        short_hash(&current_consensus)
     );
 
     // STEP 2: Rename current -> -old (backup)
@@ -1663,29 +1646,24 @@ fn verify_baker_signing(config: &RussignolConfig) -> bool {
 /// Requires explicit user confirmation unless `auto_confirm` is true.
 fn cleanup_backup_aliases(auto_confirm: bool, config: &RussignolConfig) -> Result<()> {
     // Show what we're about to delete
-    let consensus_old = keys::get_key_hash(CONSENSUS_KEY_OLD_ALIAS, config).ok();
-    let companion_old = keys::get_key_hash(COMPANION_KEY_OLD_ALIAS, config).ok();
+    let old_hashes =
+        KeyRole::map_all(|role| keys::get_key_hash(role.baker_old_alias(), config).ok());
 
-    if consensus_old.is_none() && companion_old.is_none() {
+    if old_hashes.iter().all(Option::is_none) {
         info("No backup aliases to clean up");
         return Ok(());
     }
 
     println!();
     info("Backup aliases to remove:");
-    if let Some(ref hash) = consensus_old {
-        info(&format!(
-            "  {} -> {}...",
-            CONSENSUS_KEY_OLD_ALIAS,
-            &hash[..12.min(hash.len())]
-        ));
-    }
-    if let Some(ref hash) = companion_old {
-        info(&format!(
-            "  {} -> {}...",
-            COMPANION_KEY_OLD_ALIAS,
-            &hash[..12.min(hash.len())]
-        ));
+    for role in KeyRole::ALL {
+        if let Some(hash) = &old_hashes[role.index()] {
+            info(&format!(
+                "  {} -> {}...",
+                role.baker_old_alias(),
+                short_hash(hash)
+            ));
+        }
     }
 
     // Always require explicit confirmation for cleanup
@@ -1699,12 +1677,12 @@ fn cleanup_backup_aliases(auto_confirm: bool, config: &RussignolConfig) -> Resul
 
         if !proceed {
             info("Keeping backup aliases. You can remove them later with:");
-            info(&format!(
-                "  octez-client forget address {CONSENSUS_KEY_OLD_ALIAS} --force"
-            ));
-            info(&format!(
-                "  octez-client forget address {COMPANION_KEY_OLD_ALIAS} --force"
-            ));
+            for role in KeyRole::ALL {
+                info(&format!(
+                    "  octez-client forget address {} --force",
+                    role.baker_old_alias()
+                ));
+            }
             return Ok(());
         }
     }
@@ -1712,21 +1690,14 @@ fn cleanup_backup_aliases(auto_confirm: bool, config: &RussignolConfig) -> Resul
     // Remove -old aliases. A lingering -old alias makes the next rotation
     // misdetect an in-progress swap, so a failed removal must be surfaced.
     let mut unremoved = Vec::new();
-    if consensus_old.is_some()
-        && let Err(e) = keys::forget_key_alias(CONSENSUS_KEY_OLD_ALIAS, config)
-    {
-        warning(&format!(
-            "Failed to remove {CONSENSUS_KEY_OLD_ALIAS}: {e:#}"
-        ));
-        unremoved.push(CONSENSUS_KEY_OLD_ALIAS);
-    }
-    if companion_old.is_some()
-        && let Err(e) = keys::forget_key_alias(COMPANION_KEY_OLD_ALIAS, config)
-    {
-        warning(&format!(
-            "Failed to remove {COMPANION_KEY_OLD_ALIAS}: {e:#}"
-        ));
-        unremoved.push(COMPANION_KEY_OLD_ALIAS);
+    for role in KeyRole::ALL {
+        let alias = role.baker_old_alias();
+        if old_hashes[role.index()].is_some()
+            && let Err(e) = keys::forget_key_alias(alias, config)
+        {
+            warning(&format!("Failed to remove {alias}: {e:#}"));
+            unremoved.push(alias);
+        }
     }
     if !unremoved.is_empty() {
         anyhow::bail!(
@@ -2095,18 +2066,22 @@ fn resume_from_pending_on_chain_only(
         info("Attempting to discover keys from connected signer...");
 
         match discover_key_hashes(config) {
-            Ok((consensus_hash, companion_hash)) => {
+            Ok(hashes) => {
+                let consensus_hash = &hashes[KeyRole::Consensus.index()];
                 // Check if one of the discovered keys matches the pending on-chain key
                 let matches_pending = status
                     .consensus_pending_hash
                     .as_ref()
-                    .is_some_and(|h| h == &consensus_hash);
+                    .is_some_and(|h| h == consensus_hash);
 
                 if matches_pending {
                     success("Found matching key on connected signer!");
 
                     // Import as -pending aliases
-                    import_new_keys(&consensus_hash, &companion_hash, config)?;
+                    import_new_keys(
+                        KeyRole::map_all(|role| hashes[role.index()].as_str()),
+                        config,
+                    )?;
                     success("Created local -pending aliases");
 
                     // Now proceed with normal pending flow

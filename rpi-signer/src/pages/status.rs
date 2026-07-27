@@ -48,13 +48,10 @@ impl Page {
                         .lock()
                         .ok()
                         .map_or((None, 0), |activity| {
-                            let ct = activity.consensus.as_ref().map(|c| c.timestamp);
-                            let cpt = activity.companion.as_ref().map(|c| c.timestamp);
-                            let last = match (ct, cpt) {
-                                (Some(a), Some(b)) => Some(a.max(b)),
-                                (Some(t), None) | (None, Some(t)) => Some(t),
-                                (None, None) => None,
-                            };
+                            let last = russignol_signer_lib::KeyRole::ALL
+                                .iter()
+                                .filter_map(|role| activity.last(*role).map(|a| a.timestamp))
+                                .max();
                             (last, activity.total_signatures)
                         });
 

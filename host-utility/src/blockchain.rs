@@ -8,6 +8,7 @@ use std::fmt::Write;
 use crate::config::RussignolConfig;
 use crate::utils::{JsonValueExt, rpc_get_json, run_octez_client_command};
 use anyhow::{Context, Result};
+use russignol_signer_lib::KeyRole;
 
 /// Status of key activation on the blockchain
 #[derive(Debug)]
@@ -20,6 +21,41 @@ pub struct KeyActivationStatus {
     pub companion_active: bool,
     pub companion_cycle: Option<i64>,
     pub companion_time_estimate: Option<String>,
+}
+
+impl KeyActivationStatus {
+    /// Pending activation for `role` as `(cycle, time estimate)`. The three
+    /// underlying fields are populated together, so they resolve as one.
+    #[must_use]
+    pub fn pending_for(&self, role: KeyRole) -> Option<(i64, &str)> {
+        let (pending, cycle, estimate) = match role {
+            KeyRole::Consensus => (
+                self.consensus_pending,
+                self.consensus_cycle,
+                self.consensus_time_estimate.as_deref(),
+            ),
+            KeyRole::Companion => (
+                self.companion_pending,
+                self.companion_cycle,
+                self.companion_time_estimate.as_deref(),
+            ),
+        };
+        if !pending {
+            return None;
+        }
+        Some((cycle?, estimate?))
+    }
+
+    /// Whether `role` has an active key on-chain. The delegate RPC always
+    /// carries `consensus_key.active` for a registered baker, while
+    /// `companion_key.active` may be null — only the companion can be unset.
+    #[must_use]
+    pub fn active_for(&self, role: KeyRole) -> bool {
+        match role {
+            KeyRole::Consensus => true,
+            KeyRole::Companion => self.companion_active,
+        }
+    }
 }
 
 /// Get the active consensus key hash for a delegate

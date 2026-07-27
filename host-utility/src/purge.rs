@@ -1,8 +1,8 @@
 use crate::config::RussignolConfig;
 use crate::constants::{
-    COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, NETWORK_CONFIG_PATH, NETWORKMANAGER_CONFIG_PATH,
-    NM_CONNECTION_PATH, UDEV_RULE_PATH,
+    NETWORK_CONFIG_PATH, NETWORKMANAGER_CONFIG_PATH, NM_CONNECTION_PATH, UDEV_RULE_PATH,
 };
+use crate::key_role::baker_aliases;
 use crate::progress::create_spinner;
 use crate::utils::{
     ensure_sudo, info, is_service_active, run_command, run_octez_client_command, success, warning,
@@ -53,7 +53,7 @@ pub fn run_purge(dry_run: bool, config: &RussignolConfig) -> Result<bool> {
                 (String::new(), false)
             }
         };
-    let keys_to_remove = present_aliases(&known, &[CONSENSUS_KEY_ALIAS, COMPANION_KEY_ALIAS]);
+    let keys_to_remove = present_aliases(&known, &baker_aliases());
 
     let has_config = !files_to_remove.is_empty();
     let has_keys = !keys_to_remove.is_empty();
@@ -283,7 +283,7 @@ fn verify_purge(config: &RussignolConfig) -> usize {
     match run_octez_client_command(&["list", "known", "addresses"], config) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            for alias in present_aliases(&stdout, &[CONSENSUS_KEY_ALIAS, COMPANION_KEY_ALIAS]) {
+            for alias in present_aliases(&stdout, &baker_aliases()) {
                 warning(&format!("{alias} key still exists"));
                 survivors += 1;
             }
@@ -310,12 +310,13 @@ mod tests {
 
     #[test]
     fn present_aliases_finds_only_listed_ones() {
-        let known = "russignol-consensus: tz4abc (tcp sk known)\nother: tz1xyz\n";
-        assert_eq!(
-            present_aliases(known, &[CONSENSUS_KEY_ALIAS, COMPANION_KEY_ALIAS]),
-            vec![CONSENSUS_KEY_ALIAS]
-        );
-        assert!(present_aliases("", &[CONSENSUS_KEY_ALIAS]).is_empty());
+        use crate::key_role::BakerKeyNames;
+        use russignol_signer_lib::KeyRole;
+
+        let consensus = KeyRole::Consensus.baker_alias();
+        let known = format!("{consensus}: tz4abc (tcp sk known)\nother: tz1xyz\n");
+        assert_eq!(present_aliases(&known, &baker_aliases()), vec![consensus]);
+        assert!(present_aliases("", &[consensus]).is_empty());
     }
 
     #[test]

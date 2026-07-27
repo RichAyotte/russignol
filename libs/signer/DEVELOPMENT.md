@@ -69,7 +69,8 @@ A map of the public API; see the module docs (`cargo doc --open`) for details.
 | `signer` (`src/signer.rs`) | `Unencrypted` signer, `Handler` (magic-byte-filtering wrapper), `SignatureVersion` |
 | `protocol` (`src/protocol.rs`) | `SignerRequest`, `SignerResponse`, `encoding::{encode_request, decode_request, encode_response, decode_response}` |
 | `high_watermark` (`src/high_watermark.rs`) | `HighWatermark`, `WatermarkUpdate`, `ChainId`, `WatermarkError` |
-| `server` (`src/server.rs`) | `Server`, `RequestHandler`, `KeyManager` (re-exported as `ServerKeyManager`), `KEY_ROLES` |
+| `server` (`src/server.rs`) | `Server`, `RequestHandler`, `KeyManager` (re-exported as `ServerKeyManager`) |
+| `key_role` (`src/key_role.rs`) | `KeyRole` — device consensus/companion roles, ordered via `KeyRole::ALL` |
 | `wallet` (`src/wallet.rs`) | `KeyManager` for OCaml-format wallet files, `StoredKey` |
 | `signing_activity` (`src/signing_activity.rs`) | `SigningActivity`, `SigningEvent`, `SigningEventRing` — per-key signing metrics |
 | `test_utils` (`src/test_utils.rs`) | Builders for Tenderbake test payloads, watermark pre-initialization helpers |
@@ -78,7 +79,7 @@ Notable API points:
 
 - **`RequestHandler` builder callbacks** (`src/server.rs`): `with_signing_activity`, `with_watermark_error_callback`, `with_signing_notify`, `with_large_gap_callback` (enables rejection of sign requests more than 4 cycles ahead of the current watermark), `with_pre_sign_callback` / `with_post_sign_callback` (e.g. CPU frequency boost/restore).
 - **`Server` configuration** (`src/server.rs`): `with_max_message_size` (default 64 KiB), `with_max_connections` (default 4), `with_connection_counter`.
-- **`KEY_ROLES` ordering contract** (`src/server.rs`): `KeyManager::list_keys()` returns the consensus key first, then the companion key; the host utility relies on this ordering.
+- **Role order contract** (`src/key_role.rs`): `KeyRole::ALL` is the single global order (consensus, then companion); device aliases come only from `KeyRole::device_alias()`. `KeyManager::list_keys()` returns roles in that order (case-insensitive alias match), then any non-role keys. Both groups break ties by base58 pkh — including when two stored keys share a role alias — so `HashMap` iteration order cannot reach the result. Host code assumes `list_keys()[0]` = consensus and `[1]` = companion when both roles are present.
 - **`HighWatermark` write path** (`src/high_watermark.rs`): `check_and_update` advances the in-memory watermark and returns a `WatermarkUpdate`; `write_watermark` persists it (pwrite + fdatasync) before the signature is returned; `rollback_update` / `rollback_disk_watermark` undo a failed sign. `write_ceiling` / `ceiling_covers` implement the ceiling optimization (see below).
 - **`wallet::KeyManager` split storage** (`src/wallet.rs`): `new_with_secret_keys_path` keeps `secret_keys` in a separate directory (e.g. tmpfs for decrypted keys); `gen_keys_in_memory` generates without disk writes; `save_public_keys_only` never writes secret keys.
 

@@ -697,15 +697,18 @@ fn extract_tz4_addresses(public_key_hashs: &[u8]) -> Result<Vec<String>> {
 /// role names a migrated card carries, so the confirmation box labels migrated
 /// keys by role too.
 fn friendly_key_label(alias: &str) -> &str {
-    use crate::constants;
-    use russignol_signer_lib::server::KEY_ROLES;
-    match alias {
-        s if s == constants::CONSENSUS_KEY_ALIAS || s == KEY_ROLES[0] => "Consensus key",
-        s if s == constants::COMPANION_KEY_ALIAS || s == KEY_ROLES[1] => "Companion key",
-        s if s == constants::CONSENSUS_KEY_PENDING_ALIAS => "Pending consensus key",
-        s if s == constants::COMPANION_KEY_PENDING_ALIAS => "Pending companion key",
-        _ => "Key",
+    use crate::key_role::BakerKeyNames;
+    use russignol_signer_lib::KeyRole;
+
+    for role in KeyRole::ALL {
+        if alias == role.baker_alias() || alias == role.device_alias() {
+            return role.display_name();
+        }
+        if alias == role.baker_pending_alias() {
+            return role.pending_display_name();
+        }
     }
+    "Key"
 }
 
 /// Print the success message shared by restore and migrate flashes.

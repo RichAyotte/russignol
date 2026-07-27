@@ -6,6 +6,7 @@
 
 use crate::utils::run_octez_client_command;
 use anyhow::Result;
+use russignol_signer_lib::KeyRole;
 
 /// Classify a `show address` result into present, absent, or indeterminate.
 ///
@@ -60,9 +61,20 @@ pub fn get_key_hash(alias: &str, config: &crate::config::RussignolConfig) -> Res
     anyhow::bail!("Could not parse key hash from octez-client output")
 }
 
-/// Discover BLS keys from the remote signer
+/// Discover BLS keys from the remote signer, in device role order.
 ///
-/// Returns a list of tz4 key hashes available on the signer
+/// Returns tz4 key hashes with `[KeyRole::index()]` naming the role: `[0]` =
+/// consensus, `[1]` = companion.
+///
+/// **Position is the only channel for that mapping, and this side cannot check
+/// it.** The signer's `KnownKeys` response is a bare pkh list carrying no
+/// aliases, so the role of each hash is knowable only from its ordinal. The
+/// chain is: the device's `KeyManager::list_keys()` emits `KeyRole::ALL` order,
+/// the wire codec preserves list order, and `octez-client list known remote
+/// keys` is assumed to print in the order it received. That last link is
+/// octez-client's behaviour, not ours — if it ever sorted or regrouped its
+/// output, every caller would silently swap the two roles. Any caller that
+/// could verify a hash's role by another route should.
 pub fn discover_remote_keys(config: &crate::config::RussignolConfig) -> Result<Vec<String>> {
     let signer_uri = config.signer_uri();
     let output =
@@ -85,12 +97,13 @@ pub fn discover_remote_keys(config: &crate::config::RussignolConfig) -> Result<V
     Ok(keys)
 }
 
-/// Check if the remote signer is accessible and has at least 2 BLS keys
+/// Check if the remote signer is accessible and holds a BLS key for every role
 ///
-/// Returns true if signer is accessible with ≥2 keys, false otherwise
+/// Returns true if the signer is reachable with at least [`KeyRole::COUNT`]
+/// keys, false otherwise
 pub fn check_remote_signer(config: &crate::config::RussignolConfig) -> bool {
     match discover_remote_keys(config) {
-        Ok(keys) => keys.len() >= 2,
+        Ok(keys) => keys.len() >= KeyRole::COUNT,
         Err(_) => false,
     }
 }
@@ -111,7 +124,7 @@ pub fn signer_holds_key(
 
 /// Wait for the remote signer to become accessible, showing a spinner while waiting
 ///
-/// This polls `check_remote_signer` until it succeeds (signer accessible with ≥2 keys),
+/// This polls `check_remote_signer` until it succeeds (signer accessible with a key per role),
 /// displaying progress to the user. If `auto_confirm` is true and the signer isn't
 /// immediately available, returns an error. Otherwise prompts the user to retry.
 pub fn wait_for_signer(
@@ -124,7 +137,7 @@ pub fn wait_for_signer(
 
     // Quick check first - if already accessible, return discovered keys
     if let Ok(keys) = discover_remote_keys(config)
-        && keys.len() >= 2
+        && keys.len() >= KeyRole::COUNT
     {
         return Ok(keys);
     }
@@ -136,7 +149,7 @@ pub fn wait_for_signer(
     // Wait a moment and check again (network might just be slow)
     std::thread::sleep(Duration::from_secs(2));
     if let Ok(keys) = discover_remote_keys(config)
-        && keys.len() >= 2
+        && keys.len() >= KeyRole::COUNT
     {
         spinner.finish_and_clear();
         return Ok(keys);
@@ -166,7 +179,9 @@ pub fn wait_for_signer(
     let spinner = create_spinner("Rechecking signer...");
 
     std::thread::sleep(Duration::from_secs(2));
-    let keys = discover_remote_keys(config).ok().filter(|k| k.len() >= 2);
+    let keys = discover_remote_keys(config)
+        .ok()
+        .filter(|k| k.len() >= KeyRole::COUNT);
     spinner.finish_and_clear();
 
     match keys {

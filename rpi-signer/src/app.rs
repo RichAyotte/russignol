@@ -1749,6 +1749,62 @@ mod tests {
         }
     }
 
+    /// Screensaver gate runs after `take()`; a false gate does not re-queue, so
+    /// the Invalidate is lost until wake rebuilds from state.
+    #[test]
+    fn take_then_screensaver_gate_discards_in_place_without_requeue() {
+        let app = active_screensaver_app();
+        let mut pending = PendingRender::None;
+        pending.record_invalidate();
+
+        let kind = pending.take();
+        assert_eq!(kind, PendingRender::InPlace);
+        assert!(
+            !app.should_flush_repaint(kind),
+            "screensaver suppresses InPlace flush"
+        );
+        assert_eq!(
+            pending,
+            PendingRender::None,
+            "take drained pending; false gate does not re-record (Invalidate lost)"
+        );
+    }
+
+    #[test]
+    fn take_then_live_gate_flushes_in_place() {
+        let app = active_app();
+        let mut pending = PendingRender::None;
+        pending.record_invalidate();
+
+        let kind = pending.take();
+        assert!(app.should_flush_repaint(kind));
+        assert_eq!(pending, PendingRender::None);
+    }
+
+    /// Busy after take must re-record; otherwise the repaint is dropped.
+    #[test]
+    fn busy_requeue_restores_in_place_after_take() {
+        let mut pending = PendingRender::None;
+        pending.record_invalidate();
+        let kind = pending.take();
+        assert_eq!(kind, PendingRender::InPlace);
+        assert_eq!(pending, PendingRender::None);
+
+        pending.record_invalidate();
+        assert_eq!(pending, PendingRender::InPlace);
+    }
+
+    #[test]
+    fn signing_burst_invalidates_coalesce_to_single_in_place() {
+        let mut pending = PendingRender::None;
+        for _ in 0..10 {
+            pending.record_invalidate();
+        }
+        assert_eq!(pending, PendingRender::InPlace);
+        assert_eq!(pending.take(), PendingRender::InPlace);
+        assert_eq!(pending, PendingRender::None);
+    }
+
     // === Screensaver tests ===
 
     /// A below-floor rejection is routine (stale/replayed request, hostile

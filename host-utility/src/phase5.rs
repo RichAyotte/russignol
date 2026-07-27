@@ -1,8 +1,6 @@
 use crate::blockchain;
 use crate::config::RussignolConfig;
-use crate::constants::{
-    COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, NETWORK_CONFIG, NETWORK_MASK, ORANGE, SIGNER_IP,
-};
+use crate::constants::{NETWORK_CONFIG, NETWORK_MASK, ORANGE, SIGNER_IP};
 use colored::Colorize;
 use std::path::Path;
 
@@ -135,7 +133,7 @@ fn print_next_steps(config: &RussignolConfig) {
     println!("{}", "Next, start your baker:".bold());
     println!("  octez-baker --endpoint {} \\", config.rpc_endpoint);
     println!("    run with local node {node_dir} \\");
-    println!("    {CONSENSUS_KEY_ALIAS} {COMPANION_KEY_ALIAS} \\");
+    println!("    {} \\", crate::key_role::baker_aliases().join(" "));
     println!("    --dal-node {dal_endpoint} \\");
     println!("    --liquidity-baking-toggle-vote <on|off|pass>");
     println!();

@@ -11,6 +11,7 @@ use embedded_graphics::{
     prelude::{DrawTarget, Point, Primitive},
     primitives::{Line, PrimitiveStyle},
 };
+use russignol_signer_lib::KeyRole;
 use u8g2_fonts::{
     FontRenderer,
     types::{FontColor, HorizontalAlignment, VerticalPosition},
@@ -20,8 +21,8 @@ pub struct Page {
     app_sender: Sender<AppEvent>,
     chain_name: String,
     chain_id: String,
-    consensus_pkh: Option<String>,
-    companion_pkh: Option<String>,
+    /// Pkh per role ([`KeyRole::ALL`] order).
+    pkh_by_role: [Option<String>; KeyRole::COUNT],
 }
 
 use super::DISPLAY_WIDTH;
@@ -30,21 +31,24 @@ const TITLE_Y: i32 = 18;
 const LINE_Y: i32 = 26;
 const CHAIN_NAME_Y: i32 = 44;
 const CHAIN_ID_Y: i32 = 62;
-const KEY_ROW_1_Y: i32 = 84;
-const KEY_ROW_2_Y: i32 = 108;
 const ICON_GAP: i32 = 8;
+
+/// Baseline Y of the key row for a role.
+const fn key_row_y(role: KeyRole) -> i32 {
+    match role {
+        KeyRole::Consensus => 84,
+        KeyRole::Companion => 108,
+    }
+}
 
 impl Page {
     pub fn new(app_sender: Sender<AppEvent>) -> Self {
         let keys = tezos_signer::get_keys();
-        let consensus_pkh = keys
-            .iter()
-            .find(|k| k.name.contains("consensus"))
-            .map(|k| k.value.clone());
-        let companion_pkh = keys
-            .iter()
-            .find(|k| k.name.contains("companion"))
-            .map(|k| k.value.clone());
+        let pkh_by_role = KeyRole::map_all(|role| {
+            keys.iter()
+                .find(|k| k.name == role.device_alias())
+                .map(|k| k.value.clone())
+        });
 
         let (chain_name, chain_id) = match chain_info::read_chain_info() {
             Ok(info) => (info.name, info.id),
@@ -58,8 +62,7 @@ impl Page {
             app_sender,
             chain_name,
             chain_id,
-            consensus_pkh,
-            companion_pkh,
+            pkh_by_role,
         }
     }
 }
@@ -109,9 +112,15 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         )
         .ok();
 
-        // Key rows
-        draw_key_row(display, self.consensus_pkh.as_deref(), "1", KEY_ROW_1_Y);
-        draw_key_row(display, self.companion_pkh.as_deref(), "0", KEY_ROW_2_Y);
+        // Key rows in KeyRole::ALL order
+        for role in KeyRole::ALL {
+            draw_key_row(
+                display,
+                self.pkh_by_role[role.index()].as_deref(),
+                super::key_icon(role),
+                key_row_y(role),
+            );
+        }
 
         Ok(())
     }

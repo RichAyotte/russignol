@@ -24,7 +24,7 @@ mod widgets;
 use app::{App, Effect, LoopAction, PageSpec, PendingRender};
 use crossbeam_channel::Sender;
 use russignol_signer_lib::{
-    ChainId, HighWatermark,
+    ChainId, HighWatermark, KeyRole,
     bls::PublicKeyHash,
     signing_activity,
     wallet::{KeyManager, StoredKey},
@@ -1168,23 +1168,23 @@ fn apply_watermark_update(
 fn generate_and_encrypt_keys(pin: &[u8]) -> Result<Secret<String>, String> {
     let key_manager = KeyManager::new(Some(PathBuf::from(KEYS_DIR)));
 
-    // Generate keys IN MEMORY ONLY - no disk writes yet
-    log::info!("Generating consensus key (in memory)...");
-    let consensus_key = key_manager
-        .gen_keys_in_memory("consensus", false)
-        .map_err(|e| format!("Failed to generate consensus key: {e}"))?;
-    log::info!("Consensus key generated");
+    // Generate keys IN MEMORY ONLY - no disk writes yet. Walk KeyRole::ALL so
+    // emit order matches list_keys (consensus then companion).
+    let mut generated = Vec::with_capacity(KeyRole::ALL.len());
+    for role in KeyRole::ALL {
+        let alias = role.device_alias();
+        log::info!("Generating {alias} key (in memory)...");
+        let key = key_manager
+            .gen_keys_in_memory(alias, false)
+            .map_err(|e| format!("Failed to generate {alias} key: {e}"))?;
+        log::info!("{alias} key generated");
+        generated.push(key);
+    }
 
-    log::info!("Generating companion key (in memory)...");
-    let companion_key = key_manager
-        .gen_keys_in_memory("companion", false)
-        .map_err(|e| format!("Failed to generate companion key: {e}"))?;
-    log::info!("Companion key generated");
-
-    let keys = [&consensus_key, &companion_key];
+    let key_refs: Vec<&StoredKey> = generated.iter().collect();
 
     // Build secret_keys JSON in memory (OCaml-compatible format)
-    let secret_keys_json = build_secret_keys_json(&keys);
+    let secret_keys_json = build_secret_keys_json(&key_refs);
 
     // Encrypt secret keys and write ONLY the encrypted form to disk
     log::info!("Encrypting secret keys...");
@@ -1195,7 +1195,7 @@ fn generate_and_encrypt_keys(pin: &[u8]) -> Result<Secret<String>, String> {
     // Save ONLY public keys to disk (secret keys stay encrypted)
     log::info!("Saving public keys...");
     key_manager
-        .save_public_keys_only(&[consensus_key, companion_key])
+        .save_public_keys_only(&generated)
         .map_err(|e| format!("Failed to save public keys: {e}"))?;
     log::info!("Public keys saved");
 
@@ -1347,24 +1347,26 @@ mod tests {
 
     #[test]
     fn emit_round_trip() {
-        let k1 = make_key("consensus", Some(SAMPLE_SK));
-        let k2 = make_key("companion", Some(SAMPLE_SK));
+        let consensus = KeyRole::Consensus.device_alias();
+        let companion = KeyRole::Companion.device_alias();
+        let k1 = make_key(consensus, Some(SAMPLE_SK));
+        let k2 = make_key(companion, Some(SAMPLE_SK));
         let keys = [&k1, &k2];
 
         let secret = build_secret_keys_json(&keys);
         let parsed: Vec<OcamlKeyEntry<String>> =
             serde_json::from_str(&secret).expect("emitter must produce valid JSON");
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].name, "consensus");
+        assert_eq!(parsed[0].name, consensus);
         assert_eq!(parsed[0].value, format!("unencrypted:{SAMPLE_SK}"));
-        assert_eq!(parsed[1].name, "companion");
+        assert_eq!(parsed[1].name, companion);
         assert_eq!(parsed[1].value, format!("unencrypted:{SAMPLE_SK}"));
     }
 
     #[test]
     fn emit_no_realloc() {
-        let k1 = make_key("consensus", Some(SAMPLE_SK));
-        let k2 = make_key("companion", Some(SAMPLE_SK));
+        let k1 = make_key(KeyRole::Consensus.device_alias(), Some(SAMPLE_SK));
+        let k2 = make_key(KeyRole::Companion.device_alias(), Some(SAMPLE_SK));
         let keys = [&k1, &k2];
         let n: usize = keys.iter().filter(|k| k.secret_key.is_some()).count();
         let expected_cap = 2 + n.saturating_mul(192);
@@ -1419,7 +1421,7 @@ mod tests {
 
     #[test]
     fn emit_prefix_present() {
-        let k = make_key("consensus", Some(SAMPLE_SK));
+        let k = make_key(KeyRole::Consensus.device_alias(), Some(SAMPLE_SK));
         let secret = build_secret_keys_json(&[&k]);
         assert!(
             secret.contains("unencrypted:"),

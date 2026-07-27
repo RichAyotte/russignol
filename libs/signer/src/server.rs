@@ -137,12 +137,6 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
     }
 }
 
-/// Canonical key role ordering: consensus first, then companion.
-///
-/// The host utility expects `list_keys()[0]` = consensus, `[1]` = companion.
-/// All code that returns keys by role must use this ordering.
-pub const KEY_ROLES: &[&str] = &["consensus", "companion"];
-
 /// Key manager for storing and retrieving signers
 pub struct KeyManager {
     /// Map of public key hash to signer
@@ -184,28 +178,43 @@ impl KeyManager {
         self.key_names.get(pkh).map(String::as_str)
     }
 
-    /// List all known public key hashes in deterministic order: consensus first, then companion.
+    /// List all known public key hashes in deterministic global role order.
     ///
-    /// The host utility expects `[0]` = consensus and `[1]` = companion.
+    /// Roles from [`crate::key_role::KeyRole::ALL`] come first (consensus, then
+    /// companion), matched case-insensitively so stored casing cannot reshuffle
+    /// the prefix. Any non-role keys follow. Both groups break ties by base58
+    /// pkh, so `HashMap` iteration order cannot reach the result even when two
+    /// stored keys carry the same alias.
+    ///
+    /// The host utility expects `[0]` = consensus and `[1]` = companion when
+    /// both roles are present.
     #[must_use]
     pub fn list_keys(&self) -> Vec<PublicKeyHash> {
-        let name_to_pkh: HashMap<&str, PublicKeyHash> = self
-            .key_names
-            .iter()
-            .map(|(pkh, name)| (name.as_str(), *pkh))
-            .collect();
+        use crate::key_role::KeyRole;
 
-        let mut keys = Vec::new();
-        for name in KEY_ROLES {
-            if let Some(pkh) = name_to_pkh.get(name) {
-                keys.push(*pkh);
+        let mut keys = Vec::with_capacity(self.signers.len());
+        let mut seen = std::collections::HashSet::with_capacity(KeyRole::COUNT);
+        for role in KeyRole::ALL {
+            let alias = role.device_alias();
+            if let Some(pkh) = self
+                .key_names
+                .iter()
+                .filter(|(_, name)| name.eq_ignore_ascii_case(alias))
+                .map(|(pkh, _)| *pkh)
+                .min_by_key(PublicKeyHash::to_b58check)
+            {
+                keys.push(pkh);
+                seen.insert(pkh);
             }
         }
-        for pkh in self.signers.keys() {
-            if !keys.contains(pkh) {
-                keys.push(*pkh);
-            }
-        }
+        let mut extras: Vec<PublicKeyHash> = self
+            .signers
+            .keys()
+            .filter(|pkh| !seen.contains(*pkh))
+            .copied()
+            .collect();
+        extras.sort_by_cached_key(PublicKeyHash::to_b58check);
+        keys.extend(extras);
         keys
     }
 
@@ -278,6 +287,11 @@ pub struct RequestHandler {
     pre_sign_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Callback invoked when a TCP connection closes (e.g., CPU frequency restore)
     post_sign_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Latches the two activity-recording failures below. Both are permanent
+    /// once hit, and the sign path runs ~3x every 6s, so an unlatched error
+    /// would churn the size-capped device log until real history is evicted.
+    unknown_alias_reported: std::sync::atomic::AtomicBool,
+    activity_poison_reported: std::sync::atomic::AtomicBool,
 }
 
 impl RequestHandler {
@@ -309,6 +323,8 @@ impl RequestHandler {
             blocks_per_cycle: None,
             pre_sign_callback: None,
             post_sign_callback: None,
+            unknown_alias_reported: std::sync::atomic::AtomicBool::new(false),
+            activity_poison_reported: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -734,53 +750,66 @@ impl RequestHandler {
         #[cfg(feature = "perf-trace")]
         log::info!("[PERF] BLS sign + watermark write: {:?}", t.elapsed());
 
-        // Update signing activity with metrics
-        if let Some(ref activity_tracker) = self.signing_activity
-            && let Ok(mut activity) = activity_tracker.lock()
-        {
-            let operation_type = if data.is_empty() {
-                None
-            } else {
-                crate::signing_activity::OperationType::from_magic_byte(data[0])
-            };
-            let level = parsed.level;
+        // Exact role aliases only: substring matches would mis-classify keys and
+        // still notify the UI for a frame that did not change.
+        let mut activity_recorded = false;
+        if let Some(ref activity_tracker) = self.signing_activity {
+            match activity_tracker.lock() {
+                Ok(mut activity) => {
+                    let operation_type = if data.is_empty() {
+                        None
+                    } else {
+                        crate::signing_activity::OperationType::from_magic_byte(data[0])
+                    };
+                    let level = parsed.level;
 
-            let sig_activity = crate::signing_activity::SignatureActivity {
-                level,
-                timestamp: std::time::SystemTime::now(),
-                duration: Some(sign_duration),
-                operation_type,
-                data_size: Some(data.len()),
-            };
+                    let sig_activity = crate::signing_activity::SignatureActivity {
+                        level,
+                        timestamp: std::time::SystemTime::now(),
+                        duration: Some(sign_duration),
+                        operation_type,
+                        data_size: Some(data.len()),
+                    };
 
-            if key_name.contains("consensus") {
-                activity.consensus = Some(sig_activity);
-                activity
-                    .recent_events
-                    .push(crate::signing_activity::SigningEvent {
-                        key_type: crate::signing_activity::KeyType::Consensus,
-                        activity: sig_activity,
-                    });
-                activity.total_signatures += 1;
-                log::debug!(
-                    "Updated consensus signing activity: level={:?}, duration={:?}ms",
-                    level,
-                    sign_duration.as_millis()
-                );
-            } else if key_name.contains("companion") {
-                activity.companion = Some(sig_activity);
-                activity
-                    .recent_events
-                    .push(crate::signing_activity::SigningEvent {
-                        key_type: crate::signing_activity::KeyType::Companion,
-                        activity: sig_activity,
-                    });
-                activity.total_signatures += 1;
-                log::debug!(
-                    "Updated companion signing activity: level={:?}, duration={:?}ms",
-                    level,
-                    sign_duration.as_millis()
-                );
+                    if let Some(role) = crate::key_role::KeyRole::from_device_alias(&key_name) {
+                        activity.set_last(role, sig_activity);
+                        activity
+                            .recent_events
+                            .push(crate::signing_activity::SigningEvent {
+                                role,
+                                activity: sig_activity,
+                            });
+                        activity.total_signatures += 1;
+                        activity_recorded = true;
+                        log::debug!(
+                            "Updated {role:?} signing activity: level={level:?}, duration={}ms",
+                            sign_duration.as_millis()
+                        );
+                    } else if !self
+                        .unknown_alias_reported
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        let expected: Vec<_> = crate::key_role::KeyRole::ALL
+                            .iter()
+                            .map(|r| r.device_alias())
+                            .collect();
+                        log::error!(
+                            "Signed successfully with unexpected key alias {key_name:?}; \
+                             activity not recorded (expected one of {expected:?})"
+                        );
+                    }
+                }
+                Err(e) => {
+                    if !self
+                        .activity_poison_reported
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        log::error!(
+                            "Signing activity lock poisoned after successful sign; \
+                             activity not recorded, UI not notified: {e}"
+                        );
+                    }
+                }
             }
         }
 
@@ -790,8 +819,12 @@ impl RequestHandler {
             request_start.elapsed()
         );
 
-        // Notify that a signature was completed (for UI refresh)
-        if let Some(ref callback) = self.signing_notify_callback {
+        // Demos without a tracker still expect a post-sign callback. With a
+        // tracker, only notify when the ring advanced — otherwise the UI draws
+        // an identical frame and refresh policy Skips that InPlace.
+        if let Some(ref callback) = self.signing_notify_callback
+            && (self.signing_activity.is_none() || activity_recorded)
+        {
             callback();
         }
 
@@ -1288,6 +1321,8 @@ mod tests {
 
     #[test]
     fn test_request_handler_known_keys() {
+        use crate::key_role::KeyRole;
+
         let seed1 = [1u8; 32];
         let seed2 = [2u8; 32];
         let (consensus_pkh, _pk1, _sk1) = generate_key(Some(&seed1)).unwrap();
@@ -1298,8 +1333,16 @@ mod tests {
 
         let mut mgr = KeyManager::new();
         // Insert companion first to prove ordering is by role, not insertion order
-        mgr.add_signer(companion_pkh, signer2, "companion".to_string());
-        mgr.add_signer(consensus_pkh, signer1, "consensus".to_string());
+        mgr.add_signer(
+            companion_pkh,
+            signer2,
+            KeyRole::Companion.device_alias().to_string(),
+        );
+        mgr.add_signer(
+            consensus_pkh,
+            signer1,
+            KeyRole::Consensus.device_alias().to_string(),
+        );
 
         let handler = RequestHandler::new(
             Arc::new(RwLock::new(mgr)),
@@ -1318,6 +1361,72 @@ mod tests {
                 assert_eq!(keys[1], companion_pkh);
             }
             _ => panic!("Expected KnownKeys response"),
+        }
+    }
+
+    /// Two stored keys can carry the same role alias (case aside). The role
+    /// slot then has to be picked, and the pick must come from the pkhs
+    /// themselves — lowest base58 — not from `HashMap` iteration.
+    #[test]
+    fn list_keys_alias_collision_takes_lowest_b58() {
+        use crate::key_role::KeyRole;
+
+        let mut mgr = KeyManager::new();
+        let mut colliding = Vec::new();
+        for (seed, alias) in [
+            ([1u8; 32], KeyRole::Consensus.device_alias().to_string()),
+            ([2u8; 32], KeyRole::Consensus.device_alias().to_uppercase()),
+        ] {
+            let (pkh, _, _) = generate_key(Some(&seed)).unwrap();
+            let signer = Unencrypted::generate(Some(&seed)).unwrap();
+            mgr.add_signer(pkh, signer, alias);
+            colliding.push(pkh);
+        }
+
+        let winner = *colliding
+            .iter()
+            .min_by_key(|pkh| pkh.to_b58check())
+            .unwrap();
+        let loser = *colliding.iter().find(|pkh| **pkh != winner).unwrap();
+
+        let listed = mgr.list_keys();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0], winner, "role slot takes the lowest base58");
+        assert_eq!(listed[1], loser, "the other lands in the sorted extras");
+    }
+
+    #[test]
+    fn list_keys_role_order_is_case_insensitive_and_extras_sorted() {
+        let seeds: [[u8; 32]; 4] = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+        let mut pkhs = Vec::new();
+        let mut mgr = KeyManager::new();
+        for (i, seed) in seeds.iter().enumerate() {
+            let (pkh, _, _) = generate_key(Some(seed)).unwrap();
+            let signer = Unencrypted::generate(Some(seed)).unwrap();
+            let name = match i {
+                // Mixed case must still land in the global role slots.
+                0 => "Consensus".to_string(),
+                1 => "COMPANION".to_string(),
+                2 => "extra_z".to_string(),
+                _ => "extra_a".to_string(),
+            };
+            mgr.add_signer(pkh, signer, name);
+            pkhs.push(pkh);
+        }
+
+        let listed = mgr.list_keys();
+        assert_eq!(listed.len(), 4);
+        assert_eq!(listed[0], pkhs[0]);
+        assert_eq!(listed[1], pkhs[1]);
+        // Non-role keys follow, sorted by base58 (not HashMap / insertion order).
+        let extra_a = pkhs[3].to_b58check();
+        let extra_z = pkhs[2].to_b58check();
+        if extra_a < extra_z {
+            assert_eq!(listed[2], pkhs[3]);
+            assert_eq!(listed[3], pkhs[2]);
+        } else {
+            assert_eq!(listed[2], pkhs[2]);
+            assert_eq!(listed[3], pkhs[3]);
         }
     }
 
@@ -2202,6 +2311,169 @@ mod tests {
         assert!(
             !callback_triggered.load(Ordering::SeqCst),
             "Gap callback should not be triggered when blocks_per_cycle is 0"
+        );
+    }
+
+    // === Signing activity recording + notify (Activity page data path) ===
+
+    fn activity_sign_fixture(
+        alias: &str,
+    ) -> (
+        RequestHandler,
+        PublicKeyHash,
+        Arc<std::sync::Mutex<crate::signing_activity::SigningActivity>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let seed = [7u8; 32];
+        let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
+        let signer = Unencrypted::generate(Some(&seed)).unwrap();
+        let mut mgr = KeyManager::new();
+        mgr.add_signer(pkh, signer, alias.to_string());
+
+        let activity = Arc::new(std::sync::Mutex::new(
+            crate::signing_activity::SigningActivity::default(),
+        ));
+        let notify_count = Arc::new(AtomicUsize::new(0));
+        let notify_count_cb = Arc::clone(&notify_count);
+        let handler = RequestHandler::new(
+            Arc::new(RwLock::new(mgr)),
+            None,
+            Some(magic_bytes::MagicByte::all()),
+            true,
+            true,
+        )
+        .with_signing_activity(Arc::clone(&activity))
+        .with_signing_notify(Arc::new(move || {
+            notify_count_cb.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        (handler, pkh, activity, notify_count)
+    }
+
+    fn sign_block(handler: &RequestHandler, pkh: PublicKeyHash, level: u32) {
+        let data = crate::test_utils::create_block_data(level, 0);
+        let (response, _) = handler
+            .handle_request(SignerRequest::Sign {
+                pkh: (pkh, 0),
+                data,
+                signature: None,
+            })
+            .expect("sign should succeed");
+        assert!(matches!(response, SignerResponse::Signature(_)));
+    }
+
+    /// Successful Sign with a production consensus alias must advance the ring
+    /// and counters with display-complete fields (level, duration, op type).
+    #[test]
+    fn sign_consensus_alias_records_activity_and_notifies() {
+        use crate::key_role::KeyRole;
+        use crate::signing_activity::OperationType;
+        use std::sync::atomic::Ordering;
+
+        let (handler, pkh, activity, notify_count) =
+            activity_sign_fixture(KeyRole::Consensus.device_alias());
+        sign_block(&handler, pkh, 150);
+
+        assert_eq!(notify_count.load(Ordering::SeqCst), 1);
+
+        let a = activity.lock().unwrap();
+        assert_eq!(a.total_signatures, 1);
+        assert_eq!(a.recent_events.iter().count(), 1);
+        let event = a.recent_events.iter().next().unwrap();
+        assert_eq!(event.role, KeyRole::Consensus);
+        assert_eq!(event.activity.level, Some(150));
+        assert!(event.activity.duration.is_some());
+        assert_eq!(event.activity.operation_type, Some(OperationType::Block));
+        assert!(a.last(KeyRole::Consensus).is_some());
+        assert!(a.last(KeyRole::Companion).is_none());
+    }
+
+    #[test]
+    fn sign_companion_alias_records_activity_and_notifies() {
+        use crate::key_role::KeyRole;
+        use std::sync::atomic::Ordering;
+
+        let (handler, pkh, activity, notify_count) =
+            activity_sign_fixture(KeyRole::Companion.device_alias());
+        sign_block(&handler, pkh, 200);
+
+        assert_eq!(notify_count.load(Ordering::SeqCst), 1);
+        let a = activity.lock().unwrap();
+        assert_eq!(a.total_signatures, 1);
+        let event = a.recent_events.iter().next().unwrap();
+        assert_eq!(event.role, KeyRole::Companion);
+        assert_eq!(event.activity.level, Some(200));
+        assert!(a.last(KeyRole::Companion).is_some());
+        assert!(a.last(KeyRole::Consensus).is_none());
+    }
+
+    /// Alias matching is case-insensitive (`to_lowercase` before exact match).
+    #[test]
+    fn sign_consensus_alias_is_case_insensitive() {
+        let (handler, pkh, activity, _) = activity_sign_fixture("Consensus");
+        sign_block(&handler, pkh, 10);
+        assert_eq!(activity.lock().unwrap().total_signatures, 1);
+    }
+
+    /// Unmatched alias: sign still succeeds, but activity is not advanced and
+    /// the UI is not notified (avoids Invalidate → identical frame → Skip).
+    #[test]
+    fn sign_unmatched_alias_neither_records_nor_notifies() {
+        use std::sync::atomic::Ordering;
+
+        let (handler, pkh, activity, notify_count) = activity_sign_fixture("baker_key");
+        sign_block(&handler, pkh, 300);
+
+        assert_eq!(
+            notify_count.load(Ordering::SeqCst),
+            0,
+            "notify must not fire when activity was not recorded"
+        );
+        let a = activity.lock().unwrap();
+        assert_eq!(a.total_signatures, 0);
+        assert_eq!(a.recent_events.iter().count(), 0);
+        for role in crate::key_role::KeyRole::ALL {
+            assert!(a.last(role).is_none());
+        }
+    }
+
+    /// Substring is not a role: only exact role aliases record.
+    #[test]
+    fn sign_substring_alias_neither_records_nor_notifies() {
+        use crate::key_role::KeyRole;
+        use std::sync::atomic::Ordering;
+
+        let (handler, pkh, activity, notify_count) =
+            activity_sign_fixture(&format!("my-{}-key", KeyRole::Consensus.device_alias()));
+        sign_block(&handler, pkh, 1);
+        assert_eq!(activity.lock().unwrap().total_signatures, 0);
+        assert_eq!(notify_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn sign_attestation_records_level_and_operation_type() {
+        use crate::key_role::KeyRole;
+        use crate::signing_activity::OperationType;
+
+        let (handler, pkh, activity, _) = activity_sign_fixture(KeyRole::Consensus.device_alias());
+        let data = crate::test_utils::create_attestation_data(42, 1);
+        let (response, _) = handler
+            .handle_request(SignerRequest::Sign {
+                pkh: (pkh, 0),
+                data,
+                signature: None,
+            })
+            .unwrap();
+        assert!(matches!(response, SignerResponse::Signature(_)));
+
+        let a = activity.lock().unwrap();
+        let event = a.recent_events.iter().next().unwrap();
+        assert_eq!(event.activity.level, Some(42));
+        assert_eq!(
+            event.activity.operation_type,
+            Some(OperationType::Attestation)
         );
     }
 }

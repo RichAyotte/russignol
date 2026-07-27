@@ -1,6 +1,7 @@
 use crate::events::AppEvent;
 use crate::fonts;
-use russignol_signer_lib::signing_activity::{KeyType, OperationType, SigningActivity};
+use russignol_signer_lib::KeyRole;
+use russignol_signer_lib::signing_activity::{OperationType, SigningActivity};
 
 use super::Page as PageTrait;
 use crossbeam_channel::Sender;
@@ -15,7 +16,7 @@ use u8g2_fonts::FontRenderer;
 /// Record of a signing operation for display in the table
 #[derive(Clone, Debug)]
 struct SigningRecord {
-    key_type: KeyType,
+    role: KeyRole,
     /// Pre-truncated public key hash for the key column (ASCII, ≤7 chars)
     pkh_short: String,
     level: u32,
@@ -35,9 +36,8 @@ pub fn format_key_short(s: &str) -> String {
 pub struct Page {
     app_sender: Sender<AppEvent>,
     signing_activity_shared: Arc<Mutex<SigningActivity>>,
-    /// Precomputed short labels (built once at page construct)
-    consensus_short: Option<String>,
-    companion_short: Option<String>,
+    /// Precomputed short labels per role ([`KeyRole::ALL`] order).
+    short_by_role: [Option<String>; KeyRole::COUNT],
 }
 
 impl Page {
@@ -46,20 +46,16 @@ impl Page {
         signing_activity: Arc<Mutex<SigningActivity>>,
     ) -> Self {
         let keys = crate::tezos_signer::get_keys();
-        let consensus_short = keys
-            .iter()
-            .find(|k| k.name == "consensus")
-            .map(|k| format_key_short(&k.value));
-        let companion_short = keys
-            .iter()
-            .find(|k| k.name == "companion")
-            .map(|k| format_key_short(&k.value));
+        let short_by_role = KeyRole::map_all(|role| {
+            keys.iter()
+                .find(|k| k.name == role.device_alias())
+                .map(|k| format_key_short(&k.value))
+        });
 
         Self {
             app_sender,
             signing_activity_shared: signing_activity,
-            consensus_short,
-            companion_short,
+            short_by_role,
         }
     }
 
@@ -77,19 +73,12 @@ impl Page {
                     return None;
                 };
 
-                let pkh_short = match event.key_type {
-                    KeyType::Consensus => self
-                        .consensus_short
-                        .clone()
-                        .unwrap_or_else(|| "???".to_string()),
-                    KeyType::Companion => self
-                        .companion_short
-                        .clone()
-                        .unwrap_or_else(|| "???".to_string()),
-                };
+                let pkh_short = self.short_by_role[event.role.index()]
+                    .clone()
+                    .unwrap_or_else(|| "???".to_string());
 
                 Some(SigningRecord {
-                    key_type: event.key_type,
+                    role: event.role,
                     pkh_short,
                     level,
                     op_type,
@@ -195,11 +184,8 @@ fn draw_signing_record_row<D: DrawTarget<Color = BinaryColor>>(
         )
         .ok();
 
-    // Key icon (C→"1", P→"0" glyph set) + pre-truncated pkh
-    let icon_char = match record.key_type {
-        KeyType::Consensus => "1",
-        KeyType::Companion => "0",
-    };
+    // Key icon + pre-truncated pkh
+    let icon_char = super::key_icon(record.role);
     icon_key
         .render_aligned(
             icon_char,
@@ -248,23 +234,26 @@ fn draw_signing_record_row<D: DrawTarget<Color = BinaryColor>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use russignol_signer_lib::signing_activity::{KeyType, SignatureActivity, SigningEvent};
+    use russignol_signer_lib::signing_activity::{SignatureActivity, SigningEvent};
     use std::time::{Duration, SystemTime};
 
     fn make_activity(consensus_pkh: Option<&str>, companion_pkh: Option<&str>) -> Page {
         let shared = Arc::new(Mutex::new(SigningActivity::default()));
         let (sender, _receiver) = crossbeam_channel::unbounded();
+        let short_by_role = KeyRole::map_all(|role| match role {
+            KeyRole::Consensus => consensus_pkh.map(format_key_short),
+            KeyRole::Companion => companion_pkh.map(format_key_short),
+        });
         Page {
             app_sender: sender,
             signing_activity_shared: shared,
-            consensus_short: consensus_pkh.map(format_key_short),
-            companion_short: companion_pkh.map(format_key_short),
+            short_by_role,
         }
     }
 
-    fn make_event(key_type: KeyType, level: u32) -> SigningEvent {
+    fn make_event(role: KeyRole, level: u32) -> SigningEvent {
         SigningEvent {
-            key_type,
+            role,
             activity: SignatureActivity {
                 level: Some(level),
                 timestamp: SystemTime::now(),
@@ -284,20 +273,20 @@ mod tests {
             let mut activity = page.signing_activity_shared.lock().unwrap();
             activity
                 .recent_events
-                .push(make_event(KeyType::Consensus, 100));
+                .push(make_event(KeyRole::Consensus, 100));
             activity
                 .recent_events
-                .push(make_event(KeyType::Companion, 101));
+                .push(make_event(KeyRole::Companion, 101));
         }
 
         let activity = page.signing_activity_shared.lock().unwrap();
         let records = page.build_records(&activity);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].level, 100);
-        assert_eq!(records[0].key_type, KeyType::Consensus);
+        assert_eq!(records[0].role, KeyRole::Consensus);
         assert_eq!(records[0].pkh_short, "tz4cons");
         assert_eq!(records[1].level, 101);
-        assert_eq!(records[1].key_type, KeyType::Companion);
+        assert_eq!(records[1].role, KeyRole::Companion);
         assert_eq!(records[1].pkh_short, "tz4comp");
     }
 
@@ -310,32 +299,65 @@ mod tests {
         assert_eq!(format_key_short("tz4ABCDEFG"), "tz4ABCD");
     }
 
+    /// Rows need `level`, `duration`, and `operation_type`; any missing field drops the row.
     #[test]
     fn events_missing_fields_are_skipped() {
         let page = make_activity(Some("tz4consensus"), None);
+        let now = SystemTime::now();
 
         {
             let mut activity = page.signing_activity_shared.lock().unwrap();
-            // Event with no level — should be filtered out
-            activity.recent_events.push(SigningEvent {
-                key_type: KeyType::Consensus,
-                activity: SignatureActivity {
+            for sa in [
+                SignatureActivity {
                     level: None,
-                    timestamp: SystemTime::now(),
+                    timestamp: now,
                     duration: Some(Duration::from_millis(42)),
                     operation_type: Some(OperationType::Block),
                     data_size: Some(128),
                 },
-            });
-            // Valid event
+                SignatureActivity {
+                    level: Some(1),
+                    timestamp: now,
+                    duration: None,
+                    operation_type: Some(OperationType::Attestation),
+                    data_size: Some(128),
+                },
+                SignatureActivity {
+                    level: Some(2),
+                    timestamp: now,
+                    duration: Some(Duration::from_millis(42)),
+                    operation_type: None,
+                    data_size: Some(128),
+                },
+            ] {
+                activity.recent_events.push(SigningEvent {
+                    role: KeyRole::Consensus,
+                    activity: sa,
+                });
+            }
             activity
                 .recent_events
-                .push(make_event(KeyType::Consensus, 200));
+                .push(make_event(KeyRole::Consensus, 200));
         }
 
         let activity = page.signing_activity_shared.lock().unwrap();
         let records = page.build_records(&activity);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].level, 200);
+    }
+
+    /// Activity has no background poll; UI refresh is only via sign-path Invalidate.
+    #[test]
+    fn activity_page_does_not_poll_for_invalidate() {
+        let shared = Arc::new(Mutex::new(SigningActivity::default()));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let _page = Page::new(tx, Arc::clone(&shared));
+
+        shared.lock().unwrap().total_signatures = 5;
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "Activity must not background-poll; refresh is AppEvent::Invalidate from sign notify"
+        );
     }
 }

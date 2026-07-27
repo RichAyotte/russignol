@@ -70,8 +70,20 @@ fn test_tcp_server_known_keys() {
 
     let mut key_mgr = ServerKeyManager::new();
     // Insert companion first to prove ordering is by role, not insertion order
-    key_mgr.add_signer(companion_pkh, signer2, "companion".to_string());
-    key_mgr.add_signer(consensus_pkh, signer1, "consensus".to_string());
+    key_mgr.add_signer(
+        companion_pkh,
+        signer2,
+        russignol_signer_lib::KeyRole::Companion
+            .device_alias()
+            .to_string(),
+    );
+    key_mgr.add_signer(
+        consensus_pkh,
+        signer1,
+        russignol_signer_lib::KeyRole::Consensus
+            .device_alias()
+            .to_string(),
+    );
 
     let handler = RequestHandler::new(
         Arc::new(RwLock::new(key_mgr)),

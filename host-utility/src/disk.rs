@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use russignol_signer_lib::KeyManager;
-use russignol_signer_lib::server::{KEY_ROLES, LARGE_GAP_CYCLES};
+use russignol_signer_lib::KeyRole;
+use russignol_signer_lib::server::LARGE_GAP_CYCLES;
 use russignol_storage::watermark;
 
 use crate::card_fs::{self, CHAIN_INFO_MODE, DEVICE_GID, DEVICE_UID};
@@ -492,8 +493,9 @@ fn classify_keys(state: &CardState, issues: &mut Vec<Issue>) {
             message: "public_key_hashs is present but could not be parsed or is empty".to_string(),
         }),
         KeysState::Parsed { aliases, .. } => {
-            for role in KEY_ROLES {
-                if !aliases.iter().any(|a| a == role) {
+            for role in KeyRole::ALL {
+                let alias = role.device_alias();
+                if !aliases.iter().any(|a| a == alias) {
                     issues.push(Issue {
                         kind: IssueKind::KeysRoleMissing,
                         severity: Severity::Warning,
@@ -501,7 +503,7 @@ fn classify_keys(state: &CardState, issues: &mut Vec<Issue>) {
                         remedy: Remedy::Manual,
                         action: None,
                         message: format!(
-                            "expected key role '{role}' was not found among the card's \
+                            "expected key role '{alias}' was not found among the card's \
                              key aliases"
                         ),
                     });
@@ -963,13 +965,27 @@ fn read_keys_state(mount: &Path) -> KeysState {
     if loaded.is_empty() {
         return KeysState::Unparseable;
     }
-    let mut aliases = Vec::with_capacity(loaded.len());
-    let mut pkhs = Vec::with_capacity(loaded.len());
-    for (alias, key) in loaded {
-        aliases.push(alias);
-        pkhs.push(key.public_key_hash);
-    }
+    let (aliases, pkhs) = order_card_keys(
+        loaded
+            .into_iter()
+            .map(|(alias, key)| (alias, key.public_key_hash)),
+    );
     KeysState::Parsed { aliases, pkhs }
+}
+
+/// Split card keys into index-correlated alias and pkh columns, ordered the way
+/// the device itself lists them: roles in [`KeyRole::ALL`] order, then any other
+/// alias sorted. `load_keys` hands back a `HashMap`, so without this the report
+/// would reorder between runs on identical cards.
+fn order_card_keys(keys: impl Iterator<Item = (String, String)>) -> (Vec<String>, Vec<String>) {
+    let mut entries: Vec<(String, String)> = keys.collect();
+    entries.sort_by_cached_key(|(alias, _)| {
+        KeyRole::from_device_alias(alias).map_or_else(
+            || (KeyRole::COUNT, alias.clone()),
+            |role| (role.index(), String::new()),
+        )
+    });
+    entries.into_iter().unzip()
 }
 
 fn read_chain_info_state(mount: &Path) -> ChainInfoState {
@@ -1664,7 +1680,10 @@ mod tests {
             setup_complete: true,
             migration_pending: false,
             keys: KeysState::Parsed {
-                aliases: vec!["consensus".to_string(), "companion".to_string()],
+                aliases: KeyRole::ALL
+                    .iter()
+                    .map(|r| r.device_alias().to_string())
+                    .collect(),
                 pkhs: vec![CONSENSUS_PKH.to_string(), COMPANION_PKH.to_string()],
             },
             chain_info: ChainInfoState::Present {
@@ -2028,18 +2047,44 @@ mod tests {
         assert!(find(&issues, IssueKind::KeysUnparseable).is_some());
     }
 
+    /// Card reports must not reorder between runs on an identical card, so the
+    /// order comes from the role, not from `load_keys`' `HashMap`.
+    #[test]
+    fn order_card_keys_is_role_order_then_sorted_extras() {
+        let consensus = KeyRole::Consensus.device_alias();
+        let companion = KeyRole::Companion.device_alias();
+        let input = vec![
+            ("zeta".to_string(), "tz4zeta".to_string()),
+            (companion.to_string(), COMPANION_PKH.to_string()),
+            ("alpha".to_string(), "tz4alpha".to_string()),
+            (consensus.to_string(), CONSENSUS_PKH.to_string()),
+        ];
+
+        let (aliases, pkhs) = order_card_keys(input.clone().into_iter());
+        assert_eq!(aliases, vec![consensus, companion, "alpha", "zeta"]);
+        assert_eq!(
+            pkhs,
+            vec![CONSENSUS_PKH, COMPANION_PKH, "tz4alpha", "tz4zeta"]
+        );
+
+        // Same card, different HashMap iteration order → same report.
+        let mut reversed = input;
+        reversed.reverse();
+        assert_eq!(order_card_keys(reversed.into_iter()), (aliases, pkhs));
+    }
+
     #[test]
     fn missing_key_role_reported() {
         let mut state = healthy_state();
         state.keys = KeysState::Parsed {
-            aliases: vec!["consensus".to_string()],
+            aliases: vec![KeyRole::Consensus.device_alias().to_string()],
             pkhs: vec![CONSENSUS_PKH.to_string()],
         };
         // Only the consensus key's watermarks remain, so drop the companion set.
         state.watermarks.truncate(1);
         let issues = classify(&state, Some(&node()));
         let issue = find(&issues, IssueKind::KeysRoleMissing).expect("role-missing issue");
-        assert!(issue.message.contains("companion"));
+        assert!(issue.message.contains(KeyRole::Companion.device_alias()));
     }
 
     #[test]

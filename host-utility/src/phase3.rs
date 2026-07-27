@@ -1,11 +1,13 @@
 use crate::backup;
 use crate::blockchain;
 use crate::config::RussignolConfig;
-use crate::constants::{COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, ORANGE_RGB};
+use crate::constants::ORANGE_RGB;
+use crate::key_role::BakerKeyNames;
 use crate::keys;
 use crate::progress::{run_step, run_step_detail};
 use crate::utils::{JsonValueExt, read_file, run_octez_client_command, success, warning};
 use anyhow::{Context, Result};
+use russignol_signer_lib::KeyRole;
 use std::io::Write;
 use std::path::Path;
 
@@ -570,23 +572,31 @@ fn discover_and_import_keys(
 
     let signer_uri = config.signer_uri();
 
-    // Validate pre-discovered keys
+    // Validate pre-discovered keys. remote_keys is device list_keys order =
+    // KeyRole::ALL (roles first); zip is the sole consumer of that contract.
     run_step_detail(
         "Discovering remote keys",
         &format!("octez-client list known remote keys {signer_uri}"),
         || {
-            if remote_keys.len() < 2 {
+            if remote_keys.len() < KeyRole::COUNT {
                 anyhow::bail!(
-                    "Expected at least 2 remote keys but found {}. Please ensure the signer is properly configured.",
+                    "Expected at least {} remote keys but found {}. Please ensure the signer is properly configured.",
+                    KeyRole::COUNT,
                     remote_keys.len()
                 );
             }
 
-            // Validate keys are distinct (defensive check against signer bugs)
-            if remote_keys[0] == remote_keys[1] {
-                anyhow::bail!(
-                    "Signer returned duplicate keys - consensus and companion have the same public key hash"
-                );
+            // Distinct role pkhs (defensive check against signer bugs).
+            for (i, role_a) in KeyRole::ALL.into_iter().enumerate() {
+                for role_b in KeyRole::ALL.into_iter().skip(i + 1) {
+                    if remote_keys[role_a.index()] == remote_keys[role_b.index()] {
+                        anyhow::bail!(
+                            "Signer returned duplicate keys - {} and {} have the same public key hash",
+                            role_a.device_alias(),
+                            role_b.device_alias()
+                        );
+                    }
+                }
             }
 
             let detail = format!("found {} keys", remote_keys.len());
@@ -594,73 +604,64 @@ fn discover_and_import_keys(
         },
     )?;
 
-    // Check which keys are already correctly imported
     let signer_ip = config.signer_ip();
-    let (consensus_imported, companion_imported) = check_keys_correctly_imported(
-        &secret_keys_file,
-        &remote_keys[0],
-        &remote_keys[1],
-        signer_ip,
-    )
-    .unwrap_or((false, false));
+    let role_remote: Vec<(KeyRole, &str)> = KeyRole::ALL
+        .into_iter()
+        .map(|role| (role, remote_keys[role.index()].as_str()))
+        .collect();
 
-    // Fast path: both keys imported AND set on-chain → skip all subprocess work
-    if consensus_imported && companion_imported {
-        let (ch, cph) = read_local_key_hashes(&secret_keys_file, signer_ip);
-        if let (Some(consensus_hash), Some(companion_hash)) = (ch, cph)
-            && let Ok((true, true)) =
-                check_individual_keys_on_chain(baker_key, &consensus_hash, &companion_hash, config)
-        {
-            success(&format!("Consensus key set to {consensus_hash}"));
-            success(&format!("Companion key set to {companion_hash}"));
+    // One parse of the wallet file answers every role, and it stays valid for
+    // the loop below: importing one role never rewrites another role's entry.
+    let imported = roles_correctly_imported(&secret_keys_file, &role_remote, signer_ip);
+
+    // Fast path: every role imported AND set on-chain → skip all subprocess work
+    if imported.iter().all(|&i| i) {
+        let local = read_local_key_hashes(&secret_keys_file, signer_ip);
+        let all_on_chain = fetch_delegate_info(baker_key, config).is_ok_and(|info| {
+            KeyRole::ALL.into_iter().all(|role| {
+                local[role.index()]
+                    .as_ref()
+                    .is_some_and(|hash| role_key_set_on_chain(&info, role, hash))
+            })
+        });
+        if all_on_chain {
+            for role in KeyRole::ALL {
+                if let Some(hash) = &local[role.index()] {
+                    success(&format!("{} set to {hash}", role.display_name()));
+                }
+            }
             validate_imported_keys(client_dir, signer_ip, config)?;
             return Ok(());
         }
     }
 
-    // ── Consensus key ───────────────────────────────────────────────────
-    import_and_set_key(
-        CONSENSUS_KEY_ALIAS,
-        "consensus",
-        &remote_keys[0],
-        consensus_imported,
-        baker_key,
-        &secret_keys_file,
-        backup_dir,
-        signer_uri,
-        verbose,
-        auto_confirm,
-        config,
-    )?;
-
-    // ── Companion key ───────────────────────────────────────────────────
-    import_and_set_key(
-        COMPANION_KEY_ALIAS,
-        "companion",
-        &remote_keys[1],
-        companion_imported,
-        baker_key,
-        &secret_keys_file,
-        backup_dir,
-        signer_uri,
-        verbose,
-        auto_confirm,
-        config,
-    )?;
+    for (role, remote_pkh) in role_remote {
+        import_and_set_key(
+            role,
+            remote_pkh,
+            imported[role.index()],
+            baker_key,
+            &secret_keys_file,
+            backup_dir,
+            signer_uri,
+            verbose,
+            auto_confirm,
+            config,
+        )?;
+    }
 
     // Final filesystem validation
     validate_imported_keys(client_dir, signer_ip, config)
 }
 
-/// Import a single key and set it on-chain, using one spinner that updates its
-/// message across phases, then prints a final success line with the key hash.
+/// Import a single role key and set it on-chain, using one spinner that updates
+/// its message across phases, then prints a final success line with the key hash.
 #[expect(
     clippy::too_many_arguments,
     reason = "orchestrates prompt, import, and on-chain set"
 )]
 fn import_and_set_key(
-    alias: &str,
-    kind: &str,
+    role: KeyRole,
     remote_key_hash: &str,
     already_imported: bool,
     baker_key: &str,
@@ -671,6 +672,9 @@ fn import_and_set_key(
     auto_confirm: bool,
     config: &RussignolConfig,
 ) -> Result<()> {
+    let alias = role.baker_alias();
+    let kind = role.cli_key_kind();
+
     // Prompt OUTSIDE the spinner so stdin isn't corrupted
     let force = if !already_imported && alias_exists_in_file(secret_keys_file, alias) {
         let should_overwrite =
@@ -699,12 +703,8 @@ fn import_and_set_key(
         // Resolve the imported key's public key hash
         let pkh = keys::get_key_hash(alias, config)?;
 
-        // Check if already set on-chain (pass pkh in the correct slot)
-        let already_set = if kind == "consensus" {
-            check_individual_keys_on_chain(baker_key, &pkh, "", config).is_ok_and(|(c, _)| c)
-        } else {
-            check_individual_keys_on_chain(baker_key, "", &pkh, config).is_ok_and(|(_, c)| c)
-        };
+        let already_set = fetch_delegate_info(baker_key, config)
+            .is_ok_and(|info| role_key_set_on_chain(&info, role, &pkh));
 
         if !already_set {
             spinner.set_message(format!(
@@ -725,12 +725,7 @@ fn import_and_set_key(
         }
 
         spinner.finish_and_clear();
-        let label = format!(
-            "{}{} key set to {pkh}",
-            kind[..1].to_uppercase(),
-            &kind[1..]
-        );
-        success(&label);
+        success(&format!("{} set to {pkh}", role.display_name()));
         Ok(())
     })();
 
@@ -760,13 +755,14 @@ fn validate_imported_keys(
                 );
             }
             let list_output = String::from_utf8_lossy(&output.stdout).to_string();
+            let tcp_known =
+                list_output.contains("tcp sk known") || list_output.contains("tcp:sk known");
+            let all_roles = tcp_known
+                && KeyRole::ALL
+                    .into_iter()
+                    .all(|role| list_output.contains(role.baker_alias()));
 
-            let has_consensus = list_output.contains(CONSENSUS_KEY_ALIAS)
-                && (list_output.contains("tcp sk known") || list_output.contains("tcp:sk known"));
-            let has_companion = list_output.contains(COMPANION_KEY_ALIAS)
-                && (list_output.contains("tcp sk known") || list_output.contains("tcp:sk known"));
-
-            if !has_consensus || !has_companion {
+            if !all_roles {
                 anyhow::bail!(
                     "Keys not found in octez-client after import (CLI validation failed)"
                 );
@@ -779,85 +775,68 @@ fn validate_imported_keys(
     )
 }
 
-fn check_keys_correctly_imported(
+/// Whether the baker-wallet file holds each role pointing at its expected hash
+/// on `signer_ip`. Slots in [`KeyRole::ALL`] order; one read and one parse
+/// answers every role. An unreadable or unparseable file reports all-false.
+fn roles_correctly_imported(
     secret_keys_file: &Path,
-    expected_consensus_hash: &str,
-    expected_companion_hash: &str,
+    role_remote: &[(KeyRole, &str)],
     signer_ip: &str,
-) -> Result<(bool, bool)> {
-    if !secret_keys_file.exists() {
-        return Ok((false, false));
+) -> [bool; KeyRole::COUNT] {
+    let mut imported = [false; KeyRole::COUNT];
+
+    let Ok(content) = read_file(secret_keys_file) else {
+        return imported;
+    };
+    let Ok(keys) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return imported;
+    };
+    let Some(arr) = keys.as_array() else {
+        return imported;
+    };
+
+    for &(role, expected_hash) in role_remote {
+        let alias = role.baker_alias();
+        imported[role.index()] = arr.iter().any(|key| {
+            key.get_str("name") == Some(alias)
+                && key
+                    .get_str("value")
+                    .is_some_and(|value| value.contains(expected_hash) && value.contains(signer_ip))
+        });
     }
-
-    let content = read_file(secret_keys_file)?;
-    let keys: serde_json::Value =
-        serde_json::from_str(&content).context("Failed to parse secret_keys file")?;
-
-    let mut consensus_correct = false;
-    let mut companion_correct = false;
-
-    if let Some(keys_array) = keys.as_array() {
-        for key in keys_array {
-            if let Some(name) = key.get_str("name")
-                && let Some(value) = key.get_str("value")
-            {
-                // Check consensus key
-                if name == CONSENSUS_KEY_ALIAS
-                    && value.contains(expected_consensus_hash)
-                    && value.contains(signer_ip)
-                {
-                    consensus_correct = true;
-                }
-
-                // Check companion key
-                if name == COMPANION_KEY_ALIAS
-                    && value.contains(expected_companion_hash)
-                    && value.contains(signer_ip)
-                {
-                    companion_correct = true;
-                }
-            }
-        }
-    }
-
-    Ok((consensus_correct, companion_correct))
+    imported
 }
 
-/// Read the actual key hashes from the `secret_keys` file for our two aliases,
-/// filtered by signer IP. Returns `(consensus_hash, companion_hash)` with `None`
-/// for any alias that isn't found or can't be parsed.
+/// Local baker-wallet pkh for each role (slots in [`KeyRole::ALL`] order),
+/// filtered by signer IP. `None` when the alias is missing or unparseable.
 fn read_local_key_hashes(
     secret_keys_file: &Path,
     signer_ip: &str,
-) -> (Option<String>, Option<String>) {
+) -> [Option<String>; KeyRole::COUNT] {
+    let mut out: [Option<String>; KeyRole::COUNT] = std::array::from_fn(|_| None);
+
     let content = read_file(secret_keys_file).ok();
     let keys: Option<serde_json::Value> = content.and_then(|c| serde_json::from_str(&c).ok());
-
-    let mut consensus_hash = None;
-    let mut companion_hash = None;
 
     if let Some(arr) = keys.as_ref().and_then(|v| v.as_array()) {
         for key in arr {
             if let Some(name) = key.get_str("name")
                 && let Some(value) = key.get_str("value")
                 && value.contains(signer_ip)
+                && let Some(role) = KeyRole::ALL
+                    .into_iter()
+                    .find(|role| name == role.baker_alias())
             {
-                let hash = value
+                out[role.index()] = value
                     .rsplit('/')
                     .next()
                     .filter(|h| h.starts_with("tz"))
                     .map(String::from);
-
-                if name == CONSENSUS_KEY_ALIAS {
-                    consensus_hash = hash;
-                } else if name == COMPANION_KEY_ALIAS {
-                    companion_hash = hash;
-                }
             }
         }
     }
 
-    (consensus_hash, companion_hash)
+    out
 }
 
 fn alias_exists_in_file(secret_keys_file: &Path, alias: &str) -> bool {
@@ -874,42 +853,37 @@ fn alias_exists_in_file(secret_keys_file: &Path, alias: &str) -> bool {
 fn validate_keys_in_filesystem(client_dir: &Path, signer_ip: &str) -> Result<()> {
     let secret_keys_file = client_dir.join("secret_keys");
 
-    // Check secret_keys
     let secret_content = read_file(&secret_keys_file)?;
     let secret_keys: serde_json::Value =
         serde_json::from_str(&secret_content).context("Failed to parse secret_keys file")?;
 
-    let mut found_consensus = false;
-    let mut found_companion = false;
+    let mut found = [false; KeyRole::COUNT];
 
     if let Some(keys_array) = secret_keys.as_array() {
         for key in keys_array {
             if let Some(name) = key.get_str("name")
                 && let Some(value) = key.get_str("value")
+                && value.contains(signer_ip)
             {
-                if name == CONSENSUS_KEY_ALIAS && value.contains(signer_ip) {
-                    found_consensus = true;
-                }
-                if name == COMPANION_KEY_ALIAS && value.contains(signer_ip) {
-                    found_companion = true;
+                for role in KeyRole::ALL {
+                    if name == role.baker_alias() {
+                        found[role.index()] = true;
+                    }
                 }
             }
         }
     }
 
-    if !found_consensus || !found_companion {
+    if !found.iter().all(|&f| f) {
         anyhow::bail!("Keys validation failed: keys not found in filesystem with correct URIs");
     }
 
     Ok(())
 }
 
-fn check_individual_keys_on_chain(
-    baker_key: &str,
-    expected_consensus: &str,
-    expected_companion: &str,
-    config: &RussignolConfig,
-) -> Result<(bool, bool)> {
+/// One delegate RPC round-trip, answering [`role_key_set_on_chain`] for every
+/// role. Callers that ask about more than one role must share a single fetch.
+fn fetch_delegate_info(baker_key: &str, config: &RussignolConfig) -> Result<serde_json::Value> {
     let output = run_octez_client_command(
         &[
             "rpc",
@@ -923,40 +897,19 @@ fn check_individual_keys_on_chain(
         anyhow::bail!("Failed to query delegate info from blockchain");
     }
 
-    let delegate_info: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("Failed to parse delegate info")?;
+    serde_json::from_slice(&output.stdout).context("Failed to parse delegate info")
+}
 
-    // Check consensus key (active or pending)
-    let consensus_key_obj = delegate_info.get_nested("consensus_key");
+/// Whether `expected_pkh` is the active or pending key for `role` on-chain.
+fn role_key_set_on_chain(
+    delegate_info: &serde_json::Value,
+    role: KeyRole,
+    expected_pkh: &str,
+) -> bool {
+    let key_obj = delegate_info.get_nested(role.rpc_delegate_key_field());
 
-    let active_consensus = consensus_key_obj
-        .and_then(|ck| ck.get_nested("active"))
-        .and_then(|active| active.get_str("pkh"))
-        .unwrap_or("");
-
-    // Also check pendings array for consensus key
-    let mut pending_consensus = String::new();
-    if let Some(pendings) = consensus_key_obj
-        .and_then(|ck| ck.get_nested("pendings"))
-        .and_then(|p| p.as_array())
-    {
-        for pending in pendings {
-            if let Some(pkh) = pending.get_str("pkh")
-                && pkh == expected_consensus
-            {
-                pending_consensus = pkh.to_string();
-                break;
-            }
-        }
-    }
-
-    let consensus_match =
-        active_consensus == expected_consensus || pending_consensus == expected_consensus;
-
-    // Check companion key (active or pending)
-    let companion_key_obj = delegate_info.get_nested("companion_key");
-
-    let active_companion = companion_key_obj
+    // Companion's active field may be JSON null; treat that as absent.
+    let active = key_obj
         .and_then(|ck| ck.get_nested("active"))
         .and_then(|active| {
             if active.is_null() {
@@ -967,53 +920,22 @@ fn check_individual_keys_on_chain(
         })
         .unwrap_or("");
 
-    // Also check pendings array for companion key
-    let mut pending_companion = String::new();
-    if let Some(pendings) = companion_key_obj
+    let mut pending_match = false;
+    if let Some(pendings) = key_obj
         .and_then(|ck| ck.get_nested("pendings"))
         .and_then(|p| p.as_array())
     {
-        for pending in pendings {
-            if let Some(pkh) = pending.get_str("pkh")
-                && pkh == expected_companion
-            {
-                pending_companion = pkh.to_string();
-                break;
-            }
-        }
+        pending_match = pendings
+            .iter()
+            .any(|pending| pending.get_str("pkh") == Some(expected_pkh));
     }
 
-    let companion_match =
-        active_companion == expected_companion || pending_companion == expected_companion;
-
-    log::debug!("On-chain active consensus key: {active_consensus}");
-    log::debug!("On-chain pending consensus key: {pending_consensus}");
-    log::debug!("Expected consensus key: {expected_consensus}");
-    log::debug!("On-chain active companion key: {active_companion}");
-    log::debug!("On-chain pending companion key: {pending_companion}");
-    log::debug!("Expected companion key: {expected_companion}");
-
-    if consensus_match {
-        if pending_consensus.is_empty() {
-            log::debug!("Consensus key is active and matches");
-        } else {
-            log::debug!("Consensus key is pending (will become active soon)");
-        }
-    } else {
-        log::debug!("Consensus key mismatch (neither active nor pending)");
-    }
-
-    if companion_match {
-        if pending_companion.is_empty() {
-            log::debug!("Companion key is active and matches");
-        } else {
-            log::debug!("Companion key is pending (will become active soon)");
-        }
-    } else {
-        log::debug!("Companion key mismatch (neither active nor pending)");
-    }
-
-    Ok((consensus_match, companion_match))
+    let matches = active == expected_pkh || pending_match;
+    log::debug!(
+        "On-chain {} active={active:?} expected={expected_pkh:?} match={matches}",
+        role.device_alias()
+    );
+    matches
 }
 
 #[cfg(test)]

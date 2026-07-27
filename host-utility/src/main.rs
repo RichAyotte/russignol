@@ -21,6 +21,7 @@ mod disk;
 mod hardware;
 mod image;
 mod install;
+mod key_role;
 mod keys;
 mod migrate_keys;
 mod network;

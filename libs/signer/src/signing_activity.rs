@@ -1,3 +1,4 @@
+use crate::key_role::KeyRole;
 use std::time::{Duration, SystemTime};
 
 /// Type of signing operation
@@ -73,20 +74,11 @@ impl Default for SignatureActivity {
     }
 }
 
-/// Which key was used for signing
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyType {
-    /// Consensus key
-    Consensus,
-    /// Companion key
-    Companion,
-}
-
-/// A single signing event with key type and activity details
+/// A single signing event with role and activity details
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SigningEvent {
-    /// Which key was used
-    pub key_type: KeyType,
+    /// Which role signed
+    pub role: KeyRole,
     /// Activity details for this signing event
     pub activity: SignatureActivity,
 }
@@ -120,13 +112,11 @@ impl SigningEventRing {
     }
 }
 
-/// Tracks signature activity for consensus and companion keys
+/// Tracks signature activity for device key roles
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SigningActivity {
-    /// Last signature activity for consensus key
-    pub consensus: Option<SignatureActivity>,
-    /// Last signature activity for companion key
-    pub companion: Option<SignatureActivity>,
+    /// Last signature activity per role, slots in [`KeyRole::ALL`] order.
+    last: [Option<SignatureActivity>; KeyRole::COUNT],
     /// Chain ID detected from signature requests (first 4 bytes after magic byte)
     pub chain_id: Option<[u8; 4]>,
     /// Recent signing events (ring buffer, newest last)
@@ -136,21 +126,27 @@ pub struct SigningActivity {
 }
 
 impl SigningActivity {
+    /// Last recorded activity for `role`, if any.
+    #[must_use]
+    pub fn last(&self, role: KeyRole) -> Option<&SignatureActivity> {
+        self.last[role.index()].as_ref()
+    }
+
+    /// Record the latest activity for `role`.
+    pub fn set_last(&mut self, role: KeyRole, activity: SignatureActivity) {
+        self.last[role.index()] = Some(activity);
+    }
+
     /// Check if we've had any activity within the last N seconds
     #[must_use]
     pub fn has_recent_activity(&self, seconds: u64) -> bool {
         let now = SystemTime::now();
-
-        let check_activity = |activity: &Option<SignatureActivity>| {
-            if let Some(act) = activity
-                && let Ok(elapsed) = now.duration_since(act.timestamp)
-            {
-                return elapsed.as_secs() < seconds;
-            }
-            false
-        };
-
-        check_activity(&self.consensus) || check_activity(&self.companion)
+        KeyRole::ALL.iter().any(|role| {
+            self.last(*role).is_some_and(|act| {
+                now.duration_since(act.timestamp)
+                    .is_ok_and(|elapsed| elapsed.as_secs() < seconds)
+            })
+        })
     }
 }
 
@@ -233,6 +229,12 @@ mod tests {
         assert_eq!(extract_chain_id(&data), Some([0x01, 0x02, 0x03, 0x04]));
     }
 
+    fn with_last(role: KeyRole, activity: SignatureActivity) -> SigningActivity {
+        let mut sa = SigningActivity::default();
+        sa.set_last(role, activity);
+        sa
+    }
+
     #[test]
     fn test_has_recent_activity_no_activity() {
         let activity = SigningActivity::default();
@@ -241,49 +243,49 @@ mod tests {
 
     #[test]
     fn test_has_recent_activity_recent_consensus() {
-        let activity = SigningActivity {
-            consensus: Some(SignatureActivity {
+        let activity = with_last(
+            KeyRole::Consensus,
+            SignatureActivity {
                 level: Some(100),
                 timestamp: SystemTime::now(),
                 duration: None,
                 operation_type: Some(OperationType::Block),
                 data_size: None,
-            }),
-            ..Default::default()
-        };
+            },
+        );
 
         assert!(activity.has_recent_activity(60));
     }
 
     #[test]
     fn test_has_recent_activity_recent_companion() {
-        let activity = SigningActivity {
-            companion: Some(SignatureActivity {
+        let activity = with_last(
+            KeyRole::Companion,
+            SignatureActivity {
                 level: Some(100),
                 timestamp: SystemTime::now(),
                 duration: None,
                 operation_type: Some(OperationType::Attestation),
                 data_size: None,
-            }),
-            ..Default::default()
-        };
+            },
+        );
 
         assert!(activity.has_recent_activity(60));
     }
 
     #[test]
     fn test_has_recent_activity_old_activity() {
-        let activity = SigningActivity {
-            consensus: Some(SignatureActivity {
+        let activity = with_last(
+            KeyRole::Consensus,
+            SignatureActivity {
                 level: Some(100),
                 // 120 seconds ago
                 timestamp: SystemTime::now() - Duration::from_mins(2),
                 duration: None,
                 operation_type: Some(OperationType::Block),
                 data_size: None,
-            }),
-            ..Default::default()
-        };
+            },
+        );
 
         // Should not be considered recent if threshold is 60 seconds
         assert!(!activity.has_recent_activity(60));
@@ -293,16 +295,16 @@ mod tests {
 
     #[test]
     fn test_has_recent_activity_epoch_timestamp() {
-        let activity = SigningActivity {
-            consensus: Some(SignatureActivity {
+        let activity = with_last(
+            KeyRole::Consensus,
+            SignatureActivity {
                 level: Some(100),
                 timestamp: SystemTime::UNIX_EPOCH, // Very old timestamp
                 duration: None,
                 operation_type: None,
                 data_size: None,
-            }),
-            ..Default::default()
-        };
+            },
+        );
 
         assert!(!activity.has_recent_activity(60));
     }
@@ -314,9 +316,9 @@ mod tests {
         assert_eq!(OperationType::Attestation.as_str(), "attested");
     }
 
-    fn make_event(key_type: KeyType, level: u32) -> SigningEvent {
+    fn make_event(role: KeyRole, level: u32) -> SigningEvent {
         SigningEvent {
-            key_type,
+            role,
             activity: SignatureActivity {
                 level: Some(level),
                 timestamp: SystemTime::now(),
@@ -336,8 +338,8 @@ mod tests {
     #[test]
     fn ring_push_and_iterate_roundtrip() {
         let mut ring = SigningEventRing::default();
-        let e1 = make_event(KeyType::Consensus, 100);
-        let e2 = make_event(KeyType::Companion, 101);
+        let e1 = make_event(KeyRole::Consensus, 100);
+        let e2 = make_event(KeyRole::Companion, 101);
         ring.push(e1);
         ring.push(e2);
 
@@ -351,7 +353,7 @@ mod tests {
     fn ring_push_exactly_5_returns_all_in_order() {
         let mut ring = SigningEventRing::default();
         for level in 1..=5 {
-            ring.push(make_event(KeyType::Consensus, level));
+            ring.push(make_event(KeyRole::Consensus, level));
         }
 
         let levels: Vec<_> = ring.iter().map(|e| e.activity.level.unwrap()).collect();
@@ -362,7 +364,7 @@ mod tests {
     fn ring_overflow_drops_oldest_preserves_newest() {
         let mut ring = SigningEventRing::default();
         for level in 1..=7 {
-            ring.push(make_event(KeyType::Consensus, level));
+            ring.push(make_event(KeyRole::Consensus, level));
         }
 
         let levels: Vec<_> = ring.iter().map(|e| e.activity.level.unwrap()).collect();

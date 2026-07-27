@@ -282,6 +282,7 @@ fn run_signer_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use russignol_signer_lib::KeyRole;
     use russignol_signer_lib::wallet::OcamlKeyEntry;
 
     const SAMPLE_SK: &str = "BLsk2snGqdSb7qBDhKbc62AxbZXJycDvA5QmeYYhB7Nb3wFuMMbq9x";
@@ -296,8 +297,10 @@ mod tests {
             .unwrap()
             .secret_key()
             .to_b58check();
+        let consensus = KeyRole::Consensus.device_alias();
+        let companion = KeyRole::Companion.device_alias();
         let input = format!(
-            r#"[{{"name":"consensus","value":"unencrypted:{SAMPLE_SK}"}},{{"name":"companion","value":"unencrypted:{other_sk}"}}]"#
+            r#"[{{"name":"{consensus}","value":"unencrypted:{SAMPLE_SK}"}},{{"name":"{companion}","value":"unencrypted:{other_sk}"}}]"#
         );
         let key_manager = parse_secret_keys(&input).expect("valid keys load");
         assert_eq!(key_manager.list_keys().len(), 2);
@@ -307,7 +310,8 @@ mod tests {
     /// `mac_keys_from_manager` so unlock has a single BLS load path.
     #[test]
     fn load_secret_keys_mac_keys_match_manager_derive() {
-        let input = format!(r#"[{{"name":"consensus","value":"unencrypted:{SAMPLE_SK}"}}]"#);
+        let consensus = KeyRole::Consensus.device_alias();
+        let input = format!(r#"[{{"name":"{consensus}","value":"unencrypted:{SAMPLE_SK}"}}]"#);
         let (manager, from_load) = load_secret_keys(&input).expect("load");
         let from_manager = mac_keys_from_manager(&manager);
         assert_eq!(from_load, from_manager);
@@ -319,14 +323,16 @@ mod tests {
     /// stops attesting with nothing on the display.
     #[test]
     fn parse_secret_keys_rejects_any_unloadable_key() {
+        let consensus = KeyRole::Consensus.device_alias();
+        let companion = KeyRole::Companion.device_alias();
         let input = format!(
-            r#"[{{"name":"consensus","value":"unencrypted:{SAMPLE_SK}"}},{{"name":"companion","value":"unencrypted:BLsk3NotAValidKey"}}]"#
+            r#"[{{"name":"{consensus}","value":"unencrypted:{SAMPLE_SK}"}},{{"name":"{companion}","value":"unencrypted:BLsk3NotAValidKey"}}]"#
         );
         let Err(err) = parse_secret_keys(&input) else {
             panic!("unloadable key must abort")
         };
         assert!(
-            err.contains("companion"),
+            err.contains(companion),
             "error must name the failing alias: {err}"
         );
     }
@@ -349,13 +355,15 @@ mod tests {
     /// must continue to accept that whitespace-rich form unchanged.
     #[test]
     fn parse_pretty_legacy() {
+        let consensus = KeyRole::Consensus.device_alias();
+        let companion = KeyRole::Companion.device_alias();
         let legacy = vec![
             OcamlKeyEntry {
-                name: "consensus".to_string(),
+                name: consensus.to_string(),
                 value: format!("unencrypted:{SAMPLE_SK}"),
             },
             OcamlKeyEntry {
-                name: "companion".to_string(),
+                name: companion.to_string(),
                 value: format!("unencrypted:{SAMPLE_SK}"),
             },
         ];
@@ -363,9 +371,9 @@ mod tests {
 
         let entries = parse(&pretty).expect("pretty-legacy parses");
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name.as_ref(), "consensus");
+        assert_eq!(entries[0].name.as_ref(), consensus);
         assert_eq!(entries[0].value, format!("unencrypted:{SAMPLE_SK}"));
-        assert_eq!(entries[1].name.as_ref(), "companion");
+        assert_eq!(entries[1].name.as_ref(), companion);
         assert_eq!(entries[1].value, format!("unencrypted:{SAMPLE_SK}"));
     }
 

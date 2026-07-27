@@ -45,6 +45,8 @@
 mod base58check;
 pub mod bls;
 pub mod high_watermark;
+/// Device key roles (consensus / companion)
+pub mod key_role;
 pub mod magic_bytes;
 pub mod protocol;
 pub mod server;
@@ -58,12 +60,13 @@ pub mod wallet;
 // Re-export commonly used types
 pub use bls::{PublicKey, PublicKeyHash, SecretKey, Signature};
 pub use high_watermark::{ChainId, HighWatermark, WatermarkError};
+pub use key_role::KeyRole;
 pub use magic_bytes::{MagicByte, MagicByteError};
 pub use protocol::{SignerRequest, SignerResponse};
-pub use server::{KEY_ROLES, KeyManager as ServerKeyManager, RequestHandler};
+pub use server::{KeyManager as ServerKeyManager, RequestHandler};
 pub use signer::SignatureVersion;
 pub use signing_activity::{
-    KeyType, OperationType, SignatureActivity, SigningActivity, SigningEvent, SigningEventRing,
+    OperationType, SignatureActivity, SigningActivity, SigningEvent, SigningEventRing,
 };
 pub use wallet::{KeyManager, StoredKey};
 

@@ -4,13 +4,13 @@ use colored::{ColoredString, Colorize};
 // Import shared modules
 use crate::blockchain;
 use crate::config::RussignolConfig;
-use crate::constants::{
-    COMPANION_KEY_ALIAS, CONSENSUS_KEY_ALIAS, NETWORK_CONFIG_PATH, NM_CONNECTION_PATH, USB_VID_PID,
-};
+use crate::constants::{NETWORK_CONFIG_PATH, NM_CONNECTION_PATH, USB_VID_PID};
 use crate::hardware;
+use crate::key_role::BakerKeyNames;
 use crate::keys;
 use crate::progress;
 use crate::system;
+use russignol_signer_lib::KeyRole;
 
 /// Outcome of a yes/no health probe that can also fail to run.
 ///
@@ -142,10 +142,10 @@ struct SystemData {
 }
 
 struct KeysData {
-    consensus: Probe,
-    consensus_hash: Option<String>,
-    companion: Probe,
-    companion_hash: Option<String>,
+    /// Baker-wallet probe per role, slots in [`KeyRole::ALL`] order.
+    probe: [Probe; KeyRole::COUNT],
+    /// Imported pkh per role, slots in [`KeyRole::ALL`] order.
+    hash: [Option<String>; KeyRole::COUNT],
 }
 
 struct BlockchainData {
@@ -210,7 +210,7 @@ fn fetch_connectivity_data(config: &RussignolConfig) -> ConnectivityData {
     // Distinguish "signer unreachable" (Unknown) from "reachable but too few
     // keys" (Bad) so the report and exit code do not conflate the two.
     let remote_signer = match keys::discover_remote_keys(config) {
-        Ok(keys) => Probe::from_bool(keys.len() >= 2),
+        Ok(keys) => Probe::from_bool(keys.len() >= KeyRole::COUNT),
         Err(e) => Probe::Unknown(format!("{e:#}")),
     };
 
@@ -232,27 +232,16 @@ fn fetch_connectivity_data(config: &RussignolConfig) -> ConnectivityData {
 }
 
 fn fetch_keys_data(config: &RussignolConfig) -> KeysData {
-    let consensus = Probe::from_result(keys::check_key_alias_exists(CONSENSUS_KEY_ALIAS, config));
-    let companion = Probe::from_result(keys::check_key_alias_exists(COMPANION_KEY_ALIAS, config));
+    let probe = KeyRole::map_all(|role| {
+        Probe::from_result(keys::check_key_alias_exists(role.baker_alias(), config))
+    });
+    let hash = KeyRole::map_all(|role| {
+        matches!(probe[role.index()], Probe::Good)
+            .then(|| keys::get_key_hash(role.baker_alias(), config).ok())
+            .flatten()
+    });
 
-    let consensus_hash = if matches!(consensus, Probe::Good) {
-        keys::get_key_hash(CONSENSUS_KEY_ALIAS, config).ok()
-    } else {
-        None
-    };
-
-    let companion_hash = if matches!(companion, Probe::Good) {
-        keys::get_key_hash(COMPANION_KEY_ALIAS, config).ok()
-    } else {
-        None
-    };
-
-    KeysData {
-        consensus,
-        consensus_hash,
-        companion,
-        companion_hash,
-    }
+    KeysData { probe, hash }
 }
 
 fn fetch_blockchain_data(
@@ -320,9 +309,12 @@ fn status_is_healthy(
     let baking = query_probe(&rights.baking);
     let attesting = query_probe(&rights.attesting);
 
-    let mut probes: Vec<(&Probe, bool)> = vec![
-        (&keys.consensus, true),
-        (&keys.companion, true),
+    let mut probes: Vec<(&Probe, bool)> = keys
+        .probe
+        .iter()
+        .map(|probe| (probe, true))
+        .collect::<Vec<_>>();
+    probes.extend([
         (&node, true),
         (&connectivity.remote_signer, true),
         (&connectivity.interface, false),
@@ -331,7 +323,7 @@ fn status_is_healthy(
         (&baking, false),
         (&attesting, false),
         (&delegate, false),
-    ];
+    ]);
     // Registration only means anything once a delegate address is configured.
     if matches!(delegate_result, Ok(Some(_))) {
         probes.push((&blockchain.delegate_registered, false));
@@ -618,8 +610,9 @@ fn display_keys_and_blockchain_status(
         return;
     }
 
-    display_consensus_key_status(verbose, keys_data, blockchain_data);
-    display_companion_key_status(verbose, keys_data, blockchain_data);
+    for role in KeyRole::ALL {
+        display_role_key_status(verbose, role, keys_data, blockchain_data);
+    }
     display_staking_status(verbose, blockchain_data);
 
     println!();
@@ -679,19 +672,24 @@ fn display_delegate_status(
     }
 }
 
-fn display_consensus_key_status(
+/// One row per role: wallet probe first, then on-chain activation. Companion is
+/// the only role that can be genuinely unset, via `KeyActivationStatus::active_for`.
+fn display_role_key_status(
     verbose: bool,
+    role: KeyRole,
     keys_data: &KeysData,
     blockchain_data: &BlockchainData,
 ) {
-    match &keys_data.consensus {
+    let label = role.display_name();
+
+    match &keys_data.probe[role.index()] {
         Probe::Bad => {
-            println!("  {} Consensus key: not imported", Marker::Bad.glyph());
+            println!("  {} {label}: not imported", Marker::Bad.glyph());
             return;
         }
         Probe::Unknown(e) => {
             println!(
-                "  {} Consensus key: could not check wallet",
+                "  {} {label}: could not check wallet",
                 Marker::Unknown.glyph()
             );
             if verbose {
@@ -702,95 +700,31 @@ fn display_consensus_key_status(
         Probe::Good => {}
     }
 
-    let key_info = keys_data.consensus_hash.as_ref().map_or_else(
-        || CONSENSUS_KEY_ALIAS.to_string(),
-        |hash| format!("{CONSENSUS_KEY_ALIAS} ({hash})"),
-    );
+    let alias = role.baker_alias();
+    let key_info = keys_data.hash[role.index()]
+        .as_ref()
+        .map_or_else(|| alias.to_string(), |hash| format!("{alias} ({hash})"));
 
-    match &blockchain_data.key_activation {
-        Some(status) if status.consensus_pending => {
-            println!(
-                "  {} Consensus key: {} - Pending (cycle {})",
-                "⏳".yellow(),
-                key_info,
-                status.consensus_cycle.unwrap()
-            );
-            if verbose {
-                println!(
-                    "      Activation: {}",
-                    status.consensus_time_estimate.as_ref().unwrap()
-                );
-            }
-        }
-        Some(_) => {
-            println!("  {} Consensus key: {} - Active", "✓".green(), key_info);
-        }
-        None => {
-            println!(
-                "  {} Consensus key: {} - Activation status unavailable",
-                "?".yellow(),
-                key_info
-            );
-        }
-    }
-}
+    let Some(status) = &blockchain_data.key_activation else {
+        println!(
+            "  {} {label}: {key_info} - Activation status unavailable",
+            "?".yellow()
+        );
+        return;
+    };
 
-fn display_companion_key_status(
-    verbose: bool,
-    keys_data: &KeysData,
-    blockchain_data: &BlockchainData,
-) {
-    match &keys_data.companion {
-        Probe::Bad => {
-            println!("  {} Companion key: not imported", Marker::Bad.glyph());
-            return;
+    if let Some((cycle, estimate)) = status.pending_for(role) {
+        println!(
+            "  {} {label}: {key_info} - Pending (cycle {cycle})",
+            "⏳".yellow()
+        );
+        if verbose {
+            println!("      Activation: {estimate}");
         }
-        Probe::Unknown(e) => {
-            println!(
-                "  {} Companion key: could not check wallet",
-                Marker::Unknown.glyph()
-            );
-            if verbose {
-                println!("      Error: {e}");
-            }
-            return;
-        }
-        Probe::Good => {}
-    }
-
-    let key_info = keys_data.companion_hash.as_ref().map_or_else(
-        || COMPANION_KEY_ALIAS.to_string(),
-        |hash| format!("{COMPANION_KEY_ALIAS} ({hash})"),
-    );
-
-    match &blockchain_data.key_activation {
-        Some(status) if status.companion_pending => {
-            println!(
-                "  {} Companion key: {} - Pending (cycle {})",
-                "⏳".yellow(),
-                key_info,
-                status.companion_cycle.unwrap()
-            );
-            if verbose {
-                println!(
-                    "      Activation: {}",
-                    status.companion_time_estimate.as_ref().unwrap()
-                );
-            }
-        }
-        Some(status) if status.companion_active => {
-            println!("  {} Companion key: {} - Active", "✓".green(), key_info);
-        }
-        Some(_) => {
-            println!("  {} Companion key: {} - Not set", "?".yellow(), key_info);
-        }
-        None => {
-            println!(
-                "  {} Companion key: {} - Activation status unavailable",
-                "?".yellow(),
-                key_info
-            );
-        }
+    } else if status.active_for(role) {
+        println!("  {} {label}: {key_info} - Active", "✓".green());
+    } else {
+        println!("  {} {label}: {key_info} - Not set", "?".yellow());
     }
 }
 

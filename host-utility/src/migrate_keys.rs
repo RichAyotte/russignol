@@ -10,7 +10,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use inquire::{Password, PasswordDisplayMode, Select};
 use russignol_signer_lib::KeyManager;
-use russignol_signer_lib::server::KEY_ROLES;
+use russignol_signer_lib::KeyRole;
 use russignol_signer_lib::signer::Unencrypted;
 use russignol_signer_lib::wallet::StoredKey;
 use std::collections::HashMap;
@@ -48,8 +48,8 @@ pub struct RoleMapping {
 
 /// A source key assigned to a Russignol role.
 struct RoleAssignment {
-    /// Russignol role: `consensus` or `companion`.
-    role: &'static str,
+    /// Device role this source key fills.
+    role: KeyRole,
     /// Original alias on the source card (e.g. `key1`).
     source_name: String,
     /// `unencrypted:BLsk…` value, carried through verbatim.
@@ -109,7 +109,7 @@ pub fn build_migrated_backup(
         }
 
         stored.push(StoredKey {
-            alias: a.role.to_string(),
+            alias: a.role.device_alias().to_string(),
             public_key_hash: public.pkh.clone(),
             public_key: public.pk.clone(),
             secret_key: None,
@@ -182,7 +182,7 @@ fn relabeled_secret_keys_json(assignments: &[RoleAssignment]) -> Zeroizing<Strin
             json.push(',');
         }
         json.push_str(r#"{"name":""#);
-        json.push_str(a.role);
+        json.push_str(a.role.device_alias());
         json.push_str(r#"","value":""#);
         json.push_str(&a.secret_value);
         json.push_str(r#""}"#);
@@ -262,29 +262,58 @@ fn source_alias_for(derived: &[DerivedPub], key: &str) -> Option<String> {
         .map(|d| d.source_name.clone())
 }
 
-/// Assign source keys to the consensus/companion roles in canonical order.
+/// Assign source keys to each [`KeyRole`] by identity (not array position).
 fn assign_roles(
     entries: &[(String, Zeroizing<String>)],
     mapping: &RoleMapping,
 ) -> Result<Vec<RoleAssignment>> {
-    let (consensus_name, companion_name) = match (&mapping.consensus, &mapping.companion) {
-        // No overrides: require exactly two keys and map positionally.
+    // Source alias for each role, slots in KeyRole::ALL order. Every arm fills
+    // every slot, so no role can reach the assignments below unresolved.
+    let source_for: [String; KeyRole::COUNT] = match (&mapping.consensus, &mapping.companion) {
+        // No overrides: require one source key per role; source order fills ALL.
         (None, None) => {
-            if entries.len() != 2 {
+            if entries.len() != KeyRole::COUNT {
                 bail!(
-                    "expected exactly 2 keys on the source card, found {} (use --consensus-key/--companion-key to disambiguate)",
+                    "expected exactly {} keys on the source card, found {} (use --consensus-key/--companion-key to disambiguate)",
+                    KeyRole::COUNT,
                     entries.len()
                 );
             }
-            (entries[0].0.clone(), entries[1].0.clone())
+            KeyRole::map_all(|role| entries[role.index()].0.clone())
         }
-        (Some(c), Some(k)) => (c.clone(), k.clone()),
+        (Some(c), Some(k)) => KeyRole::map_all(|role| match role {
+            KeyRole::Consensus => c.clone(),
+            KeyRole::Companion => k.clone(),
+        }),
         // One role given: the other defaults to the remaining key.
-        (Some(c), None) => (c.clone(), remaining_source_key(entries, c)?),
-        (None, Some(k)) => (remaining_source_key(entries, k)?, k.clone()),
+        (Some(c), None) => {
+            let rest = remaining_source_key(entries, c)?;
+            KeyRole::map_all(|role| match role {
+                KeyRole::Consensus => c.clone(),
+                KeyRole::Companion => rest.clone(),
+            })
+        }
+        (None, Some(k)) => {
+            let rest = remaining_source_key(entries, k)?;
+            KeyRole::map_all(|role| match role {
+                KeyRole::Consensus => rest.clone(),
+                KeyRole::Companion => k.clone(),
+            })
+        }
     };
-    if consensus_name == companion_name {
-        bail!("consensus and companion cannot both be source key '{consensus_name}'");
+
+    // Distinctness: every role slot must name a different source key.
+    for (i, role_a) in KeyRole::ALL.into_iter().enumerate() {
+        for role_b in KeyRole::ALL.into_iter().skip(i + 1) {
+            let a = &source_for[role_a.index()];
+            if a == &source_for[role_b.index()] {
+                bail!(
+                    "{} and {} cannot both be source key '{a}'",
+                    role_a.device_alias(),
+                    role_b.device_alias()
+                );
+            }
+        }
     }
 
     let find = |name: &str| -> Result<Zeroizing<String>> {
@@ -295,18 +324,17 @@ fn assign_roles(
             .with_context(|| format!("source card has no key named '{name}'"))
     };
 
-    Ok(vec![
-        RoleAssignment {
-            role: KEY_ROLES[0],
-            secret_value: find(&consensus_name)?,
-            source_name: consensus_name,
-        },
-        RoleAssignment {
-            role: KEY_ROLES[1],
-            secret_value: find(&companion_name)?,
-            source_name: companion_name,
-        },
-    ])
+    KeyRole::ALL
+        .into_iter()
+        .zip(source_for)
+        .map(|(role, source_name)| {
+            Ok(RoleAssignment {
+                role,
+                secret_value: find(&source_name)?,
+                source_name,
+            })
+        })
+        .collect()
 }
 
 /// The first source key whose alias differs from `taken` — the remaining key
@@ -939,16 +967,22 @@ mod tests {
         assert_eq!(backup.pin_blobs[0].0, SECRET_KEYS_ENC_V2_FILENAME);
 
         let plaintext = russignol_crypto::decrypt(b"12345678", &backup.pin_blobs[0].1).unwrap();
-        assert!(plaintext.contains(r#""name":"consensus""#));
-        assert!(plaintext.contains(r#""name":"companion""#));
+        assert!(plaintext.contains(&format!(
+            r#""name":"{}""#,
+            KeyRole::Consensus.device_alias()
+        )));
+        assert!(plaintext.contains(&format!(
+            r#""name":"{}""#,
+            KeyRole::Companion.device_alias()
+        )));
         assert!(plaintext.contains(&format!("unencrypted:{sk1}")));
         assert!(plaintext.contains(&format!("unencrypted:{sk2}")));
 
         let pkh = String::from_utf8(backup.public_key_hashs.clone()).unwrap();
         assert!(pkh.contains(&tz1));
         assert!(pkh.contains(&tz2));
-        assert!(pkh.contains("consensus"));
-        assert!(pkh.contains("companion"));
+        assert!(pkh.contains(KeyRole::Consensus.device_alias()));
+        assert!(pkh.contains(KeyRole::Companion.device_alias()));
     }
 
     #[test]
@@ -965,7 +999,7 @@ mod tests {
         let plaintext = russignol_crypto::decrypt(b"0000", &backup.pin_blobs[0].1).unwrap();
 
         // consensus comes first; key2 was designated consensus.
-        let consensus_pos = plaintext.find("consensus").unwrap();
+        let consensus_pos = plaintext.find(KeyRole::Consensus.device_alias()).unwrap();
         let sk2_pos = plaintext.find(&sk2 as &str).unwrap();
         let sk1_pos = plaintext.find(&sk1 as &str).unwrap();
         assert!(consensus_pos < sk2_pos);
@@ -1051,12 +1085,14 @@ mod tests {
         assert!(err.to_string().contains("expected exactly 2 keys"));
     }
 
-    /// The tz4 the built backup labels as `consensus`, read from the generated
+    /// The tz4 the built backup labels as consensus, read from the generated
     /// `public_key_hashs`.
     fn consensus_tz4(backup: &SourceBackup) -> String {
         let arr: Vec<serde_json::Value> = serde_json::from_slice(&backup.public_key_hashs).unwrap();
         arr.iter()
-            .find(|e| e.get("name").and_then(|v| v.as_str()) == Some("consensus"))
+            .find(|e| {
+                e.get("name").and_then(|v| v.as_str()) == Some(KeyRole::Consensus.device_alias())
+            })
             .and_then(|e| e.get("value").and_then(|v| v.as_str()))
             .unwrap()
             .to_string()
