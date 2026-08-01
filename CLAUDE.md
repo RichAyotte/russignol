@@ -10,7 +10,7 @@
 Use xtask for all build and test operations:
 
 ```sh
-cargo xtask test              # Run tests (--no-fuzz skips proptest fuzzing)
+cargo xtask test              # Run every test in the workspace
 cargo xtask rpi-signer        # Build RPi signer (--dev for debug build)
 cargo xtask host-utility      # Build host utility
 cargo xtask image             # Build SD card image
@@ -23,7 +23,9 @@ cargo xtask deploy --dev      # Build and deploy debug binary
 cargo xtask deploy --skip-build  # Deploy previously built binary
 cargo xtask coverage          # Code coverage report (--open, --lcov)
 cargo xtask watermark-test    # Watermark E2E tests on a physical device
-cargo xtask upgrade           # Upgrade dependencies
+cargo xtask upgrade           # Upgrade dependencies, verify, and commit
+cargo xtask upgrade --no-image   # Skip the image build (buildroot/kernel bumps stay uncommitted)
+cargo xtask upgrade --no-verify  # Apply upgrades only (implies no commit)
 cargo xtask deps              # Check for unused dependencies
 cargo xtask validate          # Validate build environment
 cargo xtask clean             # Clean build artifacts

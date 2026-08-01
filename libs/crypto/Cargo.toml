@@ -15,4 +15,4 @@ log = { workspace = true }
 zeroize = "1.9"
 
 [dev-dependencies]
-toml = "1.1.2"
+toml = "1.1.4"

@@ -9,6 +9,9 @@ use crate::utils::{
 };
 
 const BUILDROOT_DIR: &str = "buildroot";
+pub const BUILDROOT_CONFIG: &str = ".config";
+const KERNEL_TREE_DIR: &str = "output/build/linux-custom";
+const KERNEL_TREE_MARKER: &str = ".russignol-kernel-source";
 
 /// Build the SD card image using buildroot
 pub fn build_image(is_dev: bool, force_clean: bool) -> Result<()> {
@@ -124,15 +127,26 @@ fn run_build(config_name: &str, force_clean: bool, external_tree: &Path) -> Resu
 
     run_buildroot_make(Path::new("."), &external_tree_abs, &[config_name])?;
 
-    // Smart Rebuild Logic - detect configuration changes
+    // Discard an output tree the current config and buildroot cannot extend
     let state_file = external_tree_abs.join(".last_build_config");
-    if check_buildroot_state(config_name, &state_file)? {
-        println!(
-            "{}",
-            "⚠ Configuration changed - forcing full clean...".yellow()
-        );
+    let state = BuildState {
+        config: config_name.to_string(),
+        buildroot_commit: buildroot_commit(Path::new("."))?,
+    };
+    if !force_clean && check_buildroot_state(&state, &state_file) {
         run_cmd_in_dir(".", "make", &["clean"], "Clean failed")?;
     }
+
+    // Resolved before the build rather than after it, so a configuration that
+    // pins no kernel source fails without first spending the build on it.
+    let loaded_config = std::fs::read_to_string(BUILDROOT_CONFIG)
+        .with_context(|| format!("Failed to read the loaded {BUILDROOT_CONFIG}"))?;
+    let kernel_state = KernelTreeState {
+        config: config_name.to_string(),
+        buildroot_commit: state.buildroot_commit.clone(),
+        kernel_commit: kernel_commit_from_config(&loaded_config)
+            .context("No kernel source commit pinned by the loaded configuration")?,
+    };
 
     println!();
     println!("Configuration loaded. Building...");
@@ -148,7 +162,8 @@ fn run_build(config_name: &str, force_clean: bool, external_tree: &Path) -> Resu
     verify_kernel_hardening(Path::new("output/build/linux-custom/.config"))?;
     verify_compression_backend(Path::new("output/build/linux-custom/.config"))?;
     verify_mount_opts_drift()?;
-    save_buildroot_state(config_name, &state_file)?;
+    save_buildroot_state(&state, &state_file)?;
+    kernel_state.save(Path::new("."))?;
 
     Ok(())
 }
@@ -406,41 +421,351 @@ fn print_flashing_instructions() {
     println!();
 }
 
-/// Check if buildroot state indicates a config change that needs cleaning
-fn check_buildroot_state(config_name: &str, state_file: &Path) -> Result<bool> {
-    if !state_file.exists() {
-        return Ok(false);
-    }
-
-    let last_config =
-        std::fs::read_to_string(state_file).context("Failed to read buildroot state file")?;
-
-    if last_config.trim() != config_name {
-        println!();
-        println!(
-            "{}",
-            format!(
-                "⚠ Configuration changed from {} to {}.",
-                last_config.trim(),
-                config_name
-            )
-            .yellow()
-        );
-        return Ok(true); // Need clean
-    }
-
-    Ok(false)
+/// What the buildroot output tree was last built from.
+///
+/// Buildroot carries no record of which of its own versions produced a tree and
+/// does not support rebuilding one across a version change: a bumped checkout
+/// reuses packages, host tools and the target skeleton left by the previous one.
+/// Recording the commit beside the config is what lets a later build recognise
+/// a tree it cannot safely extend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BuildState {
+    config: String,
+    buildroot_commit: String,
 }
 
-/// Save current buildroot configuration state
-fn save_buildroot_state(config_name: &str, state_file: &Path) -> Result<()> {
-    std::fs::write(state_file, config_name).context("Failed to save buildroot state file")?;
+impl BuildState {
+    fn render(&self) -> String {
+        format!("{}\n{}\n", self.config, self.buildroot_commit)
+    }
+
+    /// Reads back a state written by [`BuildState::render`].
+    ///
+    /// Anything else — a truncated write, or the config-only format that
+    /// predates commit tracking — leaves the tree's provenance unknown.
+    fn parse(contents: &str) -> Option<Self> {
+        let mut lines = contents.lines();
+        let config = lines.next()?.trim();
+        let buildroot_commit = lines.next()?.trim();
+
+        if config.is_empty() || buildroot_commit.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            config: config.to_string(),
+            buildroot_commit: buildroot_commit.to_string(),
+        })
+    }
+}
+
+/// Whether the existing output tree has to be removed before building `current`.
+///
+/// A tree of unknown provenance is discarded rather than trusted, since it may
+/// have been produced by any config or buildroot version.
+fn needs_clean(previous: Option<&BuildState>, current: &BuildState) -> bool {
+    previous.is_none_or(|previous| previous != current)
+}
+
+/// Commit of the buildroot checkout at `buildroot_dir`
+pub fn buildroot_commit(buildroot_dir: &Path) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(buildroot_dir)
+        .output()
+        .context("Failed to run git in the buildroot checkout")?;
+
+    if !output.status.success() {
+        bail!("Could not read the buildroot commit; is the submodule initialised?");
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// What a configured kernel build tree was produced from.
+///
+/// Buildroot's stamp files record that a step ran, not what it ran against:
+/// `.stamp_configured` survives a source, buildroot or config change, so
+/// nothing in the tree otherwise distinguishes a kernel configured from one set
+/// of inputs from a kernel configured from another. The record lives inside the
+/// tree so that removing the tree removes it, and an absent record therefore
+/// means the tree's provenance is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelTreeState {
+    pub config: String,
+    pub buildroot_commit: String,
+    pub kernel_commit: String,
+}
+
+impl KernelTreeState {
+    fn render(&self) -> String {
+        format!(
+            "{}\n{}\n{}\n",
+            self.config, self.buildroot_commit, self.kernel_commit
+        )
+    }
+
+    /// Reads back a state written by [`KernelTreeState::render`]. Anything else
+    /// — a truncated write, or an earlier format — leaves provenance unknown.
+    fn parse(contents: &str) -> Option<Self> {
+        let mut lines = contents.lines();
+        let config = lines.next()?.trim();
+        let buildroot_commit = lines.next()?.trim();
+        let kernel_commit = lines.next()?.trim();
+
+        if config.is_empty() || buildroot_commit.is_empty() || kernel_commit.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            config: config.to_string(),
+            buildroot_commit: buildroot_commit.to_string(),
+            kernel_commit: kernel_commit.to_string(),
+        })
+    }
+
+    fn marker(buildroot_dir: &Path) -> PathBuf {
+        buildroot_dir.join(KERNEL_TREE_DIR).join(KERNEL_TREE_MARKER)
+    }
+
+    pub fn read(buildroot_dir: &Path) -> Option<Self> {
+        Self::parse(&std::fs::read_to_string(Self::marker(buildroot_dir)).unwrap_or_default())
+    }
+
+    /// Records this state against the kernel tree at `buildroot_dir`.
+    ///
+    /// Every step that leaves a configured kernel tree behind calls this, so a
+    /// tree produced by an image build is as recognisable as one produced by an
+    /// upgrade and neither has to rebuild what the other already configured.
+    pub fn save(&self, buildroot_dir: &Path) -> Result<()> {
+        let marker = Self::marker(buildroot_dir);
+        std::fs::write(&marker, self.render())
+            .with_context(|| format!("Failed to write {}", marker.display()))
+    }
+}
+
+/// Whether the kernel build tree has to be removed before it can be configured.
+pub fn needs_dirclean(previous: Option<&KernelTreeState>, current: &KernelTreeState) -> bool {
+    previous.is_none_or(|previous| previous != current)
+}
+
+/// Commit of the kernel source a buildroot configuration pins.
+///
+/// Read from the configuration rather than from the `rpi-linux` checkout so
+/// that it names the source the build will actually take, whether buildroot
+/// fetches the tarball or rsyncs the submodule held at that same commit.
+/// Accepts a `.config` or a defconfig, which carry the same key.
+pub fn kernel_commit_from_config(config: &str) -> Option<String> {
+    let url = config
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION=")
+        })?
+        .trim()
+        .trim_matches('"');
+
+    let commit = url.rsplit('/').next()?.strip_suffix(".tar.gz")?;
+
+    // A release tarball is named for its version, not a commit; only a hex name
+    // identifies the source precisely enough to compare two trees by.
+    (!commit.is_empty() && commit.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| commit.to_string())
+}
+
+fn check_buildroot_state(current: &BuildState, state_file: &Path) -> bool {
+    let contents = std::fs::read_to_string(state_file).unwrap_or_default();
+    let previous = BuildState::parse(&contents);
+
+    if !needs_clean(previous.as_ref(), current) {
+        return false;
+    }
+
+    println!();
+    match previous {
+        None => println!(
+            "{}",
+            "⚠ Build tree provenance unknown - forcing full clean...".yellow()
+        ),
+        Some(previous) if previous.config != current.config => println!(
+            "{}",
+            format!(
+                "⚠ Configuration changed from {} to {} - forcing full clean...",
+                previous.config, current.config
+            )
+            .yellow()
+        ),
+        Some(previous) => println!(
+            "{}",
+            format!(
+                "⚠ Buildroot changed from {} to {} - forcing full clean...",
+                &previous.buildroot_commit[..12.min(previous.buildroot_commit.len())],
+                &current.buildroot_commit[..12.min(current.buildroot_commit.len())]
+            )
+            .yellow()
+        ),
+    }
+
+    true
+}
+
+/// Written only after a successful build, so a build that dies partway leaves
+/// the tree marked as unbuildable-from rather than as matching the new state.
+fn save_buildroot_state(state: &BuildState, state_file: &Path) -> Result<()> {
+    std::fs::write(state_file, state.render()).context("Failed to save buildroot state file")?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn state(config: &str, commit: &str) -> BuildState {
+        BuildState {
+            config: config.to_string(),
+            buildroot_commit: commit.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_unchanged_config_and_buildroot_extends_the_tree() {
+        let current = state("russignol_hardened_defconfig", "313414b92c25");
+
+        assert!(!needs_clean(Some(&current.clone()), &current));
+    }
+
+    #[test]
+    fn switching_config_discards_the_tree() {
+        let previous = state("russignol_defconfig", "313414b92c25");
+        let current = state("russignol_hardened_defconfig", "313414b92c25");
+
+        assert!(needs_clean(Some(&previous), &current));
+    }
+
+    #[test]
+    fn bumping_buildroot_discards_the_tree() {
+        // Same config, moved buildroot: the tree holds packages and host tools
+        // the new buildroot did not produce.
+        let previous = state("russignol_hardened_defconfig", "313414b92c25");
+        let current = state("russignol_hardened_defconfig", "a1b2c3d4e5f6");
+
+        assert!(needs_clean(Some(&previous), &current));
+    }
+
+    #[test]
+    fn an_unrecorded_tree_is_discarded() {
+        assert!(needs_clean(None, &state("russignol_defconfig", "313414b")));
+    }
+
+    #[test]
+    fn state_survives_a_write_and_read_back() {
+        let current = state("russignol_hardened_defconfig", "313414b92c25");
+
+        assert_eq!(BuildState::parse(&current.render()), Some(current));
+    }
+
+    const HARDENED: &str = "russignol_hardened_defconfig";
+
+    fn kernel_state(config: &str, buildroot: &str, kernel: &str) -> KernelTreeState {
+        KernelTreeState {
+            config: config.to_string(),
+            buildroot_commit: buildroot.to_string(),
+            kernel_commit: kernel.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_pinned_tarball_names_the_kernel_source_commit() {
+        let config = "BR2_LINUX_KERNEL=y\nBR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION=\"https://github.com/raspberrypi/linux/archive/825dba6c63eeb40a62699d1f8a4aa3f02b0eaf49.tar.gz\"\nBR2_LINUX_KERNEL_GZIP=y\n";
+
+        assert_eq!(
+            kernel_commit_from_config(config).as_deref(),
+            Some("825dba6c63eeb40a62699d1f8a4aa3f02b0eaf49")
+        );
+    }
+
+    #[test]
+    fn a_version_named_tarball_pins_no_commit() {
+        // A release tarball names its version, which cannot tell two trees apart
+        // the way a commit does.
+        let config = "BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION=\"https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.tar.gz\"\n";
+
+        assert_eq!(kernel_commit_from_config(config), None);
+    }
+
+    #[test]
+    fn a_config_without_a_custom_tarball_pins_no_commit() {
+        assert_eq!(kernel_commit_from_config("BR2_LINUX_KERNEL=y\n"), None);
+    }
+
+    #[test]
+    fn a_kernel_tree_built_from_the_same_inputs_is_kept() {
+        let current = kernel_state(HARDENED, "cb857ba4c87a", "825dba6c63ee");
+
+        assert!(!needs_dirclean(Some(&current.clone()), &current));
+    }
+
+    #[test]
+    fn moving_the_kernel_source_discards_the_kernel_tree() {
+        let previous = kernel_state(HARDENED, "cb857ba4c87a", "f2f1e849f4fe");
+        let current = kernel_state(HARDENED, "cb857ba4c87a", "825dba6c63ee");
+
+        assert!(needs_dirclean(Some(&previous), &current));
+    }
+
+    #[test]
+    fn bumping_buildroot_discards_the_kernel_tree() {
+        // Buildroot's kconfig fixups are applied at configure time, so the same
+        // source under a different buildroot is a different configured tree.
+        let previous = kernel_state(HARDENED, "313414b92c25", "825dba6c63ee");
+        let current = kernel_state(HARDENED, "cb857ba4c87a", "825dba6c63ee");
+
+        assert!(needs_dirclean(Some(&previous), &current));
+    }
+
+    #[test]
+    fn switching_config_discards_the_kernel_tree() {
+        let previous = kernel_state("russignol_defconfig", "cb857ba4c87a", "825dba6c63ee");
+        let current = kernel_state(HARDENED, "cb857ba4c87a", "825dba6c63ee");
+
+        assert!(needs_dirclean(Some(&previous), &current));
+    }
+
+    #[test]
+    fn an_unrecorded_kernel_tree_is_discarded() {
+        let current = kernel_state(HARDENED, "cb857ba4c87a", "825dba6c63ee");
+
+        assert!(needs_dirclean(None, &current));
+    }
+
+    #[test]
+    fn kernel_state_survives_a_write_and_read_back() {
+        let current = kernel_state(HARDENED, "cb857ba4c87a", "825dba6c63ee");
+
+        assert_eq!(KernelTreeState::parse(&current.render()), Some(current));
+    }
+
+    #[test]
+    fn a_partial_kernel_state_reads_as_unknown() {
+        assert_eq!(KernelTreeState::parse(""), None);
+        assert_eq!(
+            KernelTreeState::parse("russignol_hardened_defconfig\ncb857ba4c87a\n"),
+            None
+        );
+        assert_eq!(
+            KernelTreeState::parse("russignol_hardened_defconfig\ncb857ba4c87a\n\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_config_only_format_reads_as_unknown() {
+        // Written before buildroot commits were tracked; the tree behind it may
+        // have been produced by any buildroot version.
+        assert_eq!(BuildState::parse("russignol_defconfig\n"), None);
+        assert_eq!(BuildState::parse(""), None);
+        assert_eq!(BuildState::parse("russignol_defconfig\n\n"), None);
+    }
 
     /// A minimal config satisfying every [`KERNEL_HARDENING`] requirement.
     fn compliant_config() -> String {

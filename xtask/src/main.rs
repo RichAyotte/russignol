@@ -218,14 +218,23 @@ enum Commands {
     },
 
     /// Run test suites across workspace
-    Test {
-        /// Skip proptest fuzzing
-        #[arg(long)]
-        no_fuzz: bool,
-    },
+    Test,
 
-    /// Check for and apply dependency upgrades
-    Upgrade,
+    /// Check for and apply dependency upgrades, then verify and commit them
+    Upgrade {
+        /// Skip verification (clippy, fmt, tests, builds); implies no commit
+        #[arg(long)]
+        no_verify: bool,
+
+        /// Skip the SD image build during verification; buildroot and kernel
+        /// changes then go uncommitted, having been exercised by nothing
+        #[arg(long)]
+        no_image: bool,
+
+        /// Do not commit, even when every check passes
+        #[arg(long)]
+        no_commit: bool,
+    },
 
     /// Check for unused dependencies
     Deps,
@@ -473,8 +482,16 @@ fn try_main() -> Result<()> {
             clean,
             publish,
         }),
-        Commands::Upgrade => upgrade::cmd_upgrade(),
-        Commands::Test { no_fuzz } => cmd_test(!no_fuzz),
+        Commands::Upgrade {
+            no_verify,
+            no_image,
+            no_commit,
+        } => upgrade::cmd_upgrade(upgrade::UpgradeOptions {
+            no_verify,
+            no_image,
+            no_commit,
+        }),
+        Commands::Test => cmd_test(),
         Commands::Deps => cmd_deps(),
         Commands::Clean { buildroot, deep } => do_clean(buildroot, deep),
         Commands::Validate => cmd_validate(),
@@ -1006,7 +1023,7 @@ fn cmd_release(opts: &ReleaseOptions) -> Result<()> {
 
     // 3. Test - always run tests
     println!("\n{}", format!("Step {step}: Test").cyan().bold());
-    cmd_test(true)?;
+    cmd_test()?;
     step += 1;
 
     // 4. Component-specific build steps
@@ -1430,26 +1447,16 @@ fn print_release_summary(component: ReleaseComponent, version: &str, publish: &P
     }
 }
 
-fn cmd_test(fuzz: bool) -> Result<()> {
+/// Run every test in the workspace.
+///
+/// `--workspace` already covers the proptest suite in `russignol-signer-lib`,
+/// since it is an ordinary integration test target rather than one gated behind
+/// a feature.
+fn cmd_test() -> Result<()> {
     println!("{}", "Running tests...".cyan());
     run_cargo(&["test", "--workspace"], "Tests failed")?;
     println!("{}", "✓ All tests passed".green());
 
-    // Run proptest fuzzing if requested
-    if fuzz {
-        println!("\n{}", "Running proptest fuzzing...".cyan());
-        run_cargo(
-            &[
-                "test",
-                "--package",
-                "russignol-signer-lib",
-                "--test",
-                "proptest_protocol",
-            ],
-            "Proptest fuzzing failed",
-        )?;
-        println!("{}", "✓ Proptest fuzzing complete".green());
-    }
     Ok(())
 }
 
