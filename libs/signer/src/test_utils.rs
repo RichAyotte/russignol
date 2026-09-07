@@ -4,13 +4,15 @@
 //! watermark protection and signing operations. The formats follow the
 //! Tenderbake consensus protocol specifications.
 
-use crate::bls::PublicKeyHash;
-use crate::high_watermark::{ChainId, HighWatermark};
+use crate::high_watermark::{ChainId, HighWatermark, MarkParams};
 use crate::protocol::encoding::{decode_response, encode_request};
 use crate::protocol::{SignerRequest, SignerResponse};
+use crate::scheme::{PublicKey, PublicKeyHash, Scheme, SecretKey};
+use crate::xmss::Epoch;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::ops::RangeInclusive;
 use std::path::Path;
 
 /// Create Tenderbake block data for testing
@@ -70,12 +72,54 @@ pub fn create_attestation_data(level: u32, round: u32) -> Vec<u8> {
 /// Create Tenderbake attestation data with a specific chain ID
 #[must_use]
 pub fn create_attestation_data_with_chain(chain_id: &[u8; 4], level: u32, round: u32) -> Vec<u8> {
-    let mut data = vec![0x13]; // Attestation magic byte
-    data.extend_from_slice(chain_id); // chain_id (4 bytes)
-    data.extend_from_slice(&[0u8; 32]); // branch (32 bytes)
-    data.push(0x15); // kind byte for attestation
-    data.extend_from_slice(&level.to_be_bytes()); // level (4 bytes)
-    data.extend_from_slice(&round.to_be_bytes()); // round (4 bytes)
+    create_attestation_data_for_chain(Scheme::Bls, chain_id, level, round)
+}
+
+/// Create Tenderbake attestation data in `scheme`'s own layout.
+#[must_use]
+pub fn create_attestation_data_for(scheme: Scheme, level: u32, round: u32) -> Vec<u8> {
+    create_attestation_data_for_chain(scheme, &[0, 0, 0, 1], level, round)
+}
+
+/// Create Tenderbake attestation data in `scheme`'s own layout for `chain_id`.
+#[must_use]
+pub fn create_attestation_data_for_chain(
+    scheme: Scheme,
+    chain_id: &[u8; 4],
+    level: u32,
+    round: u32,
+) -> Vec<u8> {
+    consensus_body(0x13, 0x15, scheme, *chain_id, level, round)
+}
+
+/// Create Tenderbake preattestation data in `scheme`'s own layout.
+#[must_use]
+pub fn create_preattestation_data_for(scheme: Scheme, level: u32, round: u32) -> Vec<u8> {
+    consensus_body(0x12, 0x14, scheme, [0, 0, 0, 1], level, round)
+}
+
+/// The attestation and preattestation body both schemes are signed over.
+///
+/// The 2-byte committee slot sits between the kind byte and the level for every
+/// scheme but BLS (`src/bin_signer/handler.ml:99-105`), so the layout is built
+/// once here rather than once per operation kind.
+fn consensus_body(
+    magic: u8,
+    kind: u8,
+    scheme: Scheme,
+    chain_id: [u8; 4],
+    level: u32,
+    round: u32,
+) -> Vec<u8> {
+    let mut data = vec![magic];
+    data.extend_from_slice(&chain_id);
+    data.extend_from_slice(&[0u8; 32]); // branch
+    data.push(kind);
+    if scheme != Scheme::Bls {
+        data.extend_from_slice(&[0u8; 2]); // committee slot
+    }
+    data.extend_from_slice(&level.to_be_bytes());
+    data.extend_from_slice(&round.to_be_bytes());
     data
 }
 
@@ -100,13 +144,7 @@ pub fn create_preattestation_data_with_chain(
     level: u32,
     round: u32,
 ) -> Vec<u8> {
-    let mut data = vec![0x12]; // Preattestation magic byte
-    data.extend_from_slice(chain_id); // chain_id (4 bytes)
-    data.extend_from_slice(&[0u8; 32]); // branch (32 bytes)
-    data.push(0x14); // kind byte for preattestation
-    data.extend_from_slice(&level.to_be_bytes()); // level (4 bytes)
-    data.extend_from_slice(&round.to_be_bytes()); // round (4 bytes)
-    data
+    consensus_body(0x12, 0x14, Scheme::Bls, *chain_id, level, round)
 }
 
 /// Create a `ChainId` from 4-byte chain identifier
@@ -143,6 +181,25 @@ pub fn ghostnet_chain_id() -> ChainId {
     create_chain_id(&GHOSTNET_CHAIN_ID)
 }
 
+/// Seeded BLS key material, as the scheme-level types every caller handles.
+///
+/// Reads the values off a signer rather than deriving them again, so the hash a
+/// test compares against is the one the signer answers requests under.
+///
+/// # Errors
+///
+/// Returns an error if BLS key generation fails.
+pub fn generate_key(
+    seed: Option<&[u8; 32]>,
+) -> crate::signer::Result<(PublicKeyHash, PublicKey, SecretKey)> {
+    let signer = crate::signer::Unencrypted::generate(seed)?;
+    Ok((
+        *signer.public_key_hash(),
+        signer.public_key().clone(),
+        signer.secret_key().clone(),
+    ))
+}
+
 /// Deterministic per-key MAC key for tests.
 ///
 /// A fixed function of the pkh so seeding and loading agree; not the production
@@ -152,19 +209,54 @@ pub fn test_mac_key(pkh: &PublicKeyHash) -> [u8; 32] {
     *blake3::keyed_hash(&[0xAB; 32], pkh.to_bytes()).as_bytes()
 }
 
-/// Build the per-key MAC key map for the given keys.
-#[must_use]
-pub fn test_mac_keys(pkhs: &[PublicKeyHash]) -> HashMap<PublicKeyHash, [u8; 32]> {
-    pkhs.iter().map(|p| (*p, test_mac_key(p))).collect()
+/// Construct a `HighWatermark` over keys of both schemes on the default chain,
+/// each carrying the epochs it spends — `None` under a scheme that spends none.
+///
+/// # Errors
+///
+/// Returns an error if loading the watermark or epoch records fails.
+pub fn new_mixed_watermark(
+    base_dir: &Path,
+    keys: &[(PublicKeyHash, Option<RangeInclusive<Epoch>>)],
+) -> std::io::Result<HighWatermark> {
+    let pkhs: Vec<PublicKeyHash> = keys.iter().map(|(pkh, _)| *pkh).collect();
+    let params: HashMap<PublicKeyHash, MarkParams> = keys
+        .iter()
+        .map(|(pkh, epochs)| {
+            (
+                *pkh,
+                MarkParams {
+                    mac_key: test_mac_key(pkh),
+                    epochs: epochs.clone(),
+                },
+            )
+        })
+        .collect();
+    HighWatermark::new(base_dir, &pkhs, params, default_test_chain_id())
 }
 
-/// Construct a `HighWatermark` with the shared test MAC keys and default chain.
+/// Construct a `HighWatermark` for keys that spend no epochs.
 ///
 /// # Errors
 ///
 /// Returns an error if loading watermark files fails.
 pub fn new_watermark(base_dir: &Path, pkhs: &[PublicKeyHash]) -> std::io::Result<HighWatermark> {
-    HighWatermark::new(base_dir, pkhs, test_mac_keys(pkhs), default_test_chain_id())
+    let keys: Vec<_> = pkhs.iter().map(|pkh| (*pkh, None)).collect();
+    new_mixed_watermark(base_dir, &keys)
+}
+
+/// Construct a `HighWatermark` in which `pkh` spends one epoch of `epochs` per
+/// signature, as a tz6 key does.
+///
+/// # Errors
+///
+/// Returns an error if loading the watermark or epoch records fails.
+pub fn new_epoch_watermark(
+    base_dir: &Path,
+    pkh: &PublicKeyHash,
+    epochs: RangeInclusive<Epoch>,
+) -> std::io::Result<HighWatermark> {
+    new_mixed_watermark(base_dir, &[(*pkh, Some(epochs))])
 }
 
 /// Pre-initialize watermark files, panicking on I/O failure.
@@ -283,6 +375,21 @@ mod tests {
         // Round
         let round = u32::from_be_bytes([data[42], data[43], data[44], data[45]]);
         assert_eq!(round, 2);
+    }
+
+    /// An attestation of any scheme but BLS carries the committee slot between
+    /// the kind byte and the level, on the chain it was built for.
+    #[test]
+    fn an_xmss_attestation_for_a_chain_carries_its_slot() {
+        let data = create_attestation_data_for_chain(Scheme::Xmss, &[9, 8, 7, 6], 100, 5);
+
+        assert_eq!(data[0], 0x13);
+        assert_eq!(data[1..5], [9, 8, 7, 6]);
+        assert_eq!(data[37], 0x15);
+        assert_eq!(data[38..40], [0, 0]);
+        assert_eq!(u32::from_be_bytes(data[40..44].try_into().unwrap()), 100);
+        assert_eq!(u32::from_be_bytes(data[44..48].try_into().unwrap()), 5);
+        assert_eq!(data.len(), 48);
     }
 
     #[test]

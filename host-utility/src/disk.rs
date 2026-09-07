@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use russignol_signer_lib::KeyManager;
-use russignol_signer_lib::KeyRole;
 use russignol_signer_lib::server::LARGE_GAP_CYCLES;
+use russignol_signer_lib::{DeviceKey, KeyRole};
 use russignol_storage::watermark;
 
 use crate::card_fs::{self, CHAIN_INFO_MODE, DEVICE_GID, DEVICE_UID};
@@ -122,6 +122,19 @@ pub struct BootConfigState {
     pub level: u32,
 }
 
+/// What the boot partition holds for the device's next boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootConfig {
+    /// No `watermark-config.json` is staged.
+    Absent,
+    /// The boot partition would not mount, so whether one is staged is unknown.
+    Uninspected,
+    /// A `watermark-config.json` is staged that will not read.
+    Unreadable,
+    /// A `watermark-config.json` the device consumes on its next boot.
+    Staged(BootConfigState),
+}
+
 /// Outcome of trying to inspect the f2fs partitions (p3/p4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inspection {
@@ -151,7 +164,7 @@ pub struct CardState {
     pub panic_log_size: Option<u64>,
 
     // p1 boot
-    pub boot_config: Option<BootConfigState>,
+    pub boot_config: BootConfig,
 }
 
 // =============================================================================
@@ -227,6 +240,8 @@ pub enum IssueKind {
     ChainInfoModeDrift,
     OwnershipDrift,
     LeftoverBootConfig,
+    BootConfigUnreadable,
+    BootNotInspected,
     LogsDirMissing,
     PanicLogOversized,
 }
@@ -326,8 +341,10 @@ pub fn classify(state: &CardState, node: Option<&ChainInfo>) -> Vec<Issue> {
         // but with a node a boot config can be staged for the device to apply on
         // its next boot. A failed mount is a card fault to investigate, not a
         // case for a blind staged config, so this is offered only when the host
-        // simply lacks f2fs support.
+        // simply lacks f2fs support, and only where the boot partition mounted,
+        // since the stage writes it.
         if state.inspection == Inspection::NotCapable
+            && state.boot_config != BootConfig::Uninspected
             && let Some(n) = node
         {
             issues.push(Issue {
@@ -376,8 +393,13 @@ pub fn classify(state: &CardState, node: Option<&ChainInfo>) -> Vec<Issue> {
         // A card that has never completed first-boot setup and has no seed staged
         // cannot establish an authenticated watermark floor on its own; stage a boot
         // config so the device seeds one. A seed already present is classified by
-        // `classify_boot_config`, so gate on its absence to avoid double-counting.
-        if state.boot_config.is_none() {
+        // `classify_boot_config`, so gate on its absence to avoid double-counting;
+        // one that will not read seeds nothing, and the config staged here
+        // supersedes deleting it in `plan_repairs`.
+        if matches!(
+            state.boot_config,
+            BootConfig::Absent | BootConfig::Unreadable
+        ) {
             let remedy = if node.is_some() {
                 Remedy::FatStage
             } else {
@@ -415,8 +437,37 @@ pub fn classify(state: &CardState, node: Option<&ChainInfo>) -> Vec<Issue> {
 }
 
 fn classify_boot_config(state: &CardState, node: Option<&ChainInfo>, issues: &mut Vec<Issue>) {
-    let Some(bc) = &state.boot_config else {
-        return;
+    let bc = match &state.boot_config {
+        BootConfig::Absent => return,
+        BootConfig::Uninspected => {
+            issues.push(Issue {
+                kind: IssueKind::BootNotInspected,
+                severity: Severity::Warning,
+                partition: Partition::Boot,
+                remedy: Remedy::Manual,
+                action: None,
+                message: "the boot partition could not be mounted, so whether a \
+                          watermark-config.json is staged is unknown; check that the \
+                          card is readable"
+                    .to_string(),
+            });
+            return;
+        }
+        BootConfig::Unreadable => {
+            issues.push(Issue {
+                kind: IssueKind::BootConfigUnreadable,
+                severity: Severity::Warning,
+                partition: Partition::Boot,
+                remedy: Remedy::HostDirect,
+                action: Some(RepairAction::DeleteBootConfig),
+                message: "a staged watermark-config.json will not read, so the device \
+                          cannot consume it and the floor it was meant to seed never \
+                          lands; it can be deleted"
+                    .to_string(),
+            });
+            return;
+        }
+        BootConfig::Staged(bc) => bc,
     };
     let stale_delete = |message: String| Issue {
         kind: IssueKind::LeftoverBootConfig,
@@ -493,9 +544,17 @@ fn classify_keys(state: &CardState, issues: &mut Vec<Issue>) {
             message: "public_key_hashs is present but could not be parsed or is empty".to_string(),
         }),
         KeysState::Parsed { aliases, .. } => {
+            // Resolved rather than compared: a card provisioned before the
+            // scheme suffix carries the bare role words, and reporting each of
+            // its keys missing sends the operator to restore an intact card.
+            let held: Vec<DeviceKey> = aliases
+                .iter()
+                .filter_map(|a| DeviceKey::from_device_alias(a))
+                .collect();
             for role in KeyRole::ALL {
-                let alias = role.device_alias();
-                if !aliases.iter().any(|a| a == alias) {
+                let key = DeviceKey::Bls(role);
+                if !held.contains(&key) {
+                    let alias = key.device_alias();
                     issues.push(Issue {
                         kind: IssueKind::KeysRoleMissing,
                         severity: Severity::Warning,
@@ -622,12 +681,13 @@ fn classify_chain_info(state: &CardState, node: Option<&ChainInfo>, issues: &mut
 /// but only for the chain the config targets, so a config whose chain differs
 /// from the node's (the stale case `classify_boot_config` flags for deletion)
 /// does not cover it. With no node the staged config is taken at face value,
-/// matching the never-booted path's `boot_config.is_none()` gate above.
+/// matching the gate in `classify` that raises `WatermarkSeedMissing`, which
+/// stages a config only where none that reads is staged.
 fn staged_config_seeds_watermarks(state: &CardState, node: Option<&ChainInfo>) -> bool {
     match (&state.boot_config, node) {
-        (Some(bc), Some(n)) => n.id == bc.chain_id,
-        (Some(_), None) => true,
-        (None, _) => false,
+        (BootConfig::Staged(bc), Some(n)) => n.id == bc.chain_id,
+        (BootConfig::Staged(_), None) => true,
+        (BootConfig::Absent | BootConfig::Uninspected | BootConfig::Unreadable, _) => false,
     }
 }
 
@@ -864,7 +924,7 @@ fn inspection_from_failed_mount(f2fs_registered: bool) -> Inspection {
 /// Placeholder state used when the f2fs partitions cannot be read; only
 /// `inspection` and `boot_config` are meaningful, and the classifier reads
 /// nothing else once `inspection` is not `Inspected`.
-fn uninspected_state(inspection: Inspection, boot_config: Option<BootConfigState>) -> CardState {
+fn uninspected_state(inspection: Inspection, boot_config: BootConfig) -> CardState {
     CardState {
         inspection,
         setup_complete: false,
@@ -923,15 +983,23 @@ fn gather_card_state(device: &Path) -> CardState {
     }
 }
 
-/// Read an un-consumed `watermark-config.json` off the boot partition. Absent or
-/// unreadable both resolve to `None` (absent is the healthy case).
-fn gather_boot_config(device: &Path) -> Option<BootConfigState> {
-    crate::watermark::read_watermark_config(device)
-        .ok()
-        .map(|wc| BootConfigState {
+fn gather_boot_config(device: &Path) -> BootConfig {
+    use crate::watermark::StagedConfig;
+    match crate::watermark::read_watermark_config(device) {
+        Ok(StagedConfig::Absent) => BootConfig::Absent,
+        Ok(StagedConfig::Present(wc)) => BootConfig::Staged(BootConfigState {
             chain_id: wc.chain.id,
             level: wc.chain.level,
-        })
+        }),
+        Ok(StagedConfig::Unreadable(e)) => {
+            warning(&format!("{e:#}"));
+            BootConfig::Unreadable
+        }
+        Err(e) => {
+            warning(&format!("{e:#}"));
+            BootConfig::Uninspected
+        }
+    }
 }
 
 fn gather_keys_partition(device: &Path) -> Result<KeysPartitionState> {
@@ -961,31 +1029,44 @@ fn read_keys_state(mount: &Path) -> KeysState {
     }
     // Single parser for the OCaml `{name,value}` key files (invariant: keys are
     // never re-parsed elsewhere).
-    let loaded = KeyManager::new(Some(mount.to_path_buf())).load_keys();
+    // A file that will not read is a card whose keys are unreachable rather
+    // than a card without any, and the report has one reading for both.
+    let Ok(loaded) = KeyManager::new(Some(mount.to_path_buf())).load_keys() else {
+        return KeysState::Unparseable;
+    };
     if loaded.is_empty() {
         return KeysState::Unparseable;
     }
-    let (aliases, pkhs) = order_card_keys(
-        loaded
-            .into_iter()
-            .map(|(alias, key)| (alias, key.public_key_hash)),
-    );
+    let (aliases, pkhs) = order_card_keys(loaded.into_iter().map(|(alias, key)| CardKey {
+        alias,
+        address: key.public_key_hash,
+    }));
     KeysState::Parsed { aliases, pkhs }
 }
 
+/// One key as a card's wallet files name it. Both halves are base58 text, so
+/// naming them is what keeps a caller from filing an address as a name.
+#[derive(Clone)]
+struct CardKey {
+    alias: String,
+    address: String,
+}
+
 /// Split card keys into index-correlated alias and pkh columns, ordered the way
-/// the device itself lists them: roles in [`KeyRole::ALL`] order, then any other
-/// alias sorted. `load_keys` hands back a `HashMap`, so without this the report
-/// would reorder between runs on identical cards.
-fn order_card_keys(keys: impl Iterator<Item = (String, String)>) -> (Vec<String>, Vec<String>) {
-    let mut entries: Vec<(String, String)> = keys.collect();
-    entries.sort_by_cached_key(|(alias, _)| {
-        KeyRole::from_device_alias(alias).map_or_else(
-            || (KeyRole::COUNT, alias.clone()),
-            |role| (role.index(), String::new()),
-        )
-    });
-    entries.into_iter().unzip()
+/// the device itself lists them: the keys in [`DeviceKey::ALL`] order, then any
+/// other alias sorted. `load_keys` hands back a `HashMap`, so without this the
+/// report would reorder between runs on identical cards.
+///
+/// Two spellings of one role share a slot, and the lower address takes it
+/// first — the same tie-break `list_keys()` uses to decide which of them it
+/// serves there, so the report names them in the order the device does.
+fn order_card_keys(keys: impl Iterator<Item = CardKey>) -> (Vec<String>, Vec<String>) {
+    let mut entries: Vec<CardKey> = keys.collect();
+    entries.sort_by_cached_key(|key| DeviceKey::slot_order(&key.alias, &key.address));
+    entries
+        .into_iter()
+        .map(|key| (key.alias, key.address))
+        .unzip()
 }
 
 fn read_chain_info_state(mount: &Path) -> ChainInfoState {
@@ -1206,7 +1287,7 @@ fn describe_action(action: &RepairAction) -> String {
         }
         RepairAction::TruncatePanicLog => "truncate the oversized panic.log".to_string(),
         RepairAction::DeleteBootConfig => {
-            "delete the stale watermark-config.json from the boot partition".to_string()
+            "delete the watermark-config.json from the boot partition".to_string()
         }
         RepairAction::StageBootConfig(chain_info) => format!(
             "stage a watermark-config.json so the device configures watermarks and \
@@ -1386,7 +1467,7 @@ fn apply_action(mount: &Path, node: Option<&ChainInfo>, action: &RepairAction) -
             let cfg = mount.join(crate::watermark::CONFIG_FILENAME);
             std::fs::remove_file(&cfg)
                 .with_context(|| format!("failed to delete {}", cfg.display()))?;
-            success("Deleted the stale watermark-config.json");
+            success("Deleted the watermark-config.json");
         }
         // Staging self-mounts the boot partition, so `execute_repairs` applies it
         // outside the mount loop and it never reaches here.
@@ -1409,7 +1490,10 @@ fn apply_action(mount: &Path, node: Option<&ChainInfo>, action: &RepairAction) -
 fn card_target_chain_id(state: &CardState) -> Option<&str> {
     match &state.chain_info {
         ChainInfoState::Present { id, .. } => Some(id.as_str()),
-        _ => state.boot_config.as_ref().map(|bc| bc.chain_id.as_str()),
+        _ => match &state.boot_config {
+            BootConfig::Staged(bc) => Some(bc.chain_id.as_str()),
+            BootConfig::Absent | BootConfig::Uninspected | BootConfig::Unreadable => None,
+        },
     }
 }
 
@@ -1682,7 +1766,7 @@ mod tests {
             keys: KeysState::Parsed {
                 aliases: KeyRole::ALL
                     .iter()
-                    .map(|r| r.device_alias().to_string())
+                    .map(|r| DeviceKey::Bls(*r).device_alias().to_string())
                     .collect(),
                 pkhs: vec![CONSENSUS_PKH.to_string(), COMPANION_PKH.to_string()],
             },
@@ -1697,7 +1781,7 @@ mod tests {
             ],
             logs_dir_present: true,
             panic_log_size: Some(1024),
-            boot_config: None,
+            boot_config: BootConfig::Absent,
         }
     }
 
@@ -1762,7 +1846,7 @@ mod tests {
             key.dir_owner = None;
             key.files.clear();
         }
-        state.boot_config = Some(BootConfigState {
+        state.boot_config = BootConfig::Staged(BootConfigState {
             chain_id: n.id.clone(),
             level: n.level,
         });
@@ -1794,7 +1878,7 @@ mod tests {
             key.dir_owner = None;
             key.files.clear();
         }
-        state.boot_config = Some(BootConfigState {
+        state.boot_config = BootConfig::Staged(BootConfigState {
             chain_id: "NetXmainnet".to_string(),
             level: 1_000,
         });
@@ -1810,7 +1894,7 @@ mod tests {
         let mut state = healthy_state();
         state.watermarks[0].dir_present = false;
         state.watermarks[0].files.clear();
-        state.boot_config = Some(BootConfigState {
+        state.boot_config = BootConfig::Staged(BootConfigState {
             chain_id: "NetXold".to_string(),
             level: 1,
         });
@@ -1987,7 +2071,7 @@ mod tests {
         state.keys = KeysState::Missing;
         state.chain_info = ChainInfoState::Missing;
         state.watermarks.clear();
-        state.boot_config = None;
+        state.boot_config = BootConfig::Absent;
         state
     }
 
@@ -2018,7 +2102,7 @@ mod tests {
         // A seed already staged is handled by the boot-config classifier; the
         // seed-missing finding must not double-count it.
         let mut state = uninitialized_state();
-        state.boot_config = Some(BootConfigState {
+        state.boot_config = BootConfig::Staged(BootConfigState {
             chain_id: "NetXmainnet".to_string(),
             level: 1_000,
         });
@@ -2051,13 +2135,25 @@ mod tests {
     /// order comes from the role, not from `load_keys`' `HashMap`.
     #[test]
     fn order_card_keys_is_role_order_then_sorted_extras() {
-        let consensus = KeyRole::Consensus.device_alias();
-        let companion = KeyRole::Companion.device_alias();
+        let consensus = DeviceKey::Bls(KeyRole::Consensus).device_alias();
+        let companion = DeviceKey::Bls(KeyRole::Companion).device_alias();
         let input = vec![
-            ("zeta".to_string(), "tz4zeta".to_string()),
-            (companion.to_string(), COMPANION_PKH.to_string()),
-            ("alpha".to_string(), "tz4alpha".to_string()),
-            (consensus.to_string(), CONSENSUS_PKH.to_string()),
+            CardKey {
+                alias: "zeta".to_string(),
+                address: "tz4zeta".to_string(),
+            },
+            CardKey {
+                alias: companion.to_string(),
+                address: COMPANION_PKH.to_string(),
+            },
+            CardKey {
+                alias: "alpha".to_string(),
+                address: "tz4alpha".to_string(),
+            },
+            CardKey {
+                alias: consensus.to_string(),
+                address: CONSENSUS_PKH.to_string(),
+            },
         ];
 
         let (aliases, pkhs) = order_card_keys(input.clone().into_iter());
@@ -2073,18 +2169,133 @@ mod tests {
         assert_eq!(order_card_keys(reversed.into_iter()), (aliases, pkhs));
     }
 
+    /// The tz6 key is one of the card's own keys, so it reports in its own slot
+    /// rather than among the aliases the card happens also to carry: an "alpha"
+    /// sorts above it and takes that slot otherwise.
+    #[test]
+    fn order_card_keys_gives_the_tz6_key_its_own_slot() {
+        let xmss = DeviceKey::XmssConsensus.device_alias();
+        let input = vec![
+            CardKey {
+                alias: "alpha".to_string(),
+                address: "tz4alpha".to_string(),
+            },
+            CardKey {
+                alias: xmss.to_string(),
+                address: "tz6consensus".to_string(),
+            },
+            CardKey {
+                alias: DeviceKey::Bls(KeyRole::Consensus)
+                    .device_alias()
+                    .to_string(),
+                address: CONSENSUS_PKH.to_string(),
+            },
+            CardKey {
+                alias: DeviceKey::Bls(KeyRole::Companion)
+                    .device_alias()
+                    .to_string(),
+                address: COMPANION_PKH.to_string(),
+            },
+        ];
+
+        let (aliases, pkhs) = order_card_keys(input.into_iter());
+
+        let expected: Vec<&str> = DeviceKey::ALL
+            .iter()
+            .map(|k| k.device_alias())
+            .chain(std::iter::once("alpha"))
+            .collect();
+        assert_eq!(aliases, expected);
+        assert_eq!(
+            pkhs,
+            vec![CONSENSUS_PKH, COMPANION_PKH, "tz6consensus", "tz4alpha"]
+        );
+    }
+
+    /// Two spellings of one role put two keys in one slot, and which of them
+    /// the report lists first comes from the addresses rather than from the
+    /// order `load_keys` happened to yield: the lower address is the one
+    /// `list_keys()` serves in that slot, so the report agrees with the device.
+    #[test]
+    fn order_card_keys_breaks_a_shared_slot_by_address() {
+        let listed = |input: Vec<CardKey>| order_card_keys(input.into_iter()).1;
+        let card = |alias: &str, address: &str| CardKey {
+            alias: alias.to_string(),
+            address: address.to_string(),
+        };
+        let (low, high) = ("tz4aaaaaaaaaaaaaaaaaaaaaaaa", "tz4zzzzzzzzzzzzzzzzzzzzzzzz");
+
+        let expected = vec![low.to_string(), high.to_string()];
+        assert_eq!(
+            listed(vec![card("consensus", low), card("consensus_tz4", high)]),
+            expected
+        );
+        assert_eq!(
+            listed(vec![card("consensus_tz4", high), card("consensus", low)]),
+            expected
+        );
+    }
+
+    /// A card provisioned before the scheme suffix is a card the host reads
+    /// today, so its keys report in their own slots rather than among the
+    /// aliases it happens also to carry.
+    #[test]
+    fn order_card_keys_gives_a_pre_suffix_card_its_slots() {
+        let input = vec![
+            CardKey {
+                alias: "alpha".to_string(),
+                address: "tz4alpha".to_string(),
+            },
+            CardKey {
+                alias: "companion".to_string(),
+                address: COMPANION_PKH.to_string(),
+            },
+            CardKey {
+                alias: "consensus".to_string(),
+                address: CONSENSUS_PKH.to_string(),
+            },
+        ];
+
+        let (aliases, pkhs) = order_card_keys(input.into_iter());
+
+        assert_eq!(aliases, vec!["consensus", "companion", "alpha"]);
+        assert_eq!(pkhs, vec![CONSENSUS_PKH, COMPANION_PKH, "tz4alpha"]);
+    }
+
+    /// Every card in the field carries the pre-suffix spellings until it is
+    /// migrated, and a doctor that calls each of its keys missing tells the
+    /// operator to restore a card that is intact.
+    #[test]
+    fn a_pre_suffix_card_is_not_a_card_missing_its_keys() {
+        let mut state = healthy_state();
+        state.keys = KeysState::Parsed {
+            aliases: vec!["consensus".to_string(), "companion".to_string()],
+            pkhs: vec![CONSENSUS_PKH.to_string(), COMPANION_PKH.to_string()],
+        };
+        let issues = classify(&state, Some(&node()));
+        assert!(find(&issues, IssueKind::KeysRoleMissing).is_none());
+    }
+
     #[test]
     fn missing_key_role_reported() {
         let mut state = healthy_state();
         state.keys = KeysState::Parsed {
-            aliases: vec![KeyRole::Consensus.device_alias().to_string()],
+            aliases: vec![
+                DeviceKey::Bls(KeyRole::Consensus)
+                    .device_alias()
+                    .to_string(),
+            ],
             pkhs: vec![CONSENSUS_PKH.to_string()],
         };
         // Only the consensus key's watermarks remain, so drop the companion set.
         state.watermarks.truncate(1);
         let issues = classify(&state, Some(&node()));
         let issue = find(&issues, IssueKind::KeysRoleMissing).expect("role-missing issue");
-        assert!(issue.message.contains(KeyRole::Companion.device_alias()));
+        assert!(
+            issue
+                .message
+                .contains(DeviceKey::Bls(KeyRole::Companion).device_alias())
+        );
     }
 
     #[test]
@@ -2101,7 +2312,7 @@ mod tests {
     fn f2fs_not_inspected_skips_partition_content() {
         let mut state = healthy_state();
         state.inspection = Inspection::NotCapable;
-        state.boot_config = Some(BootConfigState {
+        state.boot_config = BootConfig::Staged(BootConfigState {
             chain_id: "NetXmainnet".to_string(),
             level: 1_000,
         });
@@ -2130,7 +2341,7 @@ mod tests {
     #[test]
     fn leftover_boot_config_stale_when_chain_differs() {
         let mut state = healthy_state();
-        state.boot_config = Some(BootConfigState {
+        state.boot_config = BootConfig::Staged(BootConfigState {
             chain_id: "NetXold".to_string(),
             level: 900,
         });
@@ -2146,7 +2357,7 @@ mod tests {
         // A config above the card's floor still has work to do on the next boot
         // (it raises the floor), so it is left in place.
         let mut state = healthy_state();
-        state.boot_config = Some(BootConfigState {
+        state.boot_config = BootConfig::Staged(BootConfigState {
             chain_id: "NetXmainnet".to_string(),
             level: 1_001, // above the card's 1_000 floor
         });
@@ -2162,7 +2373,7 @@ mod tests {
         // Chain current, chain_info healthy, and every floor already at or above
         // the config level: consuming it would do nothing, so offer to delete it.
         let mut state = healthy_state();
-        state.boot_config = Some(BootConfigState {
+        state.boot_config = BootConfig::Staged(BootConfigState {
             chain_id: "NetXmainnet".to_string(),
             level: 1_000, // at the card's 1_000 floor
         });
@@ -2179,7 +2390,7 @@ mod tests {
         // would still repair chain_info on boot, so it must not be deleted.
         let mut state = healthy_state();
         state.chain_info = ChainInfoState::Missing;
-        state.boot_config = Some(BootConfigState {
+        state.boot_config = BootConfig::Staged(BootConfigState {
             chain_id: "NetXmainnet".to_string(),
             level: 1_000,
         });
@@ -2187,6 +2398,45 @@ mod tests {
         let issue = find(&issues, IssueKind::LeftoverBootConfig).expect("boot-config issue");
         assert_eq!(issue.severity, Severity::Info);
         assert!(issue.action.is_none());
+    }
+
+    /// A staged config that will not read is never consumed, so the floor it
+    /// was meant to seed never lands: it is flagged for deletion rather than
+    /// read as the healthy absence of one.
+    #[test]
+    fn an_unreadable_boot_config_is_flagged_for_deletion() {
+        let mut state = healthy_state();
+        state.boot_config = BootConfig::Unreadable;
+        let issues = classify(&state, Some(&node()));
+        let issue =
+            find(&issues, IssueKind::BootConfigUnreadable).expect("unreadable-config issue");
+        assert_eq!(issue.severity, Severity::Warning);
+        assert_eq!(issue.action, Some(RepairAction::DeleteBootConfig));
+    }
+
+    /// A never-booted card whose staged config will not read is still owed a
+    /// floor, and the plan stages a fresh config in place of deleting alone.
+    #[test]
+    fn an_unreadable_boot_config_on_a_new_card_is_replaced() {
+        let mut state = uninitialized_state();
+        state.boot_config = BootConfig::Unreadable;
+        let issues = classify(&state, Some(&node()));
+        assert!(find(&issues, IssueKind::WatermarkSeedMissing).is_some());
+        assert_eq!(
+            plan_repairs(&issues),
+            vec![RepairAction::StageBootConfig(node())]
+        );
+    }
+
+    /// A boot partition that would not mount leaves the staged config unknown:
+    /// the report says so, and nothing that would write it is planned.
+    #[test]
+    fn an_unmounted_boot_partition_is_reported_and_left_alone() {
+        let state = uninspected_state(Inspection::NotCapable, BootConfig::Uninspected);
+        let issues = classify(&state, Some(&node()));
+        assert!(find(&issues, IssueKind::BootNotInspected).is_some());
+        assert!(find(&issues, IssueKind::FatStageAvailable).is_none());
+        assert!(plan_repairs(&issues).is_empty());
     }
 
     #[test]
@@ -2351,7 +2601,7 @@ mod tests {
             key.files.clear();
         }
         state.logs_dir_present = false;
-        state.boot_config = Some(BootConfigState {
+        state.boot_config = BootConfig::Staged(BootConfigState {
             chain_id: n.id.clone(),
             level: n.level,
         });
@@ -2403,7 +2653,7 @@ mod tests {
             mode: Some(CHAIN_INFO_MODE),
             owner: Some((DEVICE_UID, DEVICE_GID)),
         };
-        state.boot_config = Some(BootConfigState {
+        state.boot_config = BootConfig::Staged(BootConfigState {
             chain_id: "NetXstaged".to_string(),
             level: 1,
         });
@@ -2414,7 +2664,7 @@ mod tests {
     fn card_chain_falls_back_to_boot_config_when_keys_unreadable() {
         let mut state = uninspected_state(
             Inspection::Failed,
-            Some(BootConfigState {
+            BootConfig::Staged(BootConfigState {
                 chain_id: network::MAINNET_CHAIN_ID.to_string(),
                 level: 1,
             }),
@@ -2428,7 +2678,7 @@ mod tests {
 
     #[test]
     fn card_chain_is_none_when_the_card_names_none() {
-        let state = uninspected_state(Inspection::Failed, None);
+        let state = uninspected_state(Inspection::Failed, BootConfig::Absent);
         assert_eq!(card_target_chain_id(&state), None);
     }
 
@@ -2559,14 +2809,14 @@ mod tests {
             owner: Some((0, 0)),
         };
         inspected.panic_log_size = Some(PANIC_LOG_MAX_BYTES + 1);
-        inspected.boot_config = Some(BootConfigState {
+        inspected.boot_config = BootConfig::Staged(BootConfigState {
             chain_id: "NetXold".to_string(),
             level: 1,
         });
         inspected.migration_pending = true;
 
         // The FAT-stage path is the other action-carrying remedy.
-        let not_capable = uninspected_state(Inspection::NotCapable, None);
+        let not_capable = uninspected_state(Inspection::NotCapable, BootConfig::Absent);
 
         let issues: Vec<Issue> = classify(&inspected, Some(&node()))
             .into_iter()
@@ -2587,7 +2837,7 @@ mod tests {
 
     #[test]
     fn fat_stage_offered_when_f2fs_not_capable_with_node() {
-        let state = uninspected_state(Inspection::NotCapable, None);
+        let state = uninspected_state(Inspection::NotCapable, BootConfig::Absent);
         let issues = classify(&state, Some(&node()));
         let issue = find(&issues, IssueKind::FatStageAvailable).expect("fat-stage issue");
         assert_eq!(issue.remedy, Remedy::FatStage);
@@ -2601,7 +2851,7 @@ mod tests {
 
     #[test]
     fn fat_stage_not_offered_without_a_node() {
-        let state = uninspected_state(Inspection::NotCapable, None);
+        let state = uninspected_state(Inspection::NotCapable, BootConfig::Absent);
         let issues = classify(&state, None);
         assert!(find(&issues, IssueKind::FatStageAvailable).is_none());
         assert!(
@@ -2625,7 +2875,7 @@ mod tests {
     fn fat_stage_not_offered_when_mount_failed() {
         // A capable host whose mount failed is a card or permission fault to
         // investigate, not a case for a blind staged config.
-        let state = uninspected_state(Inspection::Failed, None);
+        let state = uninspected_state(Inspection::Failed, BootConfig::Absent);
         let issues = classify(&state, Some(&node()));
         assert!(find(&issues, IssueKind::FatStageAvailable).is_none());
     }
@@ -2634,7 +2884,7 @@ mod tests {
     fn plan_stage_supersedes_delete_of_a_stale_boot_config() {
         let state = uninspected_state(
             Inspection::NotCapable,
-            Some(BootConfigState {
+            BootConfig::Staged(BootConfigState {
                 chain_id: "NetXold".to_string(),
                 level: 1,
             }),

@@ -8,12 +8,11 @@
 # - p3 (keys): Created at first boot, holds encrypted keys (becomes RO after key gen)
 # - p4 (data): Created at first boot, holds watermarks and logs
 #
-# IMPORTANT: This file is for the HARDENED build only.
-# The DEV build uses SysV init scripts instead:
-#   - rootfs-overlay-dev/etc/init.d/S20russignol
-#   - rootfs-overlay-dev/etc/fstab
-# If you change partition layout, paths, or startup logic here,
-# you MUST also update the dev init scripts to match.
+# This file is the HARDENED build's. The DEV build boots through SysV init,
+# rootfs-overlay-dev/etc/init.d/S20russignol with rootfs-overlay-dev/etc/fstab,
+# which encode the same partition layout, paths and startup contract, with no
+# source shared between the two, so the pair agree only for as long as each
+# change lands in both.
 #
 
 # ==============================================================================
@@ -83,6 +82,12 @@ DATA_MOUNT="/data"
 
 # Setup marker lives on keys partition (survives data partition corruption)
 SETUP_MARKER="${KEYS_MOUNT}/.setup_complete"
+# An operator's request to provision one key, staged on the data partition
+# because nothing past unlock can write the keys partition. Its presence makes
+# this boot a privileged one. The path is a cross-language contract with the
+# signer (rpi-signer/src/constants.rs PROVISION_REQUEST_FILE), like
+# EXIT_CODE_REBOOT.
+PROVISION_REQUEST="${DATA_MOUNT}/provision-request"
 
 R_USER="russignol"
 # inline_data/inline_dentry: store small files in inode (reduces write amplification)
@@ -96,6 +101,15 @@ BOOT_PROBE_MOUNT="/tmp/boot-config-probe"
 WATERMARK_CONFIG="watermark-config.json"
 FLASH_MANIFEST_FILE="flash-manifest.json"
 
+# The boot partition's failure to mount, as the sentence the signer halts on
+# before it draws the PIN page; empty where it mounted. The keys and data
+# partitions need no such record: check_boot_mounts in
+# rpi-signer/src/storage.rs reads their state off /proc/mounts, where a probe
+# mount unmounted again leaves nothing. Its env-var name is a cross-language
+# contract with the signer (rpi-signer/src/constants.rs BOOT_FAULT_ENV), like
+# EXIT_CODE_REBOOT.
+BOOT_FAULT=""
+
 # Check if partition exists in kernel (created at first boot)
 partition_exists() {
     [ -e "/sys/block/mmcblk0/mmcblk0p$1" ]
@@ -108,30 +122,33 @@ needs_migration() {
     [ -f "${KEYS_MOUNT}/secret_keys.enc" ]
 }
 
-# Returns success when a watermark-config.json is staged on the vfat boot
-# partition. Probes with a throwaway read-only mount so the keys-mount and
-# app-supervisor decisions below can keep /keys rw and run the signer as root,
-# letting it write chain_info.json and remount ro before demoting in-process.
-# Pipe-free (see init_signals): no `|` in this PID 1.
-config_pending() {
-    mkdir -p "${BOOT_PROBE_MOUNT}"
-    mount -t vfat -o ro "${BOOT_PART}" "${BOOT_PROBE_MOUNT}" 2>/dev/null || return 1
-    pending=1
-    [ -f "${BOOT_PROBE_MOUNT}/${WATERMARK_CONFIG}" ] && pending=0
-    umount "${BOOT_PROBE_MOUNT}" 2>/dev/null
-    rmdir "${BOOT_PROBE_MOUNT}" 2>/dev/null
-    return "$pending"
+# Returns success when an operator has staged a request to provision a key.
+# The signer generates it, rewrites the key store and clears the request, so
+# the boot after this one is a normal one again.
+provision_pending() {
+    [ -f "${PROVISION_REQUEST}" ]
 }
 
-# Reads the host-written flash-manifest.json off p1 (read-only) into
-# FLASH_MANIFEST, so run_supervisor can hand it to the signer as an env var for
-# the Image screen. Empty on older cards with no manifest. Pipe-free (see
-# init_signals). The env-var name is a cross-language contract with the signer
-# (rpi-signer/src/constants.rs FLASH_MANIFEST_ENV), like EXIT_CODE_REBOOT.
-read_flash_manifest() {
+# Probes the vfat boot partition once, through a throwaway read-only mount, for
+# the two files a host stages there. CONFIG_PENDING=1 records a staged
+# watermark-config.json, which init_keys_partition and run_supervisor read to
+# keep /keys rw and run the signer as root, letting it write chain_info.json
+# and remount ro before demoting in-process. FLASH_MANIFEST holds
+# flash-manifest.json, which run_supervisor hands to the signer as an env var
+# for the Image screen, empty on older cards with no manifest; the env-var name
+# is a cross-language contract with the signer (rpi-signer/src/constants.rs
+# FLASH_MANIFEST_ENV), like EXIT_CODE_REBOOT. A boot partition that will not
+# mount is recorded as a boot fault rather than read as one with nothing
+# staged. Pipe-free (see init_signals): no `|` in this PID 1.
+probe_boot_partition() {
+    CONFIG_PENDING=0
     FLASH_MANIFEST=""
     mkdir -p "${BOOT_PROBE_MOUNT}"
-    mount -t vfat -o ro "${BOOT_PART}" "${BOOT_PROBE_MOUNT}" 2>/dev/null || return 0
+    if ! mount -t vfat -o ro "${BOOT_PART}" "${BOOT_PROBE_MOUNT}" 2>/dev/null; then
+        BOOT_FAULT="Boot partition would not mount. Re-flash the SD card with the host utility."
+        return 0
+    fi
+    [ -f "${BOOT_PROBE_MOUNT}/${WATERMARK_CONFIG}" ] && CONFIG_PENDING=1
     [ -f "${BOOT_PROBE_MOUNT}/${FLASH_MANIFEST_FILE}" ] && FLASH_MANIFEST=$(cat "${BOOT_PROBE_MOUNT}/${FLASH_MANIFEST_FILE}")
     umount "${BOOT_PROBE_MOUNT}" 2>/dev/null
     rmdir "${BOOT_PROBE_MOUNT}" 2>/dev/null
@@ -156,8 +173,10 @@ init_keys_partition() {
                 log_debug "Setup complete, keys partition kept rw for PIN migration"
             elif [ "$CONFIG_PENDING" = 1 ]; then
                 log_debug "Setup complete, keys partition kept rw for watermark config recovery"
+            elif provision_pending; then
+                log_debug "Setup complete, keys partition kept rw for key provisioning"
             else
-                # After setup: remount read-only for security
+                # A normal boot's signer never sees a writable keys partition.
                 mount -o remount,ro "${KEYS_MOUNT}"
                 log_debug "Setup complete, keys partition remounted read-only"
             fi
@@ -182,8 +201,9 @@ init_data_partition() {
     # Create mount point
     mkdir -p "${DATA_MOUNT}"
 
-    # Mount data partition. The signer shows a fatal DATA UNAVAILABLE screen
-    # when /data is missing, so record a mount failure rather than hiding it.
+    # A data partition that will not mount is what the signer halts on before
+    # it draws the PIN page, through check_boot_mounts in
+    # rpi-signer/src/storage.rs.
     if mount -t f2fs -o "${F2FS_OPTS}" "${DATA_PART}" "${DATA_MOUNT}" 2>/dev/null; then
         log_debug "Data partition setup complete"
     else
@@ -480,7 +500,7 @@ run_supervisor() {
         # Migration and watermark-config-recovery boots both run as root so
         # the signer can write /keys (promote the v2 blob, or write
         # chain_info.json) and remount it ro before demoting in-process.
-        if needs_migration || [ "$CONFIG_PENDING" = 1 ]; then
+        if needs_migration || [ "$CONFIG_PENDING" = 1 ] || provision_pending; then
             log_debug "Privileged boot - running as root; signer demotes in-process"
             $R_CMD >/dev/null 2>>"$PANIC_LOG"
             ec=$?
@@ -526,26 +546,21 @@ log_debug "Before init_rng"
 init_rng
 log_debug "After init_rng"
 
-# Probe once for a staged boot-partition watermark config; init_keys_partition
-# and run_supervisor both consult the result. mdev has created the p1 node by now.
-if config_pending; then
-    CONFIG_PENDING=1
-else
-    CONFIG_PENDING=0
-fi
-
-# Read the flash manifest off p1 and export it for the signer's Image screen.
-# Inherited across the su boundary in run_supervisor like RUST_LOG.
-read_flash_manifest
+# mdev has created the p1 node by now. The exports are inherited across the su
+# boundary in run_supervisor like RUST_LOG.
+probe_boot_partition
 export RUSSIGNOL_FLASH_MANIFEST="$FLASH_MANIFEST"
+export RUSSIGNOL_BOOT_FAULT="$BOOT_FAULT"
+
+# Data first: init_keys_partition reads the provisioning request off it, and
+# a request on an unmounted partition reads as none.
+log_debug "Before init_data_partition"
+init_data_partition
+log_debug "After init_data_partition"
 
 log_debug "Before init_keys_partition"
 init_keys_partition
 log_debug "After init_keys_partition"
-
-log_debug "Before init_data_partition"
-init_data_partition
-log_debug "After init_data_partition"
 
 # Gadget bring-up + watchdog run as one background supervisor (single owner of
 # the gadget lifecycle) so the signer's startup is never blocked on USB.

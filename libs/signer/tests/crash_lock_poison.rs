@@ -158,15 +158,14 @@ fn test_recommended_fix_pattern() {
 #[test]
 fn test_request_handler_returns_error_on_poisoned_lock() {
     use russignol_signer_lib::SignerRequest;
-    use russignol_signer_lib::bls::generate_key;
     use russignol_signer_lib::server::{Error, KeyManager, RequestHandler};
 
     let seed = [42u8; 32];
-    let (pkh, _pk, _sk) = generate_key(Some(&seed)).unwrap();
     let signer = russignol_signer_lib::signer::Unencrypted::generate(Some(&seed)).unwrap();
+    let pkh = *signer.public_key_hash();
 
     let mut mgr = KeyManager::new();
-    mgr.add_signer(pkh, signer, "test_key".to_string());
+    mgr.add_signer(signer, "test_key".to_string());
 
     let keys = Arc::new(RwLock::new(mgr));
     let handler = RequestHandler::new(

@@ -39,15 +39,14 @@
 
 use colored::Colorize;
 use russignol_signer_lib::{
-    ChainId,
-    bls::PublicKeyHash,
+    ChainId, PublicKey, PublicKeyHash, Scheme, Signature, SignatureVersion,
     protocol::{
         SignerRequest, SignerResponse,
         encoding::{decode_response, encode_request},
     },
     test_utils::{
-        create_attestation_data_with_chain, create_block_data_with_chain,
-        create_preattestation_data_with_chain,
+        create_attestation_data_for_chain, create_attestation_data_with_chain,
+        create_block_data_with_chain, create_preattestation_data_with_chain,
     },
 };
 use std::cell::Cell;
@@ -124,6 +123,35 @@ fn expect_chain_mismatch(response: SignerResponse) -> Result<(), String> {
     }
 }
 
+/// Read a tz6 signature's epoch off its own bytes and decode the signature with
+/// the XMSS crate's decoder, so the layout the device framed is checked against
+/// both.
+fn framed(signature: &Signature) -> Result<(russignol_xmss::Signature, u32), String> {
+    let bytes = signature.to_bytes();
+    if bytes.len() != Scheme::Xmss.signature_len() {
+        return Err(format!(
+            "a tz6 signature is {} bytes, got {}",
+            Scheme::Xmss.signature_len(),
+            bytes.len()
+        ));
+    }
+    let epoch = u32::from_le_bytes(bytes[..4].try_into().expect("four bytes"));
+    let decoded = russignol_xmss::Signature::from_bytes(&bytes).map_err(|e| e.to_string())?;
+    if decoded.epoch() != epoch {
+        return Err(format!(
+            "the framing's epoch {epoch} and the decoder's {} disagree",
+            decoded.epoch()
+        ));
+    }
+    Ok((decoded, epoch))
+}
+
+/// The nearest-rank percentile of `sorted`, or `None` where there are no samples.
+fn percentile(sorted: &[Duration], hundredths: usize) -> Option<Duration> {
+    let rank = (sorted.len() * hundredths).div_ceil(100).max(1);
+    sorted.get(rank - 1).copied()
+}
+
 /// Default device address (link-local USB)
 const DEFAULT_DEVICE: &str = "169.254.1.1:7732";
 
@@ -134,10 +162,19 @@ const DEFAULT_DEVICE: &str = "169.254.1.1:7732";
 /// can never silently pass by signing the "foreign" chain.
 const FOREIGN_CHAIN: [u8; 4] = [0x7a, 0x06, 0xa7, 0x70];
 
-/// First level handed out by the shared cursor. The device's first block sign
-/// recovers a missing watermark to this level (setting every op-type's floor),
-/// so it must sit above any leftover floor a prior run may have lowered.
+/// First level handed out by the shared cursor where `--level-base` names none.
+/// The device's first block sign recovers a missing watermark to this level
+/// (setting every op-type's floor), so it must sit above any leftover floor a
+/// prior run may have lowered. A card whose floors sit at a chain level is run
+/// with `--level-base` above them rather than cleaned.
 const LEVEL_BASE: u32 = 100;
+
+/// Signatures timed per scheme for the latency figures. A hundred puts the p99
+/// at the second-slowest sample, which is what the slot budget is judged on.
+const LATENCY_SAMPLES: usize = 100;
+
+/// The slot three consensus signatures have to fit inside.
+const SLOT: Duration = Duration::from_secs(6);
 
 /// Gap between successive cursor hand-outs. Wide enough for a test's local
 /// offsets (a few levels up or down within its band) without overlapping the
@@ -152,15 +189,17 @@ const BELOW_FLOOR_LEVEL: u32 = 50;
 /// Test result
 struct TestResult {
     name: String,
-    passed: bool,
-    error: Option<String>,
+    outcome: Result<(), String>,
     duration: Duration,
 }
 
 /// Test context with device connection info
 struct TestContext {
     device_addr: SocketAddr,
+    /// The card's first BLS key, which every watermark test signs with.
     pkh: Option<PublicKeyHash>,
+    /// The card's XMSS key, where it holds one.
+    xmss_pkh: Option<PublicKeyHash>,
     verbose: bool,
     /// The chain the device is provisioned for; every valid sign targets it.
     provisioned_chain: [u8; 4],
@@ -177,15 +216,17 @@ impl TestContext {
         device: &str,
         provisioned_chain: [u8; 4],
         verbose: bool,
+        level_base: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let device_addr: SocketAddr = device.parse()?;
 
         Ok(Self {
             device_addr,
             pkh: None,
+            xmss_pkh: None,
             verbose,
             provisioned_chain,
-            next_level: Cell::new(LEVEL_BASE),
+            next_level: Cell::new(level_base),
         })
     }
 
@@ -207,6 +248,12 @@ impl TestContext {
         create_attestation_data_with_chain(&self.provisioned_chain, level, round)
     }
 
+    /// Attestation operation data on the provisioned chain, in the layout a key
+    /// of `scheme` signs: every scheme but BLS carries a committee slot.
+    fn attestation_for(&self, scheme: Scheme, level: u32, round: u32) -> Vec<u8> {
+        create_attestation_data_for_chain(scheme, &self.provisioned_chain, level, round)
+    }
+
     /// Preattestation operation data on the provisioned chain.
     fn preattestation(&self, level: u32, round: u32) -> Vec<u8> {
         create_preattestation_data_with_chain(&self.provisioned_chain, level, round)
@@ -217,7 +264,7 @@ impl TestContext {
     fn sign(&self, pkh: PublicKeyHash, data: Vec<u8>) -> Result<SignerResponse, String> {
         let mut stream = self.connect().map_err(|e| e.to_string())?;
         let request = SignerRequest::Sign {
-            pkh: (pkh, 0),
+            pkh: (pkh, SignatureVersion::V4),
             data,
             signature: None,
         };
@@ -232,13 +279,144 @@ impl TestContext {
         data: Vec<u8>,
         what: &str,
     ) -> Result<(), String> {
+        self.signature(pkh, data, what).map(|_| ())
+    }
+
+    /// Sign and return the signature, logging `what` on success.
+    fn signature(
+        &self,
+        pkh: PublicKeyHash,
+        data: Vec<u8>,
+        what: &str,
+    ) -> Result<Signature, String> {
+        match self.sign(pkh, data)? {
+            SignerResponse::Signature(signature) => {
+                self.log(&format!("{what}: OK"));
+                Ok(signature)
+            }
+            other => Err(format!("{what} expected a signature, got: {other:?}")),
+        }
+    }
+
+    /// Sign `data` as a key's first signature of the run. A key with no
+    /// watermark yet has the device show its recovery dialog, which sets every
+    /// op-type's floor to the requested level once the operator confirms it.
+    /// The floor records that level as signed, so a caller proves progression
+    /// with the next level rather than by retrying this one.
+    fn establish(&self, pkh: PublicKeyHash, data: Vec<u8>, what: &str) -> Result<(), String> {
         match self.sign(pkh, data)? {
             SignerResponse::Signature(_) => {
                 self.log(&format!("{what}: OK"));
                 Ok(())
             }
+            SignerResponse::Error(ref e) if e.contains("Watermark not initialized") => {
+                if !handle_watermark_error(e)? {
+                    return Err(format!("Operator cancelled the watermark dialog: {e}"));
+                }
+                self.log(&format!("{what}: recovered the missing watermark"));
+                Ok(())
+            }
+            SignerResponse::Error(ref e) if e.contains("Large level gap") => Err(format!(
+                "{what} raised the level-gap dialog ({e}); answer it on the panel, then run with \
+                 a --level-base nearer the floor"
+            )),
+            SignerResponse::Error(ref e) => Err(format!(
+                "{what} was refused ({e}); a floor at or above this level needs --clean, or a \
+                 --level-base above it"
+            )),
             other => Err(format!("{what} expected a signature, got: {other:?}")),
         }
+    }
+
+    /// The public key the device holds for `pkh`.
+    fn public_key(&self, pkh: PublicKeyHash) -> Result<PublicKey, String> {
+        let mut stream = self.connect().map_err(|e| e.to_string())?;
+        match self
+            .send_request(&mut stream, &SignerRequest::PublicKey { pkh })
+            .map_err(|e| e.to_string())?
+        {
+            SignerResponse::PublicKey(pk) => Ok(pk),
+            other => Err(format!("public key request answered: {other:?}")),
+        }
+    }
+
+    /// The port closing is what shows the power was cut, rather than the
+    /// operator's word for it: a check that took the word would pass with the
+    /// device never having gone down.
+    fn wait_for_port_closed(&self, window: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + window;
+        loop {
+            if self.connect().is_err() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the device kept answering at {} for {window:?}, so its power was not cut",
+                    self.device_addr
+                ));
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    fn wait_for_port(&self, window: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + window;
+        loop {
+            if self.connect().is_ok() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the device did not answer at {} within {window:?}",
+                    self.device_addr
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Time [`LATENCY_SAMPLES`] attestations through the signer, a level apart,
+    /// after one untimed signature that establishes the key's floor, and judge
+    /// three signatures at the p99 against a slot.
+    fn latency(&self, pkh: PublicKeyHash, name: &str) -> Result<(), String> {
+        let scheme = pkh.scheme();
+        let base = self.reserve_level();
+        self.establish(
+            pkh,
+            self.attestation_for(scheme, base, 0),
+            &format!("{name} warm-up attestation {base}"),
+        )?;
+
+        let mut samples = Vec::with_capacity(LATENCY_SAMPLES);
+        for _ in 0..LATENCY_SAMPLES {
+            let level = self.reserve_level();
+            let data = self.attestation_for(scheme, level, 0);
+            let started = Instant::now();
+            self.signature(pkh, data, &format!("{name} attestation {level}"))?;
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let (Some(p50), Some(p90), Some(p99), Some(max)) = (
+            percentile(&samples, 50),
+            percentile(&samples, 90),
+            percentile(&samples, 99),
+            samples.last().copied(),
+        ) else {
+            return Err(format!("no {name} latency samples were taken"));
+        };
+        let three = p99 * 3;
+        println!();
+        println!(
+            "    {name}: {} samples, p50 {p50:.1?}, p90 {p90:.1?}, p99 {p99:.1?}, max {max:.1?}; \
+             three at the p99 take {three:.2?} of the {SLOT:?} slot",
+            samples.len(),
+        );
+        if three >= SLOT {
+            return Err(format!(
+                "three {name} signatures at the p99 take {three:.2?}, past the {SLOT:?} slot"
+            ));
+        }
+        Ok(())
     }
 
     fn connect(&self) -> Result<TcpStream, Box<dyn std::error::Error>> {
@@ -360,8 +538,27 @@ impl TestSuite {
             self.run_category_below_floor()?;
         }
 
+        if self.should_run_category("xmss") && !self.failed {
+            self.run_category_xmss()?;
+        }
+
+        if self.should_run_category("latency") && !self.failed {
+            self.run_category_latency()?;
+        }
+
+        // A power cut needs a hand on the device, so this runs only when named.
+        if self.category_named("power") && !self.failed {
+            self.run_category_power_cut()?;
+        }
+
         self.print_summary();
         Ok(())
+    }
+
+    fn category_named(&self, category: &str) -> bool {
+        self.category_filter
+            .as_deref()
+            .is_some_and(|filter| filter.eq_ignore_ascii_case(category))
     }
 
     fn discover_pkh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -416,21 +613,20 @@ impl TestSuite {
 
         match response {
             SignerResponse::KnownKeys(keys) => {
-                if keys.is_empty() {
-                    return Err("No keys found on device".into());
-                }
-                self.ctx.pkh = Some(keys[0]);
+                let Some(bls) = keys.iter().copied().find(|k| k.scheme() == Scheme::Bls) else {
+                    return Err("No BLS key found on device".into());
+                };
+                self.ctx.pkh = Some(bls);
                 println!(
                     "  {} Using key: {}",
                     "✓".green(),
-                    keys[0].to_b58check().yellow()
+                    bls.to_b58check().yellow()
                 );
-                if keys.len() > 1 {
-                    println!(
-                        "  {} Device has {} keys, using first one",
-                        "ℹ".blue(),
-                        keys.len()
-                    );
+                self.ctx.xmss_pkh = keys.iter().copied().find(|k| k.scheme() == Scheme::Xmss);
+                if let Some(tz6) = self.ctx.xmss_pkh {
+                    println!("  {} XMSS key: {}", "✓".green(), tz6.to_b58check().yellow());
+                } else {
+                    println!("  {} No XMSS key on the card", "ℹ".blue());
                 }
             }
             SignerResponse::Error(e) => {
@@ -457,8 +653,7 @@ impl TestSuite {
         let Some(pkh) = self.ctx.pkh else {
             self.results.push(TestResult {
                 name: name.to_string(),
-                passed: false,
-                error: Some("No PKH available".to_string()),
+                outcome: Err("No PKH available".to_string()),
                 duration: Duration::ZERO,
             });
             self.failed = true;
@@ -475,8 +670,7 @@ impl TestSuite {
                 println!("{} ({:.0?})", "PASS".green().bold(), duration);
                 self.results.push(TestResult {
                     name: name.to_string(),
-                    passed: true,
-                    error: None,
+                    outcome: Ok(()),
                     duration,
                 });
             }
@@ -486,8 +680,7 @@ impl TestSuite {
                 println!("    Error: {}", e.red());
                 self.results.push(TestResult {
                     name: name.to_string(),
-                    passed: false,
-                    error: Some(e),
+                    outcome: Err(e),
                     duration,
                 });
                 self.failed = true;
@@ -505,34 +698,8 @@ impl TestSuite {
 
         // Test 1.1: Forward progression (block)
         self.run_test("1.1 Forward progression (block)", |ctx, pkh| {
-            // Establish the baseline at the first cursor level. On a freshly
-            // cleaned device the block watermark is missing, so the device shows
-            // a "Set level to N" recovery dialog; confirming it sets every
-            // op-type's floor to N. The floor records N as signed, so re-signing N
-            // is a replay — forward progression is proven by the N+1 signature
-            // below, not by retrying N.
             let base = ctx.reserve_level();
-            match ctx.sign(pkh, ctx.block(base, 0))? {
-                SignerResponse::Signature(_) => ctx.log(&format!("Signed level {base}")),
-                SignerResponse::Error(ref e) if e.contains("not initialized") => {
-                    // Missing watermark: the device shows the recovery dialog.
-                    if !handle_watermark_error(e)? {
-                        return Err(format!("Operator cancelled the watermark dialog: {e}"));
-                    }
-                    ctx.log(&format!("Recovered missing watermark to level {base}"));
-                }
-                SignerResponse::Error(ref e) => {
-                    return Err(format!(
-                        "Watermark already initialized at or above level {base} ({e}); \
-                         run with --clean to reset it first"
-                    ));
-                }
-                other => {
-                    return Err(format!(
-                        "Expected signature at level {base}, got: {other:?}"
-                    ));
-                }
-            }
+            ctx.establish(pkh, ctx.block(base, 0), &format!("Block level {base}"))?;
 
             // Prove forward progression: N+1 must sign (N+1 > the level-N floor).
             ctx.expect_signature(
@@ -841,6 +1008,202 @@ impl TestSuite {
         Ok(())
     }
 
+    fn run_category_xmss(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        println!(
+            "\n{}",
+            "─── Category 6: XMSS (tz6) Signing ────────────────────────────"
+                .cyan()
+                .bold()
+        );
+        let Some(tz6) = self.ctx.xmss_pkh else {
+            println!("  {} No XMSS key on the card; skipped", "ℹ".blue());
+            return Ok(());
+        };
+
+        // Test 6.1: The key the device serves hashes to the address it lists
+        self.run_test("6.1 tz6 public key hashes to its address", |ctx, _| {
+            let pk = ctx.public_key(tz6)?;
+            if pk.scheme() != Scheme::Xmss {
+                return Err(format!("expected an XMSS key, got a {} one", pk.scheme()));
+            }
+            if pk.hash() != tz6 {
+                return Err(format!(
+                    "the key hashes to {}, not the listed {}",
+                    pk.hash().to_b58check(),
+                    tz6.to_b58check()
+                ));
+            }
+            ctx.log(&format!(
+                "{} key bytes hash to the listed address",
+                pk.to_bytes().len()
+            ));
+            Ok(())
+        });
+
+        // Test 6.2: A tz6 attestation verifies under the XMSS crate's own verifier,
+        // at the epoch its framing carries and at no other
+        self.run_test("6.2 tz6 attestation verifies at its framed epoch", |ctx, _| {
+            let base = ctx.reserve_level();
+            ctx.establish(
+                tz6,
+                ctx.attestation_for(Scheme::Xmss, base, 0),
+                &format!("tz6 attestation {base}"),
+            )?;
+
+            let pk = ctx.public_key(tz6)?;
+            let verifier =
+                russignol_xmss::PublicKey::from_bytes(&pk.to_bytes()).map_err(|e| e.to_string())?;
+            let data = ctx.attestation_for(Scheme::Xmss, base + 1, 0);
+            let signature = ctx.signature(
+                tz6,
+                data.clone(),
+                &format!("tz6 attestation {}", base + 1),
+            )?;
+            let (decoded, epoch) = framed(&signature)?;
+            verifier
+                .verify(&decoded, None, &data)
+                .map_err(|e| format!("the signature does not verify at epoch {epoch}: {e}"))?;
+
+            let mut reframed = signature.to_bytes();
+            reframed[..4].copy_from_slice(&(epoch + 1).to_le_bytes());
+            let at_next =
+                russignol_xmss::Signature::from_bytes(&reframed).map_err(|e| e.to_string())?;
+            if verifier.verify(&at_next, None, &data).is_ok() {
+                return Err(format!(
+                    "the signature also verifies at epoch {}, so the framed epoch binds nothing",
+                    epoch + 1
+                ));
+            }
+            ctx.log(&format!("verified at epoch {epoch} and at no other"));
+            Ok(())
+        });
+
+        // Test 6.3: Each signature spends the next epoch
+        self.run_test(
+            "6.3 Epoch advances by exactly one per signature",
+            |ctx, _| {
+                let base = ctx.reserve_level();
+                let mut previous: Option<u32> = None;
+                for level in base..base + 3 {
+                    let signature = ctx.signature(
+                        tz6,
+                        ctx.attestation_for(Scheme::Xmss, level, 0),
+                        &format!("tz6 attestation {level}"),
+                    )?;
+                    let (_, epoch) = framed(&signature)?;
+                    if let Some(previous) = previous
+                        && epoch != previous + 1
+                    {
+                        return Err(format!("epoch {epoch} followed epoch {previous}"));
+                    }
+                    ctx.log(&format!("attestation {level} spent epoch {epoch}"));
+                    previous = Some(epoch);
+                }
+                Ok(())
+            },
+        );
+
+        // Test 6.4: Three tz6 signatures fit a slot at the p99
+        self.run_test(
+            "6.4 Three tz6 attestations fit a slot at the p99",
+            |ctx, _| ctx.latency(tz6, "tz6"),
+        );
+
+        Ok(())
+    }
+
+    fn run_category_latency(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        println!(
+            "\n{}",
+            "─── Category 7: Signing Latency Through the Signer ────────────"
+                .cyan()
+                .bold()
+        );
+
+        // Test 7.1: Three tz4 signatures fit a slot at the p99
+        self.run_test(
+            "7.1 Three tz4 attestations fit a slot at the p99",
+            |ctx, pkh| ctx.latency(pkh, "tz4"),
+        );
+
+        Ok(())
+    }
+
+    fn run_category_power_cut(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        println!(
+            "\n{}",
+            "─── Category 8: Epoch Across a Power Cut ──────────────────────"
+                .cyan()
+                .bold()
+        );
+        let Some(tz6) = self.ctx.xmss_pkh else {
+            println!("  {} No XMSS key on the card; skipped", "ℹ".blue());
+            return Ok(());
+        };
+
+        // Test 8.1: The epoch spent before a power cut is never spent again
+        self.run_test(
+            "8.1 The first epoch after a power cut is higher",
+            |ctx, _| {
+                let base = ctx.reserve_level();
+                ctx.establish(
+                    tz6,
+                    ctx.attestation_for(Scheme::Xmss, base, 0),
+                    &format!("tz6 attestation {base}"),
+                )?;
+                let signature = ctx.signature(
+                    tz6,
+                    ctx.attestation_for(Scheme::Xmss, base + 1, 0),
+                    &format!("tz6 attestation {}", base + 1),
+                )?;
+                let (_, before) = framed(&signature)?;
+
+                println!();
+                println!(
+                    "    {}",
+                    "══════════════════════════════════════════════════════════".yellow()
+                );
+                println!(
+                    "    {}",
+                    "  POWER CUT - Device interaction required                 "
+                        .yellow()
+                        .bold()
+                );
+                println!(
+                    "    {}",
+                    "══════════════════════════════════════════════════════════".yellow()
+                );
+                println!(
+                    "    Epoch {before} was just spent. Unplug the card's power lead yourself now: \
+                     nothing here cuts it for you."
+                );
+                ctx.wait_for_port_closed(Duration::from_secs(300))?;
+                println!("    The device is down. Restore its power and enter the PIN.");
+                ctx.wait_for_port(Duration::from_secs(600))?;
+                println!("    The device is back.");
+
+                // While idle the signer writes a ceiling for the level after the
+                // last one signed, so a restart loads (base + 2, u32::MAX) and
+                // refuses that level whole; base + 3 is the first it signs.
+                let signature = ctx.signature(
+                    tz6,
+                    ctx.attestation_for(Scheme::Xmss, base + 3, 0),
+                    &format!("tz6 attestation {}", base + 3),
+                )?;
+                let (_, after) = framed(&signature)?;
+                if after <= before {
+                    return Err(format!(
+                        "SECURITY FAILURE: epoch {after} after the power cut is not above {before}"
+                    ));
+                }
+                ctx.log(&format!("epoch {before} before the cut, {after} after"));
+                Ok(())
+            },
+        );
+
+        Ok(())
+    }
+
     fn print_summary(&self) {
         println!(
             "\n{}",
@@ -856,8 +1219,8 @@ impl TestSuite {
                 .bold()
         );
 
-        let passed = self.results.iter().filter(|r| r.passed).count();
-        let failed = self.results.iter().filter(|r| !r.passed).count();
+        let passed = self.results.iter().filter(|r| r.outcome.is_ok()).count();
+        let failed = self.results.len() - passed;
         let total = self.results.len();
         let total_duration: Duration = self.results.iter().map(|r| r.duration).sum();
 
@@ -878,11 +1241,13 @@ impl TestSuite {
             );
 
             println!("\n  {} Failed tests:", "Failed:".red().bold());
-            for result in self.results.iter().filter(|r| !r.passed) {
+            for (result, err) in self
+                .results
+                .iter()
+                .filter_map(|r| r.outcome.as_ref().err().map(|e| (r, e)))
+            {
                 println!("    • {}", result.name.red());
-                if let Some(ref err) = result.error {
-                    println!("      {}", err.dimmed());
-                }
+                println!("      {}", err.dimmed());
             }
         }
 
@@ -909,6 +1274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut category = None;
     let mut chain_id = None;
     let mut verbose = false;
+    let mut level_base = LEVEL_BASE;
 
     let mut i = 1;
     while i < args.len() {
@@ -931,6 +1297,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     chain_id = Some(args[i].clone());
                 }
             }
+            "--level-base" => {
+                i += 1;
+                if i < args.len() {
+                    level_base = args[i]
+                        .parse()
+                        .map_err(|e| format!("Invalid --level-base {:?}: {e}", args[i]))?;
+                }
+            }
             "--verbose" | "-v" => {
                 verbose = true;
             }
@@ -942,7 +1316,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("    -d, --device <ADDR>     Device address (default: {DEFAULT_DEVICE})");
                 println!("        --chain-id <B58>    Provisioned chain the device signs for");
                 println!("    -c, --category <NAME>   Run only tests matching category");
-                println!("                            (basic, multi, chain, edge)");
+                println!("                            (basic, multi, chain, edge, floor, xmss,");
+                println!("                            latency; power runs only when named)");
+                println!("        --level-base <N>    First level the tests sign at, above the");
+                println!("                            card's floors (default: {LEVEL_BASE})");
                 println!("    -v, --verbose           Verbose output");
                 println!("    -h, --help              Print this help");
                 return Ok(());
@@ -970,7 +1347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let ctx = TestContext::new(&device, provisioned_chain, verbose)?;
+    let ctx = TestContext::new(&device, provisioned_chain, verbose, level_base)?;
     let mut suite = TestSuite::new(ctx, category);
 
     suite.run_all()?;

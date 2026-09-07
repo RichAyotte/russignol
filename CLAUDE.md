@@ -1,9 +1,20 @@
 # Device
 
 - **SSH**: `sshpass -p russignol ssh russignol@russignol` (dev images only — hardened builds have no SSH)
+- **Busybox**: the image ships no `timeout` applet (`CONFIG_TIMEOUT` unset), so a run on the card is bounded by a loop polling its process rather than by `timeout`
 - **Hardware**: Raspberry Pi Zero 2W (BCM2710A1 / Cortex-A53, ARMv8.0-A)
 - **Display**: Waveshare 2.13" Touch e-Paper HAT V4 (SPI: SSD1680Z8, I2C: GT1151Q)
 - **Workload**: ~3 BLS12-381 signatures (~6ms each) every ~6 seconds; idle 99.9% of the time
+- **CPU frequency**: the `userspace` governor holds 600 MHz while idle, and the signer writes `scaling_setspeed` to reach 1000 MHz around signing and key generation (`rpi-signer/src/cpu_freq.rs`). The init scripts chown that file to `russignol`, so a benchmark run over SSH can bracket itself the same way — and must, since a figure taken at the idle clock overstates the cost by the clock ratio, measured at 1.68x. Restore 600 MHz afterwards.
+
+# Cross-building for a device run
+
+Build with the flags `set_arm_rustflags` sets (`xtask/src/utils.rs:47`) rather than the defaults in `.cargo/config.toml`, whose `target-cpu=generic` is not what the deployed signer runs and whose crypto features fault on this silicon for the reason recorded there:
+
+```sh
+RUSTFLAGS="-C target-cpu=cortex-a53 -C target-feature=-aes,-sha2" \
+  cargo build --release -p <package> --target aarch64-unknown-linux-gnu
+```
 
 # Build and Test
 
@@ -56,17 +67,12 @@ cargo clippy --workspace --all-targets
 cargo fmt
 ```
 
-Run clippy on the **whole workspace** every time. Do not narrow to a single
-package (`-p …`) or target kind (`--lib` only): that skips binary crates such
-as `russignol-signer` and misses lints that only fire on the non-test binary
-compile unit (notably `dead_code` for helpers used solely from `#[cfg(test)]`).
+Run clippy on the **whole workspace** every time. Do not narrow to a single package (`-p …`) or target kind (`--lib` only): that skips binary crates such as `russignol-signer` and misses lints that only fire on the non-test binary compile unit (notably `dead_code` for helpers used solely from `#[cfg(test)]`).
 
 - `--workspace` — every member (`libs/*`, `rpi-signer`, `host-utility`, …)
 - `--all-targets` — lib, bins, tests, examples, and benches for each member
 
-Do not confuse `--fix` with “all packages”: `--fix` auto-applies clippy
-suggestions (and needs `--allow-dirty` / `--allow-staged` on a dirty tree).
-Use it only when you intend to rewrite sources.
+Do not confuse `--fix` with “all packages”: `--fix` auto-applies clippy suggestions (and needs `--allow-dirty` / `--allow-staged` on a dirty tree). Use it only when you intend to rewrite sources.
 
 Treat warnings as defects and fix them at the source.
 

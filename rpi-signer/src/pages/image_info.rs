@@ -12,11 +12,12 @@ use crate::text;
 use crate::widgets::Button;
 
 use super::Page as PageTrait;
+use super::drawn;
 use crossbeam_channel::Sender;
 use embedded_graphics::{
     Drawable,
     pixelcolor::BinaryColor,
-    prelude::{DrawTarget, Point, Size},
+    prelude::{DrawTarget, Point},
 };
 use u8g2_fonts::{
     FontRenderer,
@@ -39,21 +40,17 @@ pub struct Page {
     checksum_rows: Vec<image_info::Row>,
 }
 
+/// The tab labels, left to right.
+pub(crate) const TABS: [&str; 2] = ["Summary", "Checksums"];
+
 const MARGIN: i32 = 6;
-const TAB_Y: i32 = 2;
-const TAB_W: u32 = 116;
-const TAB_H: u32 = 30;
-const TAB_GAP: i32 = 6;
 const VALUE_COL_X: i32 = 92;
 const ROW_Y: [i32; 4] = [52, 72, 92, 112];
 
 impl Page {
     pub fn new(app_sender: Sender<AppEvent>, back: BackTarget) -> Self {
         let info = image_info::image_info();
-        let mut summary_tab = Button::new_text(Size::new(TAB_W, TAB_H), "Summary");
-        summary_tab.bounds.top_left = Point::new(MARGIN, TAB_Y);
-        let mut checksums_tab = Button::new_text(Size::new(TAB_W, TAB_H), "Checksums");
-        checksums_tab.bounds.top_left = Point::new(MARGIN + TAB_W.cast_signed() + TAB_GAP, TAB_Y);
+        let (summary_tab, checksums_tab) = super::tab_pair(TABS[0], TABS[1]);
         Self {
             app_sender,
             back,
@@ -78,7 +75,7 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
             View::Checksums => (&self.checksum_rows, true),
         };
         for (row, &y) in rows.iter().zip(ROW_Y.iter()) {
-            draw_label_value(display, row.label, row.value.as_str(), y, mono);
+            draw_label_value(display, row.label, row.value.as_str(), y, mono)?;
         }
 
         Ok(())
@@ -120,40 +117,37 @@ fn draw_label_value<D: DrawTarget<Color = BinaryColor>>(
     value: &str,
     y: i32,
     mono_value: bool,
-) {
-    FontRenderer::new::<fonts::FONT_MEDIUM>()
-        .render_aligned(
-            label,
-            Point::new(MARGIN, y),
-            VerticalPosition::Baseline,
-            HorizontalAlignment::Left,
-            FontColor::Transparent(BinaryColor::Off),
-            display,
-        )
-        .ok();
+) -> Result<(), D::Error> {
+    drawn(FontRenderer::new::<fonts::FONT_MEDIUM>().render_aligned(
+        label,
+        Point::new(MARGIN, y),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Left,
+        FontColor::Transparent(BinaryColor::Off),
+        display,
+    ))?;
 
     let value_point = Point::new(VALUE_COL_X, y);
     if mono_value {
-        FontRenderer::new::<fonts::FONT_MONO_SMALL>()
-            .render_aligned(
+        drawn(
+            FontRenderer::new::<fonts::FONT_MONO_SMALL>().render_aligned(
                 text::truncate_middle(value, 10, 6).as_str(),
                 value_point,
                 VerticalPosition::Baseline,
                 HorizontalAlignment::Left,
                 FontColor::Transparent(BinaryColor::Off),
                 display,
-            )
-            .ok();
+            ),
+        )?;
     } else {
-        FontRenderer::new::<fonts::FONT_MEDIUM>()
-            .render_aligned(
-                value,
-                value_point,
-                VerticalPosition::Baseline,
-                HorizontalAlignment::Left,
-                FontColor::Transparent(BinaryColor::Off),
-                display,
-            )
-            .ok();
+        drawn(FontRenderer::new::<fonts::FONT_MEDIUM>().render_aligned(
+            value,
+            value_point,
+            VerticalPosition::Baseline,
+            HorizontalAlignment::Left,
+            FontColor::Transparent(BinaryColor::Off),
+            display,
+        ))?;
     }
+    Ok(())
 }

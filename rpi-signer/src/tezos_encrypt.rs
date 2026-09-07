@@ -19,11 +19,12 @@
 //! v1 is never destroyed until v2 has been read back from flash and decrypted
 //! with the user's PIN, so a corrupt v2 producer cannot brick the device.
 
-use log::{debug, info, warn};
+use log::{error, info, warn};
 use russignol_crypto::BlobFormat;
+use russignol_signer_lib::durable::atomic_write;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::secret::Secret;
 
@@ -60,7 +61,38 @@ pub enum MigrationEvent {
     StagingFailed { reason: String },
     /// Retry budget exhausted. Migration is skipped this boot; v1 is
     /// decrypted with its native format and the user must take action.
-    MigrationDisabled { attempts: u32 },
+    MigrationDisabled { attempts: Attempts },
+}
+
+/// What a card's staging-attempt record says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attempts {
+    /// The record says this many staging attempts have happened.
+    Counted(u32),
+    /// The record is present and will not read as a number. How many is
+    /// unknown, and unknown is not zero: reading it as zero hands the
+    /// migration a fresh budget on every boot, which is the reboot loop the
+    /// budget exists to stop.
+    Unreadable,
+}
+
+impl Attempts {
+    /// Whether the staging budget is spent.
+    const fn exhausted(self) -> bool {
+        match self {
+            Self::Counted(n) => n >= MIGRATION_ATTEMPT_THRESHOLD,
+            Self::Unreadable => true,
+        }
+    }
+}
+
+impl std::fmt::Display for Attempts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Counted(n) => write!(f, "{n} attempts"),
+            Self::Unreadable => f.write_str("an unreadable attempt record"),
+        }
+    }
 }
 
 /// Plaintext plus an optional migration event the app event loop dispatches
@@ -85,10 +117,10 @@ impl DecryptOutcome {
 /// machine on the device.
 ///
 /// `on_stage_start` fires once on the v1-only path between the v1 unlock and
-/// the v2 re-encrypt — both scrypt steps are slow (~9s each on the target
-/// hardware), and the UI uses this hook to swap the progress page so the bar
-/// tracks the second phase instead of pinning at 100%. The hook does not
-/// fire on the verify-and-promote path or on a steady-state unlock.
+/// the v2 re-encrypt — both scrypt steps are slow, and the UI uses this hook
+/// to swap the progress page so the bar tracks the second phase instead of
+/// pinning at 100%. The hook does not fire on the verify-and-promote path or
+/// on a steady-state unlock.
 ///
 /// # Errors
 ///
@@ -105,19 +137,6 @@ pub fn decrypt_secret_keys(
         Path::new(MIGRATION_ATTEMPTS_PATH),
         on_stage_start,
     )
-}
-
-/// Encrypt secret keys JSON and atomically write to the v2 path. Used by
-/// fresh first-boot setup; new devices skip the migration machinery entirely.
-///
-/// # Errors
-///
-/// Returns an error if encryption or any file I/O step fails.
-pub fn encrypt_secret_keys(password: &[u8], secret_keys_json: &str) -> io::Result<()> {
-    let encrypted = russignol_crypto::encrypt(password, secret_keys_json)?;
-    atomic_write(Path::new(SECRET_KEYS_ENC_V2_PATH), &encrypted)?;
-    info!("Encrypted secret keys written to {SECRET_KEYS_ENC_V2_PATH}");
-    Ok(())
 }
 
 fn migrate_and_decrypt(
@@ -143,6 +162,8 @@ fn migrate_and_decrypt(
         (false, true) => {
             let v2 = fs::read(v2_path)?;
             let plaintext = Secret::from_zeroizing(russignol_crypto::decrypt(password, &v2)?);
+            // The counter is read only on the arms where the v1 blob exists, so
+            // once the blob is gone nothing reads what this unlink leaves.
             let _ = clear_counter(counter_path);
             Ok(DecryptOutcome {
                 plaintext,
@@ -166,11 +187,11 @@ fn stage_v1_to_v2(
     let v1 = fs::read(v1_path)?;
     let attempts = read_counter(counter_path);
 
-    if attempts >= MIGRATION_ATTEMPT_THRESHOLD {
+    if attempts.exhausted() {
         let (plaintext, _) = russignol_crypto::decrypt_with_format(password, &v1)?;
         let plaintext = Secret::from_zeroizing(plaintext);
         warn!(
-            "Migration disabled after {attempts} attempts; v1 decrypted natively, no further migration this boot"
+            "Migration disabled after {attempts}; v1 decrypted natively, no further migration this boot"
         );
         return Ok(DecryptOutcome {
             plaintext,
@@ -228,13 +249,11 @@ fn verify_v2_or_revert(
 ) -> io::Result<DecryptOutcome> {
     let attempts = read_counter(counter_path);
 
-    if attempts >= MIGRATION_ATTEMPT_THRESHOLD {
+    if attempts.exhausted() {
         let v1 = fs::read(v1_path)?;
         let (plaintext, _) = russignol_crypto::decrypt_with_format(password, &v1)?;
         let plaintext = Secret::from_zeroizing(plaintext);
-        warn!(
-            "Migration disabled after {attempts} attempts; v1 decrypted natively, v2 left in place"
-        );
+        warn!("Migration disabled after {attempts}; v1 decrypted natively, v2 left in place");
         return Ok(DecryptOutcome {
             plaintext,
             migration: Some(MigrationEvent::MigrationDisabled { attempts }),
@@ -246,7 +265,12 @@ fn verify_v2_or_revert(
         Ok(plaintext) => {
             let plaintext = Secret::from_zeroizing(plaintext);
             fs::remove_file(v1_path)?;
-            let _ = clear_counter(counter_path);
+            if let Err(e) = clear_counter(counter_path) {
+                error!(
+                    "Attempt record at {} outlived the promote it counted: {e}",
+                    counter_path.display()
+                );
+            }
             info!(
                 "Promoted v2 at {} after successful verification; v1 unlinked",
                 v2_path.display()
@@ -261,10 +285,15 @@ fn verify_v2_or_revert(
             match russignol_crypto::decrypt_with_format(password, &v1) {
                 Ok((plaintext, _)) => {
                     let plaintext = Secret::from_zeroizing(plaintext);
-                    let _ = fs::remove_file(v2_path);
-                    let reason = format!("{v2_err}");
+                    // A revert that cannot unlink has not reverted: both files
+                    // remain and the next boot verifies the same corrupt blob,
+                    // so what the operator is shown says so.
+                    let reason = match fs::remove_file(v2_path) {
+                        Ok(()) => format!("{v2_err}"),
+                        Err(e) => format!("{v2_err}; the corrupt blob remains ({e})"),
+                    };
                     warn!(
-                        "v2 at {} failed verification ({reason}); reverted, v1 remains",
+                        "v2 at {} failed verification ({reason}); v1 remains",
                         v2_path.display()
                     );
                     Ok(DecryptOutcome {
@@ -278,15 +307,31 @@ fn verify_v2_or_revert(
     }
 }
 
-fn read_counter(path: &Path) -> u32 {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .unwrap_or(0)
+/// What the card's attempt record says, with no record at all reading as no
+/// attempts. Every other way of not getting a number is [`Attempts::Unreadable`],
+/// which stops the migration rather than restarting its budget.
+fn read_counter(path: &Path) -> Attempts {
+    match fs::read_to_string(path) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .map_or(Attempts::Unreadable, Attempts::Counted),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Attempts::Counted(0),
+        Err(e) => {
+            error!("Attempt record at {} will not read: {e}", path.display());
+            Attempts::Unreadable
+        }
+    }
 }
 
-fn increment_counter(path: &Path, current: u32) -> io::Result<u32> {
-    let next = current.saturating_add(1);
+fn increment_counter(path: &Path, current: Attempts) -> io::Result<u32> {
+    let next = match current {
+        Attempts::Counted(n) => n.saturating_add(1),
+        // Behind exhausted(), so unreachable; the threshold is the honest
+        // answer if it ever is reached, an unreadable record being no evidence
+        // of a low count.
+        Attempts::Unreadable => MIGRATION_ATTEMPT_THRESHOLD,
+    };
     atomic_write(path, next.to_string().as_bytes())?;
     Ok(next)
 }
@@ -297,57 +342,6 @@ fn clear_counter(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
-}
-
-/// Write `data` to `target` via a `.tmp` sibling and rename, fsyncing the
-/// file before rename so the new contents survive a crash. The parent
-/// directory fsync is best-effort (some Linux mounts reject it); the
-/// rename itself is the atomicity guarantee.
-fn atomic_write(target: &Path, data: &[u8]) -> io::Result<()> {
-    use std::io::Write as _;
-
-    let mut tmp = PathBuf::from(target);
-    let tmp_filename = match target.file_name() {
-        Some(name) => {
-            let mut s = name.to_os_string();
-            s.push(".tmp");
-            s
-        }
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("atomic_write target has no filename: {}", target.display()),
-            ));
-        }
-    };
-    tmp.set_file_name(tmp_filename);
-
-    {
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(data)?;
-        file.sync_all()?;
-    }
-
-    fs::rename(&tmp, target)?;
-
-    if let Some(parent) = target.parent() {
-        match fs::File::open(parent) {
-            Ok(dir) => {
-                if let Err(e) = dir.sync_all() {
-                    debug!(
-                        "Best-effort parent fsync failed for {}: {e}",
-                        parent.display()
-                    );
-                }
-            }
-            Err(e) => debug!(
-                "Best-effort parent open failed for {}: {e}",
-                parent.display()
-            ),
-        }
-    }
-
-    Ok(())
 }
 
 /// Set ownership to russignol and mode 0400 on every key file present on
@@ -403,6 +397,7 @@ pub fn set_key_permissions() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     const LEGACY_V1_FIXTURE: &[u8] =
@@ -436,37 +431,63 @@ mod tests {
         }
     }
 
-    // ---- atomic_write -------------------------------------------------
-
-    #[test]
-    fn atomic_write_creates_file() {
-        let dir = TempDir::new().unwrap();
-        let target = dir.path().join("foo");
-        atomic_write(&target, b"hello").unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"hello");
-        assert!(!dir.path().join("foo.tmp").exists(), ".tmp leftover");
-    }
-
-    #[test]
-    fn atomic_write_overwrites_existing() {
-        let dir = TempDir::new().unwrap();
-        let target = dir.path().join("foo");
-        fs::write(&target, b"old").unwrap();
-        atomic_write(&target, b"new").unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"new");
-    }
-
-    #[test]
-    fn atomic_write_overwrites_stale_tmp() {
-        let dir = TempDir::new().unwrap();
-        let target = dir.path().join("foo");
-        let tmp = dir.path().join("foo.tmp");
-        fs::write(&tmp, b"garbage").unwrap();
-        atomic_write(&target, b"new").unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"new");
-    }
-
     // ---- migrate_and_decrypt: filename state machine -----------------
+
+    /// An unreadable attempt record is not a record of no attempts. Reading it
+    /// as zero hands the migration a fresh budget on every boot, which is the
+    /// reboot loop the budget exists to stop.
+    #[test]
+    fn an_unreadable_attempt_record_stops_the_migration() {
+        let l = Layout::new();
+        let plaintext = "legacy-secret";
+        let v1 = LEGACY_V1_FIXTURE.to_vec();
+        fs::write(&l.v1_path, &v1).unwrap();
+        let v2 = russignol_crypto::encrypt(b"999999", plaintext).unwrap();
+        fs::write(&l.v2_path, &v2).unwrap();
+        fs::write(&l.counter, "not a number").unwrap();
+
+        let outcome = l.run(LEGACY_V1_PIN).unwrap();
+
+        assert!(
+            matches!(
+                outcome.migration,
+                Some(MigrationEvent::MigrationDisabled { .. })
+            ),
+            "an unreadable record must stop the migration: {:?}",
+            outcome.migration
+        );
+        assert!(l.v1_path.exists(), "v1 must remain");
+        assert!(l.v2_path.exists(), "v2 must be left where it is");
+    }
+
+    /// A revert that cannot unlink the corrupt v2 blob has not reverted: both
+    /// files remain and the next boot verifies the same corrupt blob again, so
+    /// the operator is told rather than shown a revert that did not happen.
+    #[test]
+    fn a_revert_that_cannot_unlink_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let l = Layout::new();
+        fs::write(&l.v1_path, LEGACY_V1_FIXTURE).unwrap();
+        let v2 = russignol_crypto::encrypt(b"999999", "wrong-pin-blob").unwrap();
+        fs::write(&l.v2_path, &v2).unwrap();
+        let dir = l.v1_path.parent().expect("the layout has a directory");
+        let mode = fs::metadata(dir).unwrap().permissions().mode();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = l.run(LEGACY_V1_PIN);
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+        let outcome = outcome.unwrap();
+        let Some(MigrationEvent::RevertedFromCorruptV2 { reason }) = outcome.migration else {
+            panic!("expected a revert, got {:?}", outcome.migration)
+        };
+        assert!(
+            reason.contains("remains"),
+            "the reason must say the blob is still there: {reason}"
+        );
+        assert!(l.v2_path.exists(), "the unlink could not have succeeded");
+    }
 
     #[test]
     fn migrate_v2_only_unlocks_and_clears_counter() {
@@ -504,7 +525,7 @@ mod tests {
         );
         assert!(l.v2_path.exists(), "v2 must be staged");
         assert_eq!(fs::read(&l.v2_path).unwrap()[0], 0x02, "staged blob is v2");
-        assert_eq!(read_counter(&l.counter), 1);
+        assert_eq!(read_counter(&l.counter), Attempts::Counted(1));
     }
 
     #[test]
@@ -518,7 +539,7 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!l.v2_path.exists(), "no v2 staged when format mismatches");
-        assert_eq!(read_counter(&l.counter), 0);
+        assert_eq!(read_counter(&l.counter), Attempts::Counted(0));
     }
 
     #[test]
@@ -557,7 +578,7 @@ mod tests {
         assert_eq!(fs::read(&l.v1_path).unwrap(), LEGACY_V1_FIXTURE);
         assert_eq!(
             read_counter(&l.counter),
-            1,
+            Attempts::Counted(1),
             "revert does not advance counter"
         );
     }
@@ -603,7 +624,11 @@ mod tests {
             outcome.migration,
             Some(MigrationEvent::StagingFailed { .. })
         ));
-        assert_eq!(read_counter(&l.counter), 0, "failed staging keeps counter");
+        assert_eq!(
+            read_counter(&l.counter),
+            Attempts::Counted(0),
+            "failed staging keeps counter"
+        );
         assert!(!unwritable_v2.exists());
     }
 
@@ -633,7 +658,7 @@ mod tests {
             "v1 unchanged"
         );
         assert!(l.v2_path.exists(), "v2 staging itself succeeded");
-        assert_eq!(read_counter(&unwritable_counter), 0);
+        assert_eq!(read_counter(&unwritable_counter), Attempts::Counted(0));
     }
 
     #[test]
@@ -648,12 +673,15 @@ mod tests {
         assert_eq!(
             outcome.migration,
             Some(MigrationEvent::MigrationDisabled {
-                attempts: MIGRATION_ATTEMPT_THRESHOLD
+                attempts: Attempts::Counted(MIGRATION_ATTEMPT_THRESHOLD)
             })
         );
         assert_eq!(fs::read(&l.v1_path).unwrap(), LEGACY_V1_FIXTURE);
         assert!(!l.v2_path.exists(), "no staging when migration disabled");
-        assert_eq!(read_counter(&l.counter), MIGRATION_ATTEMPT_THRESHOLD);
+        assert_eq!(
+            read_counter(&l.counter),
+            Attempts::Counted(MIGRATION_ATTEMPT_THRESHOLD)
+        );
     }
 
     #[test]
@@ -670,12 +698,15 @@ mod tests {
         assert_eq!(
             outcome.migration,
             Some(MigrationEvent::MigrationDisabled {
-                attempts: MIGRATION_ATTEMPT_THRESHOLD
+                attempts: Attempts::Counted(MIGRATION_ATTEMPT_THRESHOLD)
             })
         );
         assert_eq!(fs::read(&l.v1_path).unwrap(), LEGACY_V1_FIXTURE);
         assert_eq!(fs::read(&l.v2_path).unwrap(), v2);
-        assert_eq!(read_counter(&l.counter), MIGRATION_ATTEMPT_THRESHOLD);
+        assert_eq!(
+            read_counter(&l.counter),
+            Attempts::Counted(MIGRATION_ATTEMPT_THRESHOLD)
+        );
     }
 
     #[test]

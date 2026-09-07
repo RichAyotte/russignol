@@ -5,9 +5,10 @@
 //! Then run this: cargo run --example `tcp_client_test`
 
 use russignol_signer_lib::{
-    bls::{PublicKeyHash, generate_key},
+    PublicKeyHash, SignatureVersion,
     protocol::encoding::{decode_response, encode_request},
     protocol::{SignerRequest, SignerResponse},
+    test_utils::{create_block_data, generate_key},
 };
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -100,7 +101,7 @@ fn run_signing_test(
         println!("  Block data: {} bytes", block_data.len());
     }
     let request = SignerRequest::Sign {
-        pkh: (pkh, 0),
+        pkh: (pkh, SignatureVersion::V4),
         data: block_data,
         signature: None,
     };
@@ -180,19 +181,4 @@ fn send_request(
     let response = decode_response(&response_data, request)?;
 
     Ok(response)
-}
-
-/// Create Tenderbake block data for testing
-fn create_block_data(level: u32, round: u32) -> Vec<u8> {
-    let mut data = vec![0x11]; // Block magic byte
-    data.extend_from_slice(&[0, 0, 0, 1]); // chain_id
-    data.extend_from_slice(&level.to_be_bytes()); // level
-    data.push(0); // proto
-    data.extend_from_slice(&[0u8; 32]); // predecessor
-    data.extend_from_slice(&[0u8; 8]); // timestamp
-    data.push(0); // validation_pass
-    data.extend_from_slice(&[0u8; 32]); // operations_hash
-    data.extend_from_slice(&8u32.to_be_bytes()); // fitness_length
-    data.extend_from_slice(&round.to_be_bytes()); // round
-    data
 }

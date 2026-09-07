@@ -27,7 +27,7 @@ use crate::utils::{
     prompt_yes_no, rpc_get_json, run_command, run_octez_client_command, success,
     sudo_command_success, warning,
 };
-use russignol_signer_lib::KeyRole;
+use russignol_signer_lib::{DeviceKey, KeyRole};
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
@@ -370,7 +370,7 @@ fn execute_fresh_rotation(ctx: &FreshRotationContext<'_>, config: &RussignolConf
         .map(|role| {
             format!(
                 "{}={}",
-                role.device_alias(),
+                DeviceKey::Bls(role).device_alias(),
                 short_hash(&new_hashes[role.index()])
             )
         })
@@ -1207,7 +1207,6 @@ fn calculate_optimal_swap_window(
 
     let minimal_block_delay = blockchain::get_minimal_block_delay(config).unwrap_or(10);
 
-    // Calculate the start level of the activation cycle
     let cycle_start_level = activation_cycle * blocks_per_cycle;
 
     // Query baking rights for first 100 blocks of the new cycle
@@ -1399,12 +1398,35 @@ fn execute_swap_sequence(
         print_title_bar("✅ Key Rotation Complete!");
         success("Your baker is now using the new keys");
     } else {
-        warning("Could not verify baker signing within timeout");
         warning("Backup aliases preserved for potential rollback");
         info("Check baker logs and retry manually if needed");
+        return Err(unverified_signing(BackupAliases::Kept));
     }
 
     Ok(())
+}
+
+/// Where a rotation the baker was not seen signing after left the backup
+/// aliases.
+#[derive(Clone, Copy)]
+enum BackupAliases {
+    Kept,
+    RolledBack,
+}
+
+/// A rotation is not complete while the baker has not been seen signing with
+/// the new key, and a run exiting zero over that reads as one that is. The
+/// error says where the aliases were left, since a rollback that has run
+/// leaves nothing kept for one.
+fn unverified_signing(aliases: BackupAliases) -> anyhow::Error {
+    let aliases = match aliases {
+        BackupAliases::Kept => "the backup aliases are kept for a rollback",
+        BackupAliases::RolledBack => "the aliases were rolled back to the old keys",
+    };
+    anyhow::anyhow!(
+        "the baker was not seen signing with the new consensus key within the timeout, so the \
+         rotation is not complete; {aliases}"
+    )
 }
 
 /// Stop the baker daemon
@@ -2263,11 +2285,11 @@ fn resume_from_keys_activated_need_swap(
         print_title_bar("✅ Key Rotation Complete!");
         success("Your baker is now using the new keys");
     } else {
-        warning("Could not verify baker signing within timeout");
         warning("Backup aliases retained for manual inspection");
         info(&format!(
             "You can manually verify and then run: octez-client forget address {CONSENSUS_KEY_OLD_ALIAS} --force"
         ));
+        return Err(unverified_signing(BackupAliases::Kept));
     }
 
     Ok(())
@@ -2354,6 +2376,11 @@ fn resume_from_partial_swap(
             warning("Backup aliases preserved for potential rollback");
             info("Check baker logs and retry manually if needed");
         }
+        return Err(unverified_signing(if should_rollback {
+            BackupAliases::RolledBack
+        } else {
+            BackupAliases::Kept
+        }));
     }
 
     Ok(())
@@ -2434,6 +2461,18 @@ mod tests {
     use super::*;
 
     const EXPECTED: &str = "tz4HVR6aty9KwsQFHh81C1G7gBdhxT8kuHtm";
+
+    /// A rollback that has run leaves nothing kept for one, so the error after
+    /// it says the aliases were rolled back rather than kept.
+    #[test]
+    fn unverified_signing_says_where_the_aliases_were_left() {
+        let kept = unverified_signing(BackupAliases::Kept).to_string();
+        let rolled_back = unverified_signing(BackupAliases::RolledBack).to_string();
+
+        assert!(kept.contains("kept for a rollback"), "{kept}");
+        assert!(rolled_back.contains("rolled back"), "{rolled_back}");
+        assert!(!rolled_back.contains("kept"), "{rolled_back}");
+    }
 
     #[test]
     fn signing_verified_requires_every_signal() {

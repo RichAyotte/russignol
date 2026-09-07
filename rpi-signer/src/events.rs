@@ -1,5 +1,5 @@
 use embedded_graphics::prelude::Point;
-use russignol_signer_lib::ChainId;
+use russignol_signer_lib::{ChainId, DeviceKey};
 use std::time::Duration;
 
 use crate::secret::Secret;
@@ -57,10 +57,28 @@ pub enum AppEvent {
         message: String,
         estimated_duration: Duration,
     },
-    /// Fired by the migration error notice's OK button; carries the
-    /// already-decrypted secret keys forward to the normal unlock path.
+    /// Fired by an error notice's OK button; carries the already-decrypted
+    /// secret keys forward to the normal unlock path.
     AcknowledgeMigrationNotice {
         json: Secret<String>,
+    },
+    /// A staged provisioning request was carried out on this boot; `json` is
+    /// the store that replaced the one on the card, which is what the device
+    /// serves whatever else this boot could not do.
+    ///
+    /// `uncleared` is why the request itself could not be deleted, where it
+    /// could not: the card is written either way, and a request left behind is
+    /// a device that provisions a fresh key on every boot after this one.
+    KeysProvisioned {
+        json: Secret<String>,
+        key: DeviceKey,
+        uncleared: Option<String>,
+    },
+    /// A staged provisioning request failed; `json` is the store the device
+    /// unlocks on, which is the one it read.
+    ProvisionFailed {
+        json: Secret<String>,
+        reason: String,
     },
     PinVerificationFailed,         // PIN verification failed (wrong PIN)
     DeviceLocked,                  // Too many failed PIN attempts, device locked
@@ -104,14 +122,29 @@ pub enum AppEvent {
     ShowMenu,               // Show menu page
     ShowStatus,             // Show status page
     ShowSignatures,         // Show signatures/activity page
-    ShowWatermarks,         // Show watermarks page
-    ShowBlockchain,         // Show blockchain/chain info page
-    ShowAbout,              // Show about page
-    ShowGreeting,           // Return to the first-boot greeting page
+    /// Show the card's keys: their addresses and their watermarks, as two tabs.
+    ShowKeys,
+    /// Show the page offering each key the device can provision.
+    ShowProvision,
+    /// The operator picked a key to provision; nothing is staged until the
+    /// confirmation and the PIN behind it are both answered.
+    ProvisionKey(DeviceKey),
+    /// The operator accepted what the run costs, so the PIN page opens.
+    ConfirmProvision(DeviceKey),
+    /// The PIN was accepted and the request is on the card, so the device
+    /// reboots into the privileged boot that carries it out.
+    ProvisionRequested,
+    /// The request was not staged: the PIN did not open the card, or the write
+    /// failed. The device goes on serving with the keys it holds.
+    ProvisionRequestFailed {
+        reason: String,
+    },
+    ShowAbout,    // Show about page
+    ShowGreeting, // Return to the first-boot greeting page
     ShowImage {
         back: BackTarget,
     }, // Show flashed-image provenance page
-    RequestShutdown,        // Show shutdown confirmation from menu
+    RequestShutdown, // Show shutdown confirmation from menu
     FatalError {
         title: String,
         message: String,

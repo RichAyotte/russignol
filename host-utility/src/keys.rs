@@ -61,20 +61,22 @@ pub fn get_key_hash(alias: &str, config: &crate::config::RussignolConfig) -> Res
     anyhow::bail!("Could not parse key hash from octez-client output")
 }
 
-/// Discover BLS keys from the remote signer, in device role order.
+/// Discover the remote signer's keys, in device-key order.
 ///
-/// Returns tz4 key hashes with `[KeyRole::index()]` naming the role: `[0]` =
-/// consensus, `[1]` = companion.
+/// Returns addresses with `[DeviceKey::index()]` naming the key: `[0]` = the
+/// BLS consensus key, `[1]` = the BLS companion key, `[2]` = the XMSS consensus
+/// key where the card holds one. `[KeyRole::index()]` therefore names the BLS
+/// key in that role.
 ///
 /// **Position is the only channel for that mapping, and this side cannot check
 /// it.** The signer's `KnownKeys` response is a bare pkh list carrying no
 /// aliases, so the role of each hash is knowable only from its ordinal. The
-/// chain is: the device's `KeyManager::list_keys()` emits `KeyRole::ALL` order,
-/// the wire codec preserves list order, and `octez-client list known remote
-/// keys` is assumed to print in the order it received. That last link is
+/// chain is: the device's `KeyManager::list_keys()` emits `DeviceKey::ALL`
+/// order, the wire codec preserves list order, and `octez-client list known
+/// remote keys` is assumed to print in the order it received. That last link is
 /// octez-client's behaviour, not ours — if it ever sorted or regrouped its
-/// output, every caller would silently swap the two roles. Any caller that
-/// could verify a hash's role by another route should.
+/// output, every caller would silently swap the roles. Any caller that could
+/// verify a hash's role by another route should.
 pub fn discover_remote_keys(config: &crate::config::RussignolConfig) -> Result<Vec<String>> {
     let signer_uri = config.signer_uri();
     let output =
@@ -85,16 +87,20 @@ pub fn discover_remote_keys(config: &crate::config::RussignolConfig) -> Result<V
         anyhow::bail!("Failed to list remote keys: {stderr}");
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(remote_keys_in_listing(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
 
-    let keys: Vec<String> = stdout
+/// The addresses in a `list known remote keys` listing, one a line, of the
+/// schemes the device signs under; every other line is client chatter.
+fn remote_keys_in_listing(stdout: &str) -> Vec<String> {
+    stdout
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with("tz4"))
+        .filter(|line| russignol_signer_lib::PublicKeyHash::from_b58check(line).is_ok())
         .map(std::string::ToString::to_string)
-        .collect();
-
-    Ok(keys)
+        .collect()
 }
 
 /// Check if the remote signer is accessible and holds a BLS key for every role
@@ -122,35 +128,71 @@ pub fn signer_holds_key(
     Ok(keys.iter().any(|k| k == expected_hash))
 }
 
-/// Wait for the remote signer to become accessible, showing a spinner while waiting
+/// How long a signer that did not answer at once is asked for, and how often.
+/// One value rather than two durations, so a caller cannot hand the window
+/// over as the interval.
+#[derive(Clone, Copy)]
+struct Polling {
+    window: std::time::Duration,
+    every: std::time::Duration,
+}
+
+/// A device plugged in moments ago is still enumerating its USB gadget link,
+/// which is what the window absorbs.
+const SIGNER_POLLING: Polling = Polling {
+    window: std::time::Duration::from_secs(2),
+    every: std::time::Duration::from_millis(250),
+};
+
+/// Ask `probe` for the signer's keys every `polling.every` until it answers or
+/// `polling.window` runs out, so a signer that comes up early is not waited on
+/// for the whole window and one that never comes up is given the whole of it.
+/// The first ask comes an interval in, since the caller has just asked and been
+/// refused.
+fn poll_for_keys(
+    mut probe: impl FnMut() -> Option<Vec<String>>,
+    polling: Polling,
+) -> Option<Vec<String>> {
+    let deadline = std::time::Instant::now() + polling.window;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        std::thread::sleep(polling.every.min(left));
+        if let Some(keys) = probe() {
+            return Some(keys);
+        }
+    }
+}
+
+/// Wait for the remote signer to answer with a key per role, showing a spinner
+/// while waiting.
 ///
-/// This polls `check_remote_signer` until it succeeds (signer accessible with a key per role),
-/// displaying progress to the user. If `auto_confirm` is true and the signer isn't
-/// immediately available, returns an error. Otherwise prompts the user to retry.
+/// Asks through [`discover_remote_keys`] for [`SIGNER_POLLING`]'s window. If
+/// `auto_confirm` is true and the signer has not answered by then, returns an
+/// error; otherwise prompts the user and asks for the same window again.
 pub fn wait_for_signer(
     auto_confirm: bool,
     config: &crate::config::RussignolConfig,
 ) -> Result<Vec<String>> {
     use crate::progress::create_spinner;
     use crate::utils::{info, success, warning};
-    use std::time::Duration;
 
-    // Quick check first - if already accessible, return discovered keys
-    if let Ok(keys) = discover_remote_keys(config)
-        && keys.len() >= KeyRole::COUNT
-    {
+    let probe = || {
+        discover_remote_keys(config)
+            .ok()
+            .filter(|keys| keys.len() >= KeyRole::COUNT)
+    };
+
+    if let Some(keys) = probe() {
         return Ok(keys);
     }
 
-    // Not accessible, show spinner and check
     let signer_uri = config.signer_uri();
     let spinner = create_spinner(&format!("Checking signer at {}...", config.signer_ip()));
 
-    // Wait a moment and check again (network might just be slow)
-    std::thread::sleep(Duration::from_secs(2));
-    if let Ok(keys) = discover_remote_keys(config)
-        && keys.len() >= KeyRole::COUNT
-    {
+    if let Some(keys) = poll_for_keys(probe, SIGNER_POLLING) {
         spinner.finish_and_clear();
         return Ok(keys);
     }
@@ -178,10 +220,7 @@ pub fn wait_for_signer(
     // Retry with spinner
     let spinner = create_spinner("Rechecking signer...");
 
-    std::thread::sleep(Duration::from_secs(2));
-    let keys = discover_remote_keys(config)
-        .ok()
-        .filter(|k| k.len() >= KeyRole::COUNT);
+    let keys = poll_for_keys(probe, SIGNER_POLLING);
     spinner.finish_and_clear();
 
     match keys {
@@ -366,6 +405,74 @@ pub fn rename_alias_locally(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use russignol_signer_lib::{PublicKeyHash, Scheme, base58check};
+
+    /// Every address of a scheme the device signs under is kept in the order
+    /// the client printed it, since position is what names the key; a line of
+    /// anything else, another scheme's address included, is not a key.
+    #[test]
+    fn a_listing_yields_each_device_scheme_in_order() {
+        let address = |scheme, byte| {
+            PublicKeyHash::from_bytes(scheme, &[byte; 20])
+                .expect("twenty bytes are an address")
+                .to_b58check()
+        };
+        let consensus = address(Scheme::Bls, 1);
+        let companion = address(Scheme::Bls, 2);
+        let tz6 = address(Scheme::Xmss, 3);
+        let tz1 = base58check::encode(&[6, 161, 159], &[4; 20]);
+        let listing = format!(
+            "Warning: the node is not synced\n{consensus}\n  {companion}\n{tz6}\n{tz1}\n\n"
+        );
+
+        assert_eq!(
+            remote_keys_in_listing(&listing),
+            [consensus, companion, tz6]
+        );
+    }
+
+    /// A signer that answers on a later probe is returned then, not after the
+    /// window; one that never answers is asked until the window runs out and
+    /// then given up on.
+    #[test]
+    fn polling_returns_on_the_first_answer_and_gives_up_at_the_deadline() {
+        use std::time::{Duration, Instant};
+
+        let mut asked = 0;
+        let keys = poll_for_keys(
+            || {
+                asked += 1;
+                (asked == 3).then(|| vec!["tz4".to_string()])
+            },
+            Polling {
+                window: Duration::from_secs(10),
+                every: Duration::from_millis(1),
+            },
+        );
+        assert_eq!(keys, Some(vec!["tz4".to_string()]));
+        assert_eq!(asked, 3);
+
+        let window = Duration::from_millis(20);
+        let started = Instant::now();
+        let mut asked = 0;
+        let keys = poll_for_keys(
+            || {
+                asked += 1;
+                None
+            },
+            Polling {
+                window,
+                every: Duration::from_millis(5),
+            },
+        );
+        assert_eq!(keys, None);
+        assert!(
+            started.elapsed() >= window,
+            "gave up after {:?}, inside the {window:?} window",
+            started.elapsed()
+        );
+        assert!(asked >= 2, "asked {asked} time(s) inside the window");
+    }
 
     #[test]
     fn forget_alias_ok_treats_success_and_absent_as_done() {

@@ -5,22 +5,39 @@ use crate::constants::ORANGE_RGB;
 use crate::key_role::BakerKeyNames;
 use crate::keys;
 use crate::progress::{run_step, run_step_detail};
-use crate::utils::{JsonValueExt, read_file, run_octez_client_command, success, warning};
+use crate::utils::{JsonValueExt, read_file, run_octez_client_command, success};
 use anyhow::{Context, Result};
-use russignol_signer_lib::KeyRole;
+use russignol_signer_lib::{DeviceKey, KeyRole};
 use std::io::Write;
 use std::path::Path;
 
-/// Baker state captured from a single delegate RPC fetch.
+/// Where a baker stands with the protocol.
 ///
-/// Distinguishes three states: unregistered, registered-but-deactivated,
-/// and registered-and-active. Fixes a bug where the old code conflated
-/// "unregistered" and "deactivated" via `is_registered_delegate()`.
+/// Registration and deactivation are not independent — an address that is no
+/// delegate cannot be a deactivated one — so this is one field rather than the
+/// two booleans whose fourth pair the protocol gives no meaning to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Registration {
+    /// The address is not a delegate.
+    Unregistered,
+    /// A delegate the protocol has deactivated; it re-registers to bake again.
+    Deactivated,
+    /// A delegate the protocol counts as active.
+    Active,
+}
+
+impl Registration {
+    /// Whether the address is a delegate at all, deactivated or not.
+    const fn is_registered(self) -> bool {
+        !matches!(self, Self::Unregistered)
+    }
+}
+
+/// Baker state captured from a single delegate RPC fetch.
 struct BakerStatus {
     alias: String,
     address: String,
-    registered: bool,
-    deactivated: bool,
+    registration: Registration,
     staked_balance: u64,
     full_balance: u64,
 }
@@ -40,7 +57,6 @@ fn select_baker(
         return Ok(("dry-run".to_string(), "tz1dummyKeyForDryRun".to_string()));
     }
 
-    // If auto_confirm is enabled and a baker key was provided, use it directly
     if auto_confirm {
         if let Some(key) = provided_baker_key {
             if let Some((alias, addr)) = blockchain::list_known_addresses(config)?
@@ -107,10 +123,6 @@ fn parse_mutez_field(delegate_info: &serde_json::Value, key: &str) -> Result<u64
 }
 
 /// Validate baker against the blockchain with a single delegate RPC fetch.
-///
-/// Returns `BakerStatus` distinguishing unregistered, deactivated, and active.
-/// Fixes a bug where `is_registered_delegate()` conflated unregistered and
-/// deactivated bakers.
 fn validate_baker(alias: &str, address: &str, config: &RussignolConfig) -> Result<BakerStatus> {
     let rpc_path = format!("/chains/main/blocks/head/context/delegates/{address}");
 
@@ -136,8 +148,11 @@ fn validate_baker(alias: &str, address: &str, config: &RussignolConfig) -> Resul
                 Ok(BakerStatus {
                     alias: alias.to_string(),
                     address: address.to_string(),
-                    registered: true,
-                    deactivated,
+                    registration: if deactivated {
+                        Registration::Deactivated
+                    } else {
+                        Registration::Active
+                    },
                     staked_balance,
                     full_balance,
                 })
@@ -152,8 +167,7 @@ fn validate_baker(alias: &str, address: &str, config: &RussignolConfig) -> Resul
                     Ok(BakerStatus {
                         alias: alias.to_string(),
                         address: address.to_string(),
-                        registered: false,
-                        deactivated: false,
+                        registration: Registration::Unregistered,
                         staked_balance: 0,
                         full_balance: 0,
                     })
@@ -167,6 +181,32 @@ fn validate_baker(alias: &str, address: &str, config: &RussignolConfig) -> Resul
     )
 }
 
+/// What the operator is asked to confirm for a baker in this state.
+fn mutations_for(baker: &BakerStatus) -> Vec<crate::confirmation::MutationAction> {
+    let staking = || crate::confirmation::MutationAction {
+        description: "Configure staking parameters".to_string(),
+        detailed_info: Some("Required for baker to participate in consensus".to_string()),
+    };
+    match baker.registration {
+        Registration::Unregistered => vec![
+            crate::confirmation::MutationAction {
+                description: "Register baker as delegate".to_string(),
+                detailed_info: Some("Blockchain transaction to register as delegate".to_string()),
+            },
+            staking(),
+        ],
+        Registration::Deactivated => vec![
+            crate::confirmation::MutationAction {
+                description: "Re-register baker as delegate".to_string(),
+                detailed_info: Some("Baker is deactivated and needs re-registration".to_string()),
+            },
+            staking(),
+        ],
+        Registration::Active if baker.staked_balance == 0 => vec![staking()],
+        Registration::Active => Vec::new(),
+    }
+}
+
 pub fn run(
     backup_dir: &Path,
     confirmation_config: &crate::confirmation::ConfirmationConfig,
@@ -178,17 +218,14 @@ pub fn run(
 
     // ── Before confirmation (read-only) ──────────────────────────────────
 
-    // Step 1: Select baker (interactive prompt or CLI arg)
     let (alias, address) =
         select_baker(dry_run, auto_confirm, provided_baker_key, russignol_config)?;
 
-    // Step 2: Validate baker against blockchain (single delegate RPC)
     let baker = if dry_run {
         BakerStatus {
             alias,
             address: address.clone(),
-            registered: true,
-            deactivated: false,
+            registration: Registration::Active,
             staked_balance: 0,
             full_balance: 0,
         }
@@ -196,8 +233,7 @@ pub fn run(
         validate_baker(&alias, &address, russignol_config)?
     };
 
-    // Step 3: Show stake status if already set
-    if baker.registered && baker.staked_balance > 0 {
+    if baker.registration.is_registered() && baker.staked_balance > 0 {
         let staked_tez = blockchain::mutez_to_tez(baker.staked_balance);
         let pct = blockchain::percentage(baker.staked_balance, baker.full_balance);
         success(&format!(
@@ -205,35 +241,9 @@ pub fn run(
         ));
     }
 
-    // Step 4: Build dynamic mutations list based on baker state
-    let mut actions = Vec::new();
+    let actions = mutations_for(&baker);
 
-    if !baker.registered {
-        actions.push(crate::confirmation::MutationAction {
-            description: "Register baker as delegate".to_string(),
-            detailed_info: Some("Blockchain transaction to register as delegate".to_string()),
-        });
-        actions.push(crate::confirmation::MutationAction {
-            description: "Configure staking parameters".to_string(),
-            detailed_info: Some("Required for baker to participate in consensus".to_string()),
-        });
-    } else if baker.deactivated {
-        actions.push(crate::confirmation::MutationAction {
-            description: "Re-register baker as delegate".to_string(),
-            detailed_info: Some("Baker is deactivated and needs re-registration".to_string()),
-        });
-        actions.push(crate::confirmation::MutationAction {
-            description: "Configure staking parameters".to_string(),
-            detailed_info: Some("Required for baker to participate in consensus".to_string()),
-        });
-    } else if baker.staked_balance == 0 {
-        actions.push(crate::confirmation::MutationAction {
-            description: "Configure staking parameters".to_string(),
-            detailed_info: Some("Required for baker to participate in consensus".to_string()),
-        });
-    }
-
-    // Step 6: Get confirmation for registration/staking actions (skip if nothing to do)
+    // Nothing to confirm where the baker needs nothing done to it.
     if !actions.is_empty() {
         let mutations = crate::confirmation::PhaseMutations {
             phase_name: "Key Configuration".to_string(),
@@ -258,17 +268,15 @@ pub fn run(
         handle_baker_registration(&baker, auto_confirm, russignol_config)?;
     }
 
-    // Check and set stake using pre-fetched BakerStatus
-    if !dry_run
-        && baker.registered
-        && baker.staked_balance == 0
-        && let Err(e) = check_and_set_stake(&baker, auto_confirm, russignol_config)
-    {
-        // Setup can still complete, but the operator must know stake was not set
-        // so they can set it manually rather than believing it was configured.
-        warning(&format!(
-            "Could not set stake automatically: {e:#}. Set it manually with 'octez-client stake ...'."
-        ));
+    // A stake the run could not set is a baker that is not ready, and an
+    // unattended run exiting zero over one reads as a baker that is. An
+    // operator declining the prompt is not that: the decision is theirs, and
+    // only an interactive run is asked.
+    if !dry_run && baker.registration.is_registered() && baker.staked_balance == 0 {
+        check_and_set_stake(&baker, auto_confirm, russignol_config).context(
+            "the stake could not be set; set it with 'octez-client stake <amount> for <alias>' and \
+             run setup again",
+        )?;
     }
 
     // Ensure signer is accessible and discover remote keys
@@ -303,7 +311,7 @@ fn handle_baker_registration(
     auto_confirm: bool,
     config: &RussignolConfig,
 ) -> Result<()> {
-    if baker.registered && baker.deactivated {
+    if baker.registration == Registration::Deactivated {
         // Baker is registered but deactivated — offer re-registration
         log::warn!(
             "Baker {} is deactivated and needs re-registration",
@@ -350,7 +358,7 @@ fn handle_baker_registration(
                 baker.alias
             );
         }
-    } else if !baker.registered {
+    } else if baker.registration == Registration::Unregistered {
         // Not registered yet — check balance, then offer registration
         run_step(
             "Checking baker balance",
@@ -592,8 +600,8 @@ fn discover_and_import_keys(
                     if remote_keys[role_a.index()] == remote_keys[role_b.index()] {
                         anyhow::bail!(
                             "Signer returned duplicate keys - {} and {} have the same public key hash",
-                            role_a.device_alias(),
-                            role_b.device_alias()
+                            DeviceKey::Bls(role_a).device_alias(),
+                            DeviceKey::Bls(role_b).device_alias()
                         );
                     }
                 }
@@ -614,14 +622,24 @@ fn discover_and_import_keys(
     // the loop below: importing one role never rewrites another role's entry.
     let imported = roles_correctly_imported(&secret_keys_file, &role_remote, signer_ip);
 
+    // One fetch answers the skip below and every role in the loop after it.
+    // Setting one role's key adds a pending entry under that role's own field,
+    // so no iteration invalidates what a later one reads here.
+    //
+    // A fetch that fails is no answer that a key is unset — it withdraws a
+    // skip rather than granting one. The set that follows is what this
+    // function is for, and octez-client reports a key already there as already
+    // active, so a failed read costs one redundant command.
+    let delegate_info = fetch_delegate_info(baker_key, config).ok();
+
     // Fast path: every role imported AND set on-chain → skip all subprocess work
     if imported.iter().all(|&i| i) {
         let local = read_local_key_hashes(&secret_keys_file, signer_ip);
-        let all_on_chain = fetch_delegate_info(baker_key, config).is_ok_and(|info| {
+        let all_on_chain = delegate_info.as_ref().is_some_and(|info| {
             KeyRole::ALL.into_iter().all(|role| {
                 local[role.index()]
                     .as_ref()
-                    .is_some_and(|hash| role_key_set_on_chain(&info, role, hash))
+                    .is_some_and(|hash| role_key_set_on_chain(info, role, hash))
             })
         });
         if all_on_chain {
@@ -640,6 +658,7 @@ fn discover_and_import_keys(
             role,
             remote_pkh,
             imported[role.index()],
+            delegate_info.as_ref(),
             baker_key,
             &secret_keys_file,
             backup_dir,
@@ -664,6 +683,7 @@ fn import_and_set_key(
     role: KeyRole,
     remote_key_hash: &str,
     already_imported: bool,
+    delegate_info: Option<&serde_json::Value>,
     baker_key: &str,
     secret_keys_file: &Path,
     backup_dir: &Path,
@@ -703,8 +723,7 @@ fn import_and_set_key(
         // Resolve the imported key's public key hash
         let pkh = keys::get_key_hash(alias, config)?;
 
-        let already_set = fetch_delegate_info(baker_key, config)
-            .is_ok_and(|info| role_key_set_on_chain(&info, role, &pkh));
+        let already_set = delegate_info.is_some_and(|info| role_key_set_on_chain(info, role, &pkh));
 
         if !already_set {
             spinner.set_message(format!(
@@ -933,7 +952,7 @@ fn role_key_set_on_chain(
     let matches = active == expected_pkh || pending_match;
     log::debug!(
         "On-chain {} active={active:?} expected={expected_pkh:?} match={matches}",
-        role.device_alias()
+        role.rpc_delegate_key_field()
     );
     matches
 }
@@ -941,6 +960,52 @@ fn role_key_set_on_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The registration state is what decides the list the operator confirms,
+    /// and an unregistered baker asked to re-register, or a deactivated one
+    /// asked to register, names an action the protocol will refuse. Stake
+    /// separates the two active cases and nothing else.
+    #[test]
+    fn each_registration_state_asks_for_its_own_mutations() {
+        let baker = |registration, staked_balance| BakerStatus {
+            alias: "baker".to_string(),
+            address: "tz1baker".to_string(),
+            registration,
+            staked_balance,
+            full_balance: 100,
+        };
+        let asked = |b: &BakerStatus| -> Vec<String> {
+            mutations_for(b)
+                .into_iter()
+                .map(|action| action.description)
+                .collect()
+        };
+
+        assert_eq!(
+            asked(&baker(Registration::Unregistered, 0)),
+            ["Register baker as delegate", "Configure staking parameters"]
+        );
+        assert_eq!(
+            asked(&baker(Registration::Deactivated, 0)),
+            [
+                "Re-register baker as delegate",
+                "Configure staking parameters"
+            ]
+        );
+        assert_eq!(
+            asked(&baker(Registration::Deactivated, 1)),
+            [
+                "Re-register baker as delegate",
+                "Configure staking parameters"
+            ],
+            "stake does not settle a delegate the protocol has deactivated"
+        );
+        assert_eq!(
+            asked(&baker(Registration::Active, 0)),
+            ["Configure staking parameters"]
+        );
+        assert!(asked(&baker(Registration::Active, 1)).is_empty());
+    }
 
     #[test]
     fn parse_mutez_field_reads_a_string_encoded_amount() {

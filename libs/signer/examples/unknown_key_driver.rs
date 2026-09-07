@@ -17,12 +17,12 @@
 //! `RUSSIGNOL_DEVICE=host:port`.
 
 use russignol_signer_lib::{
-    bls::{self, PublicKeyHash},
+    PublicKeyHash, SignatureVersion,
     protocol::{
         SignerRequest, SignerResponse,
         encoding::{decode_response, encode_request},
     },
-    test_utils::create_block_data,
+    test_utils::{create_block_data, generate_key},
 };
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -45,7 +45,7 @@ fn seed_from_label(label: &str) -> [u8; 32] {
 }
 
 fn unknown_pkh(label: &str) -> Res<PublicKeyHash> {
-    let (pkh, _, _) = bls::generate_key(Some(&seed_from_label(label)))?;
+    let (pkh, _, _) = generate_key(Some(&seed_from_label(label)))?;
     Ok(pkh)
 }
 
@@ -124,7 +124,7 @@ fn cmd_flood(label: &str, n: u32) -> Res<()> {
     for i in 1..=n {
         let mut stream = connect()?;
         let request = SignerRequest::Sign {
-            pkh: (pkh, 0),
+            pkh: (pkh, SignatureVersion::V4),
             data: create_block_data(100, 0),
             signature: None,
         };
@@ -152,7 +152,7 @@ fn main() -> Res<()> {
             override_pk: None,
         })?,
         "sign" => cmd_single(label, |pkh| SignerRequest::Sign {
-            pkh: (pkh, 0),
+            pkh: (pkh, SignatureVersion::V4),
             data: create_block_data(100, 0),
             signature: None,
         })?,

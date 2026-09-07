@@ -8,11 +8,14 @@
 //! check-and-update operations are serialized by the lock, preventing
 //! double-signing by construction.
 
-use russignol_signer_lib::bls::generate_key;
 use russignol_signer_lib::high_watermark::ChainId;
-use russignol_signer_lib::test_utils::{create_block_data, new_watermark, preinit_watermarks};
+use russignol_signer_lib::test_utils::generate_key;
+use russignol_signer_lib::test_utils::{
+    create_block_data, new_epoch_watermark, new_watermark, preinit_watermarks,
+};
+use russignol_signer_lib::{PublicKeyHash, Scheme};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, RwLock};
+use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::thread;
 use tempfile::TempDir;
 
@@ -444,4 +447,62 @@ fn test_rollback_disk_watermark_after_sign_failure() {
             "Should be able to retry at the rolled-back level"
         );
     }
+}
+
+/// Two requests against a tz6 key must never be handed the same epoch: signing
+/// twice at one discloses the secret key rather than costing a deposit. The
+/// write lock serializes claims exactly as it serializes a level check.
+#[test]
+fn concurrent_claims_never_hand_out_one_epoch_twice() {
+    const THREADS: usize = 8;
+    const CLAIMS_PER_THREAD: usize = 16;
+
+    let temp_dir = TempDir::new().unwrap();
+    let pkh = PublicKeyHash::from_bytes(Scheme::Xmss, &[6u8; 20]).unwrap();
+    let epochs = 0..=255;
+
+    let hwm = Arc::new(RwLock::new(
+        new_epoch_watermark(temp_dir.path(), &pkh, epochs.clone()).unwrap(),
+    ));
+    hwm.write().unwrap().seed_epoch_floor(&pkh, 0).unwrap();
+
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let claimed = Arc::new(Mutex::new(Vec::new()));
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let hwm = Arc::clone(&hwm);
+            let barrier = Arc::clone(&barrier);
+            let claimed = Arc::clone(&claimed);
+
+            thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..CLAIMS_PER_THREAD {
+                    let epoch = hwm.write().unwrap().claim_epoch(&pkh).unwrap();
+                    claimed.lock().unwrap().push(epoch);
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let mut claimed = claimed.lock().unwrap().clone();
+    let handed_out = claimed.len();
+    claimed.sort_unstable();
+    claimed.dedup();
+
+    assert_eq!(handed_out, THREADS * CLAIMS_PER_THREAD);
+    assert_eq!(claimed.len(), handed_out, "an epoch was handed out twice");
+
+    let resume = new_epoch_watermark(temp_dir.path(), &pkh, epochs)
+        .unwrap()
+        .next_epoch(&pkh)
+        .unwrap();
+    assert!(
+        claimed.iter().all(|epoch| u64::from(*epoch) < resume),
+        "an epoch above the durable resume point {resume} left the store"
+    );
 }

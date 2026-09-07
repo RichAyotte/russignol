@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use russignol_signer_lib::{PublicKeyHash, scheme};
 use russignol_storage::{self, F2FS_FORMAT_FEATURES, MIN_ALIGNMENT, SECTOR_SIZE};
 
 use crate::card_fs;
@@ -191,10 +192,9 @@ fn is_safe_pin_blob_filename(name: &str) -> bool {
 
 /// Read every `secret_keys.enc*` file from a mounted keys partition.
 ///
-/// Returns the entries sorted by filename for determinism. Treats each file
-/// as an opaque payload — no interpretation of the suffix. Returns the
-/// configured-setup error when no matching files exist so the caller-facing
-/// failure mode is unchanged from the v1-only era.
+/// The entries are sorted by filename and each is an opaque payload, the
+/// suffix uninterpreted. A partition holding none is a card that has not
+/// completed setup, which is what the error names.
 fn read_pin_blobs(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
     let entries =
@@ -217,6 +217,24 @@ fn read_pin_blobs(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     }
     blobs.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(blobs)
+}
+
+/// The chain id and name a source card's `chain_info.json` carries, for the
+/// network-mismatch check.
+///
+/// A card from before the file existed has none, and the check is skipped for
+/// it. A file that is there and will not read is not that card, so it stops
+/// the restore rather than being read as no chain.
+fn source_chain_info(keys_mount: &Path) -> Result<(Option<String>, Option<String>)> {
+    let contents = match fs::read_to_string(keys_mount.join("chain_info.json")) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
+        Err(e) => return Err(e).context("Failed to read chain_info.json on the source card"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&contents)
+        .context("chain_info.json on the source card is not valid JSON")?;
+    let field = |name: &str| parsed.get(name).and_then(|v| v.as_str()).map(String::from);
+    Ok((field("id"), field("name")))
 }
 
 /// Write every PIN-blob entry to the target keys partition.
@@ -256,22 +274,7 @@ pub fn read_source_card(source_device: &Path) -> Result<SourceBackup> {
         let public_key_hashs = fs::read(p3_mount.join("public_key_hashs"))
             .context("Missing public_key_hashs on source card")?;
 
-        // Read chain info for network mismatch detection (non-fatal if missing)
-        let (source_chain_id, source_chain_name) =
-            match fs::read_to_string(p3_mount.join("chain_info.json")) {
-                Ok(contents) => {
-                    let parsed: serde_json::Value =
-                        serde_json::from_str(&contents).unwrap_or_default();
-                    (
-                        parsed.get("id").and_then(|v| v.as_str()).map(String::from),
-                        parsed
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                    )
-                }
-                Err(_) => (None, None),
-            };
+        let (source_chain_id, source_chain_name) = source_chain_info(&p3_mount)?;
 
         Ok((
             pin_blobs,
@@ -544,19 +547,7 @@ pub fn write_backup_to_target(
         .context("Failed to mount target keys partition")?;
     reclaim_mount_ownership(&p3_mount, privilege)?;
 
-    let p3_result = (|| {
-        write_pin_blobs(&p3_mount, &backup.pin_blobs).context("Failed to write PIN blobs")?;
-        fs::write(p3_mount.join("public_keys"), &backup.public_keys)
-            .context("Failed to write public_keys")?;
-        fs::write(p3_mount.join("public_key_hashs"), &backup.public_key_hashs)
-            .context("Failed to write public_key_hashs")?;
-        card_fs::write_chain_info(&p3_mount, chain_info)
-            .context("Failed to write chain_info.json")?;
-        // Write setup marker so signer skips first-boot setup
-        fs::write(p3_mount.join(".setup_complete"), "1")
-            .context("Failed to write .setup_complete marker")?;
-        Ok(())
-    })();
+    let p3_result = write_keys_partition(&p3_mount, backup, chain_info);
 
     // Always sync and unmount p3, even on write error
     utils::run_best_effort("sync", &[], "Syncing keys partition");
@@ -580,6 +571,30 @@ pub fn write_backup_to_target(
     Ok(())
 }
 
+/// Write a source card's keys into a mounted keys partition, with the chain
+/// info and the marker that has the device skip first-boot setup.
+///
+/// This is the layout `verify_keys_partition` checks, and its tests write
+/// their partition through here so the two cannot drift apart.
+fn write_keys_partition(
+    keys_mount: &Path,
+    backup: &SourceBackup,
+    chain_info: &crate::watermark::ChainInfo,
+) -> Result<()> {
+    write_pin_blobs(keys_mount, &backup.pin_blobs).context("Failed to write PIN blobs")?;
+    fs::write(keys_mount.join("public_keys"), &backup.public_keys)
+        .context("Failed to write public_keys")?;
+    fs::write(
+        keys_mount.join("public_key_hashs"),
+        &backup.public_key_hashs,
+    )
+    .context("Failed to write public_key_hashs")?;
+    card_fs::write_chain_info(keys_mount, chain_info).context("Failed to write chain_info.json")?;
+    fs::write(keys_mount.join(".setup_complete"), "1")
+        .context("Failed to write .setup_complete marker")?;
+    Ok(())
+}
+
 /// Assert the target keys partition (p3) has the files a bootable card needs.
 fn verify_keys_partition(keys_mount: &Path) -> Result<()> {
     let require_nonempty = |name: &str| -> Result<()> {
@@ -593,15 +608,25 @@ fn verify_keys_partition(keys_mount: &Path) -> Result<()> {
     require_nonempty("public_keys")?;
     require_nonempty("public_key_hashs")?;
 
-    let has_key_blob = fs::read_dir(keys_mount)
-        .context("failed to read target keys partition")?
-        .filter_map(std::result::Result::ok)
-        .any(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("secret_keys.enc"))
-                && e.metadata().is_ok_and(|m| m.len() > 0)
-        });
+    let mut has_key_blob = false;
+    for entry in fs::read_dir(keys_mount).context("failed to read target keys partition")? {
+        let entry = entry.context("failed to read an entry of the target keys partition")?;
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("secret_keys.enc"))
+        {
+            continue;
+        }
+        let len = entry
+            .metadata()
+            .with_context(|| format!("failed to stat {}", entry.path().display()))?
+            .len();
+        if len > 0 {
+            has_key_blob = true;
+            break;
+        }
+    }
     if !has_key_blob {
         bail!("no non-empty secret_keys.enc* blob on target keys partition");
     }
@@ -651,57 +676,84 @@ fn verify_target(device: &Path) -> Result<()> {
 }
 
 /// A named key entry from the wallet's `public_key_hashs` file
+#[derive(Debug)]
 pub(crate) struct NamedKey {
     alias: String,
-    address: String,
+    address: PublicKeyHash,
 }
 
-/// Extract named tz4 key entries from the `public_key_hashs` JSON data.
+/// The entries of `public_key_hashs` naming a key of a scheme the device signs
+/// under.
 ///
-/// A malformed `public_key_hashs` is an error, not an empty list: silently
-/// returning empty would skip watermark seeding and let verification pass
-/// vacuously, reporting a successful restore of a card the signer can't use.
+/// A malformed `public_key_hashs` is an error, not an empty list: a restore
+/// that read it as empty would copy a wallet the device cannot read onto the
+/// target and report success. An address of another scheme is an entry the
+/// operator put there and is passed over; one that will not decode names a key
+/// the device cannot address either.
 fn extract_named_keys(public_key_hashs: &[u8]) -> Result<Vec<NamedKey>> {
     let entries: Vec<serde_json::Value> = serde_json::from_slice(public_key_hashs)
         .context("Failed to parse public_key_hashs as a JSON array")?;
 
-    Ok(entries
-        .iter()
-        .filter_map(|e| {
-            let name = e.get("name").and_then(|v| v.as_str())?;
-            let value = e.get("value").and_then(|v| v.as_str())?;
-            if value.starts_with("tz4") {
-                Some(NamedKey {
-                    alias: name.to_string(),
-                    address: value.to_string(),
-                })
-            } else {
-                None
+    let mut keys = Vec::new();
+    for entry in &entries {
+        let (Some(name), Some(value)) = (
+            entry.get("name").and_then(|v| v.as_str()),
+            entry.get("value").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        match PublicKeyHash::from_b58check(value) {
+            Ok(address) => keys.push(NamedKey {
+                alias: name.to_string(),
+                address,
+            }),
+            Err(scheme::Error::UnknownPrefix(_)) => {}
+            Err(e) => {
+                bail!("public_key_hashs entry '{name}' holds an address that will not decode: {e}")
             }
-        })
-        .collect())
+        }
+    }
+    Ok(keys)
 }
 
-/// Extract tz4 addresses from the `public_key_hashs` JSON data
-#[cfg(test)]
-fn extract_tz4_addresses(public_key_hashs: &[u8]) -> Result<Vec<String>> {
-    Ok(extract_named_keys(public_key_hashs)?
-        .into_iter()
-        .map(|k| k.address)
-        .collect())
+/// The keys a restore carries onto the target, or why it carries none.
+///
+/// The encrypted store is copied as one blob, so a source holding an XMSS key
+/// is refused whole: its epoch counter lives on the source card alone, the
+/// target would sign from the range's first epoch again, and two signatures
+/// at one epoch disclose the key.
+fn keys_to_restore(backup: &SourceBackup) -> Result<Vec<NamedKey>> {
+    let keys = extract_named_keys(&backup.public_key_hashs)?;
+    if let Some(key) = keys
+        .iter()
+        .find(|k| k.address.scheme() == russignol_signer_lib::Scheme::Xmss)
+    {
+        bail!(
+            "the source card holds {} ({}), an XMSS key whose epoch counter lives on that card \
+             alone; a restored copy would sign from its first epoch again and disclose the key. \
+             Set the new card up fresh and provision its own {} instead.",
+            key.alias,
+            key.address.to_b58check(),
+            key.alias
+        );
+    }
+    Ok(keys)
 }
 
 /// Map a key alias to a user-friendly label.
 ///
-/// Covers both russignol's own aliases and the bare `consensus`/`companion`
-/// role names a migrated card carries, so the confirmation box labels migrated
-/// keys by role too.
+/// Covers russignol's own baker aliases and every device key-store spelling,
+/// the pre-suffix ones included, so the confirmation box labels a key restored
+/// from any card by its role.
 fn friendly_key_label(alias: &str) -> &str {
     use crate::key_role::BakerKeyNames;
-    use russignol_signer_lib::KeyRole;
+    use russignol_signer_lib::{DeviceKey, KeyRole};
 
+    if let Some(key) = DeviceKey::from_device_alias(alias) {
+        return key.role().display_name();
+    }
     for role in KeyRole::ALL {
-        if alias == role.baker_alias() || alias == role.device_alias() {
+        if alias == role.baker_alias() {
             return role.display_name();
         }
         if alias == role.baker_pending_alias() {
@@ -837,7 +889,7 @@ pub fn confirm_restore_operation(
 
     for key in keys {
         let label = friendly_key_label(&key.alias);
-        lines.push(format!("{label}: {}", key.address));
+        lines.push(format!("{label}: {}", key.address.to_b58check()));
     }
 
     lines.push(format!("Chain: {} ({})", chain_info.name, chain_info.id));
@@ -1157,9 +1209,7 @@ pub fn run_single_reader_restore(
     let target = image::lookup_block_device(restore_from)
         .unwrap_or_else(|_| image::BlockDevice::from_path(restore_from));
 
-    // Derive the key list once; a malformed source aborts here rather than
-    // silently seeding no watermarks and passing a vacuous verification.
-    let named_keys = extract_named_keys(&backup.public_key_hashs)?;
+    let named_keys = keys_to_restore(&backup)?;
 
     // Confirm before flashing
     if !confirm_restore_operation(&target, &named_keys, job.chain_info, job.yes)? {
@@ -1196,9 +1246,7 @@ pub fn run_dual_reader_restore(
     job: FlashJob<'_>,
     privilege: FlashPrivilege,
 ) -> Result<()> {
-    // Derive the key list once; a malformed source aborts here rather than
-    // silently seeding no watermarks and passing a vacuous verification.
-    let named_keys = extract_named_keys(&backup.public_key_hashs)?;
+    let named_keys = keys_to_restore(backup)?;
 
     // Confirm before flashing
     if !confirm_restore_operation(target, &named_keys, job.chain_info, job.yes)? {
@@ -1228,6 +1276,7 @@ pub fn run_dual_reader_restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use russignol_signer_lib::{Scheme, base58check};
 
     /// Returns `true` when the source card has a chain ID that differs from the node's.
     ///
@@ -1281,16 +1330,46 @@ mod tests {
         assert_eq!(key_format_summary(&[]), "unrecognized");
     }
 
+    /// A keys partition as the restore writes one, through the writer that
+    /// writes it: a hand-rolled layout is a second copy of the format, and a
+    /// verifier tested against it stays green while the card it checks moves.
     fn write_complete_keys_dir(p: &Path) {
-        fs::write(p.join("public_keys"), b"pk").unwrap();
-        fs::write(p.join("public_key_hashs"), b"pkh").unwrap();
-        fs::write(p.join("secret_keys.enc.v2"), b"blob").unwrap();
-        fs::write(p.join(".setup_complete"), b"1").unwrap();
+        write_complete_keys_dir_for(p, "NetXdQprcVkpaWU", "TEZOS_MAINNET");
+    }
+
+    fn write_complete_keys_dir_for(p: &Path, chain_id: &str, chain_name: &str) {
+        let mut backup = backup_naming(&[]);
+        backup.pin_blobs = vec![("secret_keys.enc.v2".to_string(), b"blob".to_vec())];
+        backup.public_keys = b"pk".to_vec();
+        let chain = crate::watermark::ChainInfo {
+            id: chain_id.to_string(),
+            level: 1,
+            name: chain_name.to_string(),
+            blocks_per_cycle: 10800,
+        };
+        write_keys_partition(p, &backup, &chain).unwrap();
+    }
+
+    /// A source card from before `chain_info.json` existed reads as no chain,
+    /// which skips the mismatch check; one whose file will not read is a
+    /// card the restore stops on, rather than one it reads as no chain.
+    #[test]
+    fn source_chain_info_tells_a_missing_file_from_one_that_will_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(source_chain_info(dir.path()).unwrap(), (None, None));
+
+        fs::write(dir.path().join("chain_info.json"), b"{not json").unwrap();
+        assert!(source_chain_info(dir.path()).is_err());
+
         fs::write(
-            p.join("chain_info.json"),
-            br#"{"id":"NetXdQprcVkpaWU","name":"TEZOS_MAINNET"}"#,
+            dir.path().join("chain_info.json"),
+            br#"{"id":"NetXmainnet","name":"Mainnet","blocks_per_cycle":10800}"#,
         )
         .unwrap();
+        assert_eq!(
+            source_chain_info(dir.path()).unwrap(),
+            (Some("NetXmainnet".to_string()), Some("Mainnet".to_string()))
+        );
     }
 
     #[test]
@@ -1319,12 +1398,7 @@ mod tests {
     #[test]
     fn verify_keys_partition_rejects_bad_chain_info() {
         let dir = tempfile::tempdir().unwrap();
-        write_complete_keys_dir(dir.path());
-        fs::write(
-            dir.path().join("chain_info.json"),
-            br#"{"id":"","name":""}"#,
-        )
-        .unwrap();
+        write_complete_keys_dir_for(dir.path(), "", "");
         assert!(verify_keys_partition(dir.path()).is_err());
     }
 
@@ -1472,19 +1546,87 @@ mod tests {
         );
     }
 
+    fn wallet(entries: &[(&str, &str)]) -> Vec<u8> {
+        let entries: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+            .collect();
+        serde_json::to_vec(&entries).unwrap()
+    }
+
+    fn address(scheme: Scheme, byte: u8) -> PublicKeyHash {
+        PublicKeyHash::from_bytes(scheme, &[byte; 20]).expect("twenty bytes are an address")
+    }
+
+    /// A key of either scheme the device signs under is read; an address of
+    /// another scheme is an operator's own entry and is passed over.
     #[test]
-    fn test_extract_tz4_addresses() {
-        let json = serde_json::to_vec(&serde_json::json!([
-            { "name": "key1", "value": "tz4HVR6aty9KwsQFHh81C1G7gBdhxT8kuHtm" },
-            { "name": "key2", "value": "tz4KqQ9TbeYLg3Vtf6Pf5E9UJrhRepbgZ6WW" },
-            { "name": "key3", "value": "tz1aSkwEot3L2kmUvcoxzjMomb9LTQjTBGDKS" }
+    fn extract_named_keys_reads_each_device_scheme_and_passes_others_over() {
+        let tz4 = address(Scheme::Bls, 1);
+        let tz6 = address(Scheme::Xmss, 2);
+        let tz1 = base58check::encode(&[6, 161, 159], &[3; 20]);
+        let json = wallet(&[
+            ("consensus_tz4", &tz4.to_b58check()),
+            ("consensus_tz6", &tz6.to_b58check()),
+            ("payer", &tz1),
+        ]);
+
+        let keys = extract_named_keys(&json).unwrap();
+
+        assert_eq!(
+            keys.iter()
+                .map(|k| (k.alias.as_str(), k.address))
+                .collect::<Vec<_>>(),
+            [("consensus_tz4", tz4), ("consensus_tz6", tz6)]
+        );
+    }
+
+    /// An address that will not decode is a wallet the device cannot read, so
+    /// it stops the restore rather than being passed over like another scheme's.
+    #[test]
+    fn extract_named_keys_rejects_an_address_that_will_not_decode() {
+        let mut corrupt = address(Scheme::Bls, 1).to_b58check();
+        let last = corrupt.pop().unwrap();
+        corrupt.push(if last == '1' { '2' } else { '1' });
+
+        let err = extract_named_keys(&wallet(&[("consensus_tz4", &corrupt)])).unwrap_err();
+
+        assert!(err.to_string().contains("consensus_tz4"), "{err:#}");
+    }
+
+    fn backup_naming(entries: &[(&str, &str)]) -> SourceBackup {
+        SourceBackup {
+            pin_blobs: Vec::new(),
+            public_keys: Vec::new(),
+            public_key_hashs: wallet(entries),
+            source_card_id: None,
+            source_chain_id: None,
+            source_chain_name: None,
+        }
+    }
+
+    /// A source holding an XMSS key is refused whole, named by the alias the
+    /// operator would provision afresh; one holding BLS keys alone is carried.
+    #[test]
+    fn a_source_holding_an_xmss_key_is_refused() {
+        let consensus = address(Scheme::Bls, 1).to_b58check();
+        let companion = address(Scheme::Bls, 2).to_b58check();
+        let tz6 = address(Scheme::Xmss, 3).to_b58check();
+
+        let err = keys_to_restore(&backup_naming(&[
+            ("consensus_tz4", &consensus),
+            ("companion_tz4", &companion),
+            ("consensus_tz6", &tz6),
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("consensus_tz6"), "{err:#}");
+
+        let carried = keys_to_restore(&backup_naming(&[
+            ("consensus_tz4", &consensus),
+            ("companion_tz4", &companion),
         ]))
         .unwrap();
-
-        let addresses = extract_tz4_addresses(&json).unwrap();
-        assert_eq!(addresses.len(), 2);
-        assert!(addresses[0].starts_with("tz4"));
-        assert!(addresses[1].starts_with("tz4"));
+        assert_eq!(carried.len(), 2);
     }
 
     #[test]

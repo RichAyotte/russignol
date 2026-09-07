@@ -9,13 +9,14 @@
 //! and integrates with normal test infrastructure.
 
 use proptest::prelude::*;
-use russignol_signer_lib::bls::{PublicKeyHash, generate_key};
 use russignol_signer_lib::magic_bytes::{
     MagicByte, get_chain_id_for_tenderbake, get_level_and_round_for_tenderbake_attestation,
     get_level_and_round_for_tenderbake_block,
 };
 use russignol_signer_lib::protocol::SignerRequest;
 use russignol_signer_lib::protocol::encoding::{decode_request, decode_response, encode_request};
+use russignol_signer_lib::test_utils::generate_key;
+use russignol_signer_lib::{PublicKeyHash, Scheme, SignatureVersion};
 
 // ============================================================================
 // Protocol Parsing - Crash Safety
@@ -44,7 +45,6 @@ proptest! {
         request_tag in 0u8..=7u8
     ) {
         // Create a dummy request to provide context
-        // Note: Sign, DeterministicNonce, DeterministicNonceHash use VersionedPublicKeyHash = (PublicKeyHash, u8)
         let request = match request_tag {
             0 => SignerRequest::Sign {
                 pkh: create_versioned_pkh(42),
@@ -90,8 +90,8 @@ proptest! {
         // None of these should panic
         let _ = get_chain_id_for_tenderbake(&data);
         let _ = get_level_and_round_for_tenderbake_block(&data);
-        let _ = get_level_and_round_for_tenderbake_attestation(&data, true);
-        let _ = get_level_and_round_for_tenderbake_attestation(&data, false);
+        let _ = get_level_and_round_for_tenderbake_attestation(&data, Scheme::Bls);
+        let _ = get_level_and_round_for_tenderbake_attestation(&data, Scheme::Xmss);
 
         if !data.is_empty() {
             let _ = MagicByte::from_byte(data[0]);
@@ -127,12 +127,13 @@ proptest! {
     fn sign_request_roundtrips(
         seed in prop::array::uniform32(any::<u8>()),
         payload in prop::collection::vec(any::<u8>(), 1..1000),
-        version in any::<u8>()
+        version_byte in 0u8..=4u8
     ) {
         // Skip seeds that produce invalid BLS keys
         let Some(pkh) = try_create_pkh(&seed) else {
             return Ok(());
         };
+        let version = SignatureVersion::from_number(version_byte).expect("0..=4 names a version");
 
         let original = SignerRequest::Sign {
             pkh: (pkh, version),
@@ -252,8 +253,8 @@ fn create_test_pkh(seed_byte: u8) -> PublicKeyHash {
     pkh
 }
 
-fn create_versioned_pkh(seed_byte: u8) -> (PublicKeyHash, u8) {
-    (create_test_pkh(seed_byte), 0)
+fn create_versioned_pkh(seed_byte: u8) -> (PublicKeyHash, SignatureVersion) {
+    (create_test_pkh(seed_byte), SignatureVersion::V4)
 }
 
 fn try_create_pkh(seed: &[u8; 32]) -> Option<PublicKeyHash> {
@@ -264,16 +265,16 @@ fn original_versioned_pkh_bytes(req: &SignerRequest) -> Vec<u8> {
     match req {
         SignerRequest::Sign { pkh, .. } => {
             let mut bytes = pkh.0.to_bytes().to_vec();
-            bytes.push(pkh.1);
+            bytes.push(pkh.1.number());
             bytes
         }
         _ => vec![],
     }
 }
 
-fn versioned_pkh_bytes(pkh: &(PublicKeyHash, u8)) -> Vec<u8> {
+fn versioned_pkh_bytes(pkh: &(PublicKeyHash, SignatureVersion)) -> Vec<u8> {
     let mut bytes = pkh.0.to_bytes().to_vec();
-    bytes.push(pkh.1);
+    bytes.push(pkh.1.number());
     bytes
 }
 

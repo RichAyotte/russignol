@@ -6,3 +6,7 @@
 	url = https://github.com/raspberrypi/linux
 	branch = rpi-6.18.y
 	shallow = true
+[submodule "vendors/leanVM-b"]
+	path = vendors/leanVM-b
+	url = https://github.com/RichAyotte/leanVM.git
+	branch = russignol/xmss-patches

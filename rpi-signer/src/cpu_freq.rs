@@ -19,8 +19,8 @@ struct CpuBoostInner {
 /// CPU frequency controller for the userspace governor.
 ///
 /// Brackets CPU-intensive work (BLS signing, scrypt) with `boost()` and
-/// `restore()` calls. Designed for the `RPi` Zero 2W where signing takes
-/// ~5ms per operation.
+/// `restore()` calls, or holds the boost for a scope through [`CpuBoost::hold`].
+/// Designed for the `RPi` Zero 2W where signing takes ~5ms per operation.
 ///
 /// When idle (99.9% of the time), the CPU runs at minimum frequency (~600 MHz).
 /// Callers set max frequency (~1000 MHz) before work and restore min after.
@@ -53,7 +53,6 @@ impl CpuBoost {
             String::from_utf8_lossy(&max_freq)
         );
 
-        // Start at minimum frequency
         fs::write(&setspeed_path, &min_freq)?;
 
         Ok(Self(Arc::new(CpuBoostInner {
@@ -91,6 +90,25 @@ impl CpuBoost {
         {
             log::warn!("Failed to set CPU min freq: {e}");
         }
+    }
+}
+
+/// The maximum frequency held for a scope: taken when the guard is made and
+/// given back when it drops, so a scope leaving early gives it back the same
+/// as one running to its end.
+pub struct Boosted(CpuBoost);
+
+impl Drop for Boosted {
+    fn drop(&mut self) {
+        self.0.restore();
+    }
+}
+
+impl CpuBoost {
+    /// Hold the maximum frequency until the returned guard drops.
+    pub fn hold(&self) -> Boosted {
+        self.boost();
+        Boosted(self.clone())
     }
 }
 
@@ -166,6 +184,21 @@ mod tests {
         let cpu = CpuBoost::init(dir.path()).unwrap();
         cpu.restore();
 
+        let freq = fs::read_to_string(dir.path().join("scaling_setspeed")).unwrap();
+        assert_eq!(freq, "600000");
+    }
+
+    #[test]
+    fn a_hold_keeps_max_freq_until_it_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        create_mock_sysfs(dir.path());
+        let cpu = CpuBoost::init(dir.path()).unwrap();
+
+        let held = cpu.hold();
+        let freq = fs::read_to_string(dir.path().join("scaling_setspeed")).unwrap();
+        assert_eq!(freq, "1000000");
+
+        drop(held);
         let freq = fs::read_to_string(dir.path().join("scaling_setspeed")).unwrap();
         assert_eq!(freq, "600000");
     }

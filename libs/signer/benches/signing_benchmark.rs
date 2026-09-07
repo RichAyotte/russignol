@@ -49,14 +49,7 @@ fn bench_verification(c: &mut Criterion) {
         let pk = handler.public_key();
 
         group.bench_with_input(BenchmarkId::new("verify", size), size, |b, _| {
-            b.iter(|| {
-                russignol_signer_lib::bls::verify(
-                    black_box(pk),
-                    black_box(&sig),
-                    black_box(&data),
-                    None,
-                )
-            });
+            b.iter(|| black_box(pk).verify(black_box(&sig), black_box(&data), None));
         });
     }
 

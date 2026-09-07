@@ -1,7 +1,7 @@
 //! High-performance BLS12-381 signer for Tezos, optimized for Raspberry Pi Zero 2W
 //!
 //! This library provides a minimal, high-performance implementation of the Tezos
-//! russignol-signer functionality, focusing solely on BLS12-381 signatures with
+//! russignol-signer functionality, over BLS12-381 (tz4) and XMSS (tz6) keys with
 //! Tenderbake magic byte support (0x11, 0x12, 0x13).
 //!
 //! # Design Goals
@@ -16,6 +16,7 @@
 //! This implementation is a direct 1:1 port of the OCaml russignol-signer:
 //!
 //! - `bls` module ← `src/lib_crypto/bls.ml`
+//! - `xmss` module ← `src/lib_crypto/xmss.ml`
 //! - `magic_bytes` module ← `src/bin_signer/handler.ml` (magic byte checking)
 //! - `signer` module ← `src/lib_signer_backends/unencrypted.ml` + `handler.ml`
 //!
@@ -42,13 +43,17 @@
 
 #![warn(missing_docs)]
 
-mod base58check;
+pub mod base58;
+pub mod base58check;
 pub mod bls;
+pub mod durable;
 pub mod high_watermark;
 /// Device key roles (consensus / companion)
 pub mod key_role;
 pub mod magic_bytes;
 pub mod protocol;
+/// Keys and signatures over every scheme a device can hold
+pub mod scheme;
 pub mod server;
 pub mod signer;
 /// Signing activity tracking module
@@ -56,13 +61,15 @@ pub mod signing_activity;
 /// Test utilities for creating Tezos operation data
 pub mod test_utils;
 pub mod wallet;
+/// XMSS (tz6) keys: the base58 layer over `russignol-xmss`
+pub mod xmss;
 
 // Re-export commonly used types
-pub use bls::{PublicKey, PublicKeyHash, SecretKey, Signature};
-pub use high_watermark::{ChainId, HighWatermark, WatermarkError};
-pub use key_role::KeyRole;
+pub use high_watermark::{ChainId, EpochBudget, HighWatermark, WatermarkError};
+pub use key_role::{DeviceKey, KeyRole};
 pub use magic_bytes::{MagicByte, MagicByteError};
 pub use protocol::{SignerRequest, SignerResponse};
+pub use scheme::{PublicKey, PublicKeyHash, Scheme, SecretKey, Signature};
 pub use server::{KeyManager as ServerKeyManager, RequestHandler};
 pub use signer::SignatureVersion;
 pub use signing_activity::{

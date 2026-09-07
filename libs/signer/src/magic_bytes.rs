@@ -5,6 +5,7 @@
 //!
 //! Ported directly from: src/bin_signer/handler.ml:244-258
 
+use crate::scheme::Scheme;
 use thiserror::Error;
 
 /// Magic byte validation errors
@@ -183,14 +184,14 @@ pub fn get_level_and_round_for_tenderbake_block(data: &[u8]) -> Result<(u32, u32
 }
 
 /// Extract level and round from Tenderbake attestation/preattestation
-/// Corresponds to: src/bin_signer/handler.ml:70-90 - `get_level_and_round_for_tenderbake_attestation`
+/// Corresponds to: src/bin_signer/handler.ml:93-114 - `get_level_and_round_for_tenderbake_attestation`
 ///
 /// Attestation structure:
 /// - watermark (1 byte) - magic byte 0x12 or 0x13
 /// - `chain_id` (4 bytes)
 /// - branch (32 bytes)
 /// - kind (1 byte)
-/// - slot (2 bytes) - only for non-BLS signatures (Ed25519, Secp256k1, P256)
+/// - slot (2 bytes) - every scheme but BLS
 /// - level (4 bytes)
 /// - round (4 bytes)
 ///
@@ -199,14 +200,14 @@ pub fn get_level_and_round_for_tenderbake_block(data: &[u8]) -> Result<(u32, u32
 /// Returns an error if the data is too short to extract level and round fields.
 pub fn get_level_and_round_for_tenderbake_attestation(
     data: &[u8],
-    is_bls: bool,
+    scheme: Scheme,
 ) -> Result<(u32, u32)> {
-    // Corresponds to: handler.ml:76-81
-    // For BLS (tz4), slot is not part of the signed payload
-    let level_offset = if is_bls {
-        1 + 4 + 32 + 1 // No slot for BLS
-    } else {
-        1 + 4 + 32 + 1 + 2 // With slot for other key types
+    // handler.ml:99-105 groups Xmss with Ed25519/Secp256k1/P256/Mldsa44 against
+    // Bls: a tz4 attestation omits the committee slot the others carry, which
+    // moves level and round two bytes earlier.
+    let level_offset = match scheme {
+        Scheme::Bls => 1 + 4 + 32 + 1,
+        Scheme::Xmss => 1 + 4 + 32 + 1 + 2,
     };
 
     if data.len() < level_offset + 8 {
@@ -356,7 +357,7 @@ mod tests {
         attestation_data[level_offset + 4..level_offset + 8].copy_from_slice(&round_bytes);
 
         let (level, round) =
-            get_level_and_round_for_tenderbake_attestation(&attestation_data, true).unwrap();
+            get_level_and_round_for_tenderbake_attestation(&attestation_data, Scheme::Bls).unwrap();
         assert_eq!(level, 12345);
         assert_eq!(round, 5);
     }
@@ -379,7 +380,8 @@ mod tests {
         attestation_data[level_offset + 4..level_offset + 8].copy_from_slice(&round_bytes);
 
         let (level, round) =
-            get_level_and_round_for_tenderbake_attestation(&attestation_data, false).unwrap();
+            get_level_and_round_for_tenderbake_attestation(&attestation_data, Scheme::Xmss)
+                .unwrap();
         assert_eq!(level, 67890);
         assert_eq!(round, 7);
     }

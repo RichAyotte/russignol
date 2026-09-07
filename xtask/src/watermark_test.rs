@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use std::io::Write;
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -20,8 +20,8 @@ pub(crate) const DEFAULT_DEVICE_PORT: u16 = 7732;
 const CHAIN_INFO_FILE: &str = "/keys/chain_info.json";
 
 /// On-device watermark storage, the `SignerConfig::watermark_dir` default in
-/// `rpi-signer/src/signer_server.rs`. Clearing it drops every key to
-/// uninitialized so the next unlock reloads a clean slate.
+/// `rpi-signer/src/signer_server.rs`. Clearing the marks under it drops every
+/// key to uninitialized so the next unlock reloads a clean slate.
 const WATERMARK_DIR: &str = "/data/watermarks";
 
 /// Watermark test configuration
@@ -38,6 +38,8 @@ pub struct WatermarkTestConfig {
     pub clean: bool,
     /// Restart device before testing
     pub restart: bool,
+    /// First level the tests sign at, above the card's floors
+    pub level_base: Option<u32>,
     /// Verbose output
     pub verbose: bool,
 }
@@ -68,8 +70,15 @@ pub fn run_watermark_test(config: &WatermarkTestConfig) -> Result<()> {
     );
     println!();
 
-    let device_addr = format!("{}:{}", config.device_ip, config.device_port);
-    println!("  Device:     {}", device_addr.yellow());
+    let device_addr: SocketAddr = format!("{}:{}", config.device_ip, config.device_port)
+        .parse()
+        .with_context(|| {
+            format!(
+                "Invalid device address {}:{}",
+                config.device_ip, config.device_port
+            )
+        })?;
+    println!("  Device:     {}", device_addr.to_string().yellow());
     println!("  SSH User:   {}", config.ssh_user.yellow());
     println!(
         "  Category:   {}",
@@ -79,7 +88,7 @@ pub fn run_watermark_test(config: &WatermarkTestConfig) -> Result<()> {
 
     // Step 1: Check device connectivity
     println!("{}", "Step 1: Checking device connectivity...".cyan());
-    check_device_connectivity(&config.device_ip, config.device_port)?;
+    check_device_connectivity(device_addr)?;
     println!("  {} Device is reachable", "✓".green());
 
     // Step 2: Optionally clear watermarks
@@ -105,7 +114,7 @@ pub fn run_watermark_test(config: &WatermarkTestConfig) -> Result<()> {
 
         // The signer only binds its port after unlock, so the operator must
         // re-enter the PIN before the harness can reconnect.
-        check_device_connectivity(&config.device_ip, config.device_port)?;
+        check_device_connectivity(device_addr)?;
         println!("  {} Device responding after restart", "✓".green());
     } else {
         println!(
@@ -124,9 +133,10 @@ pub fn run_watermark_test(config: &WatermarkTestConfig) -> Result<()> {
     println!();
 
     run_test_harness(
-        &device_addr,
+        device_addr,
         &chain_id,
         config.category.as_deref(),
+        config.level_base,
         config.verbose,
     )?;
 
@@ -151,13 +161,7 @@ pub fn run_watermark_test(config: &WatermarkTestConfig) -> Result<()> {
 }
 
 /// Check if the device is reachable via TCP, prompting for PIN if locked
-fn check_device_connectivity(ip: &str, port: u16) -> Result<()> {
-    let addr = format!("{ip}:{port}");
-    let socket_addr: std::net::SocketAddr = addr
-        .parse()
-        .with_context(|| format!("Invalid address: {addr}"))?;
-
-    // First attempt to connect
+fn check_device_connectivity(socket_addr: SocketAddr) -> Result<()> {
     if TcpStream::connect_timeout(&socket_addr, Duration::from_secs(5)).is_ok() {
         Ok(())
     } else {
@@ -200,17 +204,20 @@ fn check_device_connectivity(ip: &str, port: u16) -> Result<()> {
             }
             if Instant::now() >= deadline {
                 println!("{}", "failed".red());
-                bail!("Still cannot connect to device at {addr} after unlock");
+                bail!("Still cannot connect to device at {socket_addr} after unlock");
             }
             std::thread::sleep(Duration::from_millis(500));
         }
     }
 }
 
-/// Clear the device's stored watermarks, dropping every key to uninitialized so
-/// the next unlock reloads a clean slate.
+/// Clear the device's stored watermarks, dropping every key's marks to
+/// uninitialized so the next unlock reloads a clean slate. A tz6 key's epoch
+/// record shares the key's directory and is kept: without it the next unlock
+/// seeds the floor at the range's first epoch, and a reused epoch discloses the
+/// key.
 fn clear_watermarks(ip: &str, user: &str) -> Result<()> {
-    ssh_run(user, ip, &format!("rm -rf {WATERMARK_DIR}/*"))
+    ssh_run(user, ip, &format!("rm -f {WATERMARK_DIR}/*/*_watermark"))
 }
 
 /// Restart the signer as root. The service comes back at PIN entry, so the
@@ -237,11 +244,13 @@ fn read_provisioned_chain(ip: &str, user: &str) -> Result<String> {
 
 /// Run the watermark E2E test harness
 fn run_test_harness(
-    device_addr: &str,
+    device_addr: SocketAddr,
     chain_id: &str,
     category: Option<&str>,
+    level_base: Option<u32>,
     verbose: bool,
 ) -> Result<()> {
+    let device = device_addr.to_string();
     let mut args = vec![
         "run",
         "--release",
@@ -251,7 +260,7 @@ fn run_test_harness(
         "russignol-signer-lib",
         "--",
         "--device",
-        device_addr,
+        device.as_str(),
         "--chain-id",
         chain_id,
     ];
@@ -259,6 +268,12 @@ fn run_test_harness(
     if let Some(cat) = category {
         args.push("--category");
         args.push(cat);
+    }
+
+    let level_base = level_base.map(|level| level.to_string());
+    if let Some(level) = &level_base {
+        args.push("--level-base");
+        args.push(level);
     }
 
     if verbose {

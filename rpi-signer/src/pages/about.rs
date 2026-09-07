@@ -2,6 +2,7 @@ use crate::events::{AppEvent, BackTarget};
 use crate::fonts;
 
 use super::Page as PageTrait;
+use super::drawn;
 use crossbeam_channel::Sender;
 use embedded_graphics::{image::Image, pixelcolor::BinaryColor, prelude::*, primitives::Rectangle};
 use tinybmp::Bmp;
@@ -57,50 +58,42 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         // 3 lines: ~14px (prop) + 10px gap + ~10px (small) + 12px gap + ~13px (medium) ≈ 59px
         let block_top = (DISPLAY_HEIGHT - 59) / 2;
 
-        font_prop
-            .render_aligned(
-                "Russignol",
-                Point::new(right_center, block_top + 14),
-                VerticalPosition::Baseline,
-                HorizontalAlignment::Center,
-                FontColor::Transparent(BinaryColor::Off),
-                display,
-            )
-            .ok();
+        drawn(font_prop.render_aligned(
+            "Russignol",
+            Point::new(right_center, block_top + 14),
+            VerticalPosition::Baseline,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(BinaryColor::Off),
+            display,
+        ))?;
 
-        font_small
-            .render_aligned(
-                version_str.as_str(),
-                Point::new(right_center, block_top + 28),
-                VerticalPosition::Baseline,
-                HorizontalAlignment::Center,
-                FontColor::Transparent(BinaryColor::Off),
-                display,
-            )
-            .ok();
+        drawn(font_small.render_aligned(
+            version_str.as_str(),
+            Point::new(right_center, block_top + 28),
+            VerticalPosition::Baseline,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(BinaryColor::Off),
+            display,
+        ))?;
 
-        font_medium
-            .render_aligned(
-                "russignol.com",
-                Point::new(right_center, block_top + 46),
-                VerticalPosition::Baseline,
-                HorizontalAlignment::Center,
-                FontColor::Transparent(BinaryColor::Off),
-                display,
-            )
-            .ok();
+        drawn(font_medium.render_aligned(
+            "russignol.com",
+            Point::new(right_center, block_top + 46),
+            VerticalPosition::Baseline,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(BinaryColor::Off),
+            display,
+        ))?;
 
         // Footer: copyright + license centered across full display width
-        font_small
-            .render_aligned(
-                format!("\u{00a9} 2026 {AUTHOR} \u{00b7} MIT License").as_str(),
-                Point::new(DISPLAY_WIDTH / 2, 116),
-                VerticalPosition::Center,
-                HorizontalAlignment::Center,
-                FontColor::Transparent(BinaryColor::Off),
-                display,
-            )
-            .ok();
+        drawn(font_small.render_aligned(
+            format!("\u{00a9} 2026 {AUTHOR} \u{00b7} MIT License").as_str(),
+            Point::new(DISPLAY_WIDTH / 2, 116),
+            VerticalPosition::Center,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(BinaryColor::Off),
+            display,
+        ))?;
 
         Ok(())
     }

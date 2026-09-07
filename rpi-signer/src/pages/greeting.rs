@@ -14,6 +14,7 @@ use u8g2_fonts::{
 };
 
 use super::Page as PageTrait;
+use super::drawn;
 
 /// Static logo BMP loaded at compile time
 const LOGO_DATA: &[u8] = include_bytes!("../../assets/russignol-61h.bmp");
@@ -72,16 +73,14 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         // Draw "Russignol" name centered below logo
         let name_font = FontRenderer::new::<fonts::FONT_PROPORTIONAL>();
         let name_y = logo_y + logo_size.height.cast_signed() + logo_text_gap + text_height;
-        name_font
-            .render_aligned(
-                "Russignol",
-                Point::new(half_width / 2, name_y),
-                VerticalPosition::Baseline,
-                U8gHAlign::Center,
-                FontColor::Transparent(BinaryColor::Off),
-                display,
-            )
-            .ok(); // Ignore font errors (BackgroundColorNotSupported can't happen with Transparent)
+        drawn(name_font.render_aligned(
+            "Russignol",
+            Point::new(half_width / 2, name_y),
+            VerticalPosition::Baseline,
+            U8gHAlign::Center,
+            FontColor::Transparent(BinaryColor::Off),
+            display,
+        ))?;
 
         // === RIGHT HALF: Button vertically centered ===
         let right_margin = 5;

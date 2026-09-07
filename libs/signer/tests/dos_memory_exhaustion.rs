@@ -5,8 +5,8 @@
 //! brick a healthy device), such a mark loads as uninitialized so signing fails
 //! closed and the on-device recovery re-establishes an authenticated floor.
 
-use russignol_signer_lib::bls::generate_key;
 use russignol_signer_lib::high_watermark::{ChainId, WatermarkError, seed_watermarks};
+use russignol_signer_lib::test_utils::generate_key;
 use russignol_signer_lib::test_utils::{
     create_block_data, default_test_chain_id, new_watermark, preinit_watermarks,
 };
@@ -22,7 +22,7 @@ fn chain_id_from_index(n: u32) -> ChainId {
 /// with `NotInitialized` so the missing-watermark recovery takes over.
 fn assert_not_trusted(
     hwm: &mut russignol_signer_lib::high_watermark::HighWatermark,
-    pkh: &russignol_signer_lib::bls::PublicKeyHash,
+    pkh: &russignol_signer_lib::PublicKeyHash,
 ) {
     assert!(
         hwm.get_max_level(pkh).is_none(),

@@ -1,4 +1,5 @@
 use super::Page as PageTrait;
+use super::drawn;
 use crate::{events::AppEvent, fonts, widgets::Button};
 use crossbeam_channel::Sender;
 use embedded_graphics::{
@@ -93,16 +94,14 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
 
         // --- Draw Title and PIN dots in Empty Space ---
         let title_font = FontRenderer::new::<fonts::FONT_PROPORTIONAL>();
-        title_font
-            .render_aligned(
-                self.title.as_str(),
-                Point::new(41, 25), // Center of the top half of the 82x81 empty block
-                VerticalPosition::Center,
-                HorizontalAlignment::Center,
-                FontColor::Transparent(BinaryColor::Off),
-                display,
-            )
-            .ok(); // Ignore font errors (BackgroundColorNotSupported can't happen with Transparent)
+        drawn(title_font.render_aligned(
+            self.title.as_str(),
+            Point::new(41, 25), // Center of the top half of the 82x81 empty block
+            VerticalPosition::Center,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(BinaryColor::Off),
+            display,
+        ))?;
 
         if !self.pin.is_empty() {
             let circle_style = PrimitiveStyle::with_fill(BinaryColor::Off);

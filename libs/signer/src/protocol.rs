@@ -5,13 +5,14 @@
 //!
 //! Ported from: `src/lib_signer_services/signer_messages.ml`
 
-use crate::bls::{PublicKey, PublicKeyHash, Signature};
+use crate::scheme::{PublicKey, PublicKeyHash, Scheme, Signature};
+use crate::signer::SignatureVersion;
 use thiserror::Error;
 
-/// A public key hash that includes the signature version byte.
+/// A public key hash together with the signature version the client asked for.
 /// This is used for requests that involve signing, where the client
 /// can specify a version.
-pub type VersionedPublicKeyHash = (PublicKeyHash, u8);
+pub type VersionedPublicKeyHash = (PublicKeyHash, SignatureVersion);
 
 /// Protocol errors
 #[derive(Error, Debug)]
@@ -216,8 +217,8 @@ impl SignerResponse {
 /// Corresponds to: Tezos `Data_encoding` library
 pub mod encoding {
     use super::{
-        Error, PublicKey, PublicKeyHash, Result, Signature, SignerRequest, SignerResponse,
-        VersionedPublicKeyHash,
+        Error, PublicKey, PublicKeyHash, Result, Scheme, Signature, SignatureVersion,
+        SignerRequest, SignerResponse, VersionedPublicKeyHash,
     };
     use std::io::{Cursor, Read, Write};
 
@@ -234,7 +235,6 @@ pub mod encoding {
     pub fn encode_request(req: &SignerRequest) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
 
-        // Write tag
         buf.write_all(&[req.tag()])?;
 
         match req {
@@ -431,7 +431,8 @@ pub mod encoding {
                 encode_pkh_list(&mut buf, keys)?;
             }
             SignerResponse::Error(_) => {
-                // This case is handled above and should not be reached
+                // The `if let SignerResponse::Error` guard at the top of
+                // `encode_response` returns before this match is entered.
                 unreachable!();
             }
         }
@@ -511,8 +512,12 @@ pub mod encoding {
             0x00 => {
                 // Ok case - decode payload based on what was requested
                 match request {
-                    SignerRequest::Sign { .. } | SignerRequest::BlsProveRequest { .. } => {
-                        let sig = decode_signature(&mut cursor)?;
+                    SignerRequest::Sign { pkh, .. } => {
+                        let sig = decode_signature(&mut cursor, pkh.0.scheme())?;
+                        Ok(SignerResponse::Signature(sig))
+                    }
+                    SignerRequest::BlsProveRequest { .. } => {
+                        let sig = decode_signature(&mut cursor, Scheme::Bls)?;
                         Ok(SignerResponse::Signature(sig))
                     }
                     SignerRequest::PublicKey { .. } => {
@@ -563,41 +568,63 @@ pub mod encoding {
         Ok(u32::from_be_bytes(buf))
     }
 
+    /// The tag a scheme takes in the raw public-key-hash union
+    /// (`signature_v4.ml:92`, `:104`) and the public-key one (`:458`, `:470`),
+    /// which agree case for case.
+    const fn scheme_tag(scheme: Scheme) -> u8 {
+        match scheme {
+            Scheme::Bls => 3,
+            Scheme::Xmss => 5,
+        }
+    }
+
+    /// The scheme a union tag names, or `None` for one this signer holds no key
+    /// of — Ed25519, Secp256k1, P256 and ML-DSA-44 among them.
+    const fn tagged_scheme(tag: u8) -> Option<Scheme> {
+        match tag {
+            3 => Some(Scheme::Bls),
+            5 => Some(Scheme::Xmss),
+            _ => None,
+        }
+    }
+
+    fn untagged(tag: u8, kind: &str) -> Error {
+        Error::InvalidFormat(format!(
+            "Unsupported {kind} encoding tag: 0x{tag:02X}. Only BLS (tag 3) and XMSS (tag 5) are supported."
+        ))
+    }
+
     /// Encodes a PKH using the simple tagged union format.
     /// `[tag][20_bytes]`
     fn encode_raw_pkh<W: Write>(buf: &mut W, pkh: &PublicKeyHash) -> Result<()> {
-        // The `public_key_hash` encoding is a tagged union.
-        // For this signer, we only support BLS keys, which have tag 3.
-        buf.write_all(&[3])?;
+        buf.write_all(&[scheme_tag(pkh.scheme())])?;
         buf.write_all(pkh.to_bytes())?;
         Ok(())
     }
 
     /// Decodes a PKH using the simple tagged union format.
     /// `[tag][20_bytes]`
+    ///
+    /// Both schemes hash to 20 bytes, so the tag decides only which key the
+    /// hash addresses.
     fn decode_raw_pkh<R: Read>(cursor: &mut R) -> Result<PublicKeyHash> {
         let tag = read_u8(cursor)?;
-        match tag {
-            // BLS
-            0x03 => {
-                let mut bytes = [0u8; 20];
-                cursor.read_exact(&mut bytes)?;
-                PublicKeyHash::from_bytes(&bytes).map_err(|e| Error::PkhDecodeError(e.to_string()))
-            }
-            _ => Err(Error::InvalidFormat(format!(
-                "Unsupported PKH encoding tag: 0x{tag:02X}. Only BLS (tag 3) is supported."
-            ))),
-        }
+        let scheme = tagged_scheme(tag).ok_or_else(|| untagged(tag, "PKH"))?;
+        let mut bytes = [0u8; 20];
+        cursor.read_exact(&mut bytes)?;
+        PublicKeyHash::from_bytes(scheme, &bytes).map_err(|e| Error::PkhDecodeError(e.to_string()))
     }
 
     /// Encodes a PKH using the complex, versioned format for signing requests.
     /// `[outer_tag][inner_tag][20_bytes][version]`
     fn encode_versioned_pkh<W: Write>(buf: &mut W, pkh: &VersionedPublicKeyHash) -> Result<()> {
-        // Outer tag for `pkh_encoding` union
-        buf.write_all(&[3])?; // 3 = BLS with version
+        // Tag 3 of `pkh_encoding` is the case carrying a version
+        // (`signer_messages.ml:60-73`), and the pkh inside it is the full union
+        // — so a tz6 address travels here too, at its own inner tag.
+        buf.write_all(&[3])?;
         // Inner encoding is `obj2 (req "pkh" raw_encoding) (req "version" ...)`
         encode_raw_pkh(buf, &pkh.0)?;
-        buf.write_all(&[pkh.1])?; // version
+        buf.write_all(&[pkh.1.number()])?;
         Ok(())
     }
 
@@ -607,44 +634,51 @@ pub mod encoding {
         let outer_tag = read_u8(cursor)?;
         if outer_tag != 3 {
             return Err(Error::InvalidFormat(format!(
-                "Unsupported versioned PKH tag: 0x{outer_tag:02X}. Only BLS (tag 3) is supported."
+                "Unsupported versioned PKH tag: 0x{outer_tag:02X}. Only the versioned case (tag 3) is supported."
             )));
         }
         let pkh = decode_raw_pkh(cursor)?;
-        let version = read_u8(cursor)?;
+        // A byte above the versions this signer knows names a union it holds no
+        // definition of. A client sends its own latest on every request
+        // (`signer_messages.ml:69-70`), so refusing one would stop a card
+        // signing the day that latest moves; the unions append cases and
+        // renumber none, and a signature travels untagged, so the newest known
+        // version emits what that later one would.
+        let version =
+            SignatureVersion::from_number(read_u8(cursor)?).unwrap_or(SignatureVersion::LATEST);
         Ok((pkh, version))
     }
 
+    /// The public-key union tags each scheme's own width: 48 bytes under BLS
+    /// against 32 under XMSS.
     fn encode_pk<W: Write>(buf: &mut W, pk: &PublicKey) -> Result<()> {
-        // Public key encoding is a tagged union. BLS is tag 3.
-        buf.write_all(&[3])?;
-        let bytes = pk.to_bytes();
-        buf.write_all(&bytes)?;
+        buf.write_all(&[scheme_tag(pk.scheme())])?;
+        buf.write_all(&pk.to_bytes())?;
         Ok(())
     }
 
     fn decode_pk<R: Read>(cursor: &mut R) -> Result<PublicKey> {
         let tag = read_u8(cursor)?;
-        if tag != 3 {
-            return Err(Error::InvalidFormat(format!(
-                "Unsupported PK encoding tag: 0x{tag:02X}. Only BLS (tag 3) is supported."
-            )));
-        }
-        let mut bytes = [0u8; 48];
+        let scheme = tagged_scheme(tag).ok_or_else(|| untagged(tag, "PK"))?;
+        let mut bytes = vec![0u8; scheme.public_key_len()];
         cursor.read_exact(&mut bytes)?;
-        PublicKey::from_bytes(&bytes).map_err(|e| Error::PkDecodeError(e.to_string()))
+        PublicKey::from_bytes(scheme, &bytes).map_err(|e| Error::PkDecodeError(e.to_string()))
     }
 
+    /// A signature travels untagged, as Octez's `Signature.raw_encoding`
+    /// (`signature_v4.ml:780-792`) does: the reader knows the scheme from the
+    /// key it asked about.
     fn encode_signature<W: Write>(buf: &mut W, sig: &Signature) -> Result<()> {
-        let bytes = sig.to_bytes();
-        buf.write_all(&bytes)?;
+        buf.write_all(&sig.to_bytes())?;
         Ok(())
     }
 
-    fn decode_signature<R: Read>(cursor: &mut R) -> Result<Signature> {
-        let mut bytes = [0u8; 96];
+    /// Read a signature of `scheme`, whose width the bytes do not carry.
+    fn decode_signature<R: Read>(cursor: &mut R, scheme: Scheme) -> Result<Signature> {
+        let mut bytes = vec![0u8; scheme.signature_len()];
         cursor.read_exact(&mut bytes)?;
-        Signature::from_bytes(&bytes).map_err(|e| Error::SignatureDecodeError(e.to_string()))
+        Signature::from_bytes(scheme, &bytes)
+            .map_err(|e| Error::SignatureDecodeError(e.to_string()))
     }
 
     fn encode_bytes<W: Write>(buf: &mut W, data: &[u8]) -> Result<()> {
@@ -659,7 +693,8 @@ pub mod encoding {
     fn decode_bytes<R: Read>(cursor: &mut R) -> Result<Vec<u8>> {
         let len = read_u32_be(cursor)? as usize;
 
-        // Prevent DoS attack from malicious length prefix
+        // Bounds the allocation below by MAX_DATA_LEN rather than by the
+        // wire-supplied length.
         if len > MAX_DATA_LEN {
             return Err(Error::DataTooLarge {
                 size: len,
@@ -690,7 +725,11 @@ pub mod encoding {
             Ok(0) => Ok(None), // EOF
             Ok(1) => {
                 if buf[0] == 0xFF {
-                    Ok(Some(decode_signature(cursor)?))
+                    // This is the authorizing key's signature rather than the
+                    // requested key's, and `handle_authorized_keys` answers None:
+                    // the signer requires no authentication and holds no
+                    // authorized key of another scheme.
+                    Ok(Some(decode_signature(cursor, Scheme::Bls)?))
                 } else {
                     Err(Error::InvalidFormat(format!(
                         "Invalid option tag: 0x{:02X}",
@@ -774,16 +813,21 @@ pub mod encoding {
 #[cfg(test)]
 mod tests {
     use super::{encoding::*, *};
-    use crate::bls::generate_key;
+    use crate::signer::SignatureVersion;
+    use crate::signer::Unencrypted;
+
+    fn bls_signer(seed: u8) -> Unencrypted {
+        Unencrypted::generate(Some(&[seed; 32])).expect("seeded BLS key")
+    }
 
     #[test]
     fn test_request_tags() {
         // Verify tag values match OCaml implementation
-        let pkh = PublicKeyHash::from_bytes(&[0u8; 20]).unwrap();
+        let pkh = PublicKeyHash::from_bytes(Scheme::Bls, &[0u8; 20]).unwrap();
 
         assert_eq!(
             SignerRequest::Sign {
-                pkh: (pkh, 0),
+                pkh: (pkh, SignatureVersion::V0),
                 data: vec![],
                 signature: None
             }
@@ -796,7 +840,7 @@ mod tests {
 
         assert_eq!(
             SignerRequest::DeterministicNonce {
-                pkh: (pkh, 0),
+                pkh: (pkh, SignatureVersion::V0),
                 data: vec![],
                 signature: None
             }
@@ -806,7 +850,7 @@ mod tests {
 
         assert_eq!(
             SignerRequest::DeterministicNonceHash {
-                pkh: (pkh, 0),
+                pkh: (pkh, SignatureVersion::V0),
                 data: vec![],
                 signature: None
             }
@@ -832,10 +876,10 @@ mod tests {
 
     #[test]
     fn test_response_tags() {
-        let seed = [42u8; 32];
-        let (pkh, pk, sk) = generate_key(Some(&seed)).unwrap();
-        let data = b"test";
-        let sig = crate::bls::sign(&sk, data, None);
+        let signer = bls_signer(42);
+        let pkh = *signer.public_key_hash();
+        let pk = signer.public_key().clone();
+        let sig = signer.sign(b"test", None, None).unwrap();
 
         assert_eq!(SignerResponse::Signature(sig).tag(), 0x00);
         assert_eq!(SignerResponse::PublicKey(pk).tag(), 0x01);
@@ -849,10 +893,10 @@ mod tests {
 
     #[test]
     fn test_roundtrip_sign_request() {
-        let pkh = PublicKeyHash::from_bytes(&[1u8; 20]).unwrap();
+        let pkh = PublicKeyHash::from_bytes(Scheme::Bls, &[1u8; 20]).unwrap();
         let data = vec![0x11, 0x00, 0x00, 0x00, 0x01];
         let request = SignerRequest::Sign {
-            pkh: (pkh, 2),
+            pkh: (pkh, SignatureVersion::V2),
             data: data.clone(),
             signature: None,
         };
@@ -861,9 +905,105 @@ mod tests {
         assert_eq!(request, decoded);
     }
 
+    /// Distinguishable filler of `len` bytes. Every fixed-width value this
+    /// module frames decodes from any bytes of its own width, so no key
+    /// generation is needed to exercise the wire layout.
+    fn filler(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect()
+    }
+
+    fn tz6(byte: u8) -> PublicKeyHash {
+        PublicKeyHash::from_bytes(Scheme::Xmss, &[byte; 20]).expect("20 bytes is a hash")
+    }
+
+    /// Octez puts Xmss at Tag 5 of the raw public-key-hash union
+    /// (`signature_v4.ml:104-108`) under the same outer Tag 3 that carries the
+    /// version, so a tz6 request travels beside a tz4 one rather than instead
+    /// of it.
+    #[test]
+    fn a_tz6_address_travels_at_the_xmss_tag() {
+        let request = SignerRequest::Sign {
+            pkh: (tz6(9), SignatureVersion::V4),
+            data: vec![0x13, 0x00],
+            signature: None,
+        };
+
+        let encoded = encode_request(&request).unwrap();
+
+        assert_eq!(
+            &encoded[..3],
+            &[0x00, 0x03, 0x05],
+            "tag, outer pkh, inner pkh"
+        );
+        assert_eq!(encoded[23], 4, "the version byte follows the 20-byte hash");
+        assert_eq!(decode_request(&encoded).unwrap(), request);
+    }
+
+    /// A tz6 public key is 32 bytes where a tz4 one is 48, and the tag is what
+    /// tells a reader which width follows.
+    #[test]
+    fn a_tz6_public_key_travels_at_the_xmss_tag() {
+        let pkh = tz6(10);
+        let pk = PublicKey::from_bytes(Scheme::Xmss, &filler(Scheme::Xmss.public_key_len()))
+            .expect("PUB_KEY_SIZE bytes are a public key");
+        let response = SignerResponse::PublicKey(pk);
+
+        let encoded = encode_response(&response).unwrap();
+
+        assert_eq!(
+            &encoded[..2],
+            &[0x00, 0x05],
+            "result tag, then the Xmss tag"
+        );
+        assert_eq!(encoded.len(), 2 + Scheme::Xmss.public_key_len());
+        assert_eq!(
+            decode_response(&encoded, &SignerRequest::PublicKey { pkh }).unwrap(),
+            response
+        );
+    }
+
+    /// The signature payload carries no tag of its own, so its width is the
+    /// requested key's scheme's — 1212 bytes for tz6 against 96 for tz4.
+    #[test]
+    fn a_tz6_signature_travels_whole() {
+        let sig = Signature::from_bytes(Scheme::Xmss, &filler(Scheme::Xmss.signature_len()))
+            .expect("SIGNATURE_SIZE bytes are a signature");
+        let request = SignerRequest::Sign {
+            pkh: (tz6(11), SignatureVersion::V4),
+            data: vec![],
+            signature: None,
+        };
+        let response = SignerResponse::Signature(sig);
+
+        let encoded = encode_response(&response).unwrap();
+
+        assert_eq!(encoded.len(), 1 + Scheme::Xmss.signature_len());
+        assert_eq!(decode_response(&encoded, &request).unwrap(), response);
+    }
+
+    /// A client sends its own latest version on every request
+    /// (`signer_messages.ml:69-70`), so refusing a byte above the versions this
+    /// signer knows would stop a card signing the day that latest moves. Every
+    /// union from V0 to V4 appends cases and renumbers none, and a signature
+    /// travels untagged, so the newest known version produces the same bytes.
+    #[test]
+    fn a_version_byte_above_the_known_ones_reads_as_the_latest() {
+        let request = SignerRequest::Sign {
+            pkh: (tz6(12), SignatureVersion::LATEST),
+            data: vec![0x13],
+            signature: None,
+        };
+        let mut encoded = encode_request(&request).unwrap();
+        encoded[23] = 5;
+
+        assert_eq!(decode_request(&encoded).unwrap(), request);
+    }
+
     #[test]
     fn test_roundtrip_public_key_request() {
-        let pkh = PublicKeyHash::from_bytes(&[2u8; 20]).unwrap();
+        let pkh = PublicKeyHash::from_bytes(Scheme::Bls, &[2u8; 20]).unwrap();
         let request = SignerRequest::PublicKey { pkh };
         let encoded = encode_request(&request).unwrap();
         let decoded = decode_request(&encoded).unwrap();
@@ -880,14 +1020,11 @@ mod tests {
 
     #[test]
     fn test_roundtrip_signature_response() {
-        let pkh = PublicKeyHash::from_bytes(&[0u8; 20]).unwrap();
-        let seed = [1u8; 32];
-        let (_pkh, _pk, sk) = generate_key(Some(&seed)).unwrap();
-        let data = b"test data";
-        let sig = crate::bls::sign(&sk, data, None);
+        let pkh = PublicKeyHash::from_bytes(Scheme::Bls, &[0u8; 20]).unwrap();
+        let sig = bls_signer(1).sign(b"test data", None, None).unwrap();
 
         let request = SignerRequest::Sign {
-            pkh: (pkh, 0),
+            pkh: (pkh, SignatureVersion::V0),
             data: vec![],
             signature: None,
         };
@@ -901,9 +1038,8 @@ mod tests {
 
     #[test]
     fn test_roundtrip_public_key_response() {
-        let pkh = PublicKeyHash::from_bytes(&[0u8; 20]).unwrap();
-        let seed = [2u8; 32];
-        let (_pkh, pk, _sk) = generate_key(Some(&seed)).unwrap();
+        let pkh = PublicKeyHash::from_bytes(Scheme::Bls, &[0u8; 20]).unwrap();
+        let pk = bls_signer(2).public_key().clone();
 
         let request = SignerRequest::PublicKey { pkh };
         let response = SignerResponse::PublicKey(pk);
@@ -916,11 +1052,11 @@ mod tests {
 
     #[test]
     fn test_roundtrip_nonce_response() {
-        let pkh = PublicKeyHash::from_bytes(&[0u8; 20]).unwrap();
+        let pkh = PublicKeyHash::from_bytes(Scheme::Bls, &[0u8; 20]).unwrap();
         let nonce = [5u8; 32];
 
         let request = SignerRequest::DeterministicNonce {
-            pkh: (pkh, 0),
+            pkh: (pkh, SignatureVersion::V0),
             data: vec![],
             signature: None,
         };
@@ -934,7 +1070,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_bool_response() {
-        let pkh = PublicKeyHash::from_bytes(&[0u8; 20]).unwrap();
+        let pkh = PublicKeyHash::from_bytes(Scheme::Bls, &[0u8; 20]).unwrap();
         let request = SignerRequest::SupportsDeterministicNonces { pkh };
 
         let response_true = SignerResponse::Bool(true);
@@ -950,8 +1086,8 @@ mod tests {
 
     #[test]
     fn test_roundtrip_known_keys_response() {
-        let pkh1 = PublicKeyHash::from_bytes(&[6u8; 20]).unwrap();
-        let pkh2 = PublicKeyHash::from_bytes(&[7u8; 20]).unwrap();
+        let pkh1 = PublicKeyHash::from_bytes(Scheme::Bls, &[6u8; 20]).unwrap();
+        let pkh2 = PublicKeyHash::from_bytes(Scheme::Bls, &[7u8; 20]).unwrap();
 
         let request = SignerRequest::KnownKeys;
         let response = SignerResponse::KnownKeys(vec![pkh1, pkh2]);
@@ -984,10 +1120,10 @@ mod tests {
         const SOCKET_FRAME_MAX: usize = 65535;
 
         // Create a Sign request with data under the limit - should succeed
-        let pkh = PublicKeyHash::from_bytes(&[1u8; 20]).unwrap();
+        let pkh = PublicKeyHash::from_bytes(Scheme::Bls, &[1u8; 20]).unwrap();
         let data_under_limit = vec![0x11u8; SOCKET_FRAME_MAX - 1];
         let request_under = SignerRequest::Sign {
-            pkh: (pkh, 0),
+            pkh: (pkh, SignatureVersion::V0),
             data: data_under_limit,
             signature: None,
         };
@@ -1000,7 +1136,7 @@ mod tests {
         // Create a Sign request with data over the limit - should fail
         let data_over_limit = vec![0x11u8; SOCKET_FRAME_MAX + 1];
         let request_over = SignerRequest::Sign {
-            pkh: (pkh, 0),
+            pkh: (pkh, SignatureVersion::V0),
             data: data_over_limit,
             signature: None,
         };

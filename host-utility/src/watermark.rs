@@ -139,27 +139,58 @@ pub fn write_watermark_config(device: &Path, chain_info: &ChainInfo) -> Result<(
     Ok(())
 }
 
-/// Read watermark config from SD card boot partition
+/// What the boot partition holds at [`CONFIG_FILENAME`].
+#[derive(Debug)]
+pub enum StagedConfig {
+    /// No config is staged.
+    Absent,
+    /// A config is staged that will not read, so the device cannot consume it.
+    Unreadable(anyhow::Error),
+    /// A config the device consumes on its next boot.
+    Present(WatermarkConfig),
+}
+
+/// The config staged on the boot partition of `device`.
 ///
-/// Used to verify that the config was written correctly after flashing.
-pub fn read_watermark_config(device: &Path) -> Result<WatermarkConfig> {
+/// # Errors
+///
+/// Returns an error only where the boot partition would not mount; what the
+/// partition holds is the returned [`StagedConfig`].
+pub fn read_watermark_config(device: &Path) -> Result<StagedConfig> {
     let boot_partition = get_boot_partition_path(device);
     let mount_point = mount_partition(&boot_partition, "vfat", true)?;
 
-    let config_path = mount_point.join(CONFIG_FILENAME);
-    let result = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("Failed to read {}", config_path.display()))
-        .and_then(|content| {
-            serde_json::from_str(&content).context("Failed to parse watermark config")
-        });
+    let staged = staged_config_in(&mount_point);
 
-    // Always unmount, even on error
     warn_if_err(
         unmount_partition(&mount_point, &boot_partition),
         "Failed to unmount after reading watermark config",
     );
 
-    result
+    Ok(staged)
+}
+
+/// The config staged in a mounted boot partition.
+///
+/// Absent and unreadable are kept apart: the disk check reads the first as
+/// healthy and deletes the second, and a restore's read-back accepts neither.
+fn staged_config_in(mount_point: &Path) -> StagedConfig {
+    let config_path = mount_point.join(CONFIG_FILENAME);
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StagedConfig::Absent,
+        Err(e) => {
+            return StagedConfig::Unreadable(
+                anyhow::Error::new(e).context(format!("Failed to read {}", config_path.display())),
+            );
+        }
+    };
+    match serde_json::from_str(&content) {
+        Ok(config) => StagedConfig::Present(config),
+        Err(e) => StagedConfig::Unreadable(
+            anyhow::Error::new(e).context("Failed to parse watermark config"),
+        ),
+    }
 }
 
 pub(crate) fn detect_and_verify_device(device: Option<PathBuf>) -> Result<PathBuf> {
@@ -304,7 +335,15 @@ fn verify_block_device(device: &Path) -> Result<()> {
 /// The post-write check shared by the flash path and the disk check's boot-config
 /// staging, so the two verify the write the same way and cannot drift.
 pub fn read_back_and_verify(device: &Path) -> Result<WatermarkConfig> {
-    let written = read_watermark_config(device).context("Failed to read back watermark config")?;
+    let written = match read_watermark_config(device)
+        .context("Failed to read back watermark config")?
+    {
+        StagedConfig::Present(config) => config,
+        StagedConfig::Absent => bail!("No watermark config on the SD card after writing one"),
+        StagedConfig::Unreadable(e) => {
+            return Err(e.context("The watermark config written to the SD card will not read back"));
+        }
+    };
     if written.chain.name.is_empty() || written.chain.id.is_empty() {
         bail!(
             "Invalid chain info on the SD card (name '{}', id '{}'); the watermark config \
@@ -319,6 +358,37 @@ pub fn read_back_and_verify(device: &Path) -> Result<WatermarkConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing config is absent, one that will not parse is unreadable, and
+    /// a written one reads back as itself: the disk check and the restore's
+    /// read-back act differently on each.
+    #[test]
+    fn a_staged_config_is_absent_unreadable_or_present() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(staged_config_in(dir.path()), StagedConfig::Absent));
+
+        std::fs::write(dir.path().join(CONFIG_FILENAME), b"{not json").unwrap();
+        assert!(matches!(
+            staged_config_in(dir.path()),
+            StagedConfig::Unreadable(_)
+        ));
+
+        let chain = ChainInfo {
+            id: "NetXtest".to_string(),
+            level: 1000,
+            name: "test".to_string(),
+            blocks_per_cycle: 8192,
+        };
+        write_config_file(
+            &dir.path().join(CONFIG_FILENAME),
+            &watermark_config_for(&chain),
+        )
+        .unwrap();
+        match staged_config_in(dir.path()) {
+            StagedConfig::Present(config) => assert_eq!(config.chain, chain),
+            other => panic!("a written config read back as {other:?}"),
+        }
+    }
 
     #[test]
     fn resolve_chain_name_prefers_human_name() {

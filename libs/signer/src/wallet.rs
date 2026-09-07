@@ -1,11 +1,10 @@
 //! Wallet management for loading and saving keys from disk in OCaml-compatible format.
-//
-// Corresponds to the file management logic originally in `main.rs`.
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -44,6 +43,83 @@ pub struct StoredKey {
     pub secret_key: Option<Zeroizing<String>>,
 }
 
+/// The locator prefix of an unencrypted secret in a `secret_keys` entry.
+pub const UNENCRYPTED_PREFIX: &str = "unencrypted:";
+
+/// One `secret_keys` entry: the alias a store files a key under and the bare
+/// base58 secret filed there.
+pub struct SecretKeyEntry<'a> {
+    /// The name the store files this key under.
+    pub alias: &'a str,
+    /// The base58 secret, without [`UNENCRYPTED_PREFIX`].
+    pub secret: &'a str,
+}
+
+/// The `secret_keys` array for `entries`, as the OCaml client writes it, in a
+/// buffer sized to the emit.
+///
+/// Sizing first keeps the plaintext in one heap block that is zeroed on drop: a
+/// reallocation would copy it into a fresh block and leave the old one
+/// un-zeroed. The size is the emit's own byte count rather than a per-entry
+/// budget, an XMSS secret being kilobytes of base58 against a `BLsk`'s 54
+/// characters, so no constant covers both. Counting runs the same emit into a
+/// sink that keeps a length and none of the bytes.
+#[must_use]
+pub fn secret_keys_json(entries: &[SecretKeyEntry<'_>]) -> Zeroizing<String> {
+    let mut counted = ByteCount::default();
+    emit_secret_keys(&mut counted, entries);
+
+    let mut json = Zeroizing::new(String::with_capacity(counted.0));
+    emit_secret_keys(&mut *json, entries);
+    json
+}
+
+const INFALLIBLE: &str = "writing to a String or a counter is infallible";
+
+fn emit_secret_keys<W: core::fmt::Write>(out: &mut W, entries: &[SecretKeyEntry<'_>]) {
+    out.write_char('[').expect(INFALLIBLE);
+    for (position, entry) in entries.iter().enumerate() {
+        if position > 0 {
+            out.write_char(',').expect(INFALLIBLE);
+        }
+        out.write_str(r#"{"name":""#).expect(INFALLIBLE);
+        write_escaped(out, entry.alias);
+        out.write_str(r#"","value":""#).expect(INFALLIBLE);
+        out.write_str(UNENCRYPTED_PREFIX).expect(INFALLIBLE);
+        // Base58 alphabet contains no `"`, `\`, or control bytes — write raw.
+        out.write_str(entry.secret).expect(INFALLIBLE);
+        out.write_str(r#""}"#).expect(INFALLIBLE);
+    }
+    out.write_char(']').expect(INFALLIBLE);
+}
+
+/// A sink keeping how many bytes were written and none of the bytes, so
+/// counting an emit that carries plaintext copies none of it.
+#[derive(Default)]
+struct ByteCount(usize);
+
+impl core::fmt::Write for ByteCount {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0 += s.len();
+        Ok(())
+    }
+}
+
+/// Escape a JSON string body: `"`, `\`, and ASCII control bytes as `\u00XX`.
+/// No other escapes are needed because non-ASCII UTF-8 is valid inside a JSON
+/// string.
+fn write_escaped<W: core::fmt::Write>(out: &mut W, s: &str) {
+    for c in s.chars() {
+        match c {
+            '"' => out.write_str("\\\""),
+            '\\' => out.write_str("\\\\"),
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32),
+            c => out.write_char(c),
+        }
+        .expect(INFALLIBLE);
+    }
+}
+
 /// Manages keys in OCaml-compatible format
 ///
 /// Supports split storage where public keys and secret keys can be in different directories.
@@ -58,24 +134,22 @@ pub struct KeyManager {
     secret_keys_dir: Option<PathBuf>,
 }
 
+/// Where a wallet lives when the caller names no directory.
+fn default_base_dir() -> PathBuf {
+    ProjectDirs::from("org", "tezos", "signer").map_or_else(
+        || {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".tezos-signer")
+        },
+        |dirs| dirs.data_dir().to_path_buf(),
+    )
+}
+
 impl KeyManager {
     /// Create a new key manager with all files in the same directory
     #[must_use]
     pub fn new(base_dir: Option<PathBuf>) -> Self {
-        let base_dir = base_dir.unwrap_or_else(|| {
-            ProjectDirs::from("org", "tezos", "signer").map_or_else(
-                || {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                    PathBuf::from(home).join(".tezos-signer")
-                },
-                |dirs| dirs.data_dir().to_path_buf(),
-            )
-        });
-
-        Self {
-            base_dir,
-            secret_keys_dir: None,
-        }
+        Self::new_with_secret_keys_path(base_dir, None)
     }
 
     /// Create a key manager with split storage
@@ -87,15 +161,7 @@ impl KeyManager {
         base_dir: Option<PathBuf>,
         secret_keys_dir: Option<PathBuf>,
     ) -> Self {
-        let base_dir = base_dir.unwrap_or_else(|| {
-            ProjectDirs::from("org", "tezos", "signer").map_or_else(
-                || {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                    PathBuf::from(home).join(".tezos-signer")
-                },
-                |dirs| dirs.data_dir().to_path_buf(),
-            )
-        });
+        let base_dir = base_dir.unwrap_or_else(default_base_dir);
 
         Self {
             base_dir,
@@ -127,77 +193,49 @@ impl KeyManager {
     }
 
     fn secret_keys_file(&self) -> PathBuf {
-        // Use separate directory if configured, otherwise use base_dir
         self.secret_keys_dir
             .as_ref()
             .unwrap_or(&self.base_dir)
             .join("secret_keys")
     }
 
-    /// Load all keys from OCaml-compatible files
-    #[must_use]
-    pub fn load_keys(&self) -> HashMap<String, StoredKey> {
+    /// Load every key the wallet files name.
+    ///
+    /// An absent address file is an empty wallet, which is what a card holds
+    /// before setup runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any wallet file that is present will not read or
+    /// parse. Answering that with an empty map tells every caller the card
+    /// holds no keys, which is what a card before setup looks like — and it
+    /// sends an operator to re-flash a card whose keys are intact behind one
+    /// unreadable file.
+    pub fn load_keys(&self) -> Result<HashMap<String, StoredKey>, String> {
+        let hash_entries: Vec<OcamlKeyEntry<String>> =
+            read_wallet_file(&self.public_key_hashs_file())?;
+        let pubkey_entries: Vec<OcamlKeyEntry<OcamlPublicKeyValue>> =
+            read_wallet_file(&self.public_keys_file())?;
+        let secret_entries: Vec<OcamlKeyEntry<String>> =
+            read_wallet_file(&self.secret_keys_file())?;
+
         let mut result = HashMap::new();
-
-        // Load public_key_hashs
-        let hash_path = self.public_key_hashs_file();
-        let pubkey_path = self.public_keys_file();
-        let secret_path = self.secret_keys_file();
-
-        if !hash_path.exists() {
-            return result;
-        }
-
-        // Read public key hashes
-        let Ok(hash_content) = fs::read_to_string(&hash_path) else {
-            return result;
-        };
-
-        let Ok(hash_entries): Result<Vec<OcamlKeyEntry<String>>, _> =
-            serde_json::from_str(&hash_content)
-        else {
-            return result;
-        };
-
-        // Read public keys (optional)
-        let pubkey_entries: Vec<OcamlKeyEntry<OcamlPublicKeyValue>> = if pubkey_path.exists() {
-            fs::read_to_string(&pubkey_path)
-                .ok()
-                .and_then(|c| serde_json::from_str(&c).ok())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Read secret keys (optional)
-        let secret_entries: Vec<OcamlKeyEntry<String>> = if secret_path.exists() {
-            fs::read_to_string(&secret_path)
-                .ok()
-                .and_then(|c| serde_json::from_str(&c).ok())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Build result HashMap
         for hash_entry in hash_entries {
             let alias = hash_entry.name.clone();
             let public_key_hash = hash_entry.value.clone();
 
-            // Find matching public key
             let public_key = pubkey_entries
                 .iter()
                 .find(|e| e.name == alias)
                 .map(|e| e.value.key.clone())
                 .unwrap_or_default();
 
-            // Find matching secret key
             let secret_key = secret_entries
                 .iter()
                 .find(|e| e.name == alias)
                 .and_then(|e| {
                     // Extract the actual key from "unencrypted:edsk..." or "encrypted:edesk..."
-                    if let Some(unenc) = e.value.strip_prefix("unencrypted:") {
+                    if let Some(unenc) = e.value.strip_prefix(UNENCRYPTED_PREFIX) {
                         Some(Zeroizing::new(unenc.to_string()))
                     } else if let Some(_enc) = e.value.strip_prefix("encrypted:") {
                         // Skip encrypted keys for now
@@ -218,7 +256,7 @@ impl KeyManager {
             );
         }
 
-        result
+        Ok(result)
     }
 
     /// Generate a new BLS key pair IN MEMORY ONLY
@@ -235,7 +273,7 @@ impl KeyManager {
     /// Returns an error if a key with the given name already exists (and `force` is false)
     /// or if key generation fails.
     pub fn gen_keys_in_memory(&self, name: &str, force: bool) -> Result<StoredKey, String> {
-        let keys = self.load_keys();
+        let keys = self.load_keys()?;
 
         if keys.contains_key(name) && !force {
             return Err(format!(
@@ -285,22 +323,24 @@ impl KeyManager {
             pubkey_entries.push(OcamlKeyEntry {
                 name: key.alias.clone(),
                 value: OcamlPublicKeyValue {
-                    locator: format!("unencrypted:{}", key.public_key),
+                    locator: format!("{UNENCRYPTED_PREFIX}{}", key.public_key),
                     key: key.public_key.clone(),
                 },
             });
         }
 
-        // Write public_key_hashs
+        // Through a rename rather than in place: these files are read back by
+        // a boot that may follow a power cut at any instant, and one caught
+        // half-written reads as a card holding no keys at all — which no later
+        // boot can repair while the keys partition is mounted read-only.
         let hash_content = serde_json::to_string_pretty(&hash_entries)
             .map_err(|e| format!("Failed to serialize public_key_hashs: {e}"))?;
-        fs::write(self.public_key_hashs_file(), hash_content)
+        crate::durable::atomic_write(&self.public_key_hashs_file(), hash_content.as_bytes())
             .map_err(|e| format!("Failed to write public_key_hashs: {e}"))?;
 
-        // Write public_keys
         let pubkey_content = serde_json::to_string_pretty(&pubkey_entries)
             .map_err(|e| format!("Failed to serialize public_keys: {e}"))?;
-        fs::write(self.public_keys_file(), pubkey_content)
+        crate::durable::atomic_write(&self.public_keys_file(), pubkey_content.as_bytes())
             .map_err(|e| format!("Failed to write public_keys: {e}"))?;
 
         // NOTE: secret_keys file is NOT written here - must be encrypted separately
@@ -309,9 +349,83 @@ impl KeyManager {
     }
 }
 
+/// Read and parse one wallet file, an absent one holding no entries.
+///
+/// Absence comes from the read itself rather than from a check before it. A
+/// file that arrives or vanishes between the two belongs to a different card
+/// from the one that was observed, and the `NotFound` a stale check leads to
+/// would surface as an unreadable wallet — which sends an operator to re-flash
+/// a card whose keys are intact.
+fn read_wallet_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
+    };
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entries<'a>(pairs: &'a [(&'a str, &'a str)]) -> Vec<SecretKeyEntry<'a>> {
+        pairs
+            .iter()
+            .map(|(alias, secret)| SecretKeyEntry { alias, secret })
+            .collect()
+    }
+
+    /// The emit parses back as the entries it was given, each value carrying
+    /// the locator prefix the OCaml client reads.
+    #[test]
+    fn secret_keys_json_round_trips_through_the_reader() {
+        let json = secret_keys_json(&entries(&[
+            ("consensus_tz4", "BLsk1"),
+            ("companion_tz4", "BLsk2"),
+        ]));
+
+        let parsed: Vec<OcamlKeyEntry<String>> = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|e| (e.name.as_str(), e.value.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("consensus_tz4", "unencrypted:BLsk1"),
+                ("companion_tz4", "unencrypted:BLsk2"),
+            ]
+        );
+    }
+
+    /// A reallocation mid-emit copies the plaintext into a fresh block and
+    /// leaves the old one un-zeroed, so the buffer holds exactly what the emit
+    /// writes, a secret of tens of thousands of characters included.
+    #[test]
+    fn secret_keys_json_never_reallocates() {
+        let wide: String = std::iter::repeat_n('3', 230_000).collect();
+        let json = secret_keys_json(&entries(&[
+            ("consensus_tz4", "BLsk1"),
+            ("consensus_tz6", &wide),
+        ]));
+
+        assert_eq!(json.capacity(), json.len());
+    }
+
+    /// Every byte JSON forbids raw in a string is escaped: a control byte
+    /// written through produces a store no parser reads back.
+    #[test]
+    fn secret_keys_json_escapes_the_alias() {
+        let json = secret_keys_json(&entries(&[("a\"b\\c\u{1}\u{1f}d", "BLsk1")]));
+
+        let parsed: Vec<OcamlKeyEntry<String>> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed[0].name, "a\"b\\c\u{1}\u{1f}d");
+    }
+
+    #[test]
+    fn secret_keys_json_of_nothing_is_an_empty_array() {
+        assert_eq!(&*secret_keys_json(&[]), "[]");
+    }
     use tempfile::TempDir;
 
     #[test]
@@ -328,9 +442,79 @@ mod tests {
         let secret_dir = temp_dir.path().join("secret");
 
         let manager =
-            KeyManager::new_with_secret_keys_path(Some(base_dir.clone()), Some(secret_dir));
+            KeyManager::new_with_secret_keys_path(Some(base_dir.clone()), Some(secret_dir.clone()));
 
         assert_eq!(manager.base_dir(), base_dir);
+        assert_eq!(manager.secret_keys_file(), secret_dir.join("secret_keys"));
+        assert_eq!(
+            KeyManager::new(Some(base_dir.clone())).secret_keys_file(),
+            base_dir.join("secret_keys"),
+            "with no split, the secret keys sit beside the public ones"
+        );
+    }
+
+    /// A secret filed under neither prefix is taken as the key itself, which is
+    /// what an `octez-client` wallet written before the locator prefix existed
+    /// carries. Reading it as absent would drop a key the card holds.
+    #[test]
+    fn a_secret_under_no_locator_prefix_is_the_key_itself() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = KeyManager::new(Some(temp_dir.path().to_path_buf()));
+        fs::write(
+            temp_dir.path().join("public_key_hashs"),
+            br#"[{"name":"bare","value":"tz4abc"}]"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("secret_keys"),
+            br#"[{"name":"bare","value":"BLskBare"}]"#,
+        )
+        .unwrap();
+
+        let keys = manager.load_keys().unwrap();
+
+        assert_eq!(
+            keys["bare"].secret_key.as_deref().map(String::as_str),
+            Some("BLskBare")
+        );
+    }
+
+    /// A wallet file that will not parse is a card whose keys are unreachable,
+    /// not a card holding none. Reading it as an empty wallet is what a card
+    /// before setup looks like, and the host's doctor sends the operator to
+    /// re-flash a card whose keys are intact behind one unreadable file.
+    #[test]
+    fn a_wallet_file_that_will_not_parse_is_not_an_empty_wallet() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = KeyManager::new(Some(temp_dir.path().to_path_buf()));
+        let addresses = temp_dir.path().join("public_key_hashs");
+        fs::write(
+            &addresses,
+            br#"[{"name":"consensus_tz4","value":"tz4abc"}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(manager.load_keys().unwrap().len(), 1);
+
+        fs::write(&addresses, b"[{ this is not json").unwrap();
+        let Err(e) = manager.load_keys() else {
+            panic!("an unparseable address file must be reported")
+        };
+        assert!(
+            e.contains("public_key_hashs"),
+            "the error names the file: {e}"
+        );
+
+        fs::write(
+            &addresses,
+            br#"[{"name":"consensus_tz4","value":"tz4abc"}]"#,
+        )
+        .unwrap();
+        fs::write(temp_dir.path().join("public_keys"), b"not json either").unwrap();
+        let Err(e) = manager.load_keys() else {
+            panic!("an unparseable public-key file must be reported")
+        };
+        assert!(e.contains("public_keys"), "the error names the file: {e}");
     }
 
     #[test]
@@ -338,7 +522,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let manager = KeyManager::new(Some(temp_dir.path().to_path_buf()));
 
-        let keys = manager.load_keys();
+        let keys = manager.load_keys().unwrap();
         assert!(keys.is_empty());
     }
 
@@ -359,7 +543,7 @@ mod tests {
         let public_key_json = r#"[{"name": "test_key", "value": {"locator": "unencrypted:BLpk1test", "key": "BLpk1test"}}]"#;
         fs::write(temp_dir.path().join("public_keys"), public_key_json).unwrap();
 
-        let keys = manager.load_keys();
+        let keys = manager.load_keys().unwrap();
         assert_eq!(keys.len(), 1);
 
         let key = keys.get("test_key").unwrap();
@@ -388,7 +572,7 @@ mod tests {
         let sk_content = r#"[{"name": "test_key", "value": "unencrypted:BLsk1secret"}]"#;
         fs::write(temp_dir.path().join("secret_keys"), sk_content).unwrap();
 
-        let keys = manager.load_keys();
+        let keys = manager.load_keys().unwrap();
         let key = keys.get("test_key").unwrap();
         assert_eq!(
             key.secret_key,
@@ -407,22 +591,10 @@ mod tests {
         let sk_content = r#"[{"name": "test_key", "value": "encrypted:edesk1encrypted"}]"#;
         fs::write(temp_dir.path().join("secret_keys"), sk_content).unwrap();
 
-        let keys = manager.load_keys();
+        let keys = manager.load_keys().unwrap();
         let key = keys.get("test_key").unwrap();
         // Encrypted keys should be skipped
         assert!(key.secret_key.is_none());
-    }
-
-    #[test]
-    fn test_load_keys_corrupt_json_returns_empty() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager = KeyManager::new(Some(temp_dir.path().to_path_buf()));
-
-        // Write invalid JSON
-        fs::write(temp_dir.path().join("public_key_hashs"), "not valid json").unwrap();
-
-        let keys = manager.load_keys();
-        assert!(keys.is_empty());
     }
 
     #[test]
@@ -504,7 +676,7 @@ mod tests {
             .save_public_keys_only(std::slice::from_ref(&original_key))
             .unwrap();
 
-        let loaded = manager.load_keys();
+        let loaded = manager.load_keys().unwrap();
         let loaded_key = loaded.get("roundtrip").unwrap();
 
         assert_eq!(loaded_key.alias, original_key.alias);

@@ -1,4 +1,5 @@
 use super::Page as PageTrait;
+use super::drawn;
 use crate::fonts;
 use embedded_graphics::{image::Image, pixelcolor::BinaryColor, prelude::*};
 use tinybmp::Bmp;
@@ -42,15 +43,14 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         // Draw "Russignol" name centered below logo
         let font = FontRenderer::new::<fonts::FONT_PROPORTIONAL>();
         let text_y = content_top + logo_size.height.cast_signed() + logo_text_gap + text_height;
-        font.render_aligned(
+        drawn(font.render_aligned(
             "Russignol",
             Point::new(display_width / 2, text_y),
             u8g2_fonts::types::VerticalPosition::Baseline,
             u8g2_fonts::types::HorizontalAlignment::Center,
             u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
             display,
-        )
-        .ok();
+        ))?;
 
         Ok(())
     }

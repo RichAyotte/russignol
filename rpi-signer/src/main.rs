@@ -9,6 +9,7 @@ mod led;
 mod log_writer;
 mod network_status;
 mod pages;
+mod provision;
 mod rootfs_check;
 mod secret;
 mod setup;
@@ -21,13 +22,10 @@ mod util;
 mod watermark_setup;
 mod widgets;
 
-use app::{App, Effect, LoopAction, PageSpec, PendingRender};
+use app::{App, Effect, LoopAction, PageSpec, PendingRender, STORE_ENCRYPT_ESTIMATE};
 use crossbeam_channel::Sender;
 use russignol_signer_lib::{
-    ChainId, HighWatermark, KeyRole,
-    bls::PublicKeyHash,
-    signing_activity,
-    wallet::{KeyManager, StoredKey},
+    ChainId, DeviceKey, HighWatermark, KeyRole, PublicKeyHash, signing_activity,
 };
 use std::sync::RwLock;
 
@@ -38,17 +36,17 @@ use epd_2in13_v4::display::{Display, UpdateOutcome};
 use epd_2in13_v4::{Device, device};
 use events::{AppEvent, ConfigPresence};
 use pages::{
-    Page, about, blockchain, confirmation, dialog, greeting, menu, notice, pin, screensaver,
-    signatures, status, watermarks,
+    Page, about, confirmation, dialog, greeting, menu, notice, pin, screensaver, signatures, status,
 };
 use russignol_ui::pages::{error, progress};
 use secret::Secret;
-use std::path::PathBuf;
+use setup::BootStage;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use constants::{KEYS_DIR, LOG_DIR, LOG_FILE};
+use constants::{LOG_DIR, LOG_FILE};
 
 /// Show a fatal error on the display and exit (never returns)
 fn fatal_error(device: &mut Device, title: &str, message: &str) -> ! {
@@ -57,6 +55,43 @@ fn fatal_error(device: &mut Device, title: &str, message: &str) -> ! {
     let _ = error_page.show(&mut device.display);
     let _ = device.display.update_transition();
     std::process::exit(1)
+}
+
+/// What an init script recorded in the variable `constants::BOOT_FAULT_ENV`
+/// names. Both scripts export it on every boot, empty where the boot
+/// partition mounted, so empty reads as no fault rather than as one with no
+/// text.
+fn boot_fault(recorded: Option<&str>) -> Option<&str> {
+    recorded.filter(|fault| !fault.is_empty())
+}
+
+fn halt_on_boot_fault(device: &mut Device) {
+    let recorded = std::env::var(constants::BOOT_FAULT_ENV).ok();
+    if let Some(fault) = boot_fault(recorded.as_deref()) {
+        fatal_error(device, "BOOT FAULT", fault);
+    }
+}
+
+/// Whether this boot's mounts are checked, and if so whether `/keys` may be
+/// writable under it. An unmarked boot holds `/keys` writable because both
+/// init scripts leave it so for key generation (`mount_keys_partition` in
+/// `rootfs-overlay-dev/etc/init.d/S20russignol`, `init_keys_partition` in
+/// `rootfs-overlay-hardened/init`), and it is checked rather than skipped as
+/// a first boot: an unmounted `/keys` has no marker in it, and that is the
+/// boot the check exists to halt. A process still root holds `/keys`
+/// writable for the staged work it was kept root for.
+const fn mount_check(stage: BootStage, is_root: bool) -> Option<bool> {
+    match stage {
+        BootStage::NoPartitions => None,
+        BootStage::Unmarked => Some(true),
+        BootStage::Provisioned => Some(is_root),
+    }
+}
+
+fn halt_on_wrong_mounts(device: &mut Device, keys_writable: bool) {
+    if let Err(fault) = storage::verify_boot_mounts(keys_writable) {
+        fatal_error(device, "BOOT FAULT", &fault);
+    }
 }
 
 fn init_logging() {
@@ -143,10 +178,11 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
     init_logging();
     image_info::log_image_info();
 
-    // Shared signing activity tracker
-    let signing_activity = Arc::new(Mutex::new(signing_activity::SigningActivity::default()));
+    // Before any key is generated, so the pool it fans out over is created in
+    // the background class and a signature never waits behind it.
+    russignol_signer_lib::xmss::deprioritize_key_generation();
 
-    // Create app event channel
+    let signing_activity = Arc::new(Mutex::new(signing_activity::SigningActivity::default()));
     let (app_tx, app_rx) = crossbeam_channel::unbounded();
 
     // Channel of already-parsed key managers (secrets loaded once at unlock)
@@ -175,6 +211,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
     let (pre_sign_callback, post_sign_callback) =
         connection_callbacks(cpu_boost.as_ref(), led.as_ref());
 
+    let boost_for_warm = cpu_boost.clone();
     let signer_handle = std::thread::spawn(move || {
         // Wait for key manager produced once at unlock (in memory only)
         if let Ok(key_manager) = start_signer_rx.recv() {
@@ -219,6 +256,7 @@ fn main() -> epd_2in13_v4::EpdResult<()> {
                 watermark.as_ref(),
                 &callbacks,
                 blocks_per_cycle,
+                boost_for_warm,
             ) {
                 report_signer_failure(&tx_for_signer, e);
             }
@@ -291,7 +329,10 @@ fn run_ui_loop(
         }
     });
 
-    let is_first_boot = setup::is_first_boot();
+    halt_on_boot_fault(&mut device);
+
+    let stage = setup::boot_stage();
+    let is_first_boot = stage.is_first_boot();
 
     // CRITICAL: Check for error conditions BEFORE showing any UI
     if is_first_boot && let Err(e) = setup::verify_partitions_early() {
@@ -303,6 +344,14 @@ fn run_ui_loop(
     }
 
     let pending_watermark_level = recover_watermark_config(&mut device, is_first_boot);
+
+    // Placed after `recover_watermark_config`, which is what demotes a boot with
+    // nothing to keep `/keys` writable for, so a process still root here holds
+    // it writable on purpose.
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if let Some(keys_writable) = mount_check(stage, is_root) {
+        halt_on_wrong_mounts(&mut device, keys_writable);
+    }
 
     let mut app = App::new(
         is_first_boot,
@@ -562,12 +611,16 @@ fn construct_page(
             Box::new(pin::Page::new(tx.clone(), "Enter\nPIN", pin::Mode::Verify))
         }
         PageSpec::Menu => Box::new(menu::Page::new(tx.clone())),
-        PageSpec::Status => Box::new(status::Page::new(tx.clone(), signing_activity.clone())),
+        PageSpec::Status => Box::new(status::Page::new(
+            tx.clone(),
+            signing_activity.clone(),
+            watermark.clone(),
+        )),
         PageSpec::Signatures => {
             Box::new(signatures::Page::new(tx.clone(), signing_activity.clone()))
         }
-        PageSpec::Watermarks => Box::new(watermarks::Page::new(tx.clone(), watermark.clone())),
-        PageSpec::Blockchain => Box::new(blockchain::Page::new(tx.clone())),
+        PageSpec::Keys => Box::new(pages::keys::Page::new(tx.clone(), watermark.clone())),
+        PageSpec::Provision => Box::new(pages::provision::Page::new(tx.clone())),
         PageSpec::About => Box::new(about::Page::new(tx.clone())),
         PageSpec::Greeting => Box::new(greeting::Page::new(tx.clone())),
         PageSpec::Image { back } => Box::new(pages::image_info::Page::new(tx.clone(), back)),
@@ -611,7 +664,6 @@ fn construct_page(
             message,
             on_dismiss,
         } => Box::new(notice::Page::new(tx.clone(), &title, &message, on_dismiss)),
-        PageSpec::DeviceLocked => unreachable!("DeviceLocked handled directly in apply_effects"),
     }
 }
 
@@ -628,6 +680,7 @@ fn apply_effects(
             Effect::ShowPage(spec) => {
                 apply_show_page(app, device, current_page, spec)?;
             }
+            Effect::ShowDeviceLocked => apply_show_device_locked(device)?,
             Effect::ShowProgress {
                 message,
                 estimated_duration,
@@ -663,10 +716,11 @@ fn apply_effects(
                 context,
                 secret_keys,
             } => {
-                apply_init_watermark(app, device, &context, &secret_keys)?;
+                apply_init_watermark(app, device, &context, &secret_keys, cpu_boost)?;
             }
             Effect::SpawnKeygen { pin } => spawn_keygen(app.tx.clone(), pin, cpu_boost),
             Effect::SpawnPinVerify { pin } => spawn_pin_verify(app.tx.clone(), pin, cpu_boost),
+            Effect::SpawnStageRequest { pin, key } => spawn_stage_request(&app.tx, pin, key),
             Effect::SpawnStorageSetup => spawn_storage_setup(app.tx.clone()),
             Effect::SyncDisk => setup::sync_disk(),
             Effect::DropPrivileges => {
@@ -705,15 +759,7 @@ fn apply_effects(
             Effect::DropCurrentPage => {
                 apply_drop_current_page(app, device, current_page)?;
             }
-            Effect::RebuildSavedPage => {
-                if let Some(spec) = app.current_page_spec.clone() {
-                    let page = construct_page(spec, &app.tx, &app.signing_activity, &app.watermark);
-                    app.current_page_modal = page.is_modal();
-                    app.needs_animation = false;
-                    *current_page = page;
-                    try_render_page_transition(device, current_page, &mut app.pending_render)?;
-                }
-            }
+            Effect::RebuildSavedPage => apply_rebuild_saved_page(app, device, current_page)?,
             Effect::FatalError { title, message } => fatal_error(device, &title, &message),
             Effect::Exit(code) => {
                 log::info!("Exiting with code {code}");
@@ -723,6 +769,22 @@ fn apply_effects(
         }
     }
     Ok(())
+}
+
+/// Rebuild the page the app last showed, where it remembers one.
+fn apply_rebuild_saved_page(
+    app: &mut App,
+    device: &mut Device,
+    current_page: &mut Box<dyn Page<Display>>,
+) -> epd_2in13_v4::EpdResult<()> {
+    let Some(spec) = app.current_page_spec.clone() else {
+        return Ok(());
+    };
+    let page = construct_page(spec, &app.tx, &app.signing_activity, &app.watermark);
+    app.current_page_modal = page.is_modal();
+    app.needs_animation = false;
+    *current_page = page;
+    try_render_page_transition(device, current_page, &mut app.pending_render)
 }
 
 /// Swap in the screensaver page and push it. Blocking: the push must
@@ -752,28 +814,28 @@ fn apply_show_page(
     current_page: &mut Box<dyn Page<Display>>,
     spec: PageSpec,
 ) -> epd_2in13_v4::EpdResult<()> {
-    if matches!(spec, PageSpec::DeviceLocked) {
-        device.display.clear(BinaryColor::On)?;
-        let font = u8g2_fonts::FontRenderer::new::<fonts::FONT_PROPORTIONAL>();
-        let display_center = device.display.bounding_box().center();
-        let _ = font.render_aligned(
-            "LOCKED\nPower cycle to retry",
-            display_center,
-            u8g2_fonts::types::VerticalPosition::Center,
-            u8g2_fonts::types::HorizontalAlignment::Center,
-            u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
-            &mut device.display,
-        );
-        device.display.update_transition()?;
-    } else {
-        app.current_page_spec = Some(spec.clone());
-        let page = construct_page(spec, &app.tx, &app.signing_activity, &app.watermark);
-        app.current_page_modal = page.is_modal();
-        app.needs_animation = false;
-        *current_page = page;
-        try_render_page_transition(device, current_page, &mut app.pending_render)?;
-    }
-    Ok(())
+    app.current_page_spec = Some(spec.clone());
+    let page = construct_page(spec, &app.tx, &app.signing_activity, &app.watermark);
+    app.current_page_modal = page.is_modal();
+    app.needs_animation = false;
+    *current_page = page;
+    try_render_page_transition(device, current_page, &mut app.pending_render)
+}
+
+/// Draw the locked screen, which is the last thing this boot puts on the panel.
+fn apply_show_device_locked(device: &mut Device) -> epd_2in13_v4::EpdResult<()> {
+    device.display.clear(BinaryColor::On)?;
+    let font = u8g2_fonts::FontRenderer::new::<fonts::FONT_PROPORTIONAL>();
+    let display_center = device.display.bounding_box().center();
+    pages::drawn(font.render_aligned(
+        "LOCKED\nPower cycle to retry",
+        display_center,
+        u8g2_fonts::types::VerticalPosition::Center,
+        u8g2_fonts::types::HorizontalAlignment::Center,
+        u8g2_fonts::types::FontColor::Transparent(BinaryColor::Off),
+        &mut device.display,
+    ))?;
+    device.display.update_transition()
 }
 
 fn apply_show_progress(
@@ -807,6 +869,7 @@ fn apply_init_watermark(
     device: &mut Device,
     context: &str,
     secret_keys: &Secret<String>,
+    cpu_boost: Option<&cpu_freq::CpuBoost>,
 ) -> epd_2in13_v4::EpdResult<()> {
     log::info!("Creating high watermark tracker...");
     // Watermarks live on /data; if the init script failed to mount it,
@@ -820,9 +883,17 @@ fn apply_init_watermark(
     }
     let config = signer_server::SignerConfig::default();
 
-    // Parse secrets once: MAC keys + key manager for the signer thread.
-    // Do not re-parse JSON/B58 on StartSigner.
-    let (key_manager, mac_keys) = match signer_server::load_secret_keys(secret_keys.as_str()) {
+    // The manager reaches the signer thread through `app.pending_key_manager` and
+    // the parameters go into the watermark store, so the JSON and its base58
+    // values decode once per unlock rather than once per signer start.
+    // A tz6 key's load is its base58 decode, quadratic in the value, and it
+    // runs at the boosted clock like the decrypt ahead of it rather than at
+    // the idle one.
+    let loaded = {
+        let _held = cpu_boost.map(cpu_freq::CpuBoost::hold);
+        signer_server::load_secret_keys(secret_keys.as_str())
+    };
+    let (key_manager, mark_params) = match loaded {
         Ok(loaded) => loaded,
         Err(e) => fatal_error(
             device,
@@ -840,7 +911,7 @@ fn apply_init_watermark(
         .and_then(|info| ChainId::from_b58check(&info.id))
         .unwrap_or_else(|| ChainId::from_bytes(&[0u8; 32]));
 
-    let hwm = signer_server::create_high_watermark(&config, &pkhs, mac_keys, chain_id)
+    let hwm = signer_server::create_high_watermark(&config, &pkhs, mark_params, chain_id)
         .map_err(|e| std::io::Error::other(format!("Failed to create watermark: {e}")))?;
 
     app.pending_key_manager = Some(key_manager);
@@ -883,14 +954,8 @@ fn spawn_keygen(
 ) {
     let boost = cpu_boost.cloned();
     std::thread::spawn(move || {
-        if let Some(ref b) = boost {
-            b.boost();
-        }
-        let result = generate_and_encrypt_keys(&pin);
-        if let Some(ref b) = boost {
-            b.restore();
-        }
-        match result {
+        let _held = boost.as_ref().map(cpu_freq::CpuBoost::hold);
+        match generate_and_encrypt_keys(&pin) {
             Ok(json) => {
                 let _ = tx.send(AppEvent::KeyGenSuccess(json));
             }
@@ -908,35 +973,138 @@ fn spawn_pin_verify(
 ) {
     let boost = cpu_boost.cloned();
     std::thread::spawn(move || {
-        if let Some(ref b) = boost {
-            b.boost();
-        }
+        let _held = boost.as_ref().map(cpu_freq::CpuBoost::hold);
         let start = std::time::Instant::now();
         let result = tezos_encrypt::decrypt_secret_keys(&pin, {
             let tx = tx.clone();
             move || {
                 let _ = tx.send(AppEvent::PinVerifyProgress {
                     message: "Upgrading PIN...".into(),
-                    estimated_duration: Duration::from_secs(12),
+                    estimated_duration: STORE_ENCRYPT_ESTIMATE,
                 });
             }
         });
-        if let Some(ref b) = boost {
-            b.restore();
-        }
-        match result {
+        let event = match result {
             Ok(outcome) => {
                 log::info!("Decrypting time: {:?}", start.elapsed());
                 let (json, migration) = outcome.into_parts();
-                let _ = tx.send(AppEvent::PinVerified { json, migration });
+                // A staged request waits out a PIN-blob migration rather than
+                // running beside it: both keep the keys partition writable for
+                // this boot, and the migration ends in a reboot the request
+                // will still be staged for.
+                match migration {
+                    None => provision_staged_request(&tx, &pin, json, &provision::Paths::device()),
+                    Some(_) => AppEvent::PinVerified { json, migration },
+                }
             }
             Err(e) => {
                 log::error!("PIN verification failed: {e}");
                 log::info!("Decrypting time: {:?}", start.elapsed());
-                let _ = tx.send(AppEvent::PinVerificationFailed);
+                AppEvent::PinVerificationFailed
             }
-        }
+        };
+        let _ = tx.send(event);
     });
+}
+
+/// Carry out the provisioning request staged for this boot, if there is one.
+///
+/// Runs here rather than on the UI thread because generating a tz6 key walks
+/// every epoch in its span and takes tens of minutes on the device.
+///
+/// Clearing the request is attempted whatever the run does, and a clear that
+/// failed rides on the answer rather than being dropped: while the request is
+/// there, every boot after this one is a privileged boot that provisions again.
+fn provision_staged_request(
+    tx: &Sender<AppEvent>,
+    pin: &[u8],
+    json: Secret<String>,
+    paths: &provision::Paths,
+) -> AppEvent {
+    let key = match provision::staged_request(paths.request()) {
+        Ok(None) => {
+            return AppEvent::PinVerified {
+                json,
+                migration: None,
+            };
+        }
+        Ok(Some(key)) => key,
+        Err(e) => {
+            let reason = format!("{e}");
+            return match provision::clear_request(paths.request()) {
+                Ok(()) => AppEvent::ProvisionFailed { json, reason },
+                Err(e) => AppEvent::ProvisionFailed {
+                    json,
+                    reason: format!("{reason}; the request would not clear: {e}"),
+                },
+            };
+        }
+    };
+
+    let what = match key {
+        DeviceKey::Bls(role) => provision::Provisioning::Bls(role),
+        DeviceKey::XmssConsensus => provision::Provisioning::Xmss(constants::XMSS_EPOCHS),
+    };
+    let _ = tx.send(AppEvent::PinVerifyProgress {
+        message: format!("Generating {}...", key.device_alias()),
+        estimated_duration: provision::estimate(key),
+    });
+
+    let outcome = provision::provision_key(paths.store(), pin, json.as_str(), what);
+    let uncleared = provision::clear_request(paths.request())
+        .err()
+        .map(|e| format!("{e}"));
+    match outcome {
+        // The card holds what the run wrote, so that is what the device
+        // serves: unlocking on the store it read would leave the signer
+        // serving a secret the card no longer carries.
+        Ok(provisioned) => AppEvent::KeysProvisioned {
+            json: provisioned,
+            key,
+            uncleared,
+        },
+        Err(reason) => AppEvent::ProvisionFailed {
+            json,
+            reason: match uncleared {
+                None => reason,
+                Some(e) => format!("{reason}; the request would not clear: {e}"),
+            },
+        },
+    }
+}
+
+/// Check `pin` against the card and, where it opens it, stage a request for
+/// the next boot to provision `key`.
+///
+/// The check is a decrypt of the card's own key store rather than anything
+/// held in memory: the store is what a provisioning boot will open with the
+/// same PIN, so a PIN that stages a request is one that boot can act on.
+fn spawn_stage_request(tx: &Sender<AppEvent>, pin: Secret<Vec<u8>>, key: DeviceKey) {
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let paths = provision::Paths::device();
+        let event = match stage_request(&paths, &pin, key) {
+            Ok(()) => AppEvent::ProvisionRequested,
+            Err(reason) => AppEvent::ProvisionRequestFailed { reason },
+        };
+        let _ = tx.send(event);
+    });
+}
+
+/// The PIN check and the write behind it.
+fn stage_request(paths: &provision::Paths, pin: &[u8], key: DeviceKey) -> Result<(), String> {
+    let blob =
+        std::fs::read(paths.store()).map_err(|e| format!("The card would not read.\n{e}"))?;
+    // A wrong PIN and a store that will not parse both come back as
+    // InvalidData, so the two are one reading at this API and the operator is
+    // given the one they can act on. The log keeps the other, as
+    // spawn_pin_verify does at unlock.
+    russignol_crypto::decrypt(pin, &blob).map_err(|e| {
+        log::error!("The card would not open: {e}");
+        "Invalid PIN".to_string()
+    })?;
+    provision::stage_request(paths.request(), key)
+        .map_err(|e| format!("The request would not be written.\n{e}"))
 }
 
 fn spawn_storage_setup(tx: Sender<AppEvent>) {
@@ -959,17 +1127,65 @@ fn spawn_storage_setup(tx: Sender<AppEvent>) {
     });
 }
 
-/// Gate for consuming a staged boot-partition watermark config on a normal
-/// boot. Recovery is only safe when setup has completed (not first boot), the
-/// init script left us running as root (so we can write `/keys` and remount it
-/// read-only), and no v1->v2 PIN-blob migration is competing for the writable
-/// keys partition.
-fn should_recover_watermark_config(
-    is_first_boot: bool,
-    is_root: bool,
-    migration_pending: bool,
-) -> bool {
-    !is_first_boot && is_root && !migration_pending
+/// What a boot does with a staged watermark config and with its privileges,
+/// before the PIN page is drawn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BootRecovery {
+    /// Leave the staged config alone. Either setup has yet to run, the init
+    /// script did not keep us privileged, or a PIN-blob migration is competing
+    /// for the writable keys partition.
+    None,
+    /// Consume it and keep root: the provisioning run that follows the PIN
+    /// needs the keys partition writable, and hands privileges off with its
+    /// own result.
+    Consume,
+    /// Consume it, then hand privileges off before the signer thread starts.
+    ConsumeAndDemote,
+}
+
+/// The work a card has staged for this boot to carry out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StagedWork {
+    /// Nothing beyond serving signatures.
+    None,
+    /// A v1 PIN blob, whose migration is competing for the writable keys
+    /// partition.
+    PinMigration,
+    /// A request to provision one key.
+    Provisioning,
+}
+
+impl StagedWork {
+    /// What the two markers on the card amount to.
+    ///
+    /// A PIN migration comes first where both are staged: it ends in a reboot
+    /// the provisioning request is still staged for.
+    const fn staged(migration_pending: bool, provision_pending: bool) -> Self {
+        if migration_pending {
+            Self::PinMigration
+        } else if provision_pending {
+            Self::Provisioning
+        } else {
+            Self::None
+        }
+    }
+}
+
+/// What this boot's posture makes safe.
+///
+/// Writing `/keys` needs root and a writable mount, which only the init script
+/// can arrange and only for the boot it arranged them on. Handing them off
+/// before the work that needs them has run leaves that work unable to write at
+/// all.
+const fn boot_recovery(is_first_boot: bool, is_root: bool, staged: StagedWork) -> BootRecovery {
+    if is_first_boot || !is_root {
+        return BootRecovery::None;
+    }
+    match staged {
+        StagedWork::PinMigration => BootRecovery::None,
+        StagedWork::Provisioning => BootRecovery::Consume,
+        StagedWork::None => BootRecovery::ConsumeAndDemote,
+    }
 }
 
 /// First-boot rootfs integrity check against the hash the host recorded in
@@ -1010,24 +1226,37 @@ fn verify_rootfs_integrity(device: &mut Device) {
     }
 }
 
-/// Consume a staged boot-partition watermark config on a normal boot, then
-/// restore the read-only-keys, unprivileged posture before the UI loop runs.
+/// Consume a staged boot-partition watermark config on a normal boot, and
+/// restore the read-only-keys, unprivileged posture where nothing later on this
+/// boot needs the other one.
 ///
 /// The init script leaves the signer running as root with `/keys` writable only
-/// when a config is staged, so `save_chain_info` (which writes
+/// where work is staged that needs it, so `save_chain_info` (which writes
 /// `/keys/chain_info.json`) can succeed. Consuming the config is best-effort:
 /// the on-device recovery dialog remains the fallback, so a consume failure must
 /// not brick a healthy device. The remount and privilege drop are load-bearing
-/// security steps and stay fatal on failure, matching the first-boot path.
+/// security steps and stay fatal on failure, matching the first-boot path — and
+/// a provisioning boot takes them from its own run instead, after the key store
+/// it was booted to write has been written.
 fn recover_watermark_config(device: &mut Device, is_first_boot: bool) -> Option<u32> {
     let is_root = unsafe { libc::geteuid() } == 0;
     let migration_pending = std::path::Path::new(tezos_encrypt::SECRET_KEYS_ENC_PATH).exists();
+    let provision_pending = std::path::Path::new(constants::PROVISION_REQUEST_FILE).exists();
 
-    if !should_recover_watermark_config(is_first_boot, is_root, migration_pending) {
-        return None;
+    let recovery = boot_recovery(
+        is_first_boot,
+        is_root,
+        StagedWork::staged(migration_pending, provision_pending),
+    );
+    match recovery {
+        BootRecovery::None => return None,
+        BootRecovery::Consume => log::info!(
+            "Provisioning request staged - consuming any watermark config and keeping root for the run"
+        ),
+        BootRecovery::ConsumeAndDemote => {
+            log::info!("Privileged boot - consuming any watermark config, then demoting");
+        }
     }
-
-    log::info!("Pending watermark config detected on normal boot - recovering");
     let pending_level = match watermark_setup::process_watermark_config() {
         watermark_setup::WatermarkResult::Configured { chain_name, level } => {
             log::info!("Recovered chain info: {chain_name}, staged floor level {level}");
@@ -1045,11 +1274,13 @@ fn recover_watermark_config(device: &mut Device, is_first_boot: bool) -> Option<
 
     // Order is load-bearing: consume with /keys writable, then remount it
     // read-only and drop privileges before the signer thread can start.
-    if let Err(e) = storage::remount_keys_readonly() {
-        fatal_error(device, "SECURITY ERROR", &e);
-    }
-    if let Err(e) = storage::drop_privileges() {
-        fatal_error(device, "SECURITY ERROR", &e);
+    if recovery == BootRecovery::ConsumeAndDemote {
+        if let Err(e) = storage::remount_keys_readonly() {
+            fatal_error(device, "SECURITY ERROR", &e);
+        }
+        if let Err(e) = storage::drop_privileges() {
+            fatal_error(device, "SECURITY ERROR", &e);
+        }
     }
     pending_level
 }
@@ -1166,38 +1397,29 @@ fn apply_watermark_update(
 ///
 /// Returns the secret keys JSON (for immediate use in signing mode).
 fn generate_and_encrypt_keys(pin: &[u8]) -> Result<Secret<String>, String> {
-    let key_manager = KeyManager::new(Some(PathBuf::from(KEYS_DIR)));
+    // Walk KeyRole::ALL so emit order matches list_keys (consensus then
+    // companion). The tz6 key is not generated here: it costs tens of minutes
+    // and is provisioned on demand rather than at every first boot.
+    let generated = KeyRole::ALL
+        .into_iter()
+        .map(|role| {
+            log::info!(
+                "Generating {} key (in memory)...",
+                DeviceKey::Bls(role).device_alias()
+            );
+            provision::Generated::new(provision::Provisioning::Bls(role))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Generate keys IN MEMORY ONLY - no disk writes yet. Walk KeyRole::ALL so
-    // emit order matches list_keys (consensus then companion).
-    let mut generated = Vec::with_capacity(KeyRole::ALL.len());
-    for role in KeyRole::ALL {
-        let alias = role.device_alias();
-        log::info!("Generating {alias} key (in memory)...");
-        let key = key_manager
-            .gen_keys_in_memory(alias, false)
-            .map_err(|e| format!("Failed to generate {alias} key: {e}"))?;
-        log::info!("{alias} key generated");
-        generated.push(key);
-    }
-
-    let key_refs: Vec<&StoredKey> = generated.iter().collect();
-
-    // Build secret_keys JSON in memory (OCaml-compatible format)
-    let secret_keys_json = build_secret_keys_json(&key_refs);
-
-    // Encrypt secret keys and write ONLY the encrypted form to disk
+    let entries: Vec<provision::Entry<'_>> =
+        generated.iter().map(provision::Generated::entry).collect();
     log::info!("Encrypting secret keys...");
-    tezos_encrypt::encrypt_secret_keys(pin, &secret_keys_json)
-        .map_err(|e| format!("Failed to encrypt keys: {e}"))?;
-    log::info!("Encrypted secret keys written to disk");
-
-    // Save ONLY public keys to disk (secret keys stay encrypted)
-    log::info!("Saving public keys...");
-    key_manager
-        .save_public_keys_only(&generated)
-        .map_err(|e| format!("Failed to save public keys: {e}"))?;
-    log::info!("Public keys saved");
+    let secret_keys_json = provision::write_store(
+        Path::new(russignol_crypto::SECRET_KEYS_ENC_V2_PATH),
+        pin,
+        &entries,
+    )?;
+    log::info!("Key store written to disk");
 
     Ok(secret_keys_json)
 }
@@ -1275,157 +1497,361 @@ fn connection_callbacks(
     }
 }
 
-/// Build OCaml-compatible `secret_keys` JSON from in-memory keys.
-///
-/// Pre-sizes the output `Secret<String>` so `String::push_str` never
-/// reallocates, which would copy the plaintext into a new heap block and
-/// leave the old block un-zeroed. The single returned buffer is the only
-/// place plaintext lives.
-fn build_secret_keys_json(keys: &[&StoredKey]) -> Secret<String> {
-    let n: usize = keys.iter().filter(|k| k.secret_key.is_some()).count();
-    // 2 bytes for `[]`, plus a per-entry budget covering the skeleton, an
-    // alias headroom, and a 64-byte upper bound on the base58 secret
-    // (BLS12-381 BLsk is 54 chars, libs/signer/src/bls.rs:93).
-    let cap = 2 + n.saturating_mul(192);
-
-    let mut secret: Secret<String> = Secret::new(String::with_capacity(cap));
-    let buf: &mut String = &mut secret;
-    buf.push('[');
-    let mut first = true;
-    for key in keys {
-        let Some(sk) = key.secret_key.as_ref() else {
-            continue;
-        };
-        if !first {
-            buf.push(',');
-        }
-        first = false;
-        buf.push_str(r#"{"name":""#);
-        write_escaped(buf, &key.alias);
-        buf.push_str(r#"","value":"unencrypted:"#);
-        // Base58 alphabet contains no `"`, `\`, or control bytes — write raw.
-        buf.push_str(sk);
-        buf.push_str(r#""}"#);
-    }
-    buf.push(']');
-    secret
-}
-
-/// Escape a JSON string body: `"`, `\`, and ASCII control bytes as
-/// `\u00XX`. No other escapes are needed because non-ASCII UTF-8 is valid
-/// inside a JSON string.
-fn write_escaped(out: &mut String, s: &str) {
-    use core::fmt::Write;
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => {
-                write!(out, "\\u{:04x}", c as u32).expect("write to String is infallible");
-            }
-            c => out.push(c),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use russignol_signer_lib::wallet::OcamlKeyEntry;
-    use zeroize::Zeroizing;
+    use russignol_signer_lib::KeyRole;
 
-    const SAMPLE_SK: &str = "BLsk2snGqdSb7qBDhKbc62AxbZXJycDvA5QmeYYhB7Nb3wFuMMbq9x";
-
-    fn make_key(alias: &str, sk: Option<&str>) -> StoredKey {
-        StoredKey {
-            alias: alias.to_string(),
-            public_key_hash: format!("tz4{alias}"),
-            public_key: format!("BLpk{alias}"),
-            secret_key: sk.map(|s| Zeroizing::new(s.to_string())),
-        }
+    #[test]
+    fn a_boot_fault_is_what_the_init_script_recorded_and_none_where_it_recorded_nothing() {
+        assert_eq!(boot_fault(None), None);
+        assert_eq!(boot_fault(Some("")), None);
+        assert_eq!(
+            boot_fault(Some("Data partition would not mount.")),
+            Some("Data partition would not mount.")
+        );
     }
 
     #[test]
-    fn emit_round_trip() {
-        let consensus = KeyRole::Consensus.device_alias();
-        let companion = KeyRole::Companion.device_alias();
-        let k1 = make_key(consensus, Some(SAMPLE_SK));
-        let k2 = make_key(companion, Some(SAMPLE_SK));
-        let keys = [&k1, &k2];
+    fn no_mount_check_before_the_partitions_exist() {
+        assert_eq!(mount_check(BootStage::NoPartitions, true), None);
+        assert_eq!(mount_check(BootStage::NoPartitions, false), None);
+    }
 
-        let secret = build_secret_keys_json(&keys);
-        let parsed: Vec<OcamlKeyEntry<String>> =
-            serde_json::from_str(&secret).expect("emitter must produce valid JSON");
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].name, consensus);
-        assert_eq!(parsed[0].value, format!("unencrypted:{SAMPLE_SK}"));
-        assert_eq!(parsed[1].name, companion);
-        assert_eq!(parsed[1].value, format!("unencrypted:{SAMPLE_SK}"));
+    /// An unmounted keys partition has no setup marker in it, so the boot
+    /// reads as unmarked, and the check has to run on it regardless.
+    #[test]
+    fn an_unmarked_boot_is_checked_holding_keys_writable() {
+        assert_eq!(mount_check(BootStage::Unmarked, false), Some(true));
+        assert_eq!(mount_check(BootStage::Unmarked, true), Some(true));
     }
 
     #[test]
-    fn emit_no_realloc() {
-        let k1 = make_key(KeyRole::Consensus.device_alias(), Some(SAMPLE_SK));
-        let k2 = make_key(KeyRole::Companion.device_alias(), Some(SAMPLE_SK));
-        let keys = [&k1, &k2];
-        let n: usize = keys.iter().filter(|k| k.secret_key.is_some()).count();
-        let expected_cap = 2 + n.saturating_mul(192);
+    fn a_privileged_provisioned_boot_is_checked_holding_keys_writable() {
+        assert_eq!(mount_check(BootStage::Provisioned, true), Some(true));
+    }
 
-        let secret = build_secret_keys_json(&keys);
+    #[test]
+    fn an_unprivileged_provisioned_boot_is_checked_holding_keys_read_only() {
+        assert_eq!(mount_check(BootStage::Provisioned, false), Some(false));
+    }
+
+    const PIN: &[u8] = b"12345678";
+
+    /// A card as a provisioning boot finds it: a written key store, and the
+    /// plaintext the boot holds in memory after the PIN.
+    fn card(paths: &provision::Paths, roles: &[KeyRole]) -> Secret<String> {
+        let generated: Vec<provision::Generated> = roles
+            .iter()
+            .map(|role| {
+                provision::Generated::new(provision::Provisioning::Bls(*role))
+                    .expect("a BLS key generates")
+            })
+            .collect();
+        let entries: Vec<provision::Entry<'_>> =
+            generated.iter().map(provision::Generated::entry).collect();
+        provision::write_store(paths.store(), PIN, &entries)
+            .expect("a store over a writable directory")
+    }
+
+    /// A request naming `key`, staged the way the operator's flow stages it:
+    /// a request this test wrote itself is one that stays readable after the
+    /// writer's own spelling moves.
+    fn stage(paths: &provision::Paths, key: DeviceKey) {
+        provision::stage_request(paths.request(), key).expect("a writable data partition");
+    }
+
+    /// Deny writes to `dir` for the length of `run`, so a write into it fails
+    /// the way a read-only keys partition makes it fail on the device.
+    fn with_read_only<T>(dir: &std::path::Path, run: impl FnOnce() -> T) -> T {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = run();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        outcome
+    }
+
+    /// The aliases a store names, in the order it holds them.
+    fn aliases(store: &str) -> Vec<String> {
+        provision::read_store(store)
+            .expect("a store this test wrote")
+            .into_iter()
+            .map(|entry| entry.alias.to_string())
+            .collect()
+    }
+
+    /// A PIN that does not open the card stages nothing. The request is what
+    /// makes the next boot generate a key over the one it replaces, and that
+    /// boot asks for no second confirmation.
+    #[test]
+    fn a_pin_that_does_not_open_the_card_stages_no_request() {
+        let keys = tempfile::TempDir::new().unwrap();
+        let data = tempfile::TempDir::new().unwrap();
+        let paths = provision::Paths::under(data.path(), keys.path());
+        let _card = card(&paths, &[KeyRole::Consensus]);
+
+        let refused = stage_request(&paths, b"87654321", DeviceKey::XmssConsensus);
+
+        let Err(reason) = refused else {
+            panic!("a wrong PIN must stage nothing")
+        };
+        assert_eq!(reason, "Invalid PIN");
+        assert!(!paths.request().exists(), "a request was staged anyway");
+    }
+
+    /// The PIN that opens the card is what stages the request, and the request
+    /// names the key the operator picked.
+    #[test]
+    fn the_cards_own_pin_stages_the_key_it_was_given() {
+        let keys = tempfile::TempDir::new().unwrap();
+        let data = tempfile::TempDir::new().unwrap();
+        let paths = provision::Paths::under(data.path(), keys.path());
+        let _card = card(&paths, &[KeyRole::Consensus]);
+
+        stage_request(&paths, PIN, DeviceKey::XmssConsensus).expect("the card's own PIN");
 
         assert_eq!(
-            secret.capacity(),
-            expected_cap,
-            "build_secret_keys_json reallocated its output buffer (capacity grew during emit)",
+            provision::staged_request(paths.request()).unwrap(),
+            Some(DeviceKey::XmssConsensus)
+        );
+    }
+
+    /// A card that will not read is reported rather than answered with a
+    /// refused PIN: the operator would read that as the wrong PIN and try
+    /// again against a card no PIN can open.
+    #[test]
+    fn a_card_that_will_not_read_is_not_a_refused_pin() {
+        let keys = tempfile::TempDir::new().unwrap();
+        let data = tempfile::TempDir::new().unwrap();
+        let paths = provision::Paths::under(data.path(), keys.path());
+
+        let Err(reason) = stage_request(&paths, PIN, DeviceKey::XmssConsensus) else {
+            panic!("a card with no store must report")
+        };
+        assert!(
+            reason.contains("would not read"),
+            "the reason names the read: {reason}"
+        );
+        assert!(!paths.request().exists(), "a request was staged anyway");
+    }
+
+    /// A run whose request will not clear has still written the card, so the
+    /// device serves the keys the card holds rather than the ones it read. The
+    /// other order leaves the signer serving a secret no longer on the card,
+    /// and every boot after this one repeats the run.
+    #[test]
+    fn a_run_whose_request_will_not_clear_unlocks_on_the_store_it_wrote() {
+        let keys = tempfile::TempDir::new().unwrap();
+        let data = tempfile::TempDir::new().unwrap();
+        let paths = provision::Paths::under(data.path(), keys.path());
+        let before = card(&paths, &[KeyRole::Consensus]);
+        stage(&paths, DeviceKey::Bls(KeyRole::Companion));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        let event = with_read_only(data.path(), || {
+            provision_staged_request(&tx, PIN, before, &paths)
+        });
+
+        let AppEvent::KeysProvisioned {
+            json,
+            key,
+            uncleared,
+        } = event
+        else {
+            panic!("a run that wrote the card must answer with what it wrote: {event:?}")
+        };
+        assert_eq!(key, DeviceKey::Bls(KeyRole::Companion));
+        assert_eq!(aliases(&json), vec!["consensus_tz4", "companion_tz4"]);
+        assert!(
+            paths.request().exists(),
+            "the request could not have been cleared"
         );
         assert!(
-            secret.len() <= expected_cap,
-            "emitted output {len} exceeded preallocated capacity {expected_cap}",
-            len = secret.len(),
+            uncleared.is_some(),
+            "the operator is told the run repeats on the next boot"
         );
     }
 
+    /// The store the run wrote is what the device unlocks on, and the request
+    /// is gone so the boot after this one is a normal one.
     #[test]
-    fn emit_escapes_alias() {
-        let alias = "a\"b\\c";
-        let k = make_key(alias, Some(SAMPLE_SK));
-        let secret = build_secret_keys_json(&[&k]);
+    fn a_completed_run_clears_its_request_and_unlocks_on_what_it_wrote() {
+        let keys = tempfile::TempDir::new().unwrap();
+        let data = tempfile::TempDir::new().unwrap();
+        let paths = provision::Paths::under(data.path(), keys.path());
+        let before = card(&paths, &[KeyRole::Consensus]);
+        stage(&paths, DeviceKey::Bls(KeyRole::Companion));
+        let (tx, _rx) = crossbeam_channel::unbounded();
 
-        let parsed: Vec<OcamlKeyEntry<String>> = serde_json::from_str(&secret)
-            .expect("escaped alias must produce valid JSON parseable by serde_json");
-        assert_eq!(parsed[0].name, alias);
+        let event = provision_staged_request(&tx, PIN, before, &paths);
+
+        let AppEvent::KeysProvisioned {
+            json,
+            key,
+            uncleared,
+        } = event
+        else {
+            panic!("a completed run must answer with the store it wrote: {event:?}")
+        };
+        assert_eq!(key, DeviceKey::Bls(KeyRole::Companion));
+        assert_eq!(aliases(&json), vec!["consensus_tz4", "companion_tz4"]);
+        assert!(!paths.request().exists(), "the request was not cleared");
+        assert_eq!(uncleared, None, "nothing was left to report");
     }
 
+    /// A staged request is what makes a boot a provisioning one, so a boot
+    /// without one carries the PIN's own outcome forward and unlocks on the
+    /// store it read.
     #[test]
-    fn emit_empty_input() {
-        let secret = build_secret_keys_json(&[]);
-        assert_eq!(&*secret, "[]");
+    fn a_boot_with_no_request_staged_unlocks_on_the_store_it_read() {
+        let keys = tempfile::TempDir::new().unwrap();
+        let data = tempfile::TempDir::new().unwrap();
+        let paths = provision::Paths::under(data.path(), keys.path());
+        let before = card(&paths, &[KeyRole::Consensus]);
+        let expected = aliases(&before);
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        let event = provision_staged_request(&tx, PIN, before, &paths);
+
+        let AppEvent::PinVerified { json, migration } = event else {
+            panic!("nothing staged must unlock as a normal boot does: {event:?}")
+        };
+        assert!(migration.is_none());
+        assert_eq!(aliases(&json), expected);
+    }
+
+    /// A run that could not write the card leaves the device serving the keys
+    /// it read, and takes the request with it: the operator asked for one run,
+    /// and a request that survives a failure repeats it on every boot after.
+    #[test]
+    fn a_failed_run_serves_the_store_it_read_and_clears_its_request() {
+        let keys = tempfile::TempDir::new().unwrap();
+        let data = tempfile::TempDir::new().unwrap();
+        let paths = provision::Paths::under(data.path(), keys.path());
+        let before = card(&paths, &[KeyRole::Consensus]);
+        let expected = aliases(&before);
+        stage(&paths, DeviceKey::Bls(KeyRole::Companion));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        let event = with_read_only(keys.path(), || {
+            provision_staged_request(&tx, PIN, before, &paths)
+        });
+
+        let AppEvent::ProvisionFailed { json, reason } = event else {
+            panic!("a run that could not write the card must report: {event:?}")
+        };
+        assert_eq!(aliases(&json), expected);
+        assert!(
+            reason.contains("key store"),
+            "the reason names what would not be written: {reason}"
+        );
+        assert!(!paths.request().exists(), "the request was not cleared");
+    }
+
+    /// A boot that could neither provision nor clear its request carries both
+    /// failures: the second is why the operator sees this run again on the
+    /// next boot, and the first is why the card is unchanged.
+    #[test]
+    fn a_failed_run_whose_request_survives_reports_both() {
+        let keys = tempfile::TempDir::new().unwrap();
+        let data = tempfile::TempDir::new().unwrap();
+        let paths = provision::Paths::under(data.path(), keys.path());
+        let before = card(&paths, &[KeyRole::Consensus]);
+        stage(&paths, DeviceKey::Bls(KeyRole::Companion));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        let event = with_read_only(keys.path(), || {
+            with_read_only(data.path(), || {
+                provision_staged_request(&tx, PIN, before, &paths)
+            })
+        });
+
+        let AppEvent::ProvisionFailed { reason, .. } = event else {
+            panic!("a run that could not write the card must report: {event:?}")
+        };
+        assert!(
+            reason.contains("key store") && reason.contains("would not clear"),
+            "the reason carries both failures: {reason}"
+        );
+        assert!(
+            paths.request().exists(),
+            "the request could not have been cleared"
+        );
+    }
+
+    /// A request naming no key of this device stops the boot and takes the
+    /// request with it. Reading it as nothing staged would leave the keys
+    /// partition writable on every boot after, with nothing to say why.
+    #[test]
+    fn a_request_naming_no_device_key_fails_the_boot_and_clears_itself() {
+        let keys = tempfile::TempDir::new().unwrap();
+        let data = tempfile::TempDir::new().unwrap();
+        let paths = provision::Paths::under(data.path(), keys.path());
+        let before = card(&paths, &[KeyRole::Consensus]);
+        let expected = aliases(&before);
+        std::fs::write(paths.request(), "consensus_tz9").unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        let event = provision_staged_request(&tx, PIN, before, &paths);
+
+        let AppEvent::ProvisionFailed { json, reason } = event else {
+            panic!("a request naming no device key must report: {event:?}")
+        };
+        assert_eq!(aliases(&json), expected);
+        assert!(
+            reason.contains("consensus_tz9"),
+            "the reason names what was staged: {reason}"
+        );
+        assert!(!paths.request().exists(), "the request was not cleared");
     }
 
     #[test]
     fn recover_gate_truth_table() {
-        // The one posture where consuming a staged config is safe: a normal
-        // boot (setup done), running as root (init kept us privileged for it),
-        // with no PIN-blob migration competing for the writable keys partition.
-        assert!(should_recover_watermark_config(false, true, false));
+        use BootRecovery::{Consume, ConsumeAndDemote, None};
 
-        // Every other combination must not trigger recovery.
-        assert!(!should_recover_watermark_config(true, true, false));
-        assert!(!should_recover_watermark_config(false, false, false));
-        assert!(!should_recover_watermark_config(false, true, true));
-        assert!(!should_recover_watermark_config(true, false, false));
-        assert!(!should_recover_watermark_config(true, true, true));
-        assert!(!should_recover_watermark_config(false, false, true));
-        assert!(!should_recover_watermark_config(true, false, true));
+        // The one posture where consuming a staged config and handing
+        // privileges off is safe: a normal boot (setup done), running as root
+        // (init kept us privileged for it), with nothing else staged.
+        assert_eq!(
+            boot_recovery(false, true, StagedWork::None),
+            ConsumeAndDemote
+        );
+
+        // A provisioning run follows the PIN and writes the keys partition, so
+        // that boot keeps root and demotes with the run's own result.
+        assert_eq!(
+            boot_recovery(false, true, StagedWork::Provisioning),
+            Consume
+        );
+
+        // Every other posture leaves the staged config alone.
+        for staged in [
+            StagedWork::None,
+            StagedWork::PinMigration,
+            StagedWork::Provisioning,
+        ] {
+            for (first_boot, root) in [(true, true), (false, false), (true, false)] {
+                assert_eq!(
+                    boot_recovery(first_boot, root, staged),
+                    None,
+                    "first_boot={first_boot} root={root} staged={staged:?}"
+                );
+            }
+        }
+        assert_eq!(boot_recovery(false, true, StagedWork::PinMigration), None);
     }
 
+    /// A PIN migration and a provisioning request can both be staged, and the
+    /// migration goes first: it ends in a reboot the request is still staged
+    /// for, where running the provisioning first would write a key store the
+    /// migration then re-encrypts under a format it is mid-way through.
     #[test]
-    fn emit_prefix_present() {
-        let k = make_key(KeyRole::Consensus.device_alias(), Some(SAMPLE_SK));
-        let secret = build_secret_keys_json(&[&k]);
-        assert!(
-            secret.contains("unencrypted:"),
-            "emitter dropped the `unencrypted:` prefix",
-        );
+    fn a_pin_migration_outranks_a_staged_provisioning() {
+        assert_eq!(StagedWork::staged(true, true), StagedWork::PinMigration);
+        assert_eq!(StagedWork::staged(true, false), StagedWork::PinMigration);
+        assert_eq!(StagedWork::staged(false, true), StagedWork::Provisioning);
+        assert_eq!(StagedWork::staged(false, false), StagedWork::None);
     }
 }

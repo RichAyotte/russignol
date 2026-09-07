@@ -4,8 +4,8 @@
 
 use clap::{Parser, Subcommand};
 use russignol_signer_lib::{
-    ChainId, HighWatermark, MagicByte, RequestHandler, ServerKeyManager, bls::watermark_mac_key,
-    server, signer, wallet::KeyManager,
+    ChainId, HighWatermark, MagicByte, RequestHandler, ServerKeyManager,
+    high_watermark::MarkParams, server, signer, wallet::KeyManager,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -112,12 +112,12 @@ enum LaunchCommand {
     },
 }
 
-fn list_known_addresses(key_manager: &KeyManager) {
-    let keys = key_manager.load_keys();
+fn list_known_addresses(key_manager: &KeyManager) -> Result<(), String> {
+    let keys = key_manager.load_keys()?;
 
     if keys.is_empty() {
         println!("No known keys.");
-        return;
+        return Ok(());
     }
 
     println!("\nKnown keys:");
@@ -127,10 +127,11 @@ fn list_known_addresses(key_manager: &KeyManager) {
     for (alias, key) in &keys {
         println!("{alias:<20} {}", key.public_key_hash);
     }
+    Ok(())
 }
 
 fn show_address(key_manager: &KeyManager, name: &str) -> Result<(), String> {
-    let keys = key_manager.load_keys();
+    let keys = key_manager.load_keys()?;
 
     let key = keys
         .get(name)
@@ -190,29 +191,30 @@ struct SocketSignerOptions {
     pidfile: Option<PathBuf>,
 }
 
-/// Launch socket signer daemon
-/// Parse the CLI wallet's stored keys into a server key manager, the loaded
-/// public key hashes, and their per-key watermark MAC keys.
+/// Load the CLI wallet's stored keys.
+///
+/// The three results travel together because `HighWatermark::new` needs all of
+/// them, and a key present in one and missing from another is a key that signs
+/// with no mark or a mark with no signer.
 fn load_cli_signers(
     keys: &HashMap<String, russignol_signer_lib::wallet::StoredKey>,
 ) -> (
     ServerKeyManager,
-    Vec<russignol_signer_lib::bls::PublicKeyHash>,
-    HashMap<russignol_signer_lib::bls::PublicKeyHash, [u8; 32]>,
+    Vec<russignol_signer_lib::PublicKeyHash>,
+    HashMap<russignol_signer_lib::PublicKeyHash, MarkParams>,
 ) {
     let mut server_key_mgr = ServerKeyManager::new();
     let mut loaded_pkhs = Vec::new();
-    let mut mac_keys = HashMap::new();
+    let mut mark_params = HashMap::new();
 
     for (alias, stored_key) in keys {
         if let Some(sk_b58) = &stored_key.secret_key {
             match signer::Unencrypted::from_b58check(sk_b58) {
                 Ok(signer) => {
-                    // Now that we handle little-endian correctly, the derived PKH matches OCaml
                     let derived_pkh = *signer.public_key_hash();
                     let derived_pkh_b58 = derived_pkh.to_b58check();
-                    mac_keys.insert(derived_pkh, watermark_mac_key(signer.secret_key()));
-                    server_key_mgr.add_signer(derived_pkh, signer, alias.clone());
+                    mark_params.insert(derived_pkh, MarkParams::from(signer.secret_key()));
+                    server_key_mgr.add_signer(signer, alias.clone());
                     loaded_pkhs.push(derived_pkh);
                     let json_pkh = &stored_key.public_key_hash;
                     println!(
@@ -226,7 +228,7 @@ fn load_cli_signers(
         }
     }
 
-    (server_key_mgr, loaded_pkhs, mac_keys)
+    (server_key_mgr, loaded_pkhs, mark_params)
 }
 
 fn launch_socket_signer(
@@ -241,7 +243,7 @@ fn launch_socket_signer(
     };
 
     // Load all keys from storage
-    let keys = cli_key_manager.load_keys();
+    let keys = cli_key_manager.load_keys()?;
 
     if keys.is_empty() {
         return Err(
@@ -253,14 +255,14 @@ fn launch_socket_signer(
     let key_count = keys.len();
     println!("Loading {key_count} key(s)...");
 
-    let (server_key_mgr, loaded_pkhs, mac_keys) = load_cli_signers(&keys);
+    let (server_key_mgr, loaded_pkhs, mark_params) = load_cli_signers(&keys);
 
     // Setup high watermark if enabled
     let watermark = if opts.check_high_watermark {
         let hwm = HighWatermark::new(
             cli_key_manager.base_dir(),
             &loaded_pkhs,
-            mac_keys,
+            mark_params,
             ChainId::from_bytes(&[0u8; 32]),
         )
         .map_err(|e| format!("Failed to create high watermark: {e}"))?;
@@ -348,10 +350,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::List { subcommand } => match subcommand {
-            ListCommand::Known { addresses: _ } => {
-                list_known_addresses(&key_manager);
-                Ok(())
-            }
+            ListCommand::Known { addresses: _ } => list_known_addresses(&key_manager),
         },
         Commands::Show { subcommand } => match subcommand {
             ShowCommand::Address { name } => show_address(&key_manager, &name),

@@ -30,14 +30,8 @@ impl Page {
         let mut buttons = vec![
             (Button::new_text(size, "System"), AppEvent::ShowStatus),
             (Button::new_text(size, "Activity"), AppEvent::ShowSignatures),
-            (
-                Button::new_text(size, "Blockchain"),
-                AppEvent::ShowBlockchain,
-            ),
-            (
-                Button::new_text(size, "Watermarks"),
-                AppEvent::ShowWatermarks,
-            ),
+            (Button::new_text(size, "Keys"), AppEvent::ShowKeys),
+            (Button::new_text(size, "Provision"), AppEvent::ShowProvision),
             (Button::new_text(size, "About"), AppEvent::ShowAbout),
             (
                 Button::new_text(size, "Shutdown"),
@@ -74,5 +68,24 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BUTTON_W, Page};
+    use crate::pages::assert_label_fits;
+
+    /// Every menu entry fits the button carrying it. A label that overruns is
+    /// drawn past the button's edge, and the entry beside it is what the
+    /// operator reads it as.
+    #[test]
+    fn every_menu_label_fits_its_button() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        for (button, _) in &Page::new(tx).buttons {
+            let label = button.text.as_ref().expect("a text button");
+            assert_label_fits(label, BUTTON_W);
+        }
     }
 }

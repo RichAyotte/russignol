@@ -25,9 +25,10 @@ struct LedInner {
 /// Activity LED controller.
 ///
 /// Turns the LED on when a signer connection opens and off when it closes.
-/// Min-on hold is aesthetic only and never blocks the caller: sleeping in
-/// `off()` delayed connection teardown by ~200ms (flat pre→att forge gap
-/// when the baker opens the next sign connection after the previous closes).
+/// The min-on hold is aesthetic only and never blocks the caller: a sleep in
+/// `off()` holds connection teardown for its whole duration, and the baker's
+/// next sign connection opens behind that teardown, so ~200ms of it lands in
+/// the pre→att forge gap.
 #[derive(Clone)]
 pub struct Led(Arc<LedInner>);
 
@@ -127,6 +128,28 @@ mod tests {
         fs::read_to_string(dir.path().join("brightness")).unwrap()
     }
 
+    /// Long enough that only a write which never lands can miss it.
+    const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Read `brightness` until it reads `want`, and answer with what it read
+    /// and how long after `since` that was.
+    ///
+    /// Waited for rather than slept through: the deferred write lands a
+    /// scheduled thread's wake-up after the hold expires, and how long that
+    /// takes is the machine's rather than this crate's. A fixed margin over
+    /// the hold is one a loaded machine loses, which turns this red with no
+    /// defect behind it.
+    fn settles_at(dir: &tempfile::TempDir, want: &str, since: Instant) -> (String, Duration) {
+        let deadline = Instant::now() + SETTLE_TIMEOUT;
+        loop {
+            let read = brightness(dir);
+            if read == want || Instant::now() >= deadline {
+                return (read, since.elapsed());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn test_initial_state_is_off() {
         let (dir, _led) = mock_led();
@@ -143,12 +166,19 @@ mod tests {
     #[test]
     fn test_off_writes_zero_after_min_on() {
         let (dir, led) = mock_led();
+        let lit = Instant::now();
         led.on();
         led.off();
         // Min-on hold is deferred — still lit immediately after off().
         assert_eq!(brightness(&dir), "1");
-        thread::sleep(MIN_ON_DURATION + Duration::from_millis(50));
-        assert_eq!(brightness(&dir), "0");
+
+        let (settled, after) = settles_at(&dir, "0", lit);
+
+        assert_eq!(settled, "0", "the deferred write never landed");
+        assert!(
+            after >= MIN_ON_DURATION,
+            "the LED went dark {after:?} after it was lit, inside the {MIN_ON_DURATION:?} hold"
+        );
     }
 
     #[test]
@@ -175,15 +205,17 @@ mod tests {
         let barrier_on = Arc::clone(&barrier);
         let on_latency = thread::spawn(move || {
             barrier_on.wait();
-            // Let off() take the lock and schedule its deferred hold first.
-            thread::sleep(Duration::from_millis(5));
             let start = Instant::now();
             led_on.on();
             start.elapsed()
         });
 
-        barrier.wait();
+        // Released after off() returns, so on() provably runs against a hold
+        // already scheduled. Releasing it first leaves which of the two goes
+        // in front to the scheduler, and the order that proves nothing is the
+        // one that passes.
         led.off();
+        barrier.wait();
         let elapsed = on_latency.join().unwrap();
         assert!(
             elapsed < Duration::from_millis(50),
@@ -204,8 +236,13 @@ mod tests {
             "deferred off from an earlier session must not darken a live session"
         );
         led.off();
-        thread::sleep(MIN_ON_DURATION + Duration::from_millis(50));
-        assert_eq!(brightness(&dir), "0");
+
+        // The LED has been lit past MIN_ON_DURATION by now, so this session's
+        // write is due immediately and what is left to establish is that it
+        // lands.
+        let (settled, _) = settles_at(&dir, "0", Instant::now());
+
+        assert_eq!(settled, "0", "the deferred write never landed");
     }
 
     #[test]
@@ -214,10 +251,16 @@ mod tests {
         led.on();
         led.on();
         led.off();
+        // Slept through rather than waited for: what is asserted is that no
+        // write landed, which only time can establish and which a longer wait
+        // can only make surer.
         thread::sleep(MIN_ON_DURATION + Duration::from_millis(50));
         assert_eq!(brightness(&dir), "1");
+
         led.off();
-        thread::sleep(MIN_ON_DURATION + Duration::from_millis(50));
-        assert_eq!(brightness(&dir), "0");
+
+        let (settled, _) = settles_at(&dir, "0", Instant::now());
+
+        assert_eq!(settled, "0", "the deferred write never landed");
     }
 }

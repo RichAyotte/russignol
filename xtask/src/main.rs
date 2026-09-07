@@ -315,7 +315,8 @@ enum Commands {
         #[arg(short, long, default_value = device::DEVICE_USER)]
         user: String,
 
-        /// Run only tests matching this category (basic, multi, chain, edge)
+        /// Run only tests matching this category (basic, multi, chain, edge,
+        /// floor, xmss, latency; power runs only when named)
         #[arg(short, long)]
         category: Option<String>,
 
@@ -326,6 +327,11 @@ enum Commands {
         /// Restart device service before testing
         #[arg(long)]
         restart: bool,
+
+        /// First level the tests sign at; set it above a card's floors instead
+        /// of cleaning them
+        #[arg(long)]
+        level_base: Option<u32>,
 
         /// Verbose output
         #[arg(short, long)]
@@ -507,6 +513,7 @@ fn try_main() -> Result<()> {
             category,
             clean,
             restart,
+            level_base,
             verbose,
         } => {
             let config = watermark_test::WatermarkTestConfig {
@@ -516,6 +523,7 @@ fn try_main() -> Result<()> {
                 category,
                 clean,
                 restart,
+                level_base,
                 verbose,
             };
             watermark_test::run_watermark_test(&config)

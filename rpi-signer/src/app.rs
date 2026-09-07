@@ -1,5 +1,5 @@
 use crossbeam_channel::Sender;
-use russignol_signer_lib::{ChainId, HighWatermark, ServerKeyManager, signing_activity};
+use russignol_signer_lib::{ChainId, DeviceKey, HighWatermark, ServerKeyManager, signing_activity};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -11,11 +11,45 @@ use crate::tezos_encrypt::MigrationEvent;
 /// Visible duration for the migration progress page before the device reboots.
 const MIGRATION_REBOOT_COUNTDOWN: Duration = Duration::from_secs(5);
 
+/// How long the `Verifying PIN...` bar runs: the release build's scrypt
+/// decrypt of the key store, 10.01 and 10.02 s over two unlocks by
+/// `Decrypting time` in the device's `signer.log`. The dev build's 11.8 s
+/// is not the figure a shipped card sees.
+const PIN_DECRYPT_ESTIMATE: Duration = Duration::from_secs(10);
+
+/// How long the store's scrypt encrypt runs on the release build: 12 s past
+/// its decrypt in a BLS provisioning run. A first boot writes no `signer.log`,
+/// the data partition not existing yet, so the span is read off the run that
+/// pays the same encrypt.
+pub(crate) const STORE_ENCRYPT_ESTIMATE: Duration = Duration::from_secs(12);
+
+fn pin_verify_bar() -> Effect {
+    Effect::ShowProgress {
+        message: "Verifying PIN...".into(),
+        estimated_duration: Some(PIN_DECRYPT_ESTIMATE),
+        modal: true,
+        percent: 0,
+    }
+}
+
 /// Exit code that the init script supervisor interprets as "reboot the device".
 /// Must stay in sync with the matching constants in
 /// `rpi-signer/buildroot-external/rootfs-overlay-dev/etc/init.d/S20russignol`
 /// and `rpi-signer/buildroot-external/rootfs-overlay-hardened/init`.
 const EXIT_CODE_REBOOT: i32 = 42;
+
+/// What the operator is asked before a key is replaced.
+///
+/// The cost is named because it is what the answer turns on: the device signs
+/// nothing for as long as the run takes, and the key the run replaces is gone
+/// once it starts.
+fn provision_confirmation(key: DeviceKey) -> String {
+    format!(
+        "Replace {}?\nTakes {}, signing nothing.",
+        key.device_alias(),
+        crate::provision::estimate_in_words(key)
+    )
+}
 
 fn push_reboot_progress(message: &str, effects: &mut Vec<Effect>) {
     effects.push(Effect::ShowProgress {
@@ -28,10 +62,10 @@ fn push_reboot_progress(message: &str, effects: &mut Vec<Effect>) {
     effects.push(Effect::Exit(EXIT_CODE_REBOOT));
 }
 
-/// Show a modal migration-error notice that the user must acknowledge.
-/// Nothing else is queued — the dismiss event drives the next step so
-/// the renderer never paints the menu over an unread error.
-fn push_migration_notice(
+/// Show a modal error notice that the user must acknowledge, then unlock on
+/// the keys already in hand. Nothing else is queued — the dismiss event drives
+/// the next step so the renderer never paints the menu over an unread error.
+fn push_notice_then_unlock(
     title: &str,
     message: &str,
     json: Secret<String>,
@@ -46,7 +80,8 @@ fn push_migration_notice(
 
 /// Retained distinct unknown pkhs; the requesting peer is untrusted network
 /// input, so alert state must stay fixed-size no matter how many keys it
-/// invents.
+/// invents. The size itself is arbitrary: any small bound does the job, and
+/// nothing on the display or in the protocol fixes eight.
 const UNKNOWN_KEY_CAP: usize = 8;
 
 /// Content of an active unknown-key alert, produced by
@@ -150,7 +185,8 @@ enum GatePolicy {
     /// watermark floor is a slashing risk, so an unprovisioned card must not
     /// commit key material it can never validly sign from.
     HardFail,
-    /// Proceed regardless; the config is consumed post-keygen as before.
+    /// Proceed regardless. The consuming pass runs after key generation, so
+    /// nothing this policy lets through reads the config any earlier.
     WarnAndContinue,
 }
 
@@ -258,8 +294,10 @@ pub enum PageSpec {
     Menu,
     Status,
     Signatures,
-    Watermarks,
-    Blockchain,
+    /// The card's keys, as two tabs over one subject.
+    Keys,
+    /// The keys this device can provision, one button each.
+    Provision,
     About,
     Greeting,
     Image {
@@ -293,13 +331,17 @@ pub enum PageSpec {
         message: String,
         on_dismiss: AppEvent,
     },
-    DeviceLocked,
 }
 
 /// Side effects returned by handlers — descriptions of work to be done
 #[derive(Debug, PartialEq, Eq)]
 pub enum Effect {
     ShowPage(PageSpec),
+    /// Draw the locked screen straight to the panel. Not a [`PageSpec`]: the
+    /// [`AppEvent::DeviceLocked`] handler queues [`Effect::Exit`] behind this,
+    /// so nothing rebuilds or repaints the screen, and a screen
+    /// `construct_page` has no answer for is one it must not be handed.
+    ShowDeviceLocked,
     ShowProgress {
         message: String,
         estimated_duration: Option<Duration>,
@@ -324,6 +366,12 @@ pub enum Effect {
     },
     SpawnPinVerify {
         pin: Secret<Vec<u8>>,
+    },
+    /// Check `pin` against the card and, where it opens it, stage a request
+    /// for the next boot to provision `key`.
+    SpawnStageRequest {
+        pin: Secret<Vec<u8>>,
+        key: DeviceKey,
     },
     SpawnStorageSetup,
     SyncDisk,
@@ -367,6 +415,10 @@ pub struct App {
     /// Signing requests for keys the device does not hold, surfaced as a
     /// modal acknowledge dialog.
     pub unknown_keys: UnknownKeyAlert,
+    /// The key a confirmed provisioning request names, held while the PIN page
+    /// is up. Taken by the PIN entry, so a PIN entered without one stages
+    /// nothing.
+    pub pending_provision: Option<DeviceKey>,
     pub needs_animation: bool,
     pub animation_interval: Duration,
     /// Render work deferred to the loop's flush site; survives loop
@@ -401,6 +453,7 @@ impl App {
             pending_watermark_level: None,
             pending_key_manager: None,
             unknown_keys: UnknownKeyAlert::default(),
+            pending_provision: None,
             needs_animation: false,
             animation_interval: Duration::from_secs(1),
             pending_render: PendingRender::None,
@@ -658,7 +711,8 @@ impl App {
             vec![
                 Effect::ShowProgress {
                     message: "Generating keys...".into(),
-                    estimated_duration: Some(Duration::from_secs(8)),
+                    // The two BLS keygens are milliseconds beside the encrypt.
+                    estimated_duration: Some(STORE_ENCRYPT_ESTIMATE),
                     modal: true,
                     percent: 0,
                 },
@@ -688,12 +742,7 @@ impl App {
                     *lockout_until = None;
                     *failed_attempts = 0;
                 }
-                effects.push(Effect::ShowProgress {
-                    message: "Verifying PIN...".into(),
-                    estimated_duration: Some(Duration::from_secs(8)),
-                    modal: true,
-                    percent: 0,
-                });
+                effects.push(pin_verify_bar());
                 effects.push(Effect::SpawnPinVerify { pin });
             }
             AppEvent::PinVerified { json, migration } => {
@@ -712,57 +761,132 @@ impl App {
                 });
             }
             AppEvent::AcknowledgeMigrationNotice { json } => {
-                log::info!("Migration notice acknowledged; demoting and proceeding to active");
+                log::info!("Notice acknowledged; demoting and proceeding to active");
                 self.proceed_to_active(json, true, &mut effects);
+            }
+            AppEvent::KeysProvisioned {
+                json,
+                key,
+                uncleared,
+            } => {
+                log::info!("Provisioned {}; demoting and unlocking", key.device_alias());
+                match uncleared {
+                    None => self.proceed_to_active(json, true, &mut effects),
+                    Some(reason) => {
+                        log::error!("The provisioning request would not clear: {reason}");
+                        push_notice_then_unlock(
+                            "REQUEST NOT CLEARED",
+                            &format!(
+                                "{} is provisioned.\nThe next boot repeats the run.\n{reason}",
+                                key.device_alias()
+                            ),
+                            json,
+                            &mut effects,
+                        );
+                    }
+                }
+            }
+            AppEvent::ProvisionFailed { json, reason } => {
+                log::error!("Provisioning failed: {reason}");
+                push_notice_then_unlock(
+                    "PROVISIONING FAILED",
+                    &format!("The card's keys are unchanged.\n{reason}"),
+                    json,
+                    &mut effects,
+                );
             }
             AppEvent::PinVerificationFailed => {
                 log::info!("PinVerificationFailed, delegating to InvalidPinEntered");
                 effects.push(Effect::Emit(AppEvent::InvalidPinEntered));
             }
-            AppEvent::InvalidPinEntered => {
-                if let AppState::PinEntry {
-                    failed_attempts,
-                    lockout_until,
-                } = &mut self.state
-                {
-                    *failed_attempts += 1;
-                    log::warn!(
-                        "Failed PIN attempt {} of {MAX_FAILED_ATTEMPTS}",
-                        *failed_attempts
-                    );
-                    if *failed_attempts >= MAX_FAILED_ATTEMPTS {
-                        *lockout_until = Some(Instant::now() + LOCKOUT_DURATION);
-                        log::error!(
-                            "Maximum PIN attempts exceeded, device locked for {} seconds",
-                            LOCKOUT_DURATION.as_secs()
-                        );
-                        effects.push(Effect::Emit(AppEvent::DeviceLocked));
-                        return (LoopAction::Proceed, effects);
-                    }
-                    let remaining = MAX_FAILED_ATTEMPTS - *failed_attempts;
-                    let message: &str = match remaining {
-                        1 => "Invalid PIN\n1 attempt left",
-                        2 => "Invalid PIN\n2 attempts left",
-                        _ => "Invalid PIN",
-                    };
-                    effects.push(Effect::ShowPage(PageSpec::Dialog {
-                        message: message.into(),
-                        on_dismiss: AppEvent::EnterPin,
-                    }));
-                }
-            }
+            AppEvent::InvalidPinEntered => self.record_failed_attempt(&mut effects),
             AppEvent::EnterPin => {
                 effects.push(Effect::ShowPage(PageSpec::PinVerify));
             }
             AppEvent::DeviceLocked => {
                 log::error!("Device locked due to too many failed PIN attempts");
                 self.state = AppState::Locked;
-                effects.push(Effect::ShowPage(PageSpec::DeviceLocked));
+                effects.push(Effect::ShowDeviceLocked);
                 effects.push(Effect::Exit(1));
             }
             _ => {}
         }
         (LoopAction::Proceed, effects)
+    }
+
+    /// The operator's provisioning flow: the key picked, the cost accepted,
+    /// the PIN, and the two answers the staging thread sends back. Any other
+    /// event belongs to no step of it and asks for nothing.
+    fn provisioning_effects(&mut self, event: AppEvent) -> Vec<Effect> {
+        match event {
+            AppEvent::ProvisionKey(key) => vec![Effect::ShowPage(PageSpec::Confirmation {
+                message: provision_confirmation(key),
+                on_confirm: AppEvent::ConfirmProvision(key),
+                on_cancel: AppEvent::ShowMenu,
+                warning: true,
+                button_text: "Replace".into(),
+            })],
+            AppEvent::ConfirmProvision(key) => {
+                self.pending_provision = Some(key);
+                vec![Effect::ShowPage(PageSpec::PinVerify)]
+            }
+            // The card is opened by the PIN before anything is staged: a
+            // request written first is one the next unlock carries out, and
+            // that unlock is the operator's rather than whoever left it there.
+            AppEvent::PinEntered(pin) => self
+                .pending_provision
+                .take()
+                .map(|key| vec![pin_verify_bar(), Effect::SpawnStageRequest { pin, key }])
+                .unwrap_or_default(),
+            AppEvent::ProvisionRequested => {
+                log::info!("Provisioning request staged; rebooting to carry it out");
+                let mut effects = Vec::new();
+                push_reboot_progress("Rebooting...", &mut effects);
+                effects
+            }
+            AppEvent::ProvisionRequestFailed { reason } => {
+                log::warn!("No provisioning request was staged: {reason}");
+                vec![Effect::ShowPage(PageSpec::Dialog {
+                    message: reason,
+                    on_dismiss: AppEvent::ShowMenu,
+                })]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn record_failed_attempt(&mut self, effects: &mut Vec<Effect>) {
+        let AppState::PinEntry {
+            failed_attempts,
+            lockout_until,
+        } = &mut self.state
+        else {
+            return;
+        };
+        *failed_attempts += 1;
+        log::warn!(
+            "Failed PIN attempt {} of {MAX_FAILED_ATTEMPTS}",
+            *failed_attempts
+        );
+        if *failed_attempts >= MAX_FAILED_ATTEMPTS {
+            *lockout_until = Some(Instant::now() + LOCKOUT_DURATION);
+            log::error!(
+                "Maximum PIN attempts exceeded, device locked for {} seconds",
+                LOCKOUT_DURATION.as_secs()
+            );
+            effects.push(Effect::Emit(AppEvent::DeviceLocked));
+            return;
+        }
+        let remaining = MAX_FAILED_ATTEMPTS - *failed_attempts;
+        let message: &str = match remaining {
+            1 => "Invalid PIN\n1 attempt left",
+            2 => "Invalid PIN\n2 attempts left",
+            _ => "Invalid PIN",
+        };
+        effects.push(Effect::ShowPage(PageSpec::Dialog {
+            message: message.into(),
+            on_dismiss: AppEvent::EnterPin,
+        }));
     }
 
     fn dispatch_pin_verified(
@@ -789,7 +913,7 @@ impl App {
             }
             Some(MigrationEvent::RevertedFromCorruptV2 { reason }) => {
                 log::warn!("PIN upgrade reverted from corrupt v2: {reason}");
-                push_migration_notice(
+                push_notice_then_unlock(
                     "PIN UPGRADE FAILED",
                     &format!("Reverted to legacy format.\n{reason}"),
                     json,
@@ -798,7 +922,7 @@ impl App {
             }
             Some(MigrationEvent::StagingFailed { reason }) => {
                 log::warn!("PIN upgrade staging failed: {reason}");
-                push_migration_notice(
+                push_notice_then_unlock(
                     "PIN UPGRADE FAILED",
                     &format!("Could not stage v2 blob.\n{reason}"),
                     json,
@@ -807,11 +931,11 @@ impl App {
             }
             Some(MigrationEvent::MigrationDisabled { attempts }) => {
                 log::error!(
-                    "Migration disabled after {attempts} attempts; device unlocked on legacy format"
+                    "Migration disabled after {attempts}; device unlocked on legacy format"
                 );
-                push_migration_notice(
+                push_notice_then_unlock(
                     "MIGRATION DISABLED",
-                    &format!("{attempts} attempts; re-image device.\nUnlocking on legacy format."),
+                    &format!("{attempts}; re-image device.\nUnlocking on legacy format."),
                     json,
                     effects,
                 );
@@ -849,8 +973,8 @@ impl App {
         match event {
             AppEvent::ShowStatus => Some(PageSpec::Status),
             AppEvent::ShowSignatures => Some(PageSpec::Signatures),
-            AppEvent::ShowWatermarks => Some(PageSpec::Watermarks),
-            AppEvent::ShowBlockchain => Some(PageSpec::Blockchain),
+            AppEvent::ShowKeys => Some(PageSpec::Keys),
+            AppEvent::ShowProvision => Some(PageSpec::Provision),
             AppEvent::ShowAbout => Some(PageSpec::About),
             AppEvent::ShowGreeting => Some(PageSpec::Greeting),
             AppEvent::ShowImage { back } => Some(PageSpec::Image { back: *back }),
@@ -941,6 +1065,9 @@ impl App {
                 });
             }
             AppEvent::WatermarkUpdateSuccess | AppEvent::DialogDismissed | AppEvent::ShowMenu => {
+                // A key picked and left behind at the menu is not one the next
+                // PIN entry should act on.
+                self.pending_provision = None;
                 effects.push(Effect::ShowPage(PageSpec::Menu));
             }
             AppEvent::RequestShutdown => {
@@ -952,7 +1079,7 @@ impl App {
                     button_text: "Shutdown".into(),
                 }));
             }
-            _ => {}
+            other => effects.extend(self.provisioning_effects(other)),
         }
         (LoopAction::Proceed, effects)
     }
@@ -1341,6 +1468,125 @@ mod tests {
         );
     }
 
+    /// A provisioning boot ran as root with the keys partition writable, so it
+    /// hands privileges off before it serves anything: the same demote the
+    /// promote path takes. The keys it unlocks on are the ones it just wrote,
+    /// not the ones it read.
+    #[test]
+    fn keys_provisioned_demotes_and_unlocks_on_the_store_it_wrote() {
+        let mut app = normal_boot_app();
+
+        let (_action, effects) = app.handle_event(AppEvent::KeysProvisioned {
+            json: json("provisioned"),
+            key: russignol_signer_lib::DeviceKey::XmssConsensus,
+            uncleared: None,
+        });
+
+        let positions = effect_positions(&effects);
+        let set_perms = positions.position_of(&Effect::SetKeyPermissions);
+        let sync = positions.position_of(&Effect::SyncDisk);
+        let remount = positions.position_of(&Effect::RemountKeysReadonly);
+        let drop_priv = positions.position_of(&Effect::DropPrivileges);
+        assert!(
+            set_perms < sync && sync < remount && remount < drop_priv,
+            "expected SetKeyPermissions < SyncDisk < RemountKeysReadonly < DropPrivileges (got {set_perms} < {sync} < {remount} < {drop_priv})"
+        );
+        assert!(
+            has_effect(
+                &effects,
+                &Effect::Emit(AppEvent::KeysDecrypted(json("provisioned")))
+            ),
+            "expected KeysDecrypted carrying the store the run wrote"
+        );
+        assert!(
+            matches!(
+                app.state,
+                AppState::Active {
+                    screensaver_active: false
+                }
+            ),
+            "a provisioned card transitions directly to Active"
+        );
+    }
+
+    /// A run whose request would not clear has still written the card, so the
+    /// device unlocks on what it wrote — behind a notice, because every boot
+    /// after this one generates another key until the request is gone.
+    #[test]
+    fn an_uncleared_request_shows_a_notice_and_unlocks_on_the_store_it_wrote() {
+        let mut app = normal_boot_app();
+
+        let (_action, effects) = app.handle_event(AppEvent::KeysProvisioned {
+            json: json("provisioned"),
+            key: russignol_signer_lib::DeviceKey::XmssConsensus,
+            uncleared: Some("Permission denied (os error 13)".to_string()),
+        });
+
+        let Some(Effect::ShowPage(PageSpec::Notice {
+            message,
+            on_dismiss,
+            ..
+        })) = effects.first()
+        else {
+            panic!("an uncleared request must show a notice first: {effects:?}")
+        };
+        assert!(
+            message.contains("Permission denied"),
+            "the notice must carry the reason: {message}"
+        );
+        assert!(
+            matches!(
+                on_dismiss,
+                AppEvent::AcknowledgeMigrationNotice { json } if json.as_str() == "provisioned"
+            ),
+            "the device unlocks on the store the run wrote"
+        );
+        assert_eq!(
+            effects.len(),
+            1,
+            "nothing is queued behind an unread notice"
+        );
+    }
+
+    /// A failed run leaves the card's keys as they were, and the operator is
+    /// told before the device goes on serving with them: a run that reported
+    /// nothing would leave them believing the rotation happened.
+    #[test]
+    fn provision_failed_shows_a_notice_before_unlocking_on_the_old_store() {
+        let mut app = normal_boot_app();
+
+        let (_action, effects) = app.handle_event(AppEvent::ProvisionFailed {
+            json: json("unchanged"),
+            reason: "the keys partition is read-only".into(),
+        });
+
+        let Some(Effect::ShowPage(PageSpec::Notice {
+            title,
+            message,
+            on_dismiss,
+        })) = effects.first()
+        else {
+            panic!("a failed run must show a notice first: {effects:?}")
+        };
+        assert_eq!(title, "PROVISIONING FAILED");
+        assert!(
+            message.contains("the keys partition is read-only"),
+            "the notice must carry the reason: {message}"
+        );
+        assert!(
+            matches!(
+                on_dismiss,
+                AppEvent::AcknowledgeMigrationNotice { json } if json.as_str() == "unchanged"
+            ),
+            "the dismiss must carry the store the device unlocks on"
+        );
+        assert_eq!(
+            effects.len(),
+            1,
+            "nothing is queued behind an unread notice"
+        );
+    }
+
     #[test]
     fn pin_verified_reverted_shows_notice_and_waits_for_ack() {
         let mut app = normal_boot_app();
@@ -1410,7 +1656,9 @@ mod tests {
         let mut app = normal_boot_app();
         let (_action, effects) = app.handle_event(AppEvent::PinVerified {
             json: json("secrets"),
-            migration: Some(MigrationEvent::MigrationDisabled { attempts: 4 }),
+            migration: Some(MigrationEvent::MigrationDisabled {
+                attempts: crate::tezos_encrypt::Attempts::Counted(4),
+            }),
         });
         assert!(effects.iter().any(|e| matches!(
             e,
@@ -1459,11 +1707,15 @@ mod tests {
         );
     }
 
+    /// A device out of PIN attempts draws the locked screen and stops there.
+    /// The screen is the last thing on the panel before the exit under it, so
+    /// nothing is queued behind it and nothing rebuilds it.
     #[test]
     fn device_locked_transitions_pin_entry_to_locked() {
         let mut app = normal_boot_app();
-        let (_action, _effects) = app.handle_event(AppEvent::DeviceLocked);
+        let (_action, effects) = app.handle_event(AppEvent::DeviceLocked);
         assert!(matches!(app.state, AppState::Locked));
+        assert_eq!(effects, vec![Effect::ShowDeviceLocked, Effect::Exit(1)]);
     }
 
     // === Event routing tests ===
@@ -1471,7 +1723,6 @@ mod tests {
     #[test]
     fn events_for_wrong_state_are_ignored() {
         let mut app = first_boot_app();
-        // WatermarkUpdateSuccess is for Active state, should produce no effects in Setup
         let (_action, effects) = app.handle_event(AppEvent::WatermarkUpdateSuccess);
         assert!(effects.is_empty());
     }
@@ -1479,9 +1730,7 @@ mod tests {
     #[test]
     fn pin_entered_in_setup_with_first_pin_confirms() {
         let mut app = first_boot_app();
-        // Set first_pin
         app.handle_event(AppEvent::FirstPinEntered(pin(&[1, 2, 3, 4])));
-        // Now confirm with same PIN
         let (_action, effects) = app.handle_event(AppEvent::PinEntered(pin(&[1, 2, 3, 4])));
         assert!(has_effect(
             &effects,
@@ -1509,6 +1758,46 @@ mod tests {
                 pin: pin(&[1, 2, 3, 4])
             }
         ));
+    }
+
+    /// The bar is timed at the release build's decrypt of the store, which is
+    /// what both the unlock and a provisioning request's PIN check run.
+    #[test]
+    fn a_pin_verify_bar_is_timed_at_the_release_decrypt() {
+        let bar = Effect::ShowProgress {
+            message: "Verifying PIN...".into(),
+            estimated_duration: Some(Duration::from_secs(10)),
+            modal: true,
+            percent: 0,
+        };
+
+        let mut app = normal_boot_app();
+        let (_action, effects) = app.handle_event(AppEvent::PinEntered(pin(&[1, 2, 3, 4])));
+        assert!(has_effect(&effects, &bar), "unlock: {effects:?}");
+
+        let mut app = active_app();
+        app.handle_event(AppEvent::ConfirmProvision(
+            russignol_signer_lib::DeviceKey::XmssConsensus,
+        ));
+        let (_action, effects) = app.handle_event(AppEvent::PinEntered(pin(&[1, 2, 3, 4])));
+        assert!(has_effect(&effects, &bar), "provisioning: {effects:?}");
+    }
+
+    /// The bar is timed at what a first boot spends past the PIN: two BLS
+    /// keygens and the store's scrypt encrypt, on the release build.
+    #[test]
+    fn a_generating_keys_bar_is_timed_at_the_release_encrypt() {
+        let bar = Effect::ShowProgress {
+            message: "Generating keys...".into(),
+            estimated_duration: Some(Duration::from_secs(12)),
+            modal: true,
+            percent: 0,
+        };
+
+        let mut app = first_boot_app();
+        app.handle_event(AppEvent::FirstPinEntered(pin(&[1, 2, 3, 4])));
+        let (_action, effects) = app.handle_event(AppEvent::PinEntered(pin(&[1, 2, 3, 4])));
+        assert!(has_effect(&effects, &bar), "{effects:?}");
     }
 
     #[test]
@@ -2534,25 +2823,148 @@ mod tests {
         assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Menu)]);
     }
 
+    /// Picking a key asks before anything is staged, and the PIN is what
+    /// stages it. A page that staged on the pick would hand a run that cannot
+    /// be undone to a single tap.
     #[test]
-    fn show_watermarks_navigates_to_watermarks() {
+    fn nothing_is_staged_until_the_pin_is_entered() {
         let mut app = active_app();
-        let (_action, effects) = app.handle_event(AppEvent::ShowWatermarks);
-        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Watermarks)]);
+        let key = russignol_signer_lib::DeviceKey::XmssConsensus;
+
+        let (_action, effects) = app.handle_event(AppEvent::ProvisionKey(key));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SpawnStageRequest { .. })),
+            "the pick staged a request: {effects:?}"
+        );
+        let Some(Effect::ShowPage(PageSpec::Confirmation {
+            message,
+            on_confirm,
+            ..
+        })) = effects.first()
+        else {
+            panic!("the pick must ask first: {effects:?}")
+        };
+        assert!(
+            message.contains("consensus_tz6") && message.contains("41 minutes"),
+            "the question names the key and what it costs: {message}"
+        );
+        assert_eq!(on_confirm, &AppEvent::ConfirmProvision(key));
+
+        let (_action, effects) = app.handle_event(AppEvent::ConfirmProvision(key));
+        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::PinVerify)]);
+
+        let (_action, effects) = app.handle_event(AppEvent::PinEntered(pin(&[1, 2, 3, 4])));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SpawnStageRequest { key: k, .. } if *k == key)),
+            "the PIN must stage the key that was picked: {effects:?}"
+        );
+    }
+
+    /// A key picked and then left behind at the menu is not staged by the
+    /// next PIN the device is given.
+    #[test]
+    fn leaving_for_the_menu_drops_the_key_that_was_picked() {
+        let mut app = active_app();
+        app.handle_event(AppEvent::ConfirmProvision(
+            russignol_signer_lib::DeviceKey::XmssConsensus,
+        ));
+
+        app.handle_event(AppEvent::ShowMenu);
+        let (_action, effects) = app.handle_event(AppEvent::PinEntered(pin(&[1, 2, 3, 4])));
+
+        assert!(
+            effects.is_empty(),
+            "a key left at the menu was staged anyway: {effects:?}"
+        );
+    }
+
+    /// A PIN entered on an unlocked device with nothing picked stages nothing.
+    #[test]
+    fn a_pin_with_no_key_picked_stages_nothing() {
+        let mut app = active_app();
+
+        let (_action, effects) = app.handle_event(AppEvent::PinEntered(pin(&[1, 2, 3, 4])));
+
+        assert!(
+            effects.is_empty(),
+            "an unasked PIN did something: {effects:?}"
+        );
+    }
+
+    /// A staged request is carried out by the boot after this one, so the
+    /// device reboots rather than going on serving with a request nobody acts
+    /// on until the next power cut.
+    #[test]
+    fn a_staged_request_reboots_the_device() {
+        let mut app = active_app();
+
+        let (_action, effects) = app.handle_event(AppEvent::ProvisionRequested);
+
+        assert_eq!(effects.last(), Some(&Effect::Exit(EXIT_CODE_REBOOT)));
+    }
+
+    /// A request that was not staged leaves the device serving, and says why:
+    /// an operator told nothing reads the reboot that did not happen as a
+    /// rotation that did.
+    #[test]
+    fn a_request_that_was_not_staged_says_so_and_stays() {
+        let mut app = active_app();
+
+        let (_action, effects) = app.handle_event(AppEvent::ProvisionRequestFailed {
+            reason: "Invalid PIN".into(),
+        });
+
+        assert_eq!(
+            effects,
+            vec![Effect::ShowPage(PageSpec::Dialog {
+                message: "Invalid PIN".into(),
+                on_dismiss: AppEvent::ShowMenu,
+            })]
+        );
+    }
+
+    /// The confirmation page clips whole rows that overflow its text column,
+    /// so the question about every key the device provisions has to render
+    /// inside it, or the operator confirms a run without seeing its cost.
+    #[test]
+    fn every_provisioning_question_fits_the_confirmation_page() {
+        for key in russignol_signer_lib::DeviceKey::ALL {
+            let mut app = active_app();
+            let (_action, effects) = app.handle_event(AppEvent::ProvisionKey(key));
+
+            let (message, warning) = confirmation_dialog(&effects);
+            let height = crate::pages::confirmation::measure_message_height(message, warning);
+            assert!(
+                height <= crate::pages::confirmation::MESSAGE_MAX_HEIGHT.cast_unsigned(),
+                "message {message:?} needs {height}px but the confirmation page fits {}px",
+                crate::pages::confirmation::MESSAGE_MAX_HEIGHT,
+            );
+        }
     }
 
     #[test]
-    fn show_blockchain_navigates_to_blockchain() {
+    fn show_keys_navigates_to_keys() {
         let mut app = active_app();
-        let (_action, effects) = app.handle_event(AppEvent::ShowBlockchain);
-        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Blockchain)]);
+        let (_action, effects) = app.handle_event(AppEvent::ShowKeys);
+        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Keys)]);
     }
 
     #[test]
-    fn show_blockchain_when_modal_produces_no_effects() {
+    fn show_provision_navigates_to_provision() {
+        let mut app = active_app();
+        let (_action, effects) = app.handle_event(AppEvent::ShowProvision);
+        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Provision)]);
+    }
+
+    #[test]
+    fn show_keys_when_modal_produces_no_effects() {
         let mut app = active_app();
         app.current_page_modal = true;
-        let (_action, effects) = app.handle_event(AppEvent::ShowBlockchain);
+        let (_action, effects) = app.handle_event(AppEvent::ShowKeys);
         assert!(effects.is_empty());
     }
 

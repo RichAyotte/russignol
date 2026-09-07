@@ -1,4 +1,5 @@
 use super::Page as PageTrait;
+use super::drawn;
 use crate::events::AppEvent;
 use crate::fonts;
 use crate::widgets::Button;
@@ -155,7 +156,6 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         reason = "complex multi-element display layout"
     )]
     fn draw(&mut self, display: &mut D) -> Result<(), D::Error> {
-        // Get display dimensions
         let display_bounds = display.bounding_box();
         let display_width = display_bounds.size.width.cast_signed();
         let display_height = display_bounds.size.height.cast_signed();
@@ -195,14 +195,14 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         if self.show_alert_icon {
             let icon_font = u8g2_fonts::FontRenderer::new::<fonts::ICON_WARNING>();
             let text_center_y = text_top + text_block_height / 2;
-            let _ = icon_font.render_aligned(
+            drawn(icon_font.render_aligned(
                 '0',
                 Point::new(ICON_MARGIN + ICON_SIZE / 2, text_center_y),
                 VerticalPosition::Center,
                 U8g2HAlign::Center,
                 FontColor::Transparent(BinaryColor::Off),
                 display,
-            );
+            ))?;
         }
 
         // TextBox gets full space above buttons for VerticalAlignment::Middle centering
@@ -221,14 +221,14 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
             // Render title centered
             let title_y = text_top + line_height;
             let content_center_x = right_start + right_width / 2;
-            let _ = font.render_aligned(
+            drawn(font.render_aligned(
                 self.message.as_str(),
                 Point::new(content_center_x, title_y),
                 VerticalPosition::Baseline,
                 U8g2HAlign::Center,
                 FontColor::Transparent(BinaryColor::Off),
                 display,
-            );
+            ))?;
 
             // Find the widest label to determine alignment position
             let max_label_width = pairs
@@ -254,24 +254,24 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
                 let row_y = title_y + (i32::try_from(i).unwrap() + 1) * line_height;
 
                 // Render label right-aligned
-                let _ = font.render_aligned(
+                drawn(font.render_aligned(
                     label.as_str(),
                     Point::new(label_right_x, row_y),
                     VerticalPosition::Baseline,
                     U8g2HAlign::Right,
                     FontColor::Transparent(BinaryColor::Off),
                     display,
-                );
+                ))?;
 
                 // Render value left-aligned
-                let _ = font.render_aligned(
+                drawn(font.render_aligned(
                     value.as_str(),
                     Point::new(value_left_x, row_y),
                     VerticalPosition::Baseline,
                     U8g2HAlign::Left,
                     FontColor::Transparent(BinaryColor::Off),
                     display,
-                );
+                ))?;
             }
         } else {
             // Draw message text with word-wrapping, centered in text area
@@ -333,6 +333,59 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
         } else {
             log::info!("[Page id={}] Touch outside buttons", self.id);
             false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pages::test_ink::{RefusesWrite, WriteRefused};
+
+    /// One page per layout the draw branches on: a title over key-value
+    /// pairs or a wrapped message, each with and without the alert icon.
+    fn page(pairs: bool, icon: bool) -> Page {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        if pairs {
+            Page::new_with_pairs(
+                tx,
+                "Replace key?",
+                vec![("Key".to_string(), "consensus_tz6".to_string())],
+                AppEvent::Invalidate,
+                AppEvent::ShowMenu,
+                icon,
+                "Replace",
+            )
+        } else {
+            Page::new(
+                tx,
+                "Replace the consensus key?",
+                AppEvent::Invalidate,
+                AppEvent::ShowMenu,
+                icon,
+                "Replace",
+            )
+        }
+    }
+
+    /// A write the panel refuses is raised whichever of the page's writes it
+    /// is, the icon, the title, each label and value and the wrapped message
+    /// among them, rather than the frame returning as drawn.
+    #[test]
+    fn a_refused_write_anywhere_on_the_page_is_raised() {
+        for (pairs, icon) in [(true, true), (true, false), (false, true), (false, false)] {
+            let mut counting = RefusesWrite::counting();
+            page(pairs, icon).draw(&mut counting).unwrap();
+            assert_ne!(counting.writes, 0);
+            for refused in 0..counting.writes {
+                let mut panel = RefusesWrite::at(refused);
+                assert_eq!(
+                    page(pairs, icon).draw(&mut panel),
+                    Err(WriteRefused),
+                    "pairs={pairs} icon={icon}: write {refused} of {} was dropped",
+                    counting.writes
+                );
+            }
         }
     }
 }

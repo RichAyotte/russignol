@@ -39,13 +39,34 @@ pub fn needs_storage_setup() -> bool {
     !Path::new("/sys/block/mmcblk0/mmcblk0p3").exists()
 }
 
-/// Check if this is a first boot (no setup marker exists)
-/// Also returns true if partitions don't exist yet (needs storage setup first)
-pub fn is_first_boot() -> bool {
-    if needs_storage_setup() {
-        return true; // Definitely first boot - partitions not created yet
+/// How far a card's setup has run, as its partitions and its setup marker
+/// show it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BootStage {
+    /// The partitions have yet to be created.
+    NoPartitions,
+    /// The partitions exist and no setup marker is readable: setup was
+    /// interrupted, or the keys partition holding the marker is not mounted.
+    Unmarked,
+    /// The setup marker is present.
+    Provisioned,
+}
+
+impl BootStage {
+    /// Whether this boot runs the first-boot setup rather than serving.
+    pub const fn is_first_boot(self) -> bool {
+        !matches!(self, Self::Provisioned)
     }
-    !Path::new(SETUP_MARKER).exists()
+}
+
+pub fn boot_stage() -> BootStage {
+    if needs_storage_setup() {
+        BootStage::NoPartitions
+    } else if Path::new(SETUP_MARKER).exists() {
+        BootStage::Provisioned
+    } else {
+        BootStage::Unmarked
+    }
 }
 
 /// Early partition verification - checks for critical error conditions
@@ -146,5 +167,17 @@ pub fn sync_disk() {
     match std::process::Command::new("sync").output() {
         Ok(_) => log::info!("Disk synced."),
         Err(e) => log::error!("Failed to sync disk: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_boot_is_first_until_the_setup_marker_is_written() {
+        assert!(BootStage::NoPartitions.is_first_boot());
+        assert!(BootStage::Unmarked.is_first_boot());
+        assert!(!BootStage::Provisioned.is_first_boot());
     }
 }

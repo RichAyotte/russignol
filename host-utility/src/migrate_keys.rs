@@ -4,15 +4,17 @@
 //! file (`unencrypted:BLsk…`) inside an eCryptfs directory unlocked by the
 //! device PIN. That plaintext shape is identical to what Russignol holds after
 //! decryption, so migration is: decrypt the source, relabel the key names to
-//! Russignol's `consensus`/`companion` roles, re-encrypt under a new PIN, and
-//! reuse the existing card-writing pipeline via [`SourceBackup`].
+//! Russignol's own device aliases, re-encrypt under a new PIN, and reuse the
+//! existing card-writing pipeline via [`SourceBackup`].
 
 use anyhow::{Context, Result, anyhow, bail};
 use inquire::{Password, PasswordDisplayMode, Select};
 use russignol_signer_lib::KeyManager;
-use russignol_signer_lib::KeyRole;
 use russignol_signer_lib::signer::Unencrypted;
-use russignol_signer_lib::wallet::StoredKey;
+use russignol_signer_lib::wallet::{
+    SecretKeyEntry, StoredKey, UNENCRYPTED_PREFIX, secret_keys_json,
+};
+use russignol_signer_lib::{DeviceKey, KeyRole};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -29,9 +31,6 @@ const SOURCE_SIGNER_DIR: &str = "home/pi/.tezos-signer-encrypted";
 
 /// On-disk filename for Russignol's v2 encrypted secret-keys blob.
 const SECRET_KEYS_ENC_V2_FILENAME: &str = "secret_keys.enc.v2";
-
-/// Octez wallet prefix on an unencrypted secret-key value.
-const UNENCRYPTED_PREFIX: &str = "unencrypted:";
 
 /// Explicit override of which source keys fill Russignol's two roles.
 ///
@@ -52,7 +51,7 @@ struct RoleAssignment {
     role: KeyRole,
     /// Original alias on the source card (e.g. `key1`).
     source_name: String,
-    /// `unencrypted:BLsk…` value, carried through verbatim.
+    /// The bare `BLsk…` secret, carried through verbatim.
     secret_value: Zeroizing<String>,
 }
 
@@ -109,7 +108,7 @@ pub fn build_migrated_backup(
         }
 
         stored.push(StoredKey {
-            alias: a.role.device_alias().to_string(),
+            alias: DeviceKey::Bls(a.role).device_alias().to_string(),
             public_key_hash: public.pkh.clone(),
             public_key: public.pk.clone(),
             secret_key: None,
@@ -141,21 +140,13 @@ pub fn build_migrated_backup(
     })
 }
 
-/// Parse an `unencrypted:BLsk…` wallet value into a signer.
-fn parse_unencrypted_bls(value: &str) -> Result<Unencrypted> {
-    let blsk = value
-        .strip_prefix(UNENCRYPTED_PREFIX)
-        .context("value is not an unencrypted secret key")?;
-    Ok(Unencrypted::from_b58check(blsk)?)
-}
-
 /// Derive tz4 + public key for every source entry — the single derivation site
 /// consumed by role resolution, the tamper cross-check, and the public files.
 fn derive_source_pubs(entries: &[(String, Zeroizing<String>)]) -> Result<Vec<DerivedPub>> {
     entries
         .iter()
         .map(|(name, value)| {
-            let signer = parse_unencrypted_bls(value)
+            let signer = Unencrypted::from_b58check(value)
                 .with_context(|| format!("invalid BLS secret key for '{name}'"))?;
             Ok(DerivedPub {
                 source_name: name.clone(),
@@ -166,29 +157,17 @@ fn derive_source_pubs(entries: &[(String, Zeroizing<String>)]) -> Result<Vec<Der
         .collect()
 }
 
-/// Serialize role assignments as Octez `secret_keys` JSON into a single
-/// pre-sized buffer.
-///
-/// Pre-sizing so `push_str` never reallocates keeps the plaintext in one heap
-/// block that is zeroed on drop; a reallocation would copy it into a new block
-/// and leave the old one un-zeroed. Role names are fixed literals and BLS
-/// base58 values contain no JSON metacharacters, so no escaping is required.
+/// The `secret_keys` array for `assignments`, each filed under its role's
+/// device alias, through the emitter the device writes its own stores with.
 fn relabeled_secret_keys_json(assignments: &[RoleAssignment]) -> Zeroizing<String> {
-    let cap = 2 + assignments.len().saturating_mul(192);
-    let mut json = Zeroizing::new(String::with_capacity(cap));
-    json.push('[');
-    for (i, a) in assignments.iter().enumerate() {
-        if i > 0 {
-            json.push(',');
-        }
-        json.push_str(r#"{"name":""#);
-        json.push_str(a.role.device_alias());
-        json.push_str(r#"","value":""#);
-        json.push_str(&a.secret_value);
-        json.push_str(r#""}"#);
-    }
-    json.push(']');
-    json
+    let entries: Vec<SecretKeyEntry<'_>> = assignments
+        .iter()
+        .map(|a| SecretKeyEntry {
+            alias: DeviceKey::Bls(a.role).device_alias(),
+            secret: &a.secret_value,
+        })
+        .collect();
+    secret_keys_json(&entries)
 }
 
 /// Parse an Octez `secret_keys` JSON array into `(alias, value)` pairs,
@@ -212,7 +191,7 @@ fn parse_octez_secret_keys(json: &[u8]) -> Result<Vec<(String, Zeroizing<String>
         if !blsk.starts_with("BLsk") {
             bail!("key '{name}' is not a BLS secret key (expected BLsk…)");
         }
-        out.push((name.to_string(), Zeroizing::new(value.to_string())));
+        out.push((name.to_string(), Zeroizing::new(blsk.to_string())));
     }
     Ok(out)
 }
@@ -309,8 +288,8 @@ fn assign_roles(
             if a == &source_for[role_b.index()] {
                 bail!(
                     "{} and {} cannot both be source key '{a}'",
-                    role_a.device_alias(),
-                    role_b.device_alias()
+                    DeviceKey::Bls(role_a).device_alias(),
+                    DeviceKey::Bls(role_b).device_alias()
                 );
             }
         }
@@ -378,6 +357,36 @@ fn parse_pkh_map(json: &[u8]) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
+/// A row of the delegate prompt.
+///
+/// Only a delegate row carries an address, so no row can be a skip naming one
+/// or a delegate naming none, and the label a row is picked by is the label
+/// that row renders.
+enum DelegateChoice {
+    ByCardOrder,
+    Delegate { label: String, address: String },
+}
+
+impl DelegateChoice {
+    fn into_address(self) -> Option<String> {
+        match self {
+            Self::ByCardOrder => None,
+            Self::Delegate { address, .. } => Some(address),
+        }
+    }
+}
+
+impl std::fmt::Display for DelegateChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ByCardOrder => {
+                f.write_str("Assign roles by source-card key order (no on-chain lookup)")
+            }
+            Self::Delegate { label, .. } => f.write_str(label),
+        }
+    }
+}
+
 /// Prompt for the baker delegate whose active on-chain consensus key labels the
 /// roles, picking from the wallet's known addresses. Returns the chosen delegate
 /// address, or `None` to fall back to positional assignment (the user skipped,
@@ -386,42 +395,48 @@ fn parse_pkh_map(json: &[u8]) -> Result<HashMap<String, String>> {
 /// Selection is a local wallet read; only the caller's follow-up consensus-key
 /// fetch touches the node — one RPC instead of probing every wallet address.
 fn prompt_delegate(config: &RussignolConfig) -> Result<Option<String>> {
-    const SKIP: &str = "Assign roles by source-card key order (no on-chain lookup)";
-
     let addresses = match blockchain::list_known_addresses(config) {
-        Ok(addresses) if !addresses.is_empty() => addresses,
-        _ => {
+        Ok(addresses) if addresses.is_empty() => {
             utils::info("No known baker addresses; assigning roles by source-card key order.");
             return Ok(None);
         }
+        Ok(addresses) => addresses,
+        // A listing that failed is not an empty wallet. Falling back would
+        // assign the two roles by source-card order under a message saying the
+        // wallet was empty, and the wrong order swaps consensus and companion.
+        Err(e) => {
+            return Err(e).context("Could not list the wallet's known addresses");
+        }
     };
 
-    let mut options = Vec::with_capacity(addresses.len() + 1);
-    options.push(SKIP.to_string());
-    options.extend(
+    // The rows themselves are what the reader picks from, so the answer comes
+    // back as the row that was offered. Recovering it from the label instead
+    // resolves to no delegate the moment the two spellings diverge, and roles
+    // assigned by card order in its place come back swapped whenever that
+    // order is not the card's.
+    let mut choices = Vec::with_capacity(addresses.len() + 1);
+    choices.push(DelegateChoice::ByCardOrder);
+    choices.extend(
         addresses
-            .iter()
-            .map(|(alias, address)| format!("{alias} ({address})")),
+            .into_iter()
+            .map(|(alias, address)| DelegateChoice::Delegate {
+                label: format!("{alias} ({address})"),
+                address,
+            }),
     );
 
     // Cancelling (Esc/Ctrl-C) aborts the migration, like the PIN prompts; the
-    // SKIP option is the way to opt out of on-chain labeling and keep going.
-    let choice = Select::new(
+    // skip row is the way to opt out of on-chain labeling and keep going.
+    let picked = Select::new(
         "Select your baker delegate to label keys by on-chain role:",
-        options,
+        choices,
     )
     .with_help_message("type to filter, ↑↓ to navigate, Enter to select")
     .with_render_config(utils::create_orange_theme())
     .prompt()
     .context("failed to select delegate")?;
 
-    if choice == SKIP {
-        return Ok(None);
-    }
-    Ok(addresses
-        .into_iter()
-        .find(|(alias, address)| format!("{alias} ({address})") == choice)
-        .map(|(_, address)| address))
+    Ok(picked.into_address())
 }
 
 /// Resolve the on-chain consensus key used to label roles: prompt for the
@@ -880,6 +895,72 @@ fn umount(mount_point: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The names a migrated card carries, stated independently of the emitter
+    /// so an assertion against them can disagree with what it emitted.
+    const CONSENSUS: &str = "consensus_tz4";
+    const COMPANION: &str = "companion_tz4";
+
+    /// The value an OCaml `{name,value}` array files under `name`.
+    ///
+    /// Read out of the parsed array rather than off a byte offset into it: an
+    /// offset holds for a swap that happens to keep the same order.
+    fn filed_under(entries: &[serde_json::Value], name: &str) -> Option<String> {
+        entries
+            .iter()
+            .find(|e| e.get("name").and_then(|v| v.as_str()) == Some(name))
+            .and_then(|e| e.get("value").and_then(|v| v.as_str()))
+            .map(str::to_string)
+    }
+
+    /// The secret each role is filed under in a built backup's key blob.
+    fn secrets(backup: &SourceBackup, pin: &[u8]) -> (Option<String>, Option<String>) {
+        let plaintext = russignol_crypto::decrypt(pin, &backup.pin_blobs[0].1).unwrap();
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&plaintext).unwrap();
+        (
+            filed_under(&entries, CONSENSUS),
+            filed_under(&entries, COMPANION),
+        )
+    }
+
+    /// The address each role is filed under in a built backup's wallet file.
+    fn addresses(backup: &SourceBackup) -> (Option<String>, Option<String>) {
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_slice(&backup.public_key_hashs).unwrap();
+        (
+            filed_under(&entries, CONSENSUS),
+            filed_under(&entries, COMPANION),
+        )
+    }
+
+    /// A migrated card carries one entry of 54 base58 characters beside one
+    /// of tens of thousands, the XMSS width growing with the key's epoch
+    /// range. That spread is what a buffer sized per entry must absorb
+    /// without growing.
+    #[test]
+    fn relabeled_json_never_reallocates() {
+        let xmsk: String = std::iter::repeat_n('3', 23_000).collect();
+        let assignments = [
+            RoleAssignment {
+                role: KeyRole::Consensus,
+                source_name: "key1".to_string(),
+                secret_value: Zeroizing::new(xmsk),
+            },
+            RoleAssignment {
+                role: KeyRole::Companion,
+                source_name: "key2".to_string(),
+                secret_value: Zeroizing::new("BLsk2snGqdSb".to_string()),
+            },
+        ];
+
+        let json = relabeled_secret_keys_json(&assignments);
+
+        assert_eq!(
+            json.capacity(),
+            json.len(),
+            "the buffer was not sized to what it emitted",
+        );
+    }
+
     #[test]
     fn device_pin_encodes_digits_as_raw_values() {
         // Must match the device keypad, which pushes each digit's numeric value.
@@ -966,23 +1047,14 @@ mod tests {
         assert_eq!(backup.pin_blobs.len(), 1);
         assert_eq!(backup.pin_blobs[0].0, SECRET_KEYS_ENC_V2_FILENAME);
 
-        let plaintext = russignol_crypto::decrypt(b"12345678", &backup.pin_blobs[0].1).unwrap();
-        assert!(plaintext.contains(&format!(
-            r#""name":"{}""#,
-            KeyRole::Consensus.device_alias()
-        )));
-        assert!(plaintext.contains(&format!(
-            r#""name":"{}""#,
-            KeyRole::Companion.device_alias()
-        )));
-        assert!(plaintext.contains(&format!("unencrypted:{sk1}")));
-        assert!(plaintext.contains(&format!("unencrypted:{sk2}")));
-
-        let pkh = String::from_utf8(backup.public_key_hashs.clone()).unwrap();
-        assert!(pkh.contains(&tz1));
-        assert!(pkh.contains(&tz2));
-        assert!(pkh.contains(KeyRole::Consensus.device_alias()));
-        assert!(pkh.contains(KeyRole::Companion.device_alias()));
+        assert_eq!(
+            secrets(&backup, b"12345678"),
+            (
+                Some(format!("unencrypted:{sk1}")),
+                Some(format!("unencrypted:{sk2}"))
+            )
+        );
+        assert_eq!(addresses(&backup), (Some(tz1), Some(tz2)));
     }
 
     #[test]
@@ -996,15 +1068,16 @@ mod tests {
         };
 
         let backup = build_migrated_backup(&src, None, b"0000", &mapping, None).unwrap();
-        let plaintext = russignol_crypto::decrypt(b"0000", &backup.pin_blobs[0].1).unwrap();
 
-        // consensus comes first; key2 was designated consensus.
-        let consensus_pos = plaintext.find(KeyRole::Consensus.device_alias()).unwrap();
-        let sk2_pos = plaintext.find(&sk2 as &str).unwrap();
-        let sk1_pos = plaintext.find(&sk1 as &str).unwrap();
-        assert!(consensus_pos < sk2_pos);
-        assert!(sk2_pos < sk1_pos);
-        let _ = (tz1, tz2);
+        // The overrides name key2 as consensus, reversing the source order.
+        assert_eq!(
+            secrets(&backup, b"0000"),
+            (
+                Some(format!("unencrypted:{sk2}")),
+                Some(format!("unencrypted:{sk1}"))
+            )
+        );
+        assert_eq!(addresses(&backup), (Some(tz2), Some(tz1)));
     }
 
     #[test]
@@ -1088,14 +1161,7 @@ mod tests {
     /// The tz4 the built backup labels as consensus, read from the generated
     /// `public_key_hashs`.
     fn consensus_tz4(backup: &SourceBackup) -> String {
-        let arr: Vec<serde_json::Value> = serde_json::from_slice(&backup.public_key_hashs).unwrap();
-        arr.iter()
-            .find(|e| {
-                e.get("name").and_then(|v| v.as_str()) == Some(KeyRole::Consensus.device_alias())
-            })
-            .and_then(|e| e.get("value").and_then(|v| v.as_str()))
-            .unwrap()
-            .to_string()
+        addresses(backup).0.expect("a consensus entry")
     }
 
     #[test]

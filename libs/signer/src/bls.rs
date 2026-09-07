@@ -77,16 +77,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 // Base58Check prefixes from OCaml code
 // src/lib_crypto/base58.ml:385 - let bls12_381_public_key_hash = "\006\161\166" (* tz4(36) *)
-const TZ4_PREFIX: &[u8] = &[0x06, 0xa1, 0xa6]; // "tz4" prefix (3 bytes)
+pub(crate) const TZ4_PREFIX: &[u8] = &[0x06, 0xa1, 0xa6]; // "tz4" prefix (3 bytes)
 
 // src/lib_crypto/base58.ml:455 - let bls12_381_public_key = "\006\149\135\204" (* BLpk(76) *)
-const BLPK_PREFIX: &[u8] = &[0x06, 0x95, 0x87, 0xcc]; // "BLpk" prefix (4 bytes)
+pub(crate) const BLPK_PREFIX: &[u8] = &[0x06, 0x95, 0x87, 0xcc]; // "BLpk" prefix (4 bytes)
 
 // src/lib_crypto/base58.ml:458 - let bls12_381_secret_key = "\003\150\192\040" (* BLsk(54) *)
-const BLSK_PREFIX: &[u8] = &[0x03, 0x96, 0xc0, 0x28]; // "BLsk" prefix (4 bytes)
+pub(crate) const BLSK_PREFIX: &[u8] = &[0x03, 0x96, 0xc0, 0x28]; // "BLsk" prefix (4 bytes)
 
 // src/lib_crypto/base58.ml:452 - let bls12_381_signature = "\040\171\064\207" (* BLsig(142) *)
-const BLSIG_PREFIX: &[u8] = &[0x28, 0x79, 0x34, 0xcf]; // "BLsig" prefix (4 bytes)
+pub(crate) const BLSIG_PREFIX: &[u8] = &[0x28, 0x79, 0x34, 0xcf]; // "BLsig" prefix (4 bytes)
 
 // BLS12-381 MinPk with Pop ciphersuite ID for regular signatures
 // Used for signing with Proof of Possession scheme as per Tezos protocol
@@ -455,6 +455,24 @@ pub fn pop_verify(pk: &PublicKey, proof: &Signature, msg: Option<&[u8]>) -> bool
 ///
 /// Returns an error if random generation or key derivation fails.
 pub fn generate_key(seed: Option<&[u8; 32]>) -> Result<(PublicKeyHash, PublicKey, SecretKey)> {
+    let sk = generate_secret_key(seed)?;
+    let pk = sk.to_public_key();
+    let pkh = pk.hash();
+
+    Ok((pkh, pk, sk))
+}
+
+/// Generate a secret key from seed, leaving its public key and address to
+/// whoever needs them.
+///
+/// The public parts are derived from the secret at one site
+/// ([`crate::signer::Unencrypted::new`]), and a caller holding the secret alone
+/// pays for neither.
+///
+/// # Errors
+///
+/// Returns an error if random generation or key derivation fails.
+pub fn generate_secret_key(seed: Option<&[u8; 32]>) -> Result<SecretKey> {
     let seed_bytes = if let Some(s) = seed {
         *s
     } else {
@@ -467,11 +485,8 @@ pub fn generate_key(seed: Option<&[u8; 32]>) -> Result<(PublicKeyHash, PublicKey
 
     let sk = blst::min_pk::SecretKey::key_gen(&seed_bytes, &[])
         .map_err(|e| Error::KeyGeneration(format!("{e:?}")))?;
-    let sk = SecretKey { sk };
-    let pk = sk.to_public_key();
-    let pkh = pk.hash();
 
-    Ok((pkh, pk, sk))
+    Ok(SecretKey { sk })
 }
 
 /// Compute deterministic nonce using HMAC-SHA256

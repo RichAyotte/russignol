@@ -8,6 +8,16 @@ pub const FILENAMES: [&str; 3] = [
     "attestation_watermark",
 ];
 
+/// Name of a key's epoch record, beside the watermark files of `FILENAMES`.
+pub const EPOCH_FILENAME: &str = "epoch";
+
+/// Appended to a key's associated data for its epoch record.
+///
+/// The epoch record and the three watermark files share a directory, a MAC key
+/// and a chain id, so without a domain tag each authenticates as the other and
+/// copying one over another lowers a floor no forgery could reach.
+pub const EPOCH_AD_TAG: &[u8] = b"epoch";
+
 /// Encode a watermark entry as 40 bytes: level (4B BE) + round (4B BE) + blake3 (32B)
 #[must_use]
 pub fn encode(level: u32, round: u32) -> [u8; FILE_SIZE] {

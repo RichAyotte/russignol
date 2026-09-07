@@ -549,13 +549,62 @@ pub fn drop_privileges() -> Result<bool, String> {
     Ok(true)
 }
 
-/// Whether `/data` appears as a mount point in `/proc/mounts` text (the mount
-/// point is the second whitespace-separated field of each line).
+const PROC_MOUNTS: &str = "/proc/mounts";
+
+/// The mount options of whatever is mounted at `mount_point`, read off
+/// `/proc/mounts` text, whose fields are device, mount point, type, options.
+fn mount_options<'a>(proc_mounts: &'a str, mount_point: &str) -> Option<&'a str> {
+    proc_mounts.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let point = fields.nth(1)?;
+        let options = fields.nth(1)?;
+        (point == mount_point).then_some(options)
+    })
+}
+
 fn data_is_mounted(proc_mounts: &str) -> bool {
-    proc_mounts
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .any(|mount_point| mount_point == DATA_MOUNT)
+    mount_options(proc_mounts, DATA_MOUNT).is_some()
+}
+
+/// How a boot's mounts fall short of what the signer serves under.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BootFault {
+    KeysNotMounted,
+    KeysWritable,
+    DataNotMounted,
+}
+
+impl std::fmt::Display for BootFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self {
+            Self::KeysNotMounted => "Keys partition is not mounted.",
+            Self::KeysWritable => "Keys partition is writable on a boot that serves signatures.",
+            Self::DataNotMounted => "Data partition is not mounted.",
+        };
+        write!(
+            f,
+            "{what} Power-cycle the device, and re-flash the SD card with the host utility if it recurs."
+        )
+    }
+}
+
+/// Whether the mounts are what the signer serves under: `/keys` and `/data`
+/// mounted, and `/keys` read-only unless this boot kept it writable for work
+/// that needs it. `ro` is matched as a whole option because the f2fs mounts
+/// carry `errors=remount-ro`, which holds it as a substring of a writable one.
+pub fn check_boot_mounts(proc_mounts: &str, keys_writable: bool) -> Result<(), BootFault> {
+    let keys = mount_options(proc_mounts, KEYS_MOUNT).ok_or(BootFault::KeysNotMounted)?;
+    if !keys_writable && !keys.split(',').any(|option| option == "ro") {
+        return Err(BootFault::KeysWritable);
+    }
+    mount_options(proc_mounts, DATA_MOUNT).ok_or(BootFault::DataNotMounted)?;
+    Ok(())
+}
+
+pub fn verify_boot_mounts(keys_writable: bool) -> Result<(), String> {
+    let mounts =
+        fs::read_to_string(PROC_MOUNTS).map_err(|e| format!("{PROC_MOUNTS} will not read: {e}"))?;
+    check_boot_mounts(&mounts, keys_writable).map_err(|fault| fault.to_string())
 }
 
 /// Whether the data partition is currently mounted at `/data`.
@@ -565,7 +614,7 @@ fn data_is_mounted(proc_mounts: &str) -> bool {
 /// rootfs and abort startup obscurely. Returns false if `/proc/mounts` is
 /// unreadable.
 pub fn is_data_mounted() -> bool {
-    std::fs::read_to_string("/proc/mounts").is_ok_and(|mounts| data_is_mounted(&mounts))
+    fs::read_to_string(PROC_MOUNTS).is_ok_and(|mounts| data_is_mounted(&mounts))
 }
 
 #[cfg(test)]
@@ -591,5 +640,79 @@ mod tests {
     fn does_not_match_data_substring_path() {
         // `/database` must not be read as `/data`.
         assert!(!data_is_mounted("/dev/sda1 /database ext4 rw 0 0\n"));
+    }
+
+    #[test]
+    fn a_read_only_keys_partition_beside_a_data_partition_satisfies_an_unprivileged_boot() {
+        let mounts = "/dev/mmcblk0p2 / ext4 ro,relatime 0 0\n\
+                      /dev/mmcblk0p3 /keys f2fs ro,relatime 0 0\n\
+                      /dev/mmcblk0p4 /data f2fs rw,inline_data,errors=remount-ro 0 0\n";
+        assert_eq!(check_boot_mounts(mounts, false), Ok(()));
+    }
+
+    #[test]
+    fn a_writable_keys_partition_faults_an_unprivileged_boot() {
+        let mounts = "/dev/mmcblk0p3 /keys f2fs rw,relatime 0 0\n\
+                      /dev/mmcblk0p4 /data f2fs rw,inline_data 0 0\n";
+        assert_eq!(
+            check_boot_mounts(mounts, false),
+            Err(BootFault::KeysWritable)
+        );
+    }
+
+    /// `errors=remount-ro` is an option of every f2fs mount here, and it carries
+    /// `ro` as a substring of a partition that is writable.
+    #[test]
+    fn a_remount_ro_error_option_does_not_read_as_a_read_only_mount() {
+        let mounts = "/dev/mmcblk0p3 /keys f2fs rw,relatime,errors=remount-ro 0 0\n\
+                      /dev/mmcblk0p4 /data f2fs rw,inline_data 0 0\n";
+        assert_eq!(
+            check_boot_mounts(mounts, false),
+            Err(BootFault::KeysWritable)
+        );
+    }
+
+    #[test]
+    fn a_writable_keys_partition_is_what_a_privileged_boot_keeps() {
+        let mounts = "/dev/mmcblk0p3 /keys f2fs rw,relatime 0 0\n\
+                      /dev/mmcblk0p4 /data f2fs rw,inline_data 0 0\n";
+        assert_eq!(check_boot_mounts(mounts, true), Ok(()));
+    }
+
+    #[test]
+    fn an_unmounted_keys_partition_faults_either_boot() {
+        let mounts = "/dev/mmcblk0p4 /data f2fs rw,inline_data 0 0\n";
+        assert_eq!(
+            check_boot_mounts(mounts, false),
+            Err(BootFault::KeysNotMounted)
+        );
+        assert_eq!(
+            check_boot_mounts(mounts, true),
+            Err(BootFault::KeysNotMounted)
+        );
+    }
+
+    #[test]
+    fn an_unmounted_data_partition_faults_either_boot() {
+        let read_only_keys = "/dev/mmcblk0p3 /keys f2fs ro,relatime 0 0\n";
+        assert_eq!(
+            check_boot_mounts(read_only_keys, false),
+            Err(BootFault::DataNotMounted)
+        );
+        let writable_keys = "/dev/mmcblk0p3 /keys f2fs rw,relatime 0 0\n";
+        assert_eq!(
+            check_boot_mounts(writable_keys, true),
+            Err(BootFault::DataNotMounted)
+        );
+    }
+
+    #[test]
+    fn a_mount_point_sharing_the_prefix_is_not_the_partition() {
+        let mounts = "/dev/sda1 /keys-backup f2fs ro 0 0\n\
+                      /dev/sda2 /database ext4 rw 0 0\n";
+        assert_eq!(
+            check_boot_mounts(mounts, false),
+            Err(BootFault::KeysNotMounted)
+        );
     }
 }
