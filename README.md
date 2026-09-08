@@ -58,6 +58,7 @@ Part numbers, what not to buy by mistake, and where to order: [Hardware](docs/HA
 - [Device Operation](docs/DEVICE_OPERATION.md)
 - [Security Audit](docs/SECURITY_AUDIT.md)
 - [Watermark Crash Analysis](docs/security/watermark-crash-analysis.md)
+- [TPM Key Storage Compared to a Dedicated Signer](docs/security/tpm-key-storage.md)
 - [Host Utility](host-utility/README.md)
 - [Configuration](host-utility/CONFIGURATION.md)
 - [Key Rotation](host-utility/KEY_ROTATION.md)
