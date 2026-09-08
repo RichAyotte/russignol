@@ -14,6 +14,9 @@
 # Coverage reports
 target/coverage/
 
+# Wrangler local state (account identifiers, cache, temp)
+.wrangler/
+
 # AI assistants (user-specific)
 .claude/
 
