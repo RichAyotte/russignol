@@ -6,7 +6,7 @@ Install Russignol using the `russignol` host utility for automated setup.
 
 ### Hardware
 
-See [Hardware Requirements](../README.md#hardware-requirements).
+See [Hardware](HARDWARE.md) for part numbers, lookalikes to avoid, and where to order.
 
 ### Software
 
@@ -101,7 +101,7 @@ A source card not flashed by the host utility (for example one written with `dd`
 ## Step 5: Boot and Initialize Device
 
 1. Insert the flashed SD card into your Raspberry Pi Zero 2W
-2. Connect the Pi to your baker host via USB data cable
+2. Connect the Pi to your baker host with a USB data cable, in the middle micro-USB socket beside the mini-HDMI, not the PWR IN socket at the corner
 3. Power on (USB provides power)
 4. Follow the on-screen setup wizard:
    - **Create PIN**: Enter a 5-10 digit PIN (entered on the touchscreen)

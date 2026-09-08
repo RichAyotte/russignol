@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Russignol - Tezos Hardware Signer</title>
-    <meta name="description" content="Secure Tezos hardware signer for Raspberry Pi Zero 2 with e-paper display.">
+    <meta name="description" content="Secure Tezos hardware signer. Runs on a Raspberry Pi Zero 2 W with a Waveshare 2.13inch Touch e-Paper HAT.">
 
     <!-- Open Graph Meta Tags -->
     <meta property="og:title" content="Russignol - Tezos Hardware Signer">
@@ -39,6 +39,7 @@
                 <ul>
                     <li><a href="#why-russignol">Why Russignol?</a></li>
                     <li><a href="#demo">Demo</a></li>
+                    <li><a href="#hardware">Hardware</a></li>
                     <li><a href="#setup">Get Started</a></li>
                 </ul>
             </nav>
@@ -61,7 +62,7 @@
                         </div>
                     </div>
                     <div class="hero-image">
-                        <img src="assets/2.13inch-touch-e-paper-hat-with-case.webp" alt="Russignol Device - Raspberry Pi Zero 2 with E-Paper Hat" width="500" height="300">
+                        <img src="assets/2.13inch-touch-e-paper-hat-with-case.webp" alt="Russignol - Raspberry Pi Zero 2 W with Waveshare 2.13inch Touch e-Paper HAT in its ABS case" width="500" height="300">
                     </div>
                 </div>
             </div>
@@ -135,6 +136,38 @@
                     <div class="demo-video">
                         <iframe src="https://www.youtube-nocookie.com/embed/FO8th1GVkIg" title="Russignol Demo" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen loading="lazy"></iframe>
                     </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="hardware" class="features">
+            <div class="container">
+                <h2>What You Need</h2>
+                <p class="hardware-description">Four parts, about US$70. Two of them have to be exact.</p>
+                <div class="feature-grid">
+                    <div class="feature-card">
+                        <img class="card-photo" src="assets/part-board.webp" alt="Raspberry Pi Zero 2 W seen from above, its 40-pin header footprint unpopulated" width="480" height="320" loading="lazy">
+                        <h3>Raspberry Pi Zero 2 W</h3>
+                        <p>Buy the <strong>with headers</strong> variant. The plain board ships with an empty 40-pin footprint, and the display needs pins to sit on.</p>
+                    </div>
+                    <div class="feature-card">
+                        <img class="card-photo" src="assets/part-hat.webp" alt="Waveshare 2.13inch Touch e-Paper HAT, front view" width="480" height="320" loading="lazy">
+                        <h3>2.13" Touch e-Paper HAT</h3>
+                        <p>Waveshare part 20716, or 19493 without the case. Touch is not optional: the PIN is typed on the panel and never crosses USB.</p>
+                    </div>
+                    <div class="feature-card">
+                        <img class="card-photo" src="assets/part-sdcard.webp" alt="An 8 GB microSD card" width="480" height="320" loading="lazy">
+                        <h3>microSD Card</h3>
+                        <p>8 GB or larger, high-endurance, from a brand you recognize. A bigger card is a longer-lived one, since the spare space becomes wear leveling headroom.</p>
+                    </div>
+                    <div class="feature-card">
+                        <img class="card-photo" src="assets/part-cable.webp" alt="A micro-USB Type B plug" width="480" height="320" loading="lazy">
+                        <h3>USB Data Cable</h3>
+                        <p>Micro-B at the device end, host end to match your baker. It has to carry data and not just power, and it goes in the middle micro-USB socket beside the mini-HDMI, never the PWR IN one at the corner.</p>
+                    </div>
+                </div>
+                <div class="cta-group">
+                    <a href="https://github.com/RichAyotte/russignol/blob/master/docs/HARDWARE.md" class="btn btn-secondary" target="_blank" rel="noopener noreferrer">Hardware Guide</a>
                 </div>
             </div>
         </section>
@@ -301,6 +334,18 @@
                     <li>Powered by <a href="https://github.com/supranational/blst" target="_blank" rel="noopener noreferrer">blst</a></li>
                     <li>Logic ported from <a href="https://gitlab.com/tezos/tezos/" target="_blank" rel="noopener noreferrer">Tezos octez-signer</a></li>
                     <li>Icons by <a href="https://mobiriseicons.com/" target="_blank" rel="noopener noreferrer">Mobirise Icons</a></li>
+                    <li>Board photo by Anil &Ouml;ztas, <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener noreferrer">CC BY 4.0</a>, cropped and background removed</li>
+                    <li>microSD photo by Afrank99, <a href="https://creativecommons.org/licenses/by-sa/3.0/" target="_blank" rel="noopener noreferrer">CC BY-SA 3.0</a>, cropped, rotated and background removed</li>
+                    <li>Cable photo by Tobiasfalk42, <a href="https://creativecommons.org/licenses/by-sa/4.0/" target="_blank" rel="noopener noreferrer">CC BY-SA 4.0</a>, cropped and background removed</li>
+                </ul>
+            </div>
+            <div class="footer-section docs">
+                <h4>Documentation</h4>
+                <ul>
+                    <li><a href="https://github.com/RichAyotte/russignol/blob/master/docs/HARDWARE.md" target="_blank" rel="noopener noreferrer">Hardware</a></li>
+                    <li><a href="https://github.com/RichAyotte/russignol/blob/master/docs/INSTALL_HOST_UTILITY.md" target="_blank" rel="noopener noreferrer">Installation</a></li>
+                    <li><a href="https://github.com/RichAyotte/russignol/blob/master/docs/DEVICE_OPERATION.md" target="_blank" rel="noopener noreferrer">Device Operation</a></li>
+                    <li><a href="https://github.com/RichAyotte/russignol/blob/master/docs/SECURITY_AUDIT.md" target="_blank" rel="noopener noreferrer">Security Audit</a></li>
                 </ul>
             </div>
         </div>
