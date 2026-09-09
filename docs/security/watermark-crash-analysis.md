@@ -2,13 +2,9 @@
 
 ## Context
 
-The old watermark design (before commit 6ddac3d) returned the signature over TCP before
-persisting the watermark to disk, and never called fsync. A power loss could therefore
-leave the on-disk watermark stale, theoretically allowing a re-request at the same level
-to be granted.
+The old watermark design (before commit 6ddac3d) returned the signature over TCP before persisting the watermark to disk, and never called fsync. A power loss could therefore leave the on-disk watermark stale, theoretically allowing a re-request at the same level to be granted.
 
-This analysis examines the probability that this vulnerability could have been exploited,
-and describes how the redesign eliminated it.
+This analysis examines the probability that this vulnerability could have been exploited, and describes how the redesign eliminated it.
 
 ## The Old Signing Flow (pre-6ddac3d)
 
@@ -47,24 +43,16 @@ handle_connection() loop:
 
 - `fs::write()` writes to the OS page cache, NOT to the SD card
 - Without fsync, dirty pages are flushed by the kernel writeback thread
-- No custom `dirty_writeback_centisecs`/`dirty_expire_centisecs` in kernel config, so
-  Linux defaults apply: writeback runs every 5s, dirty pages expire after 30s
-- Note: `fsync_mode=strict` IS set on the data partition (both hardened init and dev
-  fstab), but this only makes fsync calls more thorough when they ARE made -- it does
-  not add automatic fsync. Since the old code never calls fsync, this setting is
-  irrelevant.
-- **Effective critical window**: from TCP write until kernel writeback -- potentially
-  **5-30 seconds**
+- No custom `dirty_writeback_centisecs`/`dirty_expire_centisecs` in kernel config, so Linux defaults apply: writeback runs every 5s, dirty pages expire after 30s
+- Note: `fsync_mode=strict` IS set on the data partition (both hardened init and dev fstab), but this only makes fsync calls more thorough when they ARE made -- it does not add automatic fsync. Since the old code never calls fsync, this setting is irrelevant.
+- **Effective critical window**: from TCP write until kernel writeback -- potentially **5-30 seconds**
 
 **NOT a vulnerability: Corrupt JSON handling**
 
 - On LOAD: `load_operation_watermark()` returns `None` when JSON is corrupt or empty
-- `check_and_update_operation()` checks:
-  `let Some(current_wm) = wm.get(op_type) else { return Err(WatermarkError::NotInitialized) }`
+- `check_and_update_operation()` checks: `let Some(current_wm) = wm.get(op_type) else { return Err(WatermarkError::NotInitialized) }`
 - **Corrupt files BLOCK signing** -- the signer refuses to sign, not silently accepts
-- The `serde_json::json!({})` reinitialization in `save_operation_watermark()` only
-  applies during WRITING (it rebuilds the file structure before inserting the current
-  watermark value), not during the safety-critical LOADING path
+- The `serde_json::json!({})` reinitialization in `save_operation_watermark()` only applies during WRITING (it rebuilds the file structure before inserting the current watermark value), not during the safety-critical LOADING path
 
 ## Crash Recovery Scenarios
 
@@ -78,15 +66,13 @@ What happens to the watermark file after a crash (power loss during/after `fs::w
 | Power loss after `fs::write`, before writeback | Old content (page cache lost) | **Re-signing allowed** (M < N) |
 | Power loss after writeback | New content (level N) | Safe |
 
-The exploitable cases are 1 and 4: the file retains the old watermark, and the signer
-loads the old level M, accepting a new signing request at level N (since M < N).
+The exploitable cases are 1 and 4: the file retains the old watermark, and the signer loads the old level M, accepting a new signing request at level N (since M < N).
 
 ## The Event Chain Required for Double-Signing
 
 For a crash to lead to double-signing, ALL of these must happen:
 
-1. Crash occurs in the critical window (after signature returned to baker, before
-   watermark persisted to stable storage)
+1. Crash occurs in the critical window (after signature returned to baker, before watermark persisted to stable storage)
 2. Baker publishes the block using that signature
 3. Device reboots and signer becomes ready
 4. Same baker requests the same level/round again
@@ -113,11 +99,9 @@ Using the conservative minimum window of 1ms:
 Using the realistic window (no fsync, ~5 seconds until writeback):
 
 - P(crash during 5s window per event) = 5,000 / 2,592,000,000
-- P(crash in any signing window in a month) = 300 x 5,000 / 2,592,000,000 =
-  **5.79 x 10^-4**
+- P(crash in any signing window in a month) = 300 x 5,000 / 2,592,000,000 = **5.79 x 10^-4**
 
-**P(crash in critical window) ~ 10^-7 to 10^-4 per month** (depending on writeback
-timing)
+**P(crash in critical window) ~ 10^-7 to 10^-4 per month** (depending on writeback timing)
 
 ### Link 2: P(reboot + key derivation + ready within 6s) = 0
 
@@ -158,17 +142,14 @@ If the crash leaves the file with OLD content (not corrupt/empty):
 
 If the crash leaves the file corrupt or empty:
 
-- `load_operation_watermark()` returns `None` -> `NotInitialized` error -> **signing
-  blocked**
+- `load_operation_watermark()` returns `None` -> `NotInitialized` error -> **signing blocked**
 - **P = 0** (safe, but causes liveness issue)
 
-The most likely case (crash before writeback flushes dirty pages) leaves old content on
-disk -- the exploitable scenario.
+The most likely case (crash before writeback flushes dirty pages) leaves old content on disk -- the exploitable scenario.
 
 ## Combined Probability
 
-P(double-sign) = P(crash in window) x P(ready in 6s) x P(re-request)
-x P(stale enables re-sign)
+P(double-sign) = P(crash in window) x P(ready in 6s) x P(re-request) x P(stale enables re-sign)
 
 = **~6 x 10^-4** x **0** x **~0** x **~0.7**
 
@@ -176,9 +157,7 @@ x P(stale enables re-sign)
 
 ## Why the Old Design Was Still Safe in Practice
 
-Despite having a real vulnerability window (V1 + V2), double-signing was prevented by
-a single accidental defense: **the device takes 12-14 seconds to reboot**, far exceeding
-the 6-second Tezos block window.
+Despite having a real vulnerability window (V1 + V2), double-signing was prevented by a single accidental defense: **the device takes 12-14 seconds to reboot**, far exceeding the 6-second Tezos block window.
 
 This is defense by coincidence, not by design:
 
@@ -186,17 +165,13 @@ This is defense by coincidence, not by design:
 - It exists for brute-force resistance, not crash safety
 - A faster device or weaker KDF parameters would eliminate this protection
 
-Note: Corrupt/empty watermark files were handled safely --
-`load_operation_watermark()` returns `None`, causing
-`WatermarkError::NotInitialized` which blocks signing entirely.
+Note: Corrupt/empty watermark files were handled safely -- `load_operation_watermark()` returns `None`, causing `WatermarkError::NotInitialized` which blocks signing entirely.
 
 ### Without the Reboot Defense
 
-If we hypothetically remove the reboot time barrier (instant reboot), the probability
-per month would have been:
+If we hypothetically remove the reboot time barrier (instant reboot), the probability per month would have been:
 
-- **~5.79 x 10^-4** (crash in writeback window) x **~0.7** (stale file, not corrupt)
-  = **~4 x 10^-4 per month**
+- **~5.79 x 10^-4** (crash in writeback window) x **~0.7** (stale file, not corrupt) = **~4 x 10^-4 per month**
 - That's roughly **once per 208 years** of continuous operation
 
 ---
@@ -227,9 +202,7 @@ The redesign eliminated the vulnerability at the source:
 **Fast path** (ceiling on disk covers the update):
 
 - Only BLS sign runs, no disk I/O
-- `ceiling_covers()` only returns true if the disk value already blocks the signed
-  `(level, round)` -- a strictly higher level, or the same level with a round at or
-  above the request (ceilings are written as `(level+1, u32::MAX)`)
+- `ceiling_covers()` only returns true if the disk value already blocks the signed `(level, round)` -- a strictly higher level, or the same level with a round at or above the request (ceilings are written as `(level+1, u32::MAX)`)
 - On crash: disk loads the ceiling which blocks the signed level and below
 - **Critical window: 0** (disk already has a safe value)
 
@@ -238,5 +211,4 @@ The redesign eliminated the vulnerability at the source:
 - `load_entry_strict()`: size != 40 or Blake3 hash mismatch -> `InvalidData` error
 - Signer **refuses to boot** -- no signing until manual re-initialization
 
-The current design's safety does not depend on boot time, hardware speed, or any
-external factor. P(double-sign) = 0 by construction.
+The current design's safety does not depend on boot time, hardware speed, or any external factor. P(double-sign) = 0 by construction.
