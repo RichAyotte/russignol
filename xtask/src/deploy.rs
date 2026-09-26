@@ -3,6 +3,7 @@ use colored::Colorize;
 
 use crate::build::{build_rpi_signer, get_signer_binary_path};
 use crate::device::{DEVICE_HOST, DEVICE_USER, RESTART_SIGNER_CMD, scp, ssh_run, ssh_su};
+use crate::target_dir::TargetDir;
 use crate::utils::check_command;
 
 /// Staging path on the device tmpfs (large enough for debug builds); the SSH
@@ -13,16 +14,16 @@ const REMOTE_STAGING: &str = "/tmp/russignol-signer.next";
 /// reboots.
 const REMOTE_BINARY: &str = "/bin/russignol-signer";
 
-pub fn deploy(skip_build: bool, dev: bool) -> Result<()> {
+pub fn deploy(target: &TargetDir, skip_build: bool, dev: bool) -> Result<()> {
     check_command("sshpass", "Install with: sudo apt-get install sshpass")?;
 
     if !skip_build {
         let mode = if dev { "development" } else { "release" };
         println!("{}", format!("Building {mode} binary...").cyan());
-        build_rpi_signer(dev)?;
+        build_rpi_signer(target, dev)?;
     }
 
-    let binary_path = get_signer_binary_path(dev)?;
+    let binary_path = get_signer_binary_path(target, dev)?;
 
     println!(
         "{}",

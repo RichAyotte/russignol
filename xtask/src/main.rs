@@ -16,6 +16,7 @@ mod deploy;
 mod device;
 mod image;
 mod maintainer_key;
+mod target_dir;
 mod upgrade;
 mod utils;
 mod watermark_test;
@@ -23,6 +24,7 @@ mod watermark_test;
 use build::build_rpi_signer;
 use clean::clean as do_clean;
 use image::build_image;
+use target_dir::TargetDir;
 use utils::check_command;
 
 /// Russignol build system - Automated tasks for building, testing, and releasing
@@ -401,9 +403,20 @@ enum KernelAction {
 }
 
 /// Host-utility build targets and the release asset each is shipped as.
-const HOST_RELEASE_BINARIES: &[(&str, &str)] = &[
-    ("x86_64-unknown-linux-gnu", "target/russignol-amd64"),
-    ("aarch64-unknown-linux-gnu", "target/russignol-aarch64"),
+struct HostBinary<'a> {
+    triple: &'a str,
+    asset: &'a str,
+}
+
+const HOST_RELEASE_BINARIES: &[HostBinary<'static>] = &[
+    HostBinary {
+        triple: "x86_64-unknown-linux-gnu",
+        asset: "target/russignol-amd64",
+    },
+    HostBinary {
+        triple: "aarch64-unknown-linux-gnu",
+        asset: "target/russignol-aarch64",
+    },
 ];
 
 // glibc symbol-version floor for released host binaries. cargo-zigbuild caps the
@@ -452,13 +465,13 @@ fn try_main() -> Result<()> {
     env::set_current_dir(&project_root).context("Failed to change to project root directory")?;
 
     match cli.command {
-        Commands::RpiSigner { dev } => build_rpi_signer(dev),
+        Commands::RpiSigner { dev } => build_rpi_signer(&TargetDir::resolve()?, dev),
         Commands::HostUtility {
             arch,
             sequential,
             dev,
-        } => cmd_host_utility(arch, sequential, dev),
-        Commands::Image { dev, clean } => build_image(dev, clean),
+        } => cmd_host_utility(&TargetDir::resolve()?, arch, sequential, dev),
+        Commands::Image { dev, clean } => build_image(&TargetDir::resolve()?, dev, clean),
         Commands::Config { component } => match component {
             ConfigComponent::Buildroot { action, dev } => match action {
                 BuildrootAction::Nconfig => config::config_buildroot_nconfig(dev),
@@ -505,7 +518,9 @@ fn try_main() -> Result<()> {
         Commands::MaintainerKeygen { output } => maintainer_key::cmd_maintainer_keygen(output),
         Commands::MaintainerSign { image, key } => maintainer_key::cmd_maintainer_sign(&image, key),
         Commands::Coverage { open, lcov } => cmd_coverage(open, lcov),
-        Commands::Deploy { skip_build, dev } => deploy::deploy(skip_build, dev),
+        Commands::Deploy { skip_build, dev } => {
+            deploy::deploy(&TargetDir::resolve()?, skip_build, dev)
+        }
         Commands::WatermarkTest {
             device,
             port,
@@ -531,7 +546,7 @@ fn try_main() -> Result<()> {
     }
 }
 
-fn cmd_host_utility(arch: Arch, sequential: bool, dev: bool) -> Result<()> {
+fn cmd_host_utility(target: &TargetDir, arch: Arch, sequential: bool, dev: bool) -> Result<()> {
     let profile = if dev { "debug" } else { "release" };
     let mode_desc = if dev { "DEBUG" } else { "RELEASE" };
 
@@ -570,7 +585,7 @@ fn cmd_host_utility(arch: Arch, sequential: bool, dev: bool) -> Result<()> {
             )
             .cyan()
         );
-        build_parallel(&valid_targets, dev)?;
+        build_parallel(target, &valid_targets, dev)?;
     } else {
         println!(
             "{}",
@@ -595,7 +610,7 @@ fn resolve_targets(arch: Arch) -> Vec<&'static str> {
     match arch {
         Arch::All => HOST_RELEASE_BINARIES
             .iter()
-            .map(|(target, _)| *target)
+            .map(|binary| binary.triple)
             .collect(),
         Arch::X86_64 => vec!["x86_64-unknown-linux-gnu"],
         Arch::Aarch64 => vec!["aarch64-unknown-linux-gnu"],
@@ -626,56 +641,64 @@ fn build_for_target(target: &str, dev: bool) -> Result<()> {
     run_cargo(&args, &format!("Build failed for {target}"))
 }
 
-fn build_parallel(targets: &[&str], dev: bool) -> Result<()> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let had_error = AtomicBool::new(false);
+fn build_parallel(target_dir: &TargetDir, targets: &[&str], dev: bool) -> Result<()> {
     let profile = if dev { "debug" } else { "release" };
 
-    // Use separate target directories per-arch to avoid Cargo lock contention
-    std::thread::scope(|s| {
+    let all_built = std::thread::scope(|s| {
         let handles: Vec<_> = targets
             .iter()
             .map(|target| {
-                let had_error = &had_error;
-                // Each target gets its own build directory
-                let target_dir = format!("target-{}", target.split('-').next().unwrap_or(target));
+                let arch_dir = target_dir.for_arch(target.split('-').next().unwrap_or(target));
                 s.spawn(move || {
                     println!("  {} Building for {}...", "→".cyan(), target);
-                    if let Err(e) = build_for_target_with_dir(target, dev, &target_dir) {
-                        eprintln!("  {} {} failed: {}", "✗".red(), target, e);
-                        had_error.store(true, Ordering::SeqCst);
-                    } else {
-                        println!("  {} {}", "✓".green(), target);
+                    match build_for_target_with_dir(target, dev, arch_dir.path()) {
+                        Ok(()) => {
+                            println!("  {} {}", "✓".green(), target);
+                            true
+                        }
+                        Err(e) => {
+                            eprintln!("  {} {} failed: {}", "✗".red(), target, e);
+                            false
+                        }
                     }
                 })
             })
             .collect();
 
-        for handle in handles {
-            let _ = handle.join();
-        }
+        // Counted rather than `all`, which would stop joining at the first failure
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or(false))
+            .filter(|built| !built)
+            .count()
+            == 0
     });
 
-    if had_error.load(Ordering::SeqCst) {
+    if !all_built {
         bail!("One or more parallel builds failed");
     }
 
-    // Copy binaries from parallel target dirs to standard locations
+    // Copy binaries from the per-architecture directories to where a
+    // sequential build puts them, which is where `copy_binary_release_assets`
+    // reads them
     for target in targets {
         let arch = target.split('-').next().unwrap_or(target);
-        let src = format!("target-{arch}/{target}/{profile}/russignol");
-        let dst_dir = format!("target/{target}/{profile}");
-        let dst = format!("{dst_dir}/russignol");
+        let src = target_dir
+            .for_arch(arch)
+            .binary(target, profile, "russignol");
+        let dst = target_dir.binary(target, profile, "russignol");
+        let dst_dir = dst.parent().context("a binary path names its directory")?;
 
-        std::fs::create_dir_all(&dst_dir).with_context(|| format!("Failed to create {dst_dir}"))?;
-        std::fs::copy(&src, &dst).with_context(|| format!("Failed to copy {src} to {dst}"))?;
+        std::fs::create_dir_all(dst_dir)
+            .with_context(|| format!("Failed to create {}", dst_dir.display()))?;
+        std::fs::copy(&src, &dst)
+            .with_context(|| format!("Failed to copy {} to {}", src.display(), dst.display()))?;
     }
 
     Ok(())
 }
 
-fn build_for_target_with_dir(target: &str, dev: bool, target_dir: &str) -> Result<()> {
+fn build_for_target_with_dir(target: &str, dev: bool, target_dir: &Path) -> Result<()> {
     let zig_target = host_zig_target(target);
     let mut args = vec![
         "zigbuild",
@@ -684,7 +707,9 @@ fn build_for_target_with_dir(target: &str, dev: bool, target_dir: &str) -> Resul
         "--target",
         zig_target.as_str(),
         "--target-dir",
-        target_dir,
+        target_dir
+            .to_str()
+            .context("the target directory is not UTF-8")?,
     ];
     args.extend_from_slice(host_zig_config_overrides(target));
     if !dev {
@@ -724,21 +749,28 @@ fn compute_sha256(path: &Path) -> Result<String> {
 }
 
 /// Move release assets to target/ with canonical names and generate checksums
-fn copy_release_assets() -> Result<Vec<String>> {
-    let mut assets = move_binary_release_assets()?;
+fn copy_release_assets(target: &TargetDir) -> Result<Vec<String>> {
+    let mut assets = copy_binary_release_assets(target, HOST_RELEASE_BINARIES)?;
     assets.extend(move_image_release_asset()?);
     with_checksums(assets)
 }
 
-/// Move built host-utility binaries to their release asset paths, returning
-/// the assets that were moved.
-fn move_binary_release_assets() -> Result<Vec<String>> {
+fn copy_binary_release_assets(
+    target_dir: &TargetDir,
+    binaries: &[HostBinary],
+) -> Result<Vec<String>> {
     let mut assets: Vec<String> = Vec::new();
-    for (target, asset) in HOST_RELEASE_BINARIES {
-        let binary = format!("target/{target}/release/russignol");
-        if Path::new(&binary).exists() {
-            std::fs::rename(&binary, asset)
-                .with_context(|| format!("Failed to move binary for {target}"))?;
+    for HostBinary {
+        triple: target,
+        asset,
+    } in binaries
+    {
+        let binary = target_dir.binary(target, "release", "russignol");
+        if binary.exists() {
+            // A copy, because the target directory can sit on another
+            // filesystem than the checkout, and a rename cannot cross one
+            std::fs::copy(&binary, asset)
+                .with_context(|| format!("Failed to copy binary for {target}"))?;
             assets.push((*asset).to_string());
             println!(
                 "    {} {}",
@@ -949,7 +981,7 @@ fn sign_release_image_at(image: &Path, key_path: &Path) -> Result<()> {
 fn collect_release_assets(component: ReleaseComponent) -> Vec<String> {
     let host_binaries = HOST_RELEASE_BINARIES
         .iter()
-        .map(|(_, asset)| (*asset).to_string());
+        .map(|binary| binary.asset.to_string());
     let image_sig = russignol_release_signature::sidecar_path(Path::new(RELEASE_IMAGE))
         .display()
         .to_string();
@@ -1307,27 +1339,28 @@ fn ensure_tag_pushed(tag: &str) -> Result<()> {
 
 /// Build artifacts for a specific component, returning the next step number
 fn build_component_artifacts(component: ReleaseComponent, mut step: usize) -> Result<usize> {
+    let target = TargetDir::resolve()?;
     match component {
         ReleaseComponent::All => {
             println!(
                 "\n{}",
                 format!("Step {step}: Build Host Utility").cyan().bold()
             );
-            cmd_host_utility(Arch::All, false, false)?;
+            cmd_host_utility(&target, Arch::All, false, false)?;
             step += 1;
 
             println!(
                 "\n{}",
                 format!("Step {step}: Build SD Card Image").cyan().bold()
             );
-            build_image(false, false)?;
+            build_image(&target, false, false)?;
             step += 1;
 
             println!(
                 "\n{}",
                 format!("Step {step}: Move Release Assets").cyan().bold()
             );
-            copy_release_assets()?;
+            copy_release_assets(&target)?;
             step += 1;
         }
         ReleaseComponent::Signer => {
@@ -1335,7 +1368,7 @@ fn build_component_artifacts(component: ReleaseComponent, mut step: usize) -> Re
                 "\n{}",
                 format!("Step {step}: Build SD Card Image").cyan().bold()
             );
-            build_image(false, false)?;
+            build_image(&target, false, false)?;
             step += 1;
 
             println!(
@@ -1350,14 +1383,14 @@ fn build_component_artifacts(component: ReleaseComponent, mut step: usize) -> Re
                 "\n{}",
                 format!("Step {step}: Build Host Utility").cyan().bold()
             );
-            cmd_host_utility(Arch::All, false, false)?;
+            cmd_host_utility(&target, Arch::All, false, false)?;
             step += 1;
 
             println!(
                 "\n{}",
                 format!("Step {step}: Move Release Assets").cyan().bold()
             );
-            copy_host_utility_release_assets()?;
+            copy_host_utility_release_assets(&target)?;
             step += 1;
         }
         ReleaseComponent::SignerLib
@@ -1379,8 +1412,8 @@ fn copy_signer_release_assets() -> Result<Vec<String>> {
 }
 
 /// Copy only host-utility release assets
-fn copy_host_utility_release_assets() -> Result<Vec<String>> {
-    with_checksums(move_binary_release_assets()?)
+fn copy_host_utility_release_assets(target: &TargetDir) -> Result<Vec<String>> {
+    with_checksums(copy_binary_release_assets(target, HOST_RELEASE_BINARIES)?)
 }
 
 /// Generate the release checksums file for the given assets, returning its path
@@ -1423,7 +1456,7 @@ fn print_release_summary(component: ReleaseComponent, version: &str, publish: &P
 
     let binaries = HOST_RELEASE_BINARIES
         .iter()
-        .map(|(_, asset)| *asset)
+        .map(|binary| binary.asset)
         .collect::<Vec<_>>()
         .join(", ");
     match component {
@@ -1655,6 +1688,26 @@ fn get_component_version(component: ReleaseComponent) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_assets_are_copied_out_of_the_target_directory() {
+        let cargo_out = tempfile::TempDir::new().unwrap();
+        let release = tempfile::TempDir::new().unwrap();
+        let target_dir = TargetDir::from(cargo_out.path().to_path_buf());
+        let triple = "x86_64-unknown-linux-gnu";
+        let built = target_dir.binary(triple, "release", "russignol");
+        std::fs::create_dir_all(built.parent().unwrap()).unwrap();
+        std::fs::write(&built, b"host utility").unwrap();
+        let asset = release.path().join("russignol-amd64");
+        let asset = asset.to_str().unwrap();
+
+        let assets =
+            copy_binary_release_assets(&target_dir, &[HostBinary { triple, asset }]).unwrap();
+
+        assert_eq!(assets, vec![asset.to_string()]);
+        assert_eq!(std::fs::read(asset).unwrap(), b"host utility");
+        assert!(built.exists(), "the build output was moved away");
+    }
 
     #[test]
     fn host_zig_target_appends_glibc_floor() {

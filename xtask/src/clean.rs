@@ -13,16 +13,6 @@ pub fn clean(clean_buildroot: bool, deep: bool) -> Result<()> {
     run_cmd_in_dir(".", "cargo", &["clean"], "Cargo clean failed")?;
     println!("    {} Cargo artifacts cleaned", "✓".green());
 
-    // Clean parallel build directories
-    for dir_name in ["target-x86_64", "target-aarch64"] {
-        let dir = Path::new(dir_name);
-        if dir.exists() {
-            std::fs::remove_dir_all(dir).with_context(|| format!("Failed to remove {dir_name}"))?;
-            println!("    {} {} removed", "✓".green(), dir_name);
-        }
-    }
-
-    // Clean overlay binary
     let overlay_binary =
         Path::new("rpi-signer/buildroot-external/rootfs-overlay-common/bin/russignol-signer");
     if overlay_binary.exists() {

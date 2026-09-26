@@ -3,6 +3,7 @@ use colored::Colorize;
 use std::path::{Path, PathBuf};
 
 use crate::build::{build_rpi_signer, get_signer_binary_path};
+use crate::target_dir::TargetDir;
 use crate::utils::{
     clear_host_compiler_flags, compress_image, copy_binary_to_rootfs, get_config_name,
     run_buildroot_make, run_cmd_in_dir,
@@ -14,7 +15,7 @@ const KERNEL_TREE_DIR: &str = "output/build/linux-custom";
 const KERNEL_TREE_MARKER: &str = ".russignol-kernel-source";
 
 /// Build the SD card image using buildroot
-pub fn build_image(is_dev: bool, force_clean: bool) -> Result<()> {
+pub fn build_image(target: &TargetDir, is_dev: bool, force_clean: bool) -> Result<()> {
     let config_name = get_config_name(is_dev);
 
     println!(
@@ -33,7 +34,7 @@ pub fn build_image(is_dev: bool, force_clean: bool) -> Result<()> {
     let buildroot_dir = PathBuf::from(BUILDROOT_DIR);
     let external_tree = PathBuf::from("rpi-signer/buildroot-external");
 
-    validate_and_prepare_build(&buildroot_dir, &external_tree, config_name, is_dev)?;
+    validate_and_prepare_build(target, &buildroot_dir, &external_tree, config_name, is_dev)?;
 
     // Change to buildroot directory
     std::env::set_current_dir(&buildroot_dir).context("Failed to change to buildroot directory")?;
@@ -50,6 +51,7 @@ pub fn build_image(is_dev: bool, force_clean: bool) -> Result<()> {
 }
 
 fn validate_and_prepare_build(
+    target: &TargetDir,
     buildroot_dir: &Path,
     external_tree: &Path,
     config_name: &str,
@@ -77,8 +79,8 @@ fn validate_and_prepare_build(
     let signer_binary = prepare_signer_binary(
         is_dev,
         &rootfs_overlay,
-        build_rpi_signer,
-        get_signer_binary_path,
+        |dev| build_rpi_signer(target, dev),
+        |dev| get_signer_binary_path(target, dev),
     )?;
     println!(
         "  {} Signer built and copied to rootfs overlay: {}",
@@ -92,7 +94,7 @@ fn validate_and_prepare_build(
 
 /// Build the signer from the current sources, then copy the produced binary
 /// into the rootfs overlay, returning its path. Building here — rather than
-/// packaging whatever binary happens to sit in `target/` — is what keeps the
+/// packaging whatever binary happens to sit in the target directory — is what keeps the
 /// image from ever shipping a signer that predates the current sources.
 fn prepare_signer_binary(
     is_dev: bool,

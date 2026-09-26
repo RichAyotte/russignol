@@ -1,7 +1,5 @@
 # Rust build artifacts
 /target
-/target-x86_64
-/target-aarch64
 **/target/
 **/*.rs.bk
 

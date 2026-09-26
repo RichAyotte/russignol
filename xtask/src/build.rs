@@ -2,13 +2,14 @@ use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use std::process::{Command, Stdio};
 
+use crate::target_dir::TargetDir;
 use crate::utils::{check_command, clear_host_compiler_flags, set_arm_rustflags};
 
 const TARGET: &str = "aarch64-unknown-linux-gnu";
 const SIGNER_PACKAGE: &str = "russignol-signer";
 
 /// Build the `RPi` signer binary for ARM64
-pub fn build_rpi_signer(dev: bool) -> Result<()> {
+pub fn build_rpi_signer(target: &TargetDir, dev: bool) -> Result<()> {
     let mode_desc = if dev {
         "DEBUG"
     } else {
@@ -57,7 +58,7 @@ pub fn build_rpi_signer(dev: bool) -> Result<()> {
     }
 
     // Show build results
-    let binary_path = get_signer_binary_path(dev)?;
+    let binary_path = get_signer_binary_path(target, dev)?;
     println!("\n{}", "=== Build Complete ===".green().bold());
 
     if let Ok(metadata) = std::fs::metadata(&binary_path) {
@@ -76,14 +77,19 @@ pub fn build_rpi_signer(dev: bool) -> Result<()> {
 }
 
 /// Get the path to the built signer binary
-pub fn get_signer_binary_path(dev: bool) -> Result<std::path::PathBuf> {
-    get_binary_path(SIGNER_PACKAGE, dev, "rpi-signer")
+pub fn get_signer_binary_path(target: &TargetDir, dev: bool) -> Result<std::path::PathBuf> {
+    get_binary_path(target, SIGNER_PACKAGE, dev, "rpi-signer")
 }
 
 /// Get the path to a built ARM64 binary
-fn get_binary_path(package: &str, dev: bool, build_cmd: &str) -> Result<std::path::PathBuf> {
+fn get_binary_path(
+    target: &TargetDir,
+    package: &str,
+    dev: bool,
+    build_cmd: &str,
+) -> Result<std::path::PathBuf> {
     let profile = if dev { "debug" } else { "release" };
-    let path = std::path::PathBuf::from(format!("target/{TARGET}/{profile}/{package}"));
+    let path = target.binary(TARGET, profile, package);
 
     if !path.exists() {
         bail!(
@@ -125,4 +131,33 @@ fn install_target(target: &str) -> Result<()> {
 
     println!("  {} Target {} installed", "✓".green(), target);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_signer_is_read_from_the_target_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = TargetDir::from(dir.path().to_path_buf());
+        let built = target.binary(TARGET, "release", SIGNER_PACKAGE);
+        std::fs::create_dir_all(built.parent().unwrap()).unwrap();
+        std::fs::write(&built, b"").unwrap();
+
+        assert_eq!(get_signer_binary_path(&target, false).unwrap(), built);
+    }
+
+    #[test]
+    fn a_signer_never_built_is_reported_where_it_was_looked_for() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = TargetDir::from(dir.path().to_path_buf());
+
+        let err = get_signer_binary_path(&target, true).unwrap_err();
+        let expected = target.binary(TARGET, "debug", SIGNER_PACKAGE);
+        assert!(
+            err.to_string().contains(&expected.display().to_string()),
+            "{err}"
+        );
+    }
 }

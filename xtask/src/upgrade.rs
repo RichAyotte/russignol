@@ -562,19 +562,20 @@ fn run_checks(skip_image: bool) -> Result<Verification> {
     crate::cmd_test()?;
     passed.push("tests");
 
-    crate::build::build_rpi_signer(false)?;
+    let target = crate::target_dir::TargetDir::resolve()?;
+    crate::build::build_rpi_signer(&target, false)?;
     passed.push("aarch64 signer");
 
     // Release builds differ from the test compile by LTO, panic=abort and
     // stripping, so a shipped binary that only ever gets compiled for tests has
     // never been produced the way it is distributed.
-    crate::cmd_host_utility(crate::Arch::All, false, false)?;
+    crate::cmd_host_utility(&target, crate::Arch::All, false, false)?;
     passed.push("host utility");
 
     if skip_image {
         println!("  {} SD image build skipped (--no-image)", "⚠".yellow());
     } else {
-        crate::image::build_image(false, false)?;
+        crate::image::build_image(&target, false, false)?;
         passed.push("sd image");
     }
 
