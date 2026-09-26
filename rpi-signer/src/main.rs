@@ -621,6 +621,7 @@ fn construct_page(
         }
         PageSpec::Keys => Box::new(pages::keys::Page::new(tx.clone(), watermark.clone())),
         PageSpec::Provision => Box::new(pages::provision::Page::new(tx.clone())),
+        PageSpec::Lifetimes => Box::new(pages::lifetimes::Page::new(tx.clone())),
         PageSpec::About => Box::new(about::Page::new(tx.clone())),
         PageSpec::Greeting => Box::new(greeting::Page::new(tx.clone())),
         PageSpec::Image { back } => Box::new(pages::image_info::Page::new(tx.clone(), back)),
@@ -720,7 +721,9 @@ fn apply_effects(
             }
             Effect::SpawnKeygen { pin } => spawn_keygen(app.tx.clone(), pin, cpu_boost),
             Effect::SpawnPinVerify { pin } => spawn_pin_verify(app.tx.clone(), pin, cpu_boost),
-            Effect::SpawnStageRequest { pin, key } => spawn_stage_request(&app.tx, pin, key),
+            Effect::SpawnStageRequest { pin, request } => {
+                spawn_stage_request(&app.tx, pin, request);
+            }
             Effect::SpawnStorageSetup => spawn_storage_setup(app.tx.clone()),
             Effect::SyncDisk => setup::sync_disk(),
             Effect::DropPrivileges => {
@@ -1021,14 +1024,14 @@ fn provision_staged_request(
     json: Secret<String>,
     paths: &provision::Paths,
 ) -> AppEvent {
-    let key = match provision::staged_request(paths.request()) {
+    let request = match provision::staged_request(paths.request()) {
         Ok(None) => {
             return AppEvent::PinVerified {
                 json,
                 migration: None,
             };
         }
-        Ok(Some(key)) => key,
+        Ok(Some(request)) => request,
         Err(e) => {
             let reason = format!("{e}");
             return match provision::clear_request(paths.request()) {
@@ -1041,13 +1044,11 @@ fn provision_staged_request(
         }
     };
 
-    let what = match key {
-        DeviceKey::Bls(role) => provision::Provisioning::Bls(role),
-        DeviceKey::XmssConsensus => provision::Provisioning::Xmss(constants::XMSS_EPOCHS),
-    };
+    let key = request.device_key();
+    let what = request.provisioning();
     let _ = tx.send(AppEvent::PinVerifyProgress {
         message: format!("Generating {}...", key.device_alias()),
-        estimated_duration: provision::estimate(key),
+        estimated_duration: provision::estimate(&what),
     });
 
     let outcome = provision::provision_key(paths.store(), pin, json.as_str(), what);
@@ -1079,11 +1080,11 @@ fn provision_staged_request(
 /// The check is a decrypt of the card's own key store rather than anything
 /// held in memory: the store is what a provisioning boot will open with the
 /// same PIN, so a PIN that stages a request is one that boot can act on.
-fn spawn_stage_request(tx: &Sender<AppEvent>, pin: Secret<Vec<u8>>, key: DeviceKey) {
+fn spawn_stage_request(tx: &Sender<AppEvent>, pin: Secret<Vec<u8>>, request: provision::Request) {
     let tx = tx.clone();
     std::thread::spawn(move || {
         let paths = provision::Paths::device();
-        let event = match stage_request(&paths, &pin, key) {
+        let event = match stage_request(&paths, &pin, request) {
             Ok(()) => AppEvent::ProvisionRequested,
             Err(reason) => AppEvent::ProvisionRequestFailed { reason },
         };
@@ -1092,7 +1093,11 @@ fn spawn_stage_request(tx: &Sender<AppEvent>, pin: Secret<Vec<u8>>, key: DeviceK
 }
 
 /// The PIN check and the write behind it.
-fn stage_request(paths: &provision::Paths, pin: &[u8], key: DeviceKey) -> Result<(), String> {
+fn stage_request(
+    paths: &provision::Paths,
+    pin: &[u8],
+    request: provision::Request,
+) -> Result<(), String> {
     let blob =
         std::fs::read(paths.store()).map_err(|e| format!("The card would not read.\n{e}"))?;
     // A wrong PIN and a store that will not parse both come back as
@@ -1103,7 +1108,7 @@ fn stage_request(paths: &provision::Paths, pin: &[u8], key: DeviceKey) -> Result
         log::error!("The card would not open: {e}");
         "Invalid PIN".to_string()
     })?;
-    provision::stage_request(paths.request(), key)
+    provision::stage_request(paths.request(), request)
         .map_err(|e| format!("The request would not be written.\n{e}"))
 }
 
@@ -1554,11 +1559,16 @@ mod tests {
             .expect("a store over a writable directory")
     }
 
+    /// A tz6 request over a lifetime other than the year a bare alias reads
+    /// back as, so a lifetime lost between staging and reading turns a test red.
+    const ONE_MONTH_TZ6: provision::Request =
+        provision::Request::Xmss(provision::Lifetime::OneMonth);
+
     /// A request naming `key`, staged the way the operator's flow stages it:
     /// a request this test wrote itself is one that stays readable after the
     /// writer's own spelling moves.
-    fn stage(paths: &provision::Paths, key: DeviceKey) {
-        provision::stage_request(paths.request(), key).expect("a writable data partition");
+    fn stage(paths: &provision::Paths, request: provision::Request) {
+        provision::stage_request(paths.request(), request).expect("a writable data partition");
     }
 
     /// Deny writes to `dir` for the length of `run`, so a write into it fails
@@ -1592,7 +1602,7 @@ mod tests {
         let paths = provision::Paths::under(data.path(), keys.path());
         let _card = card(&paths, &[KeyRole::Consensus]);
 
-        let refused = stage_request(&paths, b"87654321", DeviceKey::XmssConsensus);
+        let refused = stage_request(&paths, b"87654321", ONE_MONTH_TZ6);
 
         let Err(reason) = refused else {
             panic!("a wrong PIN must stage nothing")
@@ -1610,11 +1620,11 @@ mod tests {
         let paths = provision::Paths::under(data.path(), keys.path());
         let _card = card(&paths, &[KeyRole::Consensus]);
 
-        stage_request(&paths, PIN, DeviceKey::XmssConsensus).expect("the card's own PIN");
+        stage_request(&paths, PIN, ONE_MONTH_TZ6).expect("the card's own PIN");
 
         assert_eq!(
             provision::staged_request(paths.request()).unwrap(),
-            Some(DeviceKey::XmssConsensus)
+            Some(ONE_MONTH_TZ6)
         );
     }
 
@@ -1627,7 +1637,7 @@ mod tests {
         let data = tempfile::TempDir::new().unwrap();
         let paths = provision::Paths::under(data.path(), keys.path());
 
-        let Err(reason) = stage_request(&paths, PIN, DeviceKey::XmssConsensus) else {
+        let Err(reason) = stage_request(&paths, PIN, ONE_MONTH_TZ6) else {
             panic!("a card with no store must report")
         };
         assert!(
@@ -1647,7 +1657,7 @@ mod tests {
         let data = tempfile::TempDir::new().unwrap();
         let paths = provision::Paths::under(data.path(), keys.path());
         let before = card(&paths, &[KeyRole::Consensus]);
-        stage(&paths, DeviceKey::Bls(KeyRole::Companion));
+        stage(&paths, provision::Request::Bls(KeyRole::Companion));
         let (tx, _rx) = crossbeam_channel::unbounded();
 
         let event = with_read_only(data.path(), || {
@@ -1682,7 +1692,7 @@ mod tests {
         let data = tempfile::TempDir::new().unwrap();
         let paths = provision::Paths::under(data.path(), keys.path());
         let before = card(&paths, &[KeyRole::Consensus]);
-        stage(&paths, DeviceKey::Bls(KeyRole::Companion));
+        stage(&paths, provision::Request::Bls(KeyRole::Companion));
         let (tx, _rx) = crossbeam_channel::unbounded();
 
         let event = provision_staged_request(&tx, PIN, before, &paths);
@@ -1732,7 +1742,7 @@ mod tests {
         let paths = provision::Paths::under(data.path(), keys.path());
         let before = card(&paths, &[KeyRole::Consensus]);
         let expected = aliases(&before);
-        stage(&paths, DeviceKey::Bls(KeyRole::Companion));
+        stage(&paths, provision::Request::Bls(KeyRole::Companion));
         let (tx, _rx) = crossbeam_channel::unbounded();
 
         let event = with_read_only(keys.path(), || {
@@ -1759,7 +1769,7 @@ mod tests {
         let data = tempfile::TempDir::new().unwrap();
         let paths = provision::Paths::under(data.path(), keys.path());
         let before = card(&paths, &[KeyRole::Consensus]);
-        stage(&paths, DeviceKey::Bls(KeyRole::Companion));
+        stage(&paths, provision::Request::Bls(KeyRole::Companion));
         let (tx, _rx) = crossbeam_channel::unbounded();
 
         let event = with_read_only(keys.path(), || {

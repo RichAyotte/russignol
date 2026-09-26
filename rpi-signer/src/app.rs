@@ -1,5 +1,5 @@
 use crossbeam_channel::Sender;
-use russignol_signer_lib::{ChainId, DeviceKey, HighWatermark, ServerKeyManager, signing_activity};
+use russignol_signer_lib::{ChainId, HighWatermark, ServerKeyManager, signing_activity};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -43,11 +43,16 @@ const EXIT_CODE_REBOOT: i32 = 42;
 /// The cost is named because it is what the answer turns on: the device signs
 /// nothing for as long as the run takes, and the key the run replaces is gone
 /// once it starts.
-fn provision_confirmation(key: DeviceKey) -> String {
+fn provision_confirmation(request: crate::provision::Request) -> String {
+    let what = request.provisioning();
+    let lifetime = match request {
+        crate::provision::Request::Bls(_) => String::new(),
+        crate::provision::Request::Xmss(lifetime) => format!("{}. ", lifetime.label()),
+    };
     format!(
-        "Replace {}?\nTakes {}, signing nothing.",
-        key.device_alias(),
-        crate::provision::estimate_in_words(key)
+        "Replace {}?\n{lifetime}Takes {}, signing nothing.",
+        request.device_key().device_alias(),
+        crate::provision::estimate_in_words(crate::provision::estimate(&what))
     )
 }
 
@@ -298,6 +303,8 @@ pub enum PageSpec {
     Keys,
     /// The keys this device can provision, one button each.
     Provision,
+    /// The lifetimes a tz6 key can be generated for, one button each.
+    Lifetimes,
     About,
     Greeting,
     Image {
@@ -368,10 +375,10 @@ pub enum Effect {
         pin: Secret<Vec<u8>>,
     },
     /// Check `pin` against the card and, where it opens it, stage a request
-    /// for the next boot to provision `key`.
+    /// for the next boot to carry out `request`.
     SpawnStageRequest {
         pin: Secret<Vec<u8>>,
-        key: DeviceKey,
+        request: crate::provision::Request,
     },
     SpawnStorageSetup,
     SyncDisk,
@@ -418,7 +425,7 @@ pub struct App {
     /// The key a confirmed provisioning request names, held while the PIN page
     /// is up. Taken by the PIN entry, so a PIN entered without one stages
     /// nothing.
-    pub pending_provision: Option<DeviceKey>,
+    pub pending_provision: Option<crate::provision::Request>,
     pub needs_animation: bool,
     pub animation_interval: Duration,
     /// Render work deferred to the loop's flush site; survives loop
@@ -836,7 +843,7 @@ impl App {
             AppEvent::PinEntered(pin) => self
                 .pending_provision
                 .take()
-                .map(|key| vec![pin_verify_bar(), Effect::SpawnStageRequest { pin, key }])
+                .map(|request| vec![pin_verify_bar(), Effect::SpawnStageRequest { pin, request }])
                 .unwrap_or_default(),
             AppEvent::ProvisionRequested => {
                 log::info!("Provisioning request staged; rebooting to carry it out");
@@ -975,6 +982,7 @@ impl App {
             AppEvent::ShowSignatures => Some(PageSpec::Signatures),
             AppEvent::ShowKeys => Some(PageSpec::Keys),
             AppEvent::ShowProvision => Some(PageSpec::Provision),
+            AppEvent::ShowLifetimes => Some(PageSpec::Lifetimes),
             AppEvent::ShowAbout => Some(PageSpec::About),
             AppEvent::ShowGreeting => Some(PageSpec::Greeting),
             AppEvent::ShowImage { back } => Some(PageSpec::Image { back: *back }),
@@ -1776,9 +1784,9 @@ mod tests {
         assert!(has_effect(&effects, &bar), "unlock: {effects:?}");
 
         let mut app = active_app();
-        app.handle_event(AppEvent::ConfirmProvision(
-            russignol_signer_lib::DeviceKey::XmssConsensus,
-        ));
+        app.handle_event(AppEvent::ConfirmProvision(crate::provision::Request::Xmss(
+            crate::provision::Lifetime::OneYear,
+        )));
         let (_action, effects) = app.handle_event(AppEvent::PinEntered(pin(&[1, 2, 3, 4])));
         assert!(has_effect(&effects, &bar), "provisioning: {effects:?}");
     }
@@ -2829,7 +2837,7 @@ mod tests {
     #[test]
     fn nothing_is_staged_until_the_pin_is_entered() {
         let mut app = active_app();
-        let key = russignol_signer_lib::DeviceKey::XmssConsensus;
+        let key = crate::provision::Request::Xmss(crate::provision::Lifetime::OneMonth);
 
         let (_action, effects) = app.handle_event(AppEvent::ProvisionKey(key));
         assert!(
@@ -2847,8 +2855,10 @@ mod tests {
             panic!("the pick must ask first: {effects:?}")
         };
         assert!(
-            message.contains("consensus_tz6") && message.contains("37 minutes"),
-            "the question names the key and what it costs: {message}"
+            message.contains("consensus_tz6")
+                && message.contains("1 month")
+                && message.contains("about 3 minutes"),
+            "the question names the key, its lifetime and what it costs: {message}"
         );
         assert_eq!(on_confirm, &AppEvent::ConfirmProvision(key));
 
@@ -2859,7 +2869,7 @@ mod tests {
         assert!(
             effects
                 .iter()
-                .any(|e| matches!(e, Effect::SpawnStageRequest { key: k, .. } if *k == key)),
+                .any(|e| matches!(e, Effect::SpawnStageRequest { request, .. } if *request == key)),
             "the PIN must stage the key that was picked: {effects:?}"
         );
     }
@@ -2869,9 +2879,9 @@ mod tests {
     #[test]
     fn leaving_for_the_menu_drops_the_key_that_was_picked() {
         let mut app = active_app();
-        app.handle_event(AppEvent::ConfirmProvision(
-            russignol_signer_lib::DeviceKey::XmssConsensus,
-        ));
+        app.handle_event(AppEvent::ConfirmProvision(crate::provision::Request::Xmss(
+            crate::provision::Lifetime::OneYear,
+        )));
 
         app.handle_event(AppEvent::ShowMenu);
         let (_action, effects) = app.handle_event(AppEvent::PinEntered(pin(&[1, 2, 3, 4])));
@@ -2932,9 +2942,9 @@ mod tests {
     /// inside it, or the operator confirms a run without seeing its cost.
     #[test]
     fn every_provisioning_question_fits_the_confirmation_page() {
-        for key in russignol_signer_lib::DeviceKey::ALL {
+        for request in crate::provision::Request::all() {
             let mut app = active_app();
-            let (_action, effects) = app.handle_event(AppEvent::ProvisionKey(key));
+            let (_action, effects) = app.handle_event(AppEvent::ProvisionKey(request));
 
             let (message, warning) = confirmation_dialog(&effects);
             let height = crate::pages::confirmation::measure_message_height(message, warning);
@@ -2951,6 +2961,13 @@ mod tests {
         let mut app = active_app();
         let (_action, effects) = app.handle_event(AppEvent::ShowKeys);
         assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Keys)]);
+    }
+
+    #[test]
+    fn show_lifetimes_navigates_to_lifetimes() {
+        let mut app = active_app();
+        let (_action, effects) = app.handle_event(AppEvent::ShowLifetimes);
+        assert_eq!(effects, vec![Effect::ShowPage(PageSpec::Lifetimes)]);
     }
 
     #[test]

@@ -69,3 +69,11 @@ pub const PROVISION_REQUEST_FILE: &str = "/data/provision-request";
 /// a rotation can be.
 pub const XMSS_EPOCHS: std::ops::RangeInclusive<russignol_signer_lib::xmss::Epoch> =
     0..=((1 << 24) - 1);
+
+/// Epochs a tz6 key spends in a day: three signatures per six-second block.
+pub const XMSS_EPOCHS_PER_DAY: russignol_signer_lib::xmss::Epoch = 43_200;
+
+/// What generating one tz6 leaf costs on the device, which is what a
+/// provisioning estimate scales by the span. Measured at 1 GHz: a 2^24-epoch
+/// key took 2232 s.
+pub const XMSS_LEAF_NANOS: u64 = 133_000;

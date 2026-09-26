@@ -2,6 +2,7 @@ use embedded_graphics::prelude::Point;
 use russignol_signer_lib::{ChainId, DeviceKey};
 use std::time::Duration;
 
+use crate::provision::Request;
 use crate::secret::Secret;
 use crate::tezos_encrypt::MigrationEvent;
 
@@ -126,11 +127,13 @@ pub enum AppEvent {
     ShowKeys,
     /// Show the page offering each key the device can provision.
     ShowProvision,
+    /// Show the page offering each lifetime a tz6 key can be generated for.
+    ShowLifetimes,
     /// The operator picked a key to provision; nothing is staged until the
     /// confirmation and the PIN behind it are both answered.
-    ProvisionKey(DeviceKey),
+    ProvisionKey(Request),
     /// The operator accepted what the run costs, so the PIN page opens.
-    ConfirmProvision(DeviceKey),
+    ConfirmProvision(Request),
     /// The PIN was accepted and the request is on the card, so the device
     /// reboots into the privileged boot that carries it out.
     ProvisionRequested,

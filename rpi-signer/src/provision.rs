@@ -100,6 +100,101 @@ impl Provisioning {
     }
 }
 
+/// How long a tz6 key lasts before its epochs run out and it is replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lifetime {
+    OneMonth,
+    FourMonths,
+    SixMonths,
+    OneYear,
+}
+
+impl Lifetime {
+    pub const COUNT: usize = 4;
+
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::OneMonth,
+        Self::FourMonths,
+        Self::SixMonths,
+        Self::OneYear,
+    ];
+
+    /// What the operator reads on the button that picks it.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OneMonth => "1 month",
+            Self::FourMonths => "4 months",
+            Self::SixMonths => "6 months",
+            Self::OneYear => "1 year",
+        }
+    }
+
+    /// The spelling a staged request carries after the key's alias.
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::OneMonth => "1m",
+            Self::FourMonths => "4m",
+            Self::SixMonths => "6m",
+            Self::OneYear => "1y",
+        }
+    }
+
+    fn from_tag(tag: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|lifetime| lifetime.tag() == tag)
+    }
+
+    /// The epochs a key of this lifetime is generated over.
+    ///
+    /// A year is `XMSS_EPOCHS`, which runs a month past the year so a yearly
+    /// rotation has slack. The shorter lifetimes are exactly their days at
+    /// `XMSS_EPOCHS_PER_DAY`, a month counting 30 and six months half of 365.
+    #[must_use]
+    pub const fn epochs(self) -> std::ops::RangeInclusive<xmss::Epoch> {
+        let days = match self {
+            Self::OneMonth => 30,
+            Self::FourMonths => 120,
+            Self::SixMonths => 182,
+            Self::OneYear => return crate::constants::XMSS_EPOCHS,
+        };
+        0..=days * crate::constants::XMSS_EPOCHS_PER_DAY - 1
+    }
+}
+
+/// A key the operator asked for: a BLS key in one role, or the tz6 key over
+/// one lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Request {
+    Bls(KeyRole),
+    Xmss(Lifetime),
+}
+
+impl Request {
+    #[cfg(test)]
+    pub fn all() -> impl Iterator<Item = Self> {
+        KeyRole::ALL
+            .into_iter()
+            .map(Self::Bls)
+            .chain(Lifetime::ALL.into_iter().map(Self::Xmss))
+    }
+
+    #[must_use]
+    pub const fn device_key(self) -> DeviceKey {
+        match self {
+            Self::Bls(role) => DeviceKey::Bls(role),
+            Self::Xmss(_) => DeviceKey::XmssConsensus,
+        }
+    }
+
+    #[must_use]
+    pub const fn provisioning(self) -> Provisioning {
+        match self {
+            Self::Bls(role) => Provisioning::Bls(role),
+            Self::Xmss(lifetime) => Provisioning::Xmss(lifetime.epochs()),
+        }
+    }
+}
+
 impl Generated {
     /// # Errors
     ///
@@ -290,49 +385,65 @@ fn device_file_name(path: &str) -> &str {
         .expect("a device path names a file")
 }
 
-/// The device key a staged request names, or `None` where none is staged.
+/// The request staged for the next boot, or `None` where none is staged.
 ///
-/// A request naming a key this device does not provision is an error rather
-/// than a skip. The init script has already kept the keys partition writable
-/// for it, so a boot that reads it as nothing staged repeats that on every
-/// boot after.
+/// A request naming a key this device does not provision, or a lifetime it
+/// does not offer, is an error rather than a skip. The init script has already
+/// kept the keys partition writable for it, so a boot that reads it as nothing
+/// staged repeats that on every boot after.
+///
+/// A tz6 request naming no lifetime reads as a year, so a request an earlier
+/// build staged is carried out over the span it was staged for.
 ///
 /// # Errors
 ///
-/// Returns an error if the request will not read, or names no device key.
-pub fn staged_request(path: &Path) -> io::Result<Option<DeviceKey>> {
-    let alias = match fs::read_to_string(path) {
-        Ok(alias) => alias,
+/// Returns an error if the request will not read, or names no request.
+pub fn staged_request(path: &Path) -> io::Result<Option<Request>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    DeviceKey::from_device_alias(alias.trim())
-        .map(Some)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("staged provisioning request names no device key: {alias:?}"),
-            )
-        })
+    let (alias, lifetime) = match text.trim().split_once(' ') {
+        Some((alias, tag)) => (alias, Some(tag)),
+        None => (text.trim(), None),
+    };
+    let request = match (DeviceKey::from_device_alias(alias), lifetime) {
+        (Some(DeviceKey::Bls(role)), None) => Some(Request::Bls(role)),
+        (Some(DeviceKey::XmssConsensus), None) => Some(Request::Xmss(Lifetime::OneYear)),
+        (Some(DeviceKey::XmssConsensus), Some(tag)) => Lifetime::from_tag(tag).map(Request::Xmss),
+        _ => None,
+    };
+    request.map(Some).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("staged provisioning request names no request: {text:?}"),
+        )
+    })
 }
 
-/// How long generating `key` takes on the device.
+/// How long `what` takes on the device.
 ///
-/// The XMSS figure is the 37 minutes measured at the deployed span; a BLS key
-/// is generated in milliseconds, and the estimate is there so the progress bar
-/// and the operator's confirmation read one number rather than two.
+/// A BLS key is generated in milliseconds; a tz6 key walks every epoch in its
+/// span. The estimate is there so the progress bar and the operator's
+/// confirmation read one number rather than two.
 #[must_use]
-pub const fn estimate(key: DeviceKey) -> std::time::Duration {
-    match key {
-        DeviceKey::Bls(_) => std::time::Duration::from_secs(1),
-        DeviceKey::XmssConsensus => std::time::Duration::from_mins(37),
+pub fn estimate(what: &Provisioning) -> std::time::Duration {
+    match what {
+        // A stand-in for the milliseconds a BLS key takes, which
+        // `estimate_in_words` renders as under a minute either way.
+        Provisioning::Bls(_) => std::time::Duration::from_secs(1),
+        Provisioning::Xmss(epochs) => {
+            let leaves = u64::from(*epochs.end() - *epochs.start()) + 1;
+            std::time::Duration::from_nanos(leaves * crate::constants::XMSS_LEAF_NANOS)
+        }
     }
 }
 
-/// That estimate as the operator reads it.
+/// An estimate as the operator reads it, to the nearest minute.
 #[must_use]
-pub fn estimate_in_words(key: DeviceKey) -> String {
-    let minutes = estimate(key).as_secs() / 60;
+pub fn estimate_in_words(estimate: std::time::Duration) -> String {
+    let minutes = (estimate.as_secs() + 30) / 60;
     if minutes == 0 {
         "under a minute".to_string()
     } else {
@@ -340,7 +451,7 @@ pub fn estimate_in_words(key: DeviceKey) -> String {
     }
 }
 
-/// Ask the next boot to provision `key`.
+/// Ask the next boot to carry out `request`.
 ///
 /// Through a rename, because a request caught half-written by a power cut is
 /// one no later boot resolves: its presence keeps the keys partition writable
@@ -350,8 +461,13 @@ pub fn estimate_in_words(key: DeviceKey) -> String {
 /// # Errors
 ///
 /// Returns an error if the request cannot be written.
-pub fn stage_request(path: &Path, key: DeviceKey) -> io::Result<()> {
-    atomic_write(path, key.device_alias().as_bytes())
+pub fn stage_request(path: &Path, request: Request) -> io::Result<()> {
+    let alias = request.device_key().device_alias();
+    let text = match request {
+        Request::Bls(_) => alias.to_string(),
+        Request::Xmss(lifetime) => format!("{alias} {}", lifetime.tag()),
+    };
+    atomic_write(path, text.as_bytes())
 }
 
 /// Clear a staged request, whether or not one is staged.
@@ -827,35 +943,110 @@ mod tests {
         let path = dir.path().join("provision-request");
 
         assert_eq!(staged_request(&path).unwrap(), None);
-        // The alias as it lands on disk, spelled here rather than read back
+        // The request as it lands on disk, spelled here rather than read back
         // off either side of the file: one boot writes it and the next reads
         // it, so a spelling that moves on one side has to turn a test red.
-        std::fs::write(&path, "consensus_tz6").unwrap();
+        std::fs::write(&path, "consensus_tz6 1m").unwrap();
         assert_eq!(
             staged_request(&path).unwrap(),
-            Some(DeviceKey::XmssConsensus)
+            Some(Request::Xmss(Lifetime::OneMonth))
+        );
+        std::fs::write(&path, "consensus_tz4").unwrap();
+        assert_eq!(
+            staged_request(&path).unwrap(),
+            Some(Request::Bls(KeyRole::Consensus))
         );
 
-        stage_request(&path, DeviceKey::XmssConsensus).expect("a writable directory");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "consensus_tz6");
+        stage_request(&path, Request::Xmss(Lifetime::OneMonth)).expect("a writable directory");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "consensus_tz6 1m");
 
         clear_request(&path).unwrap();
         assert_eq!(staged_request(&path).unwrap(), None);
         clear_request(&path).expect("clearing what is not there is not a failure");
     }
 
-    /// The operator's flow and the boot that carries it out agree on every key
-    /// the device provisions: a request one writes and the other does not read
-    /// is a boot that stops on it, with the keys partition left writable.
+    /// A tz6 request naming no lifetime reads as a year.
     #[test]
-    fn every_key_staged_is_a_key_the_next_boot_reads_back() {
+    fn a_tz6_request_naming_no_lifetime_is_a_year() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("provision-request");
 
-        for key in DeviceKey::ALL {
-            stage_request(&path, key).expect("a writable data partition");
-            assert_eq!(staged_request(&path).unwrap(), Some(key));
+        std::fs::write(&path, "consensus_tz6").unwrap();
+        assert_eq!(
+            staged_request(&path).unwrap(),
+            Some(Request::Xmss(Lifetime::OneYear))
+        );
+    }
+
+    /// A lifetime this device does not offer, or a lifetime on a key that
+    /// spends no epochs, stops the boot for the same reason an unknown key
+    /// does.
+    #[test]
+    fn a_request_naming_no_offered_lifetime_is_an_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("provision-request");
+
+        for text in ["consensus_tz6 2y", "consensus_tz4 1m"] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(
+                staged_request(&path).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData,
+                "{text:?}"
+            );
         }
+    }
+
+    /// The operator's flow and the boot that carries it out agree on every
+    /// request the device takes: a request one writes and the other does not
+    /// read is a boot that stops on it, with the keys partition left writable.
+    #[test]
+    fn every_request_staged_is_a_request_the_next_boot_reads_back() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("provision-request");
+
+        for request in Request::all() {
+            stage_request(&path, request).expect("a writable data partition");
+            assert_eq!(staged_request(&path).unwrap(), Some(request));
+        }
+    }
+
+    /// Each shorter lifetime spans its days at `XMSS_EPOCHS_PER_DAY`, a month
+    /// counting 30 and six months half of 365, and a year is `XMSS_EPOCHS`.
+    #[test]
+    fn each_lifetime_spans_its_days() {
+        use crate::constants::{XMSS_EPOCHS, XMSS_EPOCHS_PER_DAY};
+
+        for (lifetime, days) in [
+            (Lifetime::OneMonth, 30),
+            (Lifetime::FourMonths, 120),
+            (Lifetime::SixMonths, 182),
+        ] {
+            let epochs = lifetime.epochs();
+            assert_eq!(*epochs.start(), 0, "{lifetime:?}");
+            assert_eq!(
+                *epochs.end() + 1,
+                days * XMSS_EPOCHS_PER_DAY,
+                "{lifetime:?} is not {days} days"
+            );
+        }
+        assert_eq!(Lifetime::OneYear.epochs(), XMSS_EPOCHS);
+    }
+
+    #[test]
+    fn the_estimate_follows_the_lifetime() {
+        let words = |request: Request| estimate_in_words(estimate(&request.provisioning()));
+
+        assert_eq!(words(Request::Bls(KeyRole::Consensus)), "under a minute");
+        assert_eq!(words(Request::Xmss(Lifetime::OneMonth)), "about 3 minutes");
+        assert_eq!(
+            words(Request::Xmss(Lifetime::FourMonths)),
+            "about 11 minutes"
+        );
+        assert_eq!(
+            words(Request::Xmss(Lifetime::SixMonths)),
+            "about 17 minutes"
+        );
+        assert_eq!(words(Request::Xmss(Lifetime::OneYear)), "about 37 minutes");
     }
 
     /// A request naming no key of this device stops the boot rather than

@@ -2500,8 +2500,8 @@ mod tests {
         assert_eq!(bls.epoch_budget(&tz4), None);
     }
 
-    /// The figure a rotation is scheduled against: the deployed range is 2^24
-    /// epochs, and a baker spends a level's three of them every block.
+    /// The figure a rotation is scheduled against: a one-year key's range is
+    /// 2^24 epochs, and a baker spends a level's three of them every block.
     #[test]
     fn the_days_left_are_the_epochs_spent_at_a_level_a_block() {
         let temp_dir = TempDir::new().unwrap();

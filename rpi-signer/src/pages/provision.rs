@@ -5,6 +5,7 @@
 
 use crate::events::AppEvent;
 use crate::fonts;
+use crate::provision::Request;
 use crate::widgets::Button;
 
 use super::Page as PageTrait;
@@ -88,7 +89,10 @@ impl<D: DrawTarget<Color = BinaryColor>> PageTrait<D> for Page {
     fn handle_touch(&mut self, point: Point) -> bool {
         for (button, key) in &self.buttons {
             if button.contains(point) {
-                let _ = self.app_sender.send(AppEvent::ProvisionKey(*key));
+                let _ = self.app_sender.send(match *key {
+                    DeviceKey::Bls(role) => AppEvent::ProvisionKey(Request::Bls(role)),
+                    DeviceKey::XmssConsensus => AppEvent::ShowLifetimes,
+                });
                 return true;
             }
         }
@@ -103,6 +107,7 @@ mod tests {
     use crate::events::AppEvent;
     use crate::pages::test_ink::Ink;
     use crate::pages::{DISPLAY_HEIGHT, DISPLAY_WIDTH, assert_label_fits};
+    use crate::provision::Request;
     use embedded_graphics::prelude::Point;
     use russignol_signer_lib::DeviceKey;
 
@@ -152,13 +157,18 @@ mod tests {
             for x in 0..DISPLAY_WIDTH {
                 let point = Point::new(x, y);
                 let consumed = PageTrait::<Ink>::handle_touch(&mut page, point);
-                match rx.try_recv() {
-                    Ok(AppEvent::ProvisionKey(key)) => {
-                        assert!(consumed, "a tap that picked {key:?} was not consumed");
-                        regions[key.index()].add(point);
+                let picked = match rx.try_recv() {
+                    Ok(AppEvent::ProvisionKey(Request::Bls(role))) => Some(DeviceKey::Bls(role)),
+                    Ok(AppEvent::ShowLifetimes) => Some(DeviceKey::XmssConsensus),
+                    Ok(AppEvent::ShowMenu) => {
+                        assert!(!consumed, "a miss was consumed");
+                        None
                     }
-                    Ok(AppEvent::ShowMenu) => assert!(!consumed, "a miss was consumed"),
                     other => panic!("a tap at {point:?} answered with {other:?}"),
+                };
+                if let Some(key) = picked {
+                    assert!(consumed, "a tap that picked {key:?} was not consumed");
+                    regions[key.index()].add(point);
                 }
                 assert!(
                     rx.try_recv().is_err(),

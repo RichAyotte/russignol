@@ -5,6 +5,7 @@ pub mod dialog;
 pub mod greeting;
 pub mod image_info;
 pub mod keys;
+pub mod lifetimes;
 pub mod menu;
 pub mod notice;
 pub mod pin;

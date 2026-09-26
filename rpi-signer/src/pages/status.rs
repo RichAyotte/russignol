@@ -355,8 +355,8 @@ mod tests {
     use std::ops::RangeInclusive;
     use tempfile::TempDir;
 
-    /// The 2^24 epochs a provisioned key holds, so what these pin is the row
-    /// a reader will see.
+    /// The 2^24 epochs a one-year key holds, so what these pin is the row a
+    /// reader of such a key will see.
     const DEPLOYED: RangeInclusive<Epoch> = 0..=16_777_215;
 
     /// The store takes an address and a range rather than key material, so no
