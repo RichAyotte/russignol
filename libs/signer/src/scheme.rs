@@ -524,8 +524,8 @@ mod tests {
 
     /// The prefix as it sits in the decoded bytes, which is what a reader
     /// matches on. The rendered leading characters also depend on the payload
-    /// width, and leanVM-b's keys and signatures are not the width Octez
-    /// registered its `xmpk`/`xmsk`/`xmsig` lengths against.
+    /// width, and an XMSS secret key here is not the width Octez registered its
+    /// `xmsk` length against.
     fn carries_prefix(b58: &str, prefix: &[u8]) -> bool {
         bs58::decode(b58)
             .into_vec()

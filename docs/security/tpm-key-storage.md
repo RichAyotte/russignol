@@ -116,7 +116,7 @@ The design here concentrates that state deliberately. `libs/xmss/src/lib.rs:6` â
 
 **A TPM implementing `TPM_ALG_XMSS` would still not help.** tz6 uses the leanVM-b construction: BLAKE2s under a 16-byte tweak, target-sum WOTS encoding with 99 chains, 11 compressions per WOTS public key, a 32-level Merkle path (`vendors/leanVM-b/crates/xmss/src/hash.rs:1`). SP 800-208 XMSS is SHA-256 or SHAKE with different WOTS+ chaining and address schemes. A TPM implementing the NIST scheme correctly cannot produce a signature a Tezos node verifies as tz6.
 
-The blast radius is also larger. A tz6 key covers 2^24 epochs, 388 days of signing, takes 41 minutes to generate and rotates annually (`rpi-signer/src/constants.rs:70`, `rpi-signer/src/provision.rs:328`). A burned key is not re-provisioned in a hurry, and re-provisioning needs a person at the device entering a PIN.
+The blast radius is also larger. A tz6 key covers 2^24 epochs, 388 days of signing, takes 37 minutes to generate and rotates annually (`rpi-signer/src/constants.rs:70`, `rpi-signer/src/provision.rs:328`). A burned key is not re-provisioned in a hurry, and re-provisioning needs a person at the device entering a PIN.
 
 ## Where a TPM Is Worth Using
 

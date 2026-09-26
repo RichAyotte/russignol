@@ -60,7 +60,7 @@ fn verification_fails_when_the_framed_epoch_is_tampered_with() {
     let sig = sk.sign(START, None, b"payload").expect("in range");
 
     let mut bytes = sig.to_bytes();
-    bytes[..4].copy_from_slice(&(START + 1).to_le_bytes());
+    bytes[russignol_xmss::framing::EPOCH_AT..].copy_from_slice(&(START + 1).to_le_bytes());
     let tampered = russignol_xmss::Signature::from_bytes(&bytes).expect("still well-formed");
 
     assert_eq!(tampered.epoch(), START + 1);
@@ -188,20 +188,53 @@ fn the_watermark_is_a_plain_prefix() {
     );
 }
 
-/// Key generation is deterministic in the seed and range, so both values are
-/// pinned: the public key against a rerun, and its tz6 hash against
-/// `b2sum -l 160`, which fails if the digest width or the hashed input moves.
+/// The public key and signature Octez's `marina@leanvm-b` branch (ccd116cb)
+/// produces for this key, from its vendored `vendors/leanVM/crates/xmss`:
+/// `key_gen_from_seed([7; 32], 100, 115)`, then `sign` at epoch 105 over
+/// `hash_message(Some(b"\x11"), b"tz6 test vector")`, both as `as_ssz_bytes`.
+/// Signing there is deterministic, so a byte that differs here is a key or a
+/// signature that node rejects.
+const OCTEZ_PUBLIC_KEY: &str = include_str!("vectors/octez-leanvm-b.pk.hex").trim_ascii();
+const OCTEZ_SIGNATURE: &str = include_str!("vectors/octez-leanvm-b.sig.hex").trim_ascii();
+const OCTEZ_EPOCH: Epoch = 105;
+
 #[test]
-fn public_key_and_its_tz6_hash_are_pinned() {
+fn signs_the_bytes_octez_produces() {
+    let (sk, pk) = key();
+    let sig = sk
+        .sign(OCTEZ_EPOCH, Some(b"\x11"), b"tz6 test vector")
+        .expect("in range");
+
+    assert_eq!(hex(&pk.to_bytes()), OCTEZ_PUBLIC_KEY);
+    assert_eq!(hex(&sig.to_bytes()), OCTEZ_SIGNATURE);
+}
+
+#[test]
+fn verifies_the_bytes_octez_produces() {
+    let pk = PublicKey::from_bytes(&unhex(OCTEZ_PUBLIC_KEY)).expect("32 bytes");
+    let sig = russignol_xmss::Signature::from_bytes(&unhex(OCTEZ_SIGNATURE)).expect("1212 bytes");
+
+    assert_eq!(sig.epoch(), OCTEZ_EPOCH);
+    pk.verify(&sig, Some(b"\x11"), b"tz6 test vector")
+        .expect("Octez's signature verifies");
+}
+
+/// The tz6 hash of the Octez public key, pinned against `b2sum -l 160`, which
+/// fails if the digest width or the hashed input moves.
+#[test]
+fn the_tz6_hash_is_pinned() {
     let (_, pk) = key();
     assert_eq!(
-        hex(&pk.to_bytes()),
-        "973b971e79d7ec23437096e5eacd0263710ae48f3b5ff4a4b06b0a3c17c6ef1c"
-    );
-    assert_eq!(
         hex(pk.hash().as_bytes()),
-        "385cbcf5ffaa61bc59567020fd7d53e1c889da71"
+        "75531bc85ada2da3be943ad0755357c7e6a634aa"
     );
+}
+
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex"))
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {

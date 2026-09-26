@@ -62,7 +62,7 @@ pub const PROVISION_REQUEST_FILE: &str = "/data/provision-request";
 ///
 /// 2^24 epochs is 388 days at three signatures per six-second block, so a card
 /// is rotated once a year with a month of slack. Generation walks every leaf
-/// and costs 41 minutes on the device, paid once per rotation; per year of
+/// and costs 37 minutes on the device, paid once per rotation; per year of
 /// signing that cost is the same at every span, a leaf being a signature. What
 /// a wider span would buy is fewer years between the visits where somebody
 /// stands at the device entering a PIN, and once a year is already the fewest

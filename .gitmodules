@@ -9,4 +9,4 @@
 [submodule "vendors/leanVM-b"]
 	path = vendors/leanVM-b
 	url = https://github.com/RichAyotte/leanVM.git
-	branch = russignol/xmss-patches
+	branch = russignol/xmss-patches-2e6fe21d

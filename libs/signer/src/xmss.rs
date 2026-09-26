@@ -20,23 +20,29 @@ pub use russignol_xmss::{
 
 type HmacSha256 = Hmac<Sha256>;
 
-// Base58Check prefixes from OCaml code. The byte-lengths Octez registers
-// alongside them describe leanMultisig's 31-byte public key and 2329-byte
-// signature; leanVM-b's are 32 and 1212, so only the prefixes transfer.
+// Base58Check prefixes from Octez's leanVM `tz6`, on tezos/tezos branch
+// `marina@leanvm-b` (ccd116cb). A prefix is chosen for one payload width, so
+// these hold only for the 32-byte public keys and 1212-byte signatures that
+// branch's leanVM produces.
 //
 // src/lib_crypto/base58.ml:480 - let xmss_public_key_hash = "\006\161\171" (* tz6(36) *)
 pub(crate) const TZ6_PREFIX: &[u8] = &[0x06, 0xa1, 0xab];
 
-// src/lib_crypto/base58.ml:483 - let xmss_public_key = "\001\121\006\180" (* xmpk(52) *)
-pub(crate) const XMPK_PREFIX: &[u8] = &[0x01, 0x79, 0x06, 0xb4];
+// src/lib_crypto/base58.ml:483 - let xmss_public_key = "\019\090\092\013" (* xmpk(54) *)
+pub(crate) const XMPK_PREFIX: &[u8] = &[0x13, 0x5a, 0x5c, 0x0d];
 
 /// The bytes an `xmsk` value carries ahead of the key.
 ///
-/// `src/lib_crypto/base58.ml:486` - `let xmss_secret_key = "\032\113\056\113" (* xmsk(91) *)`
+/// Not Octez's: this crate's secret is the serialized tree where Octez's is a
+/// compact seed and range, so no Octez reads one. What reads it is
+/// `load_entry` in `rpi-signer/src/signer_server.rs`, loading the tz6 secret
+/// the card's wallet already holds under these bytes, taken from
+/// leanMultisig-era Octez
+/// (`src/lib_crypto/base58.ml:486` - `"\032\113\056\113" (* xmsk(91) *)`).
 pub const XMSK_PREFIX: &[u8] = &[0x20, 0x71, 0x38, 0x71];
 
-// src/lib_crypto/base58.ml:492 - let xmss_signature = "\006\036\134\190\013" (* xmsig(3192) *)
-pub(crate) const XMSIG_PREFIX: &[u8] = &[0x06, 0x24, 0x86, 0xbe, 0x0d];
+// src/lib_crypto/base58.ml:492 - let xmss_signature = "\036\180\033\044\187" (* xmsig(1667) *)
+pub(crate) const XMSIG_PREFIX: &[u8] = &[0x24, 0xb4, 0x21, 0x2c, 0xbb];
 
 /// Encode a tz6 public key hash
 #[must_use]
@@ -99,4 +105,39 @@ pub fn deterministic_nonce_hash(sk: &SecretKey, msg: &[u8]) -> [u8; 32] {
 #[must_use]
 pub fn watermark_mac_key(sk: &SecretKey) -> [u8; 32] {
     blake3::derive_key("russignol-watermark-mac-v1", &sk.to_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tz6 secret stored under these literal bytes loads. They are spelled
+    /// out rather than read from `XMSK_PREFIX` so the stored format holds
+    /// still when the constant moves, which a value built from it could not.
+    #[test]
+    fn a_secret_stored_under_the_cards_prefix_loads() {
+        let (sk, pk) = SecretKey::generate([7u8; 32], 0, 15).expect("range is valid");
+        let stored = base58check::encode(&[0x20, 0x71, 0x38, 0x71], &sk.to_bytes());
+
+        let loaded = crate::scheme::SecretKey::from_b58check(&stored).expect("the card's own key");
+        assert_eq!(loaded.to_public_key(), crate::scheme::PublicKey::Xmss(pk));
+    }
+
+    #[test]
+    fn keys_and_signatures_render_as_octez_registers_them() {
+        let (sk, pk) = SecretKey::generate([7u8; 32], 0, 15).expect("range is valid");
+        let signature = sk.sign(3, Some(b"\x13"), b"payload").expect("in range");
+
+        let address = pkh_to_b58check(&pk.hash());
+        let public = pk_to_b58check(&pk);
+        let sig = signature_to_b58check(&signature);
+
+        // The lengths `src/lib_crypto/base58.ml` registers beside each prefix
+        assert!(address.starts_with("tz6"), "{address}");
+        assert_eq!(address.len(), 36);
+        assert!(public.starts_with("xmpk"), "{public}");
+        assert_eq!(public.len(), 54);
+        assert!(sig.starts_with("xmsig"), "{}", &sig[..12]);
+        assert_eq!(sig.len(), 1667);
+    }
 }

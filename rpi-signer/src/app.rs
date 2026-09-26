@@ -2847,7 +2847,7 @@ mod tests {
             panic!("the pick must ask first: {effects:?}")
         };
         assert!(
-            message.contains("consensus_tz6") && message.contains("41 minutes"),
+            message.contains("consensus_tz6") && message.contains("37 minutes"),
             "the question names the key and what it costs: {message}"
         );
         assert_eq!(on_confirm, &AppEvent::ConfirmProvision(key));

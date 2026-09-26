@@ -1,24 +1,30 @@
 //! On-wire framing for a tz6 signature.
 //!
-//! leanVM-b's `XmssSignature` does not carry the epoch it was produced at, and
-//! its `verify` takes that epoch as a separate argument. The remote signer wire
-//! protocol has no field for it either, so the signature bytes carry it. Octez
-//! defines no such encoding for leanVM-b, so the layout below is this crate's
-//! own; Octez's leanMultisig signatures get the property for free, with the
-//! slot sitting inside the signature where `Xmss.check` reads it back.
+//! Upstream's `XmssSignature` does not carry the epoch it was produced at, and
+//! its `verify` takes that epoch as a separate argument. Octez's `leanvm-b`
+//! branch patches the epoch into the signature as four little-endian bytes
+//! after the body, so a tz6 signature on the wire is exactly that: the body,
+//! then the epoch.
+//!
+//! Octez writes the body with upstream's SSZ encoding. For a signature of
+//! fixed-size byte arrays that is the plain concatenation of its fields, which
+//! is also what `bincode` with fixed-width integers emits, so the body goes
+//! through the crate's `bincode` configuration rather than pulling in
+//! `ethereum_ssz` and its dependency tree. `tests/xmss.rs` pins the result
+//! against bytes Octez produced.
 
 use bincode::Options as _;
-use xmss::{Epoch, XmssSignature};
+use xmss::{Epoch, SIG_SIZE, XmssSignature};
 
 use crate::encoding;
 
 pub const EPOCH_LEN: usize = size_of::<Epoch>();
 
-pub const SIGNATURE_SIZE: usize = EPOCH_LEN + xmss::SIG_SIZE;
+pub const SIGNATURE_SIZE: usize = SIG_SIZE + EPOCH_LEN;
+
+pub const EPOCH_AT: usize = SIG_SIZE;
 
 /// Frame `signature` with the epoch it was produced at.
-///
-/// The epoch leads so a reader can take it without parsing the rest.
 ///
 /// # Panics
 ///
@@ -28,10 +34,10 @@ pub const SIGNATURE_SIZE: usize = EPOCH_LEN + xmss::SIG_SIZE;
 #[must_use]
 pub fn encode(epoch: Epoch, signature: &XmssSignature) -> [u8; SIGNATURE_SIZE] {
     let mut out = [0u8; SIGNATURE_SIZE];
-    out[..EPOCH_LEN].copy_from_slice(&epoch.to_le_bytes());
     encoding()
-        .serialize_into(&mut out[EPOCH_LEN..], signature)
+        .serialize_into(&mut out[..SIG_SIZE], signature)
         .expect("an XmssSignature serializes into SIG_SIZE bytes");
+    out[EPOCH_AT..].copy_from_slice(&epoch.to_le_bytes());
     out
 }
 
@@ -43,10 +49,12 @@ pub fn encode(epoch: Epoch, signature: &XmssSignature) -> [u8; SIGNATURE_SIZE] {
 /// than something this layer asserts.
 #[must_use]
 pub fn decode(bytes: &[u8]) -> Option<(Epoch, XmssSignature)> {
-    let bytes: &[u8; SIGNATURE_SIZE] = bytes.try_into().ok()?;
-    let epoch = Epoch::from_le_bytes(std::array::from_fn(|i| bytes[i]));
-    let signature = encoding().deserialize(&bytes[EPOCH_LEN..]).ok()?;
-    Some((epoch, signature))
+    if bytes.len() != SIGNATURE_SIZE {
+        return None;
+    }
+    let (body, epoch) = bytes.split_last_chunk::<EPOCH_LEN>()?;
+    let signature = encoding().deserialize(body).ok()?;
+    Some((Epoch::from_le_bytes(*epoch), signature))
 }
 
 #[cfg(test)]
@@ -74,14 +82,13 @@ mod tests {
         };
 
         let out = encode(0x0102_0304, &signature);
-        let tips_at = EPOCH_LEN;
-        let randomness_at = tips_at + V * DIGEST_LEN;
+        let randomness_at = V * DIGEST_LEN;
         let proof_at = randomness_at + RANDOMNESS_LEN;
+        let epoch_at = proof_at + LOG_LIFETIME * DIGEST_LEN;
 
         assert_eq!(out.len(), 1212);
-        assert_eq!(proof_at + LOG_LIFETIME * DIGEST_LEN, SIGNATURE_SIZE);
-        assert_eq!(&out[..EPOCH_LEN], &[0x04, 0x03, 0x02, 0x01]);
-        assert_eq!(&out[tips_at..tips_at + DIGEST_LEN], &[0u8; DIGEST_LEN]);
+        assert_eq!(epoch_at + EPOCH_LEN, SIGNATURE_SIZE);
+        assert_eq!(&out[..DIGEST_LEN], &[0u8; DIGEST_LEN]);
         assert_eq!(
             &out[randomness_at - DIGEST_LEN..randomness_at],
             &[byte(V - 1); DIGEST_LEN]
@@ -89,9 +96,10 @@ mod tests {
         assert_eq!(&out[randomness_at..proof_at], [0xAA; RANDOMNESS_LEN]);
         assert_eq!(&out[proof_at..proof_at + DIGEST_LEN], &[0x80; DIGEST_LEN]);
         assert_eq!(
-            &out[SIGNATURE_SIZE - DIGEST_LEN..],
+            &out[epoch_at - DIGEST_LEN..epoch_at],
             &[0x80 | byte(LOG_LIFETIME - 1); DIGEST_LEN]
         );
+        assert_eq!(&out[epoch_at..], &[0x04, 0x03, 0x02, 0x01]);
 
         assert_eq!(decode(&out), Some((0x0102_0304, signature)));
     }

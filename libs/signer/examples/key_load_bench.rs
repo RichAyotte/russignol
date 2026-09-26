@@ -11,7 +11,7 @@
 //!
 //! `write` generates a key from a fixed seed and puts its `xmsk` value in a
 //! file, and `read` times the load of the value a file holds, so a device that
-//! takes 41 minutes to generate a 2^24 key loads one the host wrote. The value
+//! takes 37 minutes to generate a 2^24 key loads one the host wrote. The value
 //! is key material only in shape: the seed is a constant, and nothing signs
 //! under it.
 

@@ -8,7 +8,6 @@ authors.workspace = true
 bincode = "1"
 blake2 = "0.10.6"
 parallel = { version = "0.1.0", path = "../../vendors/leanVM-b/crates/parallel" }
-rand = "0.9"
 xmss = { version = "0.1.0", path = "../../vendors/leanVM-b/crates/xmss", default-features = false }
 zeroize = "1"
 

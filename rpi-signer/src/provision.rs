@@ -318,14 +318,14 @@ pub fn staged_request(path: &Path) -> io::Result<Option<DeviceKey>> {
 
 /// How long generating `key` takes on the device.
 ///
-/// The XMSS figure is the 41 minutes measured at the deployed span; a BLS key
+/// The XMSS figure is the 37 minutes measured at the deployed span; a BLS key
 /// is generated in milliseconds, and the estimate is there so the progress bar
 /// and the operator's confirmation read one number rather than two.
 #[must_use]
 pub const fn estimate(key: DeviceKey) -> std::time::Duration {
     match key {
         DeviceKey::Bls(_) => std::time::Duration::from_secs(1),
-        DeviceKey::XmssConsensus => std::time::Duration::from_mins(41),
+        DeviceKey::XmssConsensus => std::time::Duration::from_mins(37),
     }
 }
 

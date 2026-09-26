@@ -1,4 +1,4 @@
-//! XMSS (tz6) signing for Tezos, over the vendored leanVM-b `xmss` crate.
+//! XMSS (tz6) signing for Tezos, over the vendored leanVM `xmss` crate.
 //!
 //! XMSS is stateful: every epoch is a one-time key, and signing two different
 //! messages at one epoch discloses the secret key rather than costing a
@@ -55,6 +55,9 @@ pub enum Error {
         start: Epoch,
         end: Epoch,
     },
+    /// Every randomizer upstream tries at this epoch failed to encode the
+    /// message, so nothing was signed.
+    NoAdmissibleEncoding { epoch: Epoch },
     /// Signature bytes were not [`SIGNATURE_SIZE`] long.
     MalformedSignature { len: usize },
     /// Public key bytes were not [`PUB_KEY_SIZE`] long.
@@ -78,6 +81,9 @@ impl std::fmt::Display for Error {
                     f,
                     "epoch {epoch} is outside the key's range {start}..={end}"
                 )
+            }
+            Self::NoAdmissibleEncoding { epoch } => {
+                write!(f, "no randomizer encodes the message at epoch {epoch}")
             }
             Self::MalformedSignature { len } => {
                 write!(f, "signature is {len} bytes, expected {SIGNATURE_SIZE}")
@@ -114,7 +120,7 @@ pub struct PublicKeyHash([u8; PUBLIC_KEY_HASH_SIZE]);
 
 /// A signature together with the epoch it was produced at.
 ///
-/// The two travel as one value because verification needs both and leanVM-b's
+/// The two travel as one value because verification needs both and upstream's
 /// signature does not carry the epoch itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature {
@@ -210,9 +216,15 @@ impl SecretKey {
 
     /// Sign `payload` at `epoch`.
     ///
+    /// Deterministic in the key, epoch and message, so signing the same payload
+    /// at the same epoch again yields the same signature; only two different
+    /// payloads at one epoch disclose the key.
+    ///
     /// # Errors
     ///
-    /// [`Error::EpochOutOfRange`] if `epoch` is not in [`Self::epoch_range`].
+    /// [`Error::EpochOutOfRange`] if `epoch` is not in [`Self::epoch_range`];
+    /// [`Error::NoAdmissibleEncoding`] if no randomizer upstream tries yields a
+    /// valid encoding.
     pub fn sign(
         &self,
         epoch: Epoch,
@@ -220,13 +232,16 @@ impl SecretKey {
         payload: &[u8],
     ) -> Result<Signature, Error> {
         let digest = hash_message(watermark, payload);
-        let inner = xmss::sign(&mut rand::rng(), &self.0, &digest, epoch).map_err(|_| {
-            let range = self.epoch_range();
-            Error::EpochOutOfRange {
-                epoch,
-                start: *range.start(),
-                end: *range.end(),
+        let inner = xmss::sign(&self.0, &digest, epoch).map_err(|e| match e {
+            xmss::XmssSignError::EpochOutOfRange => {
+                let range = self.epoch_range();
+                Error::EpochOutOfRange {
+                    epoch,
+                    start: *range.start(),
+                    end: *range.end(),
+                }
             }
+            xmss::XmssSignError::NoAdmissibleEncoding => Error::NoAdmissibleEncoding { epoch },
         })?;
         Ok(Signature { epoch, inner })
     }

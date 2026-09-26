@@ -135,7 +135,11 @@ fn framed(signature: &Signature) -> Result<(russignol_xmss::Signature, u32), Str
             bytes.len()
         ));
     }
-    let epoch = u32::from_le_bytes(bytes[..4].try_into().expect("four bytes"));
+    let epoch = u32::from_le_bytes(
+        bytes[russignol_xmss::framing::EPOCH_AT..]
+            .try_into()
+            .expect("four bytes"),
+    );
     let decoded = russignol_xmss::Signature::from_bytes(&bytes).map_err(|e| e.to_string())?;
     if decoded.epoch() != epoch {
         return Err(format!(
@@ -1065,7 +1069,8 @@ impl TestSuite {
                 .map_err(|e| format!("the signature does not verify at epoch {epoch}: {e}"))?;
 
             let mut reframed = signature.to_bytes();
-            reframed[..4].copy_from_slice(&(epoch + 1).to_le_bytes());
+            reframed[russignol_xmss::framing::EPOCH_AT..]
+                .copy_from_slice(&(epoch + 1).to_le_bytes());
             let at_next =
                 russignol_xmss::Signature::from_bytes(&reframed).map_err(|e| e.to_string())?;
             if verifier.verify(&at_next, None, &data).is_ok() {
