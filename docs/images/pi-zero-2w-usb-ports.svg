@@ -1,35 +1,94 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 440" width="700" height="440" role="img" aria-labelledby="diagram-title diagram-desc">
-  <!-- 8.6 px/mm, board corner at (70, 70), from datasheets.raspberrypi.com/rpizero2/raspberry-pi-zero-2-w-mechanical-drawing.pdf: port centres 12.4, 41.4 and 54 mm from the microSD end, holes 3.5 mm in from each corner. The drawing does not dimension the microSD slot, so only its end of the board is meaningful. -->
+  <!-- Generated at 8.6 px/mm from the outlines in datasheets.raspberrypi.com/rpizero2/raspberry-pi-zero-2-w-mechanical-drawing.pdf. -->
   <title id="diagram-title">Raspberry Pi Zero 2 W connector edge</title>
   <desc id="diagram-desc">Top view of the board, drawn to scale. Along the lower edge, from the microSD end: mini HDMI, the USB On-The-Go port, then PWR IN at the corner. The two micro-USB sockets sit close together; the signer cable goes in the USB one, the one further from the corner.</desc>
-  <g fill="none" stroke="#8b8b8b" stroke-width="2.5">
-    <rect x="70" y="70" width="559" height="258" rx="26"/>
-    <rect x="131" y="78" width="437" height="44" rx="3"/>
-    <rect x="54" y="170" width="32" height="60" rx="3"/>
-    <rect x="599" y="128" width="30" height="138" rx="3"/>
-    <rect x="130" y="264" width="94" height="69" rx="3"/>
-    <rect x="501" y="285" width="67" height="55" rx="3"/>
+  <!-- Hides the board edge inside each connector that overhangs it, so the edge stops at the connector instead of running through it. -->
+  <mask id="connector-cutouts" maskUnits="userSpaceOnUse" x="0" y="0" width="700" height="440">
+    <rect width="700" height="440" fill="#fff"/>
+    <g fill="#000">
+      <rect x="129.94" y="268.4" width="93.48" height="64.41"/>
+      <rect x="391.55" y="287.58" width="69.32" height="51.17"/>
+      <rect x="500" y="287.58" width="69.32" height="51.17"/>
+    </g>
+  </mask>
+  <rect x="70" y="70" width="559" height="258" rx="25.8" fill="none" stroke="#8b8b8b" stroke-width="2.5" mask="url(#connector-cutouts)"/>
+  <g fill="none" stroke="#8b8b8b" stroke-width="1.5">
+    <circle cx="100.1" cy="100.1" r="25.8"/>
+    <circle cx="598.9" cy="100.1" r="25.8"/>
+    <circle cx="100.1" cy="297.9" r="25.8"/>
+    <circle cx="598.9" cy="297.9" r="25.8"/>
   </g>
   <g fill="none" stroke="#8b8b8b" stroke-width="2">
-    <circle cx="100" cy="100" r="12"/>
-    <circle cx="599" cy="100" r="12"/>
-    <circle cx="100" cy="298" r="12"/>
-    <circle cx="599" cy="298" r="12"/>
+    <circle cx="100.1" cy="100.1" r="11.61"/>
+    <circle cx="598.9" cy="100.1" r="11.61"/>
+    <circle cx="100.1" cy="297.9" r="11.61"/>
+    <circle cx="598.9" cy="297.9" r="11.61"/>
   </g>
-  <rect x="393" y="285" width="67" height="55" rx="3" fill="none" stroke="#f97316" stroke-width="3.5"/>
-  <g font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="14" fill="#8b8b8b">
-    <text x="349.5" y="105" text-anchor="middle">40-pin GPIO header</text>
-    <text x="38" y="200" text-anchor="middle" transform="rotate(-90 38 200)">microSD</text>
-    <text x="664" y="197" text-anchor="middle" transform="rotate(-90 664 197)">camera</text>
+  <g fill="none" stroke="#8b8b8b" stroke-width="2.5">
+    <rect x="131.06" y="78.51" width="436.88" height="43.09" rx="3"/>
+    <rect x="84.19" y="131.06" width="98.56" height="103.29" rx="3"/>
+    <rect x="129.94" y="268.4" width="93.48" height="64.41" rx="3"/>
+    <rect x="502.32" y="287.58" width="64.67" height="45.75" rx="2"/>
+    <rect x="500" y="333.33" width="69.32" height="5.42"/>
+  </g>
+  <g fill="none" stroke="#8b8b8b" stroke-width="1.5">
+    <circle cx="141.98" cy="89.18" r="4.73"/>
+    <circle cx="141.98" cy="111.02" r="4.73"/>
+    <circle cx="163.83" cy="89.18" r="4.73"/>
+    <circle cx="163.83" cy="111.02" r="4.73"/>
+    <circle cx="185.67" cy="89.18" r="4.73"/>
+    <circle cx="185.67" cy="111.02" r="4.73"/>
+    <circle cx="207.51" cy="89.18" r="4.73"/>
+    <circle cx="207.51" cy="111.02" r="4.73"/>
+    <circle cx="229.36" cy="89.18" r="4.73"/>
+    <circle cx="229.36" cy="111.02" r="4.73"/>
+    <circle cx="251.2" cy="89.18" r="4.73"/>
+    <circle cx="251.2" cy="111.02" r="4.73"/>
+    <circle cx="273.05" cy="89.18" r="4.73"/>
+    <circle cx="273.05" cy="111.02" r="4.73"/>
+    <circle cx="294.89" cy="89.18" r="4.73"/>
+    <circle cx="294.89" cy="111.02" r="4.73"/>
+    <circle cx="316.73" cy="89.18" r="4.73"/>
+    <circle cx="316.73" cy="111.02" r="4.73"/>
+    <circle cx="338.58" cy="89.18" r="4.73"/>
+    <circle cx="338.58" cy="111.02" r="4.73"/>
+    <circle cx="360.42" cy="89.18" r="4.73"/>
+    <circle cx="360.42" cy="111.02" r="4.73"/>
+    <circle cx="382.27" cy="89.18" r="4.73"/>
+    <circle cx="382.27" cy="111.02" r="4.73"/>
+    <circle cx="404.11" cy="89.18" r="4.73"/>
+    <circle cx="404.11" cy="111.02" r="4.73"/>
+    <circle cx="425.95" cy="89.18" r="4.73"/>
+    <circle cx="425.95" cy="111.02" r="4.73"/>
+    <circle cx="447.8" cy="89.18" r="4.73"/>
+    <circle cx="447.8" cy="111.02" r="4.73"/>
+    <circle cx="469.64" cy="89.18" r="4.73"/>
+    <circle cx="469.64" cy="111.02" r="4.73"/>
+    <circle cx="491.49" cy="89.18" r="4.73"/>
+    <circle cx="491.49" cy="111.02" r="4.73"/>
+    <circle cx="513.33" cy="89.18" r="4.73"/>
+    <circle cx="513.33" cy="111.02" r="4.73"/>
+    <circle cx="535.17" cy="89.18" r="4.73"/>
+    <circle cx="535.17" cy="111.02" r="4.73"/>
+    <circle cx="557.02" cy="89.18" r="4.73"/>
+    <circle cx="557.02" cy="111.02" r="4.73"/>
+  </g>
+  <g fill="none" stroke="#f97316" stroke-width="3">
+    <rect x="393.88" y="287.58" width="64.67" height="45.75" rx="2"/>
+    <rect x="391.55" y="333.33" width="69.32" height="5.42"/>
+  </g>
+  <g font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="14" fill="#8b8b8b" text-anchor="middle">
+    <text x="349.5" y="58">40-pin GPIO header</text>
+    <text x="133.47" y="187.7">microSD</text>
   </g>
   <g stroke="#8b8b8b" stroke-width="1.5">
-    <path d="M177 333 V 366"/>
-    <path d="M534.5 340 V 366"/>
+    <path d="M176.68 332.82 V 366"/>
+    <path d="M534.66 338.75 V 366"/>
   </g>
-  <path d="M426.5 340 V 398" stroke="#f97316" stroke-width="2"/>
-  <g font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="15">
-    <text x="177" y="386" text-anchor="middle" fill="#8b8b8b">mini HDMI</text>
-    <text x="534.5" y="386" text-anchor="middle" fill="#8b8b8b">PWR IN — power only</text>
-    <text x="426.5" y="420" text-anchor="middle" fill="#f97316" font-weight="700">USB — the data port, plug the cable in here</text>
+  <path d="M426.21 338.75 V 398" stroke="#f97316" stroke-width="2"/>
+  <g font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="15" text-anchor="middle">
+    <text x="176.68" y="386" fill="#8b8b8b">mini HDMI</text>
+    <text x="534.66" y="386" fill="#8b8b8b">PWR IN — power only</text>
+    <text x="426.21" y="420" fill="#f97316" font-weight="700">USB — the data port, plug the cable in here</text>
   </g>
 </svg>
