@@ -17,7 +17,7 @@ You also need an SD card reader on whichever machine flashes the card. It does n
 
 ## Board — Raspberry Pi Zero 2 W
 
-Buy the **with headers** variant.
+Buy the version with **headers soldered on**.
 
 Only this board. The image ships a single device tree, `broadcom/bcm2710-rpi-zero-2-w`, and boots on nothing else — not the original Pi Zero or Zero W, whose ARMv6 core cannot run a 64-bit binary, and not a Pi 3, 4 or 5.
 
