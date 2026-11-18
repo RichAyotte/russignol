@@ -844,6 +844,18 @@ fn cmd_publish(component: ReleaseComponent, publish: &PublishTargets) -> Result<
     Ok(())
 }
 
+/// Wrangler, given no `--branch`, deploys to the checked-out git branch, and any branch but the
+/// Pages project's production branch (master) lands on a preview URL rather than russignol.com.
+fn website_deploy_args() -> [&'static str; 5] {
+    [
+        "pages",
+        "deploy",
+        "website",
+        "--project-name=russignol",
+        "--branch=master",
+    ]
+}
+
 fn cmd_website_publish() -> Result<()> {
     check_command("wrangler", "Install with: bun add -g wrangler")?;
     println!(
@@ -853,7 +865,7 @@ fn cmd_website_publish() -> Result<()> {
 
     run_cmd(
         "wrangler",
-        &["pages", "deploy", "website", "--project-name=russignol"],
+        &website_deploy_args(),
         "Failed to publish website to Cloudflare Pages",
     )?;
 
@@ -1707,6 +1719,16 @@ mod tests {
         assert_eq!(assets, vec![asset.to_string()]);
         assert_eq!(std::fs::read(asset).unwrap(), b"host utility");
         assert!(built.exists(), "the build output was moved away");
+    }
+
+    #[test]
+    fn website_deploys_to_the_production_branch_whatever_is_checked_out() {
+        assert!(
+            website_deploy_args().contains(&"--branch=master"),
+            "without --branch, wrangler deploys to the checked-out git branch, \
+             which is a preview unless it is master: {:?}",
+            website_deploy_args()
+        );
     }
 
     #[test]
