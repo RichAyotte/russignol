@@ -101,7 +101,7 @@ A source card not flashed by the host utility (for example one written with `dd`
 ## Step 5: Boot and Initialize Device
 
 1. Insert the flashed SD card into your Raspberry Pi Zero 2W
-2. Connect the Pi to your baker host with a USB data cable, in the middle micro-USB socket beside the mini-HDMI, not the PWR IN socket at the corner
+2. Connect the Pi to your baker host with a USB data cable, in the micro-USB socket further from the corner, not the PWR IN socket at the corner
 3. Power on (USB provides power)
 4. Follow the on-screen setup wizard:
    - **Create PIN**: Enter a 5-10 digit PIN (entered on the touchscreen)

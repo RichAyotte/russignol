@@ -65,7 +65,7 @@ One cable carries power and data both, so there is no separate power supply to b
 
 - The device end is **micro-USB Type B**, and that end is fixed. The host end is whatever your baker host takes: USB-A on most desktops and servers, USB-C on a recent laptop or Mac. Either is fine, and so is an adapter on a cable you already own.
 - It must be a **data** cable. Charge-only micro-USB cables have no data pair and are common in the bottom of a drawer. The symptom is a device that boots and displays but never appears on the host.
-- It goes in the **middle** micro-USB socket, the OTG port beside the mini-HDMI. The socket at the corner of the board is PWR IN and carries power only. A cable there gives you a signer that lights up and cannot be reached.
+- The two micro-USB sockets look alike and sit close together. The one at the corner of the board is PWR IN and carries power only, and a cable there gives you a signer that lights up and cannot be reached. The cable goes in the other one, **further from the corner**: the OTG port.
 - Plug into a host port directly, or into a self-powered hub. `russignol setup` warns when the device sits behind a bus-powered hub whose devices together exceed the 500 mA budget.
 
 ## Where to buy
@@ -87,4 +87,4 @@ Before you go looking for a software fault:
 
 - The panel's back label reads V4.
 - The HAT seats fully on the header, all 40 pins.
-- With a flashed card in and the cable in the middle socket, `lsusb -d 1d6b:0104` on the host lists the device. Nothing listed, after the display has come up, means a charge-only cable or the wrong socket.
+- With a flashed card in and the cable in the micro-USB socket further from the corner, `lsusb -d 1d6b:0104` on the host lists the device. Nothing listed, after the display has come up, means a charge-only cable or the wrong socket.

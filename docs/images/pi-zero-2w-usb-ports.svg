@@ -1,28 +1,35 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 440" width="700" height="440" role="img" aria-labelledby="diagram-title diagram-desc">
+  <!-- 8.6 px/mm, board corner at (70, 70), from datasheets.raspberrypi.com/rpizero2/raspberry-pi-zero-2-w-mechanical-drawing.pdf: port centres 12.4, 41.4 and 54 mm from the microSD end, holes 3.5 mm in from each corner. The drawing does not dimension the microSD slot, so only its end of the board is meaningful. -->
   <title id="diagram-title">Raspberry Pi Zero 2 W connector edge</title>
-  <desc id="diagram-desc">Top view of the board. Along the lower edge, from the microSD end: mini HDMI, the USB On-The-Go port, then PWR IN. The signer cable goes in the USB port.</desc>
+  <desc id="diagram-desc">Top view of the board, drawn to scale. Along the lower edge, from the microSD end: mini HDMI, the USB On-The-Go port, then PWR IN at the corner. The two micro-USB sockets sit close together; the signer cable goes in the USB one, the one further from the corner.</desc>
   <g fill="none" stroke="#8b8b8b" stroke-width="2.5">
-    <rect x="60" y="70" width="560" height="258" rx="12"/>
-    <rect x="110" y="84" width="430" height="24" rx="3"/>
-    <rect x="44" y="170" width="32" height="60" rx="3"/>
-    <rect x="604" y="180" width="32" height="44" rx="3"/>
-    <rect x="150" y="316" width="54" height="24" rx="3"/>
-    <rect x="470" y="316" width="38" height="24" rx="3"/>
+    <rect x="70" y="70" width="559" height="258" rx="26"/>
+    <rect x="131" y="78" width="437" height="44" rx="3"/>
+    <rect x="54" y="170" width="32" height="60" rx="3"/>
+    <rect x="599" y="128" width="30" height="138" rx="3"/>
+    <rect x="130" y="264" width="94" height="69" rx="3"/>
+    <rect x="501" y="285" width="67" height="55" rx="3"/>
   </g>
-  <rect x="330" y="316" width="38" height="24" rx="3" fill="none" stroke="#f97316" stroke-width="3.5"/>
+  <g fill="none" stroke="#8b8b8b" stroke-width="2">
+    <circle cx="100" cy="100" r="12"/>
+    <circle cx="599" cy="100" r="12"/>
+    <circle cx="100" cy="298" r="12"/>
+    <circle cx="599" cy="298" r="12"/>
+  </g>
+  <rect x="393" y="285" width="67" height="55" rx="3" fill="none" stroke="#f97316" stroke-width="3.5"/>
   <g font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="14" fill="#8b8b8b">
-    <text x="325" y="101" text-anchor="middle">40-pin GPIO header</text>
-    <text x="30" y="204" text-anchor="middle" transform="rotate(-90 30 204)">microSD</text>
-    <text x="670" y="206" text-anchor="middle" transform="rotate(-90 670 206)">camera</text>
+    <text x="349.5" y="105" text-anchor="middle">40-pin GPIO header</text>
+    <text x="38" y="200" text-anchor="middle" transform="rotate(-90 38 200)">microSD</text>
+    <text x="664" y="197" text-anchor="middle" transform="rotate(-90 664 197)">camera</text>
   </g>
   <g stroke="#8b8b8b" stroke-width="1.5">
-    <path d="M177 340 V 366"/>
-    <path d="M489 340 V 366"/>
+    <path d="M177 333 V 366"/>
+    <path d="M534.5 340 V 366"/>
   </g>
-  <path d="M349 340 V 398" stroke="#f97316" stroke-width="2"/>
+  <path d="M426.5 340 V 398" stroke="#f97316" stroke-width="2"/>
   <g font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="15">
     <text x="177" y="386" text-anchor="middle" fill="#8b8b8b">mini HDMI</text>
-    <text x="489" y="386" text-anchor="middle" fill="#8b8b8b">PWR IN — power only</text>
-    <text x="349" y="420" text-anchor="middle" fill="#f97316" font-weight="700">USB — the data port, plug the cable in here</text>
+    <text x="534.5" y="386" text-anchor="middle" fill="#8b8b8b">PWR IN — power only</text>
+    <text x="426.5" y="420" text-anchor="middle" fill="#f97316" font-weight="700">USB — the data port, plug the cable in here</text>
   </g>
 </svg>
