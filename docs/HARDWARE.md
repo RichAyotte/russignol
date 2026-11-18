@@ -7,7 +7,7 @@ What Russignol runs on, the part numbers to order, and the traps that make a wro
 | Part | Order this | Approx. |
 | --- | --- | --- |
 | Board | Raspberry Pi Zero 2 W, **with headers** | US$21 |
-| Display | Waveshare 2.13inch Touch e-Paper HAT — part **20716** (with case) or **19493** (bare) | US$30 / US$25 |
+| Display | Waveshare 2.13inch Touch e-Paper HAT **with case** — part **20716** | US$30 |
 | Card | microSD, 8 GB or larger, high-endurance | US$10-15 |
 | Cable | **Data** cable, micro-B at the device end, host end to match your baker | US$5 |
 
@@ -27,10 +27,11 @@ The onboard radio is dead weight rather than exposure: WiFi and Bluetooth are co
 
 ## Display — Waveshare 2.13inch Touch e-Paper HAT
 
-- [2.13inch Touch e-Paper HAT](https://www.waveshare.com/2.13inch-touch-e-paper-hat.htm) — part 19493
-- [2.13inch Touch e-Paper HAT (with case)](https://www.waveshare.com/2.13inch-touch-e-paper-hat-with-case.htm) — part 20716, the same HAT plus an ABS case, screwdriver, screws, thermal tape and feet
+Buy the **with case** variant:
 
-Either works. 20716 is the one in the photographs.
+- [2.13inch Touch e-Paper HAT (with case)](https://www.waveshare.com/2.13inch-touch-e-paper-hat-with-case.htm) — part 20716, the HAT plus an ABS case, screwdriver, screws, thermal tape and feet
+
+20716 is the one in the photographs. The same HAT is sold without the case as [part 19493](https://www.waveshare.com/2.13inch-touch-e-paper-hat.htm), and the signer runs on it just the same.
 
 Three things make it the right part:
 
