@@ -39,8 +39,8 @@ Ledger Nano can't perform BLS signatures fast enough for 6-second blocks, and so
 
 | Component | Part |
 |-----------|------|
-| **Board** | Raspberry Pi Zero 2 W, with headers |
-| **Display** | Waveshare 2.13inch Touch e-Paper HAT with case (part 20716) |
+| **Board** | [Raspberry Pi Zero 2 W](https://www.raspberrypi.com/products/raspberry-pi-zero-2-w/), with headers |
+| **Display** | [Waveshare 2.13inch Touch e-Paper HAT with case](https://www.waveshare.com/2.13inch-touch-e-paper-hat-with-case.htm) (part 20716) |
 | **Storage** | microSD, 8 GB or larger, high-endurance |
 | **Cable** | USB data cable, micro-B at the device end |
 

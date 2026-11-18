@@ -454,6 +454,13 @@ ul {
 .feature-card p {
     color: var(--accent-color);
 }
+.feature-card a {
+    color: var(--primary-color);
+}
+.feature-card a:hover {
+    color: var(--primary-dark);
+    text-decoration: underline;
+}
 .code-block-container {
     position: relative;
     margin-top: 25px;
