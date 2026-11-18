@@ -27,7 +27,7 @@ The onboard radio is dead weight rather than exposure: WiFi and Bluetooth are co
 
 ## Display — Waveshare 2.13inch Touch e-Paper HAT
 
-Buy the **with case** variant:
+Buy the version that comes with a case:
 
 - [2.13inch Touch e-Paper HAT (with case)](https://www.waveshare.com/2.13inch-touch-e-paper-hat-with-case.htm) — part 20716, the HAT plus an ABS case, screwdriver, screws, thermal tape and feet
 
